@@ -1,0 +1,751 @@
+use std::collections::HashMap;
+
+/// Represents the two states of a table, array (index-value pairs) and hashmap
+/// (key-value pairs).
+#[derive(Debug, Clone)]
+pub enum Table {
+    Map(HashMap<Value, Value>),
+    Array(Vec<Value>),
+}
+
+/// Represents the types of values that can be present in the constant table.
+#[derive(Debug, Clone)]
+pub enum Constant {
+    Nil,
+    Boolean(bool),
+    // Function(Function), i don't have a function struct yet
+    Number(f64),
+    String(String),
+    Import(u32),
+    Closure(u64),
+    Table(Table),
+    Vector { x: f32, y: f32, z: f32, w: f32 },
+}
+
+/// Represents the types of operands that can be used within an IL instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Value {
+    Nil,
+    Boolean(bool),
+    ConstantIndex(usize),
+    Immediate(i32),
+    StackIndex(usize),
+}
+
+#[derive(Debug)]
+pub enum Count {
+    Number(u8),
+    Variadic,
+    All, // Multiret
+}
+
+#[derive(Debug, Clone)]
+pub enum Instr {
+    // Keep variant order in sync with LuauOpcode in Bytecode.h.
+    // 0..6: basic loads/moves
+    /// No operation.
+    Nop,
+    /// Debugger break.
+    Break,
+    /// Load nil into a register.
+    LoadNil { reg: u8 },
+    /// Load a boolean into a register and jumps to a given short offset.
+    LoadB { reg: u8, value: bool, jump: u8 },
+    /// Load an integer immediate into a register.
+    LoadN { reg: u8, value: i16 },
+    /// Load a constant into a register.
+    LoadK { reg: u8, index: u16 },
+    /// Move a value between registers.
+    Move { dest: u8, src: u8 },
+
+    // 7..12: globals/upvalues/imports
+    /// Get a global variable by constant-string key.
+    GetGlobal { dest: u8, slot: u8, key: u32 },
+    /// Set a global variable by constant-string key.
+    SetGlobal { src: u8, slot: u8, key: u32 },
+    /// Get an upvalue into a register.
+    GetUpval { dest: u8, upval: u8 },
+    /// Set an upvalue from a register.
+    SetUpval { src: u8, upval: u8 },
+    /// Close upvalues at or above a register.
+    CloseUpvals { reg: u8 },
+    /// Get an imported value.
+    GetImport { dest: u8, index: u16, path: u32 },
+
+    // 13..20: table access and call setup
+    /// Table read: dest = table[key]
+    GetTable { dest: u8, table: u8, key: u8 },
+    /// Table write: table[key] = src
+    SetTable { src: u8, table: u8, key: u8 },
+    /// Table read with constant string key.
+    GetTableKS {
+        dest: u8,
+        table: u8,
+        slot: u8,
+        key: u32,
+    },
+    /// Table write with constant string key.
+    SetTableKS {
+        src: u8,
+        table: u8,
+        slot: u8,
+        key: u32,
+    },
+    /// Table read with immediate integer key (1-indexed).
+    GetTableN { dest: u8, table: u8, index: u8 },
+    /// Table write with immediate integer key (1-indexed).
+    SetTableN { src: u8, table: u8, index: u8 },
+    /// Create a new closure from a proto.
+    NewClosure { dest: u8, proto: u16 },
+    /// Method call setup: dest+1 = object, dest = object[method]
+    NameCall {
+        dest: u8,
+        object: u8,
+        slot: u8,
+        method: u32,
+    },
+
+    // 21..32: calls, returns, and branches
+    /// Call a function: func(args...) -> results
+    Call {
+        func: u8,
+        arg_count: u8,
+        ret_count: u8,
+    },
+    /// Return from a function.
+    Return { base: u8, count: u8 },
+    /// Unconditional forward jump.
+    Jump { offset: i16 },
+    /// Unconditional backward jump (triggers interrupt hook).
+    JumpBack { offset: i16 },
+    /// Jump if register is truthy.
+    JumpIf { reg: u8, offset: i16 },
+    /// Jump if register is falsy.
+    JumpIfNot { reg: u8, offset: i16 },
+    /// Jump if reg == aux.
+    JumpIfEq { reg: u8, aux: u8, offset: i16 },
+    /// Jump if reg <= aux.
+    JumpIfLe { reg: u8, aux: u8, offset: i16 },
+    /// Jump if reg < aux.
+    JumpIfLt { reg: u8, aux: u8, offset: i16 },
+    /// Jump if reg ~= aux.
+    JumpIfNotEq { reg: u8, aux: u8, offset: i16 },
+    /// Jump if not (reg <= aux).
+    JumpIfNotLe { reg: u8, aux: u8, offset: i16 },
+    /// Jump if not (reg < aux).
+    JumpIfNotLt { reg: u8, aux: u8, offset: i16 },
+
+    // 33..52: arithmetic/logical/unary ops
+    /// dest = a + b
+    Add { dest: u8, a: u8, b: u8 },
+    /// dest = a - b
+    Sub { dest: u8, a: u8, b: u8 },
+    /// dest = a * b
+    Mul { dest: u8, a: u8, b: u8 },
+    /// dest = a / b
+    Div { dest: u8, a: u8, b: u8 },
+    /// dest = a % b
+    Mod { dest: u8, a: u8, b: u8 },
+    /// dest = a ^ b
+    Pow { dest: u8, a: u8, b: u8 },
+    /// dest = reg + const
+    AddK { dest: u8, reg: u8, k: u8 },
+    /// dest = reg - const
+    SubK { dest: u8, reg: u8, k: u8 },
+    /// dest = reg * const
+    MulK { dest: u8, reg: u8, k: u8 },
+    /// dest = reg / const
+    DivK { dest: u8, reg: u8, k: u8 },
+    /// dest = reg % const
+    ModK { dest: u8, reg: u8, k: u8 },
+    /// dest = reg ^ const
+    PowK { dest: u8, reg: u8, k: u8 },
+    /// dest = a and b
+    And { dest: u8, a: u8, b: u8 },
+    /// dest = a or b
+    Or { dest: u8, a: u8, b: u8 },
+    /// dest = reg and const
+    AndK { dest: u8, reg: u8, k: u8 },
+    /// dest = reg or const
+    OrK { dest: u8, reg: u8, k: u8 },
+    /// dest = a .. b
+    Concat { dest: u8, a: u8, b: u8 },
+    /// dest = not reg
+    Not { dest: u8, reg: u8 },
+    /// dest = -reg
+    Minus { dest: u8, reg: u8 },
+    /// dest = #reg
+    Length { dest: u8, reg: u8 },
+
+    // 53..59: table construction and loop core ops
+    /// Create a new table.
+    NewTable {
+        dest: u8,
+        hash_size: u8,
+        array_size: u32,
+    },
+    /// Duplicate a table template from the constant table.
+    DupTable { dest: u8, k: u16 },
+    /// Populate a table with values from registers.
+    SetList {
+        table: u8,
+        base: u8,
+        count: u8,
+        index: u32,
+    },
+    /// Numeric for loop prep: validate and potentially skip.
+    FornPrep { base: u8, offset: i16 },
+    /// Numeric for loop step.
+    FornLoop { base: u8, offset: i16 },
+    /// Generic for loop iteration.
+    ForgLoop {
+        base: u8,
+        offset: i16,
+        var_count: u8,
+        ipairs: bool,
+    },
+    /// Prep for ipairs-style iteration.
+    ForgPrepInext { base: u8, offset: i16 },
+
+    // 60..75: fastcall, varargs, closure helpers, extended jumps
+    /// Perform a fast call of a built-in function using 3 register arguments.
+    FastCall3 {
+        builtin: u8,
+        arg1: u8,
+        arg2: u8,
+        arg3: u8,
+        jump: u8,
+    },
+    /// Prep for next()-style iteration.
+    ForgPrepNext { base: u8, offset: i16 },
+    /// Start executing a function in native code (runtime pseudo-instruction).
+    NativeCall,
+    /// Get variadic arguments into registers.
+    GetVarArgs { dest: u8, count: u8 },
+    /// Duplicate a closure from the constant table.
+    DupClosure { dest: u8, k: u16 },
+    /// Prepare variadic function frame.
+    PrepVarArgs { nparams: u8 },
+    /// Load extended constant.
+    LoadKX { dest: u8, k: u32 },
+    /// Extended unconditional jump.
+    JumpX { offset: i32 },
+    /// Fast path for a builtin call (skipped, falls through to CALL).
+    FastCall { builtin: u8, jump: u8 },
+    /// Increment coverage counter.
+    Coverage,
+    /// Capture an upvalue (used inside NEWCLOSURE sequences).
+    Capture { capture_type: u8, reg: u8 },
+    /// dest = const - reg
+    SubRK { dest: u8, k: u8, reg: u8 },
+    /// dest = const / reg
+    DivRK { dest: u8, k: u8, reg: u8 },
+    /// Fast path for single-arg builtin (skipped).
+    FastCall1 { builtin: u8, arg: u8, jump: u8 },
+    /// Fast path for two-arg builtin (skipped).
+    FastCall2 {
+        builtin: u8,
+        arg1: u8,
+        arg2: u8,
+        jump: u8,
+    },
+    /// Fast path for builtin with one register + one constant arg (skipped).
+    FastCall2K {
+        builtin: u8,
+        arg: u8,
+        k: u32,
+        jump: u8,
+    },
+
+    // 76..82: extended loop/constant comparisons and floor division
+    /// Generic for loop prep (handles generalized iteration).
+    ForgPrep { base: u8, offset: i16 },
+    /// Jump if reg == nil, with optional inversion.
+    JumpXEqKNil { reg: u8, invert: bool, offset: i16 },
+    /// Jump if reg == bool constant, with optional inversion.
+    JumpXEqKB {
+        reg: u8,
+        k: bool,
+        invert: bool,
+        offset: i16,
+    },
+    /// Jump if reg == number constant, with optional inversion.
+    JumpXEqKN {
+        reg: u8,
+        k: u32,
+        invert: bool,
+        offset: i16,
+    },
+    /// Jump if reg == string constant, with optional inversion.
+    JumpXEqKS {
+        reg: u8,
+        k: u32,
+        invert: bool,
+        offset: i16,
+    },
+    /// dest = a // b (integer division)
+    IDiv { dest: u8, a: u8, b: u8 },
+    /// dest = reg // const (integer division)
+    IDivK { dest: u8, reg: u8, k: u8 },
+}
+
+impl Instr {
+    const LOP_COUNT: u8 = 83; // LOP__COUNT (not a valid opcode)
+
+    fn opcode_requires_aux(opcode: u8) -> bool {
+        matches!(
+            opcode,
+            7 | 8
+                | 12
+                | 15
+                | 16
+                | 20
+                | 27
+                | 28
+                | 29
+                | 30
+                | 31
+                | 32
+                | 53
+                | 55
+                | 58
+                | 60
+                | 66
+                | 74
+                | 75
+                | 77
+                | 78
+                | 79
+                | 80
+        )
+    }
+
+    pub fn word_len(&self) -> usize {
+        match self {
+            Instr::GetGlobal { .. }
+            | Instr::SetGlobal { .. }
+            | Instr::GetImport { .. }
+            | Instr::GetTableKS { .. }
+            | Instr::SetTableKS { .. }
+            | Instr::NameCall { .. }
+            | Instr::JumpIfEq { .. }
+            | Instr::JumpIfLe { .. }
+            | Instr::JumpIfLt { .. }
+            | Instr::JumpIfNotEq { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::NewTable { .. }
+            | Instr::SetList { .. }
+            | Instr::ForgLoop { .. }
+            | Instr::FastCall3 { .. }
+            | Instr::LoadKX { .. }
+            | Instr::FastCall2 { .. }
+            | Instr::FastCall2K { .. }
+            | Instr::JumpXEqKNil { .. }
+            | Instr::JumpXEqKB { .. }
+            | Instr::JumpXEqKN { .. }
+            | Instr::JumpXEqKS { .. } => 2,
+            _ => 1,
+        }
+    }
+
+    fn decode_header(value: u32, aux: Option<u32>) -> Result<Self, String> {
+        let opcode = (value & 0xff) as u8;
+        if opcode >= Self::LOP_COUNT {
+            return Err(format!(
+                "invalid Luau opcode {} in header word 0x{value:08x}",
+                opcode
+            ));
+        }
+
+        // ABC encoding
+        let a = ((value >> 8) & 0xff) as u8;
+        let b = ((value >> 16) & 0xff) as u8;
+        let c = ((value >> 24) & 0xff) as u8;
+
+        // AD encoding (sign-extended 16-bit D)
+        let d = ((value as i32) >> 16) as i16;
+
+        // E encoding (sign-extended 24-bit E)
+        let e = (value as i32) >> 8;
+
+        let d_index = u16::try_from(d).unwrap_or(0);
+
+        let aux_word = aux.unwrap_or(0);
+        let aux_a = (aux_word & 0xff) as u8;
+        let aux_b = ((aux_word >> 8) & 0xff) as u8;
+        let aux_kv = aux_word & 0x00ff_ffff;
+        let aux_not = (aux_word >> 31) != 0;
+
+        let instr = match opcode {
+            0 => Instr::Nop,
+            1 => Instr::Break,
+            2 => Instr::LoadNil { reg: a },
+            3 => Instr::LoadB {
+                reg: a,
+                value: b != 0,
+                jump: c,
+            },
+            4 => Instr::LoadN { reg: a, value: d },
+            5 => Instr::LoadK {
+                reg: a,
+                index: d_index,
+            },
+            6 => Instr::Move { dest: a, src: b },
+            7 => Instr::GetGlobal {
+                dest: a,
+                slot: c,
+                key: aux_word,
+            },
+            8 => Instr::SetGlobal {
+                src: a,
+                slot: c,
+                key: aux_word,
+            },
+            9 => Instr::GetUpval { dest: a, upval: b },
+            10 => Instr::SetUpval { src: a, upval: b },
+            11 => Instr::CloseUpvals { reg: a },
+            12 => Instr::GetImport {
+                dest: a,
+                index: d_index,
+                path: aux_word,
+            },
+            13 => Instr::GetTable {
+                dest: a,
+                table: b,
+                key: c,
+            },
+            14 => Instr::SetTable {
+                src: a,
+                table: b,
+                key: c,
+            },
+            15 => Instr::GetTableKS {
+                dest: a,
+                table: b,
+                slot: c,
+                key: aux_word,
+            },
+            16 => Instr::SetTableKS {
+                src: a,
+                table: b,
+                slot: c,
+                key: aux_word,
+            },
+            17 => Instr::GetTableN {
+                dest: a,
+                table: b,
+                index: c.wrapping_add(1),
+            },
+            18 => Instr::SetTableN {
+                src: a,
+                table: b,
+                index: c.wrapping_add(1),
+            },
+            19 => Instr::NewClosure {
+                dest: a,
+                proto: d_index,
+            },
+            20 => Instr::NameCall {
+                dest: a,
+                object: b,
+                slot: c,
+                method: aux_word,
+            },
+            21 => Instr::Call {
+                func: a,
+                arg_count: b,
+                ret_count: c,
+            },
+            22 => Instr::Return { base: a, count: b },
+            23 => Instr::Jump { offset: d },
+            24 => Instr::JumpBack { offset: d },
+            25 => Instr::JumpIf { reg: a, offset: d },
+            26 => Instr::JumpIfNot { reg: a, offset: d },
+            27 => Instr::JumpIfEq {
+                reg: a,
+                aux: aux_a,
+                offset: d,
+            },
+            28 => Instr::JumpIfLe {
+                reg: a,
+                aux: aux_a,
+                offset: d,
+            },
+            29 => Instr::JumpIfLt {
+                reg: a,
+                aux: aux_a,
+                offset: d,
+            },
+            30 => Instr::JumpIfNotEq {
+                reg: a,
+                aux: aux_a,
+                offset: d,
+            },
+            31 => Instr::JumpIfNotLe {
+                reg: a,
+                aux: aux_a,
+                offset: d,
+            },
+            32 => Instr::JumpIfNotLt {
+                reg: a,
+                aux: aux_a,
+                offset: d,
+            },
+            33 => Instr::Add {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            34 => Instr::Sub {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            35 => Instr::Mul {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            36 => Instr::Div {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            37 => Instr::Mod {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            38 => Instr::Pow {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            39 => Instr::AddK {
+                dest: a,
+                reg: b,
+                k: c,
+            },
+            40 => Instr::SubK {
+                dest: a,
+                reg: b,
+                k: c,
+            },
+            41 => Instr::MulK {
+                dest: a,
+                reg: b,
+                k: c,
+            },
+            42 => Instr::DivK {
+                dest: a,
+                reg: b,
+                k: c,
+            },
+            43 => Instr::ModK {
+                dest: a,
+                reg: b,
+                k: c,
+            },
+            44 => Instr::PowK {
+                dest: a,
+                reg: b,
+                k: c,
+            },
+            45 => Instr::And {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            46 => Instr::Or {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            47 => Instr::AndK {
+                dest: a,
+                reg: b,
+                k: c,
+            },
+            48 => Instr::OrK {
+                dest: a,
+                reg: b,
+                k: c,
+            },
+            49 => Instr::Concat {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            50 => Instr::Not { dest: a, reg: b },
+            51 => Instr::Minus { dest: a, reg: b },
+            52 => Instr::Length { dest: a, reg: b },
+            53 => Instr::NewTable {
+                dest: a,
+                hash_size: b,
+                array_size: aux_word,
+            },
+            54 => Instr::DupTable {
+                dest: a,
+                k: d_index,
+            },
+            55 => Instr::SetList {
+                table: a,
+                base: b,
+                count: c,
+                index: aux_word,
+            },
+            56 => Instr::FornPrep { base: a, offset: d },
+            57 => Instr::FornLoop { base: a, offset: d },
+            58 => Instr::ForgLoop {
+                base: a,
+                offset: d,
+                var_count: aux_a,
+                ipairs: aux_not,
+            },
+            59 => Instr::ForgPrepInext { base: a, offset: d },
+            60 => Instr::FastCall3 {
+                builtin: a,
+                arg1: b,
+                arg2: aux_a,
+                arg3: aux_b,
+                jump: c,
+            },
+            61 => Instr::ForgPrepNext { base: a, offset: d },
+            62 => Instr::NativeCall,
+            63 => Instr::GetVarArgs { dest: a, count: b },
+            64 => Instr::DupClosure {
+                dest: a,
+                k: d_index,
+            },
+            65 => Instr::PrepVarArgs { nparams: a },
+            66 => Instr::LoadKX {
+                dest: a,
+                k: aux_word,
+            },
+            67 => Instr::JumpX { offset: e },
+            68 => Instr::FastCall {
+                builtin: a,
+                jump: c,
+            },
+            69 => Instr::Coverage,
+            70 => Instr::Capture {
+                capture_type: a,
+                reg: b,
+            },
+            71 => Instr::SubRK {
+                dest: a,
+                k: b,
+                reg: c,
+            },
+            72 => Instr::DivRK {
+                dest: a,
+                k: b,
+                reg: c,
+            },
+            73 => Instr::FastCall1 {
+                builtin: a,
+                arg: b,
+                jump: c,
+            },
+            74 => Instr::FastCall2 {
+                builtin: a,
+                arg1: b,
+                arg2: aux_a,
+                jump: c,
+            },
+            75 => Instr::FastCall2K {
+                builtin: a,
+                arg: b,
+                k: aux_word,
+                jump: c,
+            },
+            76 => Instr::ForgPrep { base: a, offset: d },
+            77 => Instr::JumpXEqKNil {
+                reg: a,
+                invert: aux_not,
+                offset: d,
+            },
+            78 => Instr::JumpXEqKB {
+                reg: a,
+                k: (aux_word & 0x1) != 0,
+                invert: aux_not,
+                offset: d,
+            },
+            79 => Instr::JumpXEqKN {
+                reg: a,
+                k: aux_kv,
+                invert: aux_not,
+                offset: d,
+            },
+            80 => Instr::JumpXEqKS {
+                reg: a,
+                k: aux_kv,
+                invert: aux_not,
+                offset: d,
+            },
+            81 => Instr::IDiv {
+                dest: a,
+                a: b,
+                b: c,
+            },
+            82 => Instr::IDivK {
+                dest: a,
+                reg: b,
+                k: c,
+            },
+            _ => unreachable!("opcode range was validated"),
+        };
+
+        Ok(instr)
+    }
+
+    pub fn decode_stream(words: &[u32]) -> Result<Vec<Self>, String> {
+        let (instrs, _) = Self::decode_stream_with_word_pcs(words)?;
+        Ok(instrs)
+    }
+
+    pub fn decode_stream_with_word_pcs(words: &[u32]) -> Result<(Vec<Self>, Vec<usize>), String> {
+        let mut out = Vec::new();
+        let mut word_pcs = Vec::new();
+        let mut pc = 0usize;
+
+        while pc < words.len() {
+            let header_pc = pc;
+            let header = words[header_pc];
+            let opcode = (header & 0xff) as u8;
+
+            if opcode >= Self::LOP_COUNT {
+                return Err(format!(
+                    "invalid Luau opcode {} at word pc {} (0x{header:08x})",
+                    opcode, header_pc
+                ));
+            }
+
+            let aux = if Self::opcode_requires_aux(opcode) {
+                pc += 1;
+                if pc >= words.len() {
+                    return Err(format!(
+                        "truncated bytecode: opcode {} at word pc {} requires AUX word",
+                        opcode, header_pc
+                    ));
+                }
+                Some(words[pc])
+            } else {
+                None
+            };
+
+            out.push(Self::decode_header(header, aux)?);
+            word_pcs.push(header_pc);
+            pc += 1;
+        }
+
+        Ok((out, word_pcs))
+    }
+}
+
+impl From<u32> for Instr {
+    fn from(value: u32) -> Self {
+        Self::decode_header(value, None).unwrap_or_else(|err| panic!("{err}"))
+    }
+}
