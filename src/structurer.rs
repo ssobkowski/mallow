@@ -118,6 +118,11 @@ impl<'a> HilWalker<'a> {
         }
     }
 
+    /// Reserves additional names in the current function so generated locals fall back to `_l`.
+    fn reserve_local_names<'b>(&mut self, names: impl IntoIterator<Item = &'b Identifier>) {
+        self.used_names.extend(names.into_iter().cloned());
+    }
+
     /// Returns a stable printable local identifier for a register in this function.
     fn local_ident(&mut self, reg: u8) -> Identifier {
         if let Some(existing) = self.local_names.get(&reg) {
@@ -150,10 +155,16 @@ impl<'a> HilWalker<'a> {
                 match left {
                     HilExpr::Local(reg) => {
                         let ident = self.local_ident(reg);
+                        let rhs = match value {
+                            HilExpr::Closure { proto, captures } => {
+                                self.walk_closure_expr(proto, captures, std::slice::from_ref(&ident))
+                            }
+                            other => self.walk_expr(other),
+                        };
                         match self.scopes.get_var(&ident) {
                             Some(_) => Stmt::Assignment {
                                 lhs: Expr::Name(ident),
-                                rhs: self.walk_expr(value),
+                                rhs,
                             },
                             None => {
                                 let scope = self
@@ -163,7 +174,7 @@ impl<'a> HilWalker<'a> {
                                 scope.add_var(Var::new(ident.clone(), None));
                                 Stmt::LocalDeclaration {
                                     names: vec![ident],
-                                    values: vec![self.walk_expr(value)],
+                                    values: vec![rhs],
                                 }
                             }
                         }
@@ -236,6 +247,115 @@ impl<'a> HilWalker<'a> {
         }
     }
 
+    fn walk_closure_expr(
+        &mut self,
+        proto_idx: usize,
+        captures: Vec<HilExpr>,
+        reserved_names: &[Identifier],
+    ) -> Expr {
+        let Some(proto) = self.protos.get(proto_idx) else {
+            return Expr::AnonymousFunction {
+                params: Vec::new(),
+                body: Block::new(),
+            };
+        };
+        let mapped_captures: Vec<Expr> = captures.into_iter().map(|c| self.walk_expr(c)).collect();
+
+        if self.active_proto_stack.contains(&proto_idx) {
+            if verbose_enabled() {
+                eprintln!(
+                    "[structure] recursive proto closure detected: stack={:?}, next={}",
+                    self.active_proto_stack, proto_idx
+                );
+            }
+            return Expr::AnonymousFunction {
+                params: (0..proto.num_params)
+                    .map(|i| Parameter::Regular(Identifier::from(format!("v{}", i))))
+                    .chain(proto.is_vararg.then_some(Parameter::Vararg))
+                    .collect(),
+                body: Block::new(),
+            };
+        }
+        if self.active_proto_stack.len() >= MAX_PROTO_RECURSION_DEPTH {
+            if verbose_enabled() {
+                eprintln!(
+                    "[structure] proto recursion depth limit reached ({}), refusing to descend into proto {}",
+                    MAX_PROTO_RECURSION_DEPTH, proto_idx
+                );
+            }
+            return Expr::AnonymousFunction {
+                params: (0..proto.num_params)
+                    .map(|i| Parameter::Regular(Identifier::from(format!("v{}", i))))
+                    .chain(proto.is_vararg.then_some(Parameter::Vararg))
+                    .collect(),
+                body: Block::new(),
+            };
+        }
+
+        if verbose_enabled() {
+            eprintln!(
+                "[structure] enter closure proto {} (captures={}, parent_stack={:?})",
+                proto_idx,
+                mapped_captures.len(),
+                self.active_proto_stack
+            );
+        }
+        let prev_upvalues = std::mem::replace(&mut self.upvals, mapped_captures);
+        let prev_local_names = std::mem::take(&mut self.local_names);
+        let prev_used_names = std::mem::take(&mut self.used_names);
+        let prev_scopes = self.scopes.clone();
+
+        self.reserve_upvalue_names();
+
+        let Some(cfg) = self.cfgs.get(proto_idx) else {
+            self.used_names = prev_used_names;
+            self.local_names = prev_local_names;
+            self.scopes = prev_scopes;
+            self.upvals = prev_upvalues;
+            return Expr::AnonymousFunction {
+                params: (0..proto.num_params)
+                    .map(|i| Parameter::Regular(Identifier::from(format!("v{}", i))))
+                    .chain(proto.is_vararg.then_some(Parameter::Vararg))
+                    .collect(),
+                body: Block::new(),
+            };
+        };
+
+        let mut params: Vec<_> = (0..proto.num_params)
+            .map(|i| Parameter::Regular(self.local_ident(i)))
+            .collect();
+        if proto.is_vararg {
+            params.push(Parameter::Vararg);
+        }
+        self.reserve_local_names(reserved_names.iter());
+
+        self.active_proto_stack.push(proto_idx);
+        let param_scope: Vec<Var> = params
+            .iter()
+            .filter_map(|param| match param {
+                Parameter::Regular(name) => Some(Var::new(name.clone(), None)),
+                Parameter::Vararg => None,
+            })
+            .collect();
+        self.scopes.push_scope_with(param_scope);
+
+        let stmts = self.structure_region(cfg.entry_block, None, cfg);
+        let body = Block::with_stmts(stmts);
+
+        self.scopes.pop_scope();
+        self.active_proto_stack.pop();
+        self.used_names = prev_used_names;
+        self.local_names = prev_local_names;
+        self.scopes = prev_scopes;
+        self.upvals = prev_upvalues;
+
+        if verbose_enabled() {
+            eprintln!("[structure] exit closure proto {}", proto_idx);
+        }
+
+        Expr::AnonymousFunction { params, body }
+    }
+
     /// Walks a HIL expression and translates it into an AST expression.
     fn walk_expr(&mut self, expr: HilExpr) -> Expr {
         match expr {
@@ -246,112 +366,7 @@ impl<'a> HilWalker<'a> {
             HilExpr::Local(reg) => Expr::Name(self.local_ident(reg)),
             HilExpr::Global(name) => Expr::Name(name.into()),
             HilExpr::Upval(up) => self.resolve_upvalue_expr(up),
-            HilExpr::Closure {
-                proto: proto_idx,
-                captures,
-            } => {
-                let Some(proto) = self.protos.get(proto_idx) else {
-                    return Expr::AnonymousFunction {
-                        params: Vec::new(),
-                        body: Block::new(),
-                    };
-                };
-                let mapped_captures: Vec<Expr> =
-                    captures.into_iter().map(|c| self.walk_expr(c)).collect();
-
-                if self.active_proto_stack.contains(&proto_idx) {
-                    if verbose_enabled() {
-                        eprintln!(
-                            "[structure] recursive proto closure detected: stack={:?}, next={}",
-                            self.active_proto_stack, proto_idx
-                        );
-                    }
-                    return Expr::AnonymousFunction {
-                        params: (0..proto.num_params)
-                            .map(|i| Parameter::Regular(Identifier::from(format!("v{}", i))))
-                            .chain(proto.is_vararg.then_some(Parameter::Vararg))
-                            .collect(),
-                        body: Block::new(),
-                    };
-                }
-                if self.active_proto_stack.len() >= MAX_PROTO_RECURSION_DEPTH {
-                    if verbose_enabled() {
-                        eprintln!(
-                            "[structure] proto recursion depth limit reached ({}), refusing to descend into proto {}",
-                            MAX_PROTO_RECURSION_DEPTH, proto_idx
-                        );
-                    }
-                    return Expr::AnonymousFunction {
-                        params: (0..proto.num_params)
-                            .map(|i| Parameter::Regular(Identifier::from(format!("v{}", i))))
-                            .chain(proto.is_vararg.then_some(Parameter::Vararg))
-                            .collect(),
-                        body: Block::new(),
-                    };
-                }
-
-                if verbose_enabled() {
-                    eprintln!(
-                        "[structure] enter closure proto {} (captures={}, parent_stack={:?})",
-                        proto_idx,
-                        mapped_captures.len(),
-                        self.active_proto_stack
-                    );
-                }
-                let prev_upvalues = std::mem::replace(&mut self.upvals, mapped_captures);
-                let prev_local_names = std::mem::take(&mut self.local_names);
-                let prev_used_names = std::mem::take(&mut self.used_names);
-                let prev_scopes = self.scopes.clone();
-
-                self.reserve_upvalue_names();
-
-                let Some(cfg) = self.cfgs.get(proto_idx) else {
-                    self.used_names = prev_used_names;
-                    self.local_names = prev_local_names;
-                    self.scopes = prev_scopes;
-                    self.upvals = prev_upvalues;
-                    return Expr::AnonymousFunction {
-                        params: (0..proto.num_params)
-                            .map(|i| Parameter::Regular(Identifier::from(format!("v{}", i))))
-                            .chain(proto.is_vararg.then_some(Parameter::Vararg))
-                            .collect(),
-                        body: Block::new(),
-                    };
-                };
-
-                let mut params: Vec<_> = (0..proto.num_params)
-                    .map(|i| Parameter::Regular(self.local_ident(i)))
-                    .collect();
-                if proto.is_vararg {
-                    params.push(Parameter::Vararg);
-                }
-
-                self.active_proto_stack.push(proto_idx);
-                let param_scope: Vec<Var> = params
-                    .iter()
-                    .filter_map(|param| match param {
-                        Parameter::Regular(name) => Some(Var::new(name.clone(), None)),
-                        Parameter::Vararg => None,
-                    })
-                    .collect();
-                self.scopes.push_scope_with(param_scope);
-
-                let stmts = self.structure_region(cfg.entry_block, None, cfg);
-                let body = Block::with_stmts(stmts);
-
-                self.scopes.pop_scope();
-                self.active_proto_stack.pop();
-                self.used_names = prev_used_names;
-                self.local_names = prev_local_names;
-                self.scopes = prev_scopes;
-                self.upvals = prev_upvalues;
-
-                if verbose_enabled() {
-                    eprintln!("[structure] exit closure proto {}", proto_idx);
-                }
-
-                Expr::AnonymousFunction { params, body }
-            }
+            HilExpr::Closure { proto, captures } => self.walk_closure_expr(proto, captures, &[]),
             // this is a hack but the import thing is just really retarded
             HilExpr::Import(im) => Expr::Name(im.into()),
             HilExpr::GetField(base, field) => Expr::Field {
@@ -810,7 +825,7 @@ mod tests {
         assert!(matches!(
             &inner_body.stmts[1],
             AstStmt::LocalDeclaration { names, values }
-                if matches!(names.as_slice(), [name] if name.as_str() == "v4")
+                if matches!(names.as_slice(), [name] if name.as_str() == "v4_l0")
                     && matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == "v1")
         ));
         assert!(matches!(
