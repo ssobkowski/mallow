@@ -3,6 +3,7 @@ mod disasm;
 mod hil;
 mod il;
 mod logging;
+mod passes;
 mod printer;
 mod scopes;
 mod structurer;
@@ -111,7 +112,10 @@ fn main() {
                 disassembled.entry_proto as usize,
                 &disassembled.protos,
             );
+
+            let ast = passes::run_all(ast);
             let src = print(&ast);
+
             if let Err(e) = write_output(output, &src) {
                 eprintln!("Error writing decompiled output: {e}");
             }

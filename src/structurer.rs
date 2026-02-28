@@ -156,9 +156,11 @@ impl<'a> HilWalker<'a> {
                     HilExpr::Local(reg) => {
                         let ident = self.local_ident(reg);
                         let rhs = match value {
-                            HilExpr::Closure { proto, captures } => {
-                                self.walk_closure_expr(proto, captures, std::slice::from_ref(&ident))
-                            }
+                            HilExpr::Closure { proto, captures } => self.walk_closure_expr(
+                                proto,
+                                captures,
+                                std::slice::from_ref(&ident),
+                            ),
                             other => self.walk_expr(other),
                         };
                         match self.scopes.get_var(&ident) {
