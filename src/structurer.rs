@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt},
+    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, UnOp},
     disasm::Proto,
     hil::{
         BlockExit, ControlFlowGraph, Expr as HilExpr, Stmt as HilStmt, find_if_else_join,
@@ -558,8 +558,23 @@ impl<'a> HilWalker<'a> {
                         &mut then_stmts,
                         &mut else_stmts,
                     );
+                    if then_stmts.is_empty() && else_stmts.is_empty() {
+                        if let Some(m) = merge_block {
+                            curr_id = m;
+                            continue;
+                        }
+                        break;
+                    }
+                    let mut condition = self.walk_expr(cond.clone());
+                    if then_stmts.is_empty() && !else_stmts.is_empty() {
+                        condition = Expr::Unary {
+                            op: UnOp::Not,
+                            expr: Box::new(condition),
+                        };
+                        std::mem::swap(&mut then_stmts, &mut else_stmts);
+                    }
                     stmts.push(Stmt::If {
-                        condition: self.walk_expr(cond.clone()),
+                        condition,
                         then_body: Block::with_stmts(then_stmts),
                         else_body: if else_stmts.is_empty() {
                             None
@@ -995,6 +1010,66 @@ mod tests {
     }
 
     #[test]
+    fn structure_inverts_empty_then_branch_when_false_side_has_prelude() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                HilBlock {
+                    id: 0,
+                    stmts: vec![],
+                    exit: BlockExit::CondJump {
+                        cond: HilExpr::Local(0),
+                        then_block: 2,
+                        else_block: 1,
+                    },
+                },
+                HilBlock {
+                    id: 1,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Global("Seen".to_string()),
+                        value: HilExpr::Local(1),
+                    }],
+                    exit: BlockExit::Fallthrough(2),
+                },
+                HilBlock {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        let ast = structure(&[cfg], 0, &[Proto::default()]);
+        assert_eq!(ast.stmts.len(), 2);
+
+        match &ast.stmts[0] {
+            AstStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                assert!(else_body.is_none());
+                assert!(matches!(
+                    condition,
+                    AstExpr::Unary {
+                        op: crate::ast::UnOp::Not,
+                        expr
+                    } if matches!(expr.as_ref(), AstExpr::Name(name) if name.as_str() == "v0")
+                ));
+                assert!(matches!(
+                    then_body.stmts.as_slice(),
+                    [AstStmt::Assignment { lhs, rhs }]
+                        if matches!(lhs, AstExpr::Name(name) if name.as_str() == "Seen")
+                            && matches!(rhs, AstExpr::Name(name) if name.as_str() == "v1")
+                ));
+            }
+            _ => panic!("expected inverted if statement"),
+        }
+
+        assert!(matches!(&ast.stmts[1], AstStmt::Return { values } if values.is_empty()));
+    }
+
+    #[test]
     fn structure_numeric_for_keeps_tail_block_body_and_register_order() {
         let cfg = ControlFlowGraph::new(
             vec![
@@ -1064,6 +1139,173 @@ mod tests {
                 assert_eq!(body.stmts.len(), 2);
             }
             _ => panic!("expected numeric for"),
+        }
+    }
+
+    #[test]
+    fn structure_generic_for_keeps_linear_preheader_assignments() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                HilBlock {
+                    id: 0,
+                    stmts: vec![HilStmt::AssignMany {
+                        left: vec![HilExpr::Local(4), HilExpr::Local(5), HilExpr::Local(6)],
+                        value: HilExpr::Call(
+                            Box::new(HilExpr::Global("ipairs".to_string())),
+                            vec![HilExpr::Local(0)],
+                        ),
+                    }],
+                    exit: BlockExit::ForGPrep {
+                        base: 4,
+                        loop_block: 3,
+                    },
+                },
+                HilBlock {
+                    id: 1,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(10),
+                        value: HilExpr::Local(3),
+                    }],
+                    exit: BlockExit::Fallthrough(2),
+                },
+                HilBlock {
+                    id: 2,
+                    stmts: vec![HilStmt::Call {
+                        expr: HilExpr::Call(
+                            Box::new(HilExpr::Global("table.insert".to_string())),
+                            vec![HilExpr::Local(10), HilExpr::Local(8)],
+                        ),
+                        args: vec![HilExpr::Local(10), HilExpr::Local(8)],
+                    }],
+                    exit: BlockExit::Fallthrough(3),
+                },
+                HilBlock {
+                    id: 3,
+                    stmts: vec![],
+                    exit: BlockExit::ForGLoop {
+                        base: 4,
+                        body_block: 2,
+                        exit_block: 4,
+                        result_count: 2,
+                    },
+                },
+                HilBlock {
+                    id: 4,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        let ast = structure(&[cfg], 0, &[Proto::default()]);
+        match &ast.stmts[0] {
+            AstStmt::GenericFor { body, .. } => {
+                assert_eq!(body.stmts.len(), 2);
+                assert!(matches!(
+                    &body.stmts[0],
+                    AstStmt::LocalDeclaration { names, values }
+                        if matches!(names.as_slice(), [name] if name.as_str() == "v10")
+                            && matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == "v3")
+                ));
+                assert!(matches!(
+                    &body.stmts[1],
+                    AstStmt::Expression {
+                        expr: AstExpr::FunctionCall { args, .. }
+                    } if matches!(args.as_slice(), [AstExpr::Name(a), AstExpr::Name(b)]
+                        if a.as_str() == "v10" && b.as_str() == "v8")
+                ));
+            }
+            _ => panic!("expected generic for"),
+        }
+    }
+
+    #[test]
+    fn structure_generic_for_keeps_preheader_condition_source() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                HilBlock {
+                    id: 0,
+                    stmts: vec![HilStmt::AssignMany {
+                        left: vec![HilExpr::Local(2), HilExpr::Local(3), HilExpr::Local(4)],
+                        value: HilExpr::Call(
+                            Box::new(HilExpr::Global("pairs".to_string())),
+                            vec![HilExpr::Global("DEFAULT_CONFIG".to_string())],
+                        ),
+                    }],
+                    exit: BlockExit::ForGPrep {
+                        base: 2,
+                        loop_block: 4,
+                    },
+                },
+                HilBlock {
+                    id: 1,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(7),
+                        value: HilExpr::GetIndex(
+                            Box::new(HilExpr::Local(1)),
+                            Box::new(HilExpr::Local(5)),
+                        ),
+                    }],
+                    exit: BlockExit::Fallthrough(2),
+                },
+                HilBlock {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::CondJump {
+                        cond: HilExpr::Local(7),
+                        then_block: 4,
+                        else_block: 3,
+                    },
+                },
+                HilBlock {
+                    id: 3,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::GetIndex(
+                            Box::new(HilExpr::Local(1)),
+                            Box::new(HilExpr::Local(5)),
+                        ),
+                        value: HilExpr::Local(6),
+                    }],
+                    exit: BlockExit::Fallthrough(4),
+                },
+                HilBlock {
+                    id: 4,
+                    stmts: vec![],
+                    exit: BlockExit::ForGLoop {
+                        base: 2,
+                        body_block: 2,
+                        exit_block: 5,
+                        result_count: 2,
+                    },
+                },
+                HilBlock {
+                    id: 5,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        let ast = structure(&[cfg], 0, &[Proto::default()]);
+        match &ast.stmts[0] {
+            AstStmt::GenericFor { body, .. } => {
+                assert_eq!(body.stmts.len(), 2);
+                assert!(matches!(
+                    &body.stmts[0],
+                    AstStmt::LocalDeclaration { names, values }
+                        if matches!(names.as_slice(), [name] if name.as_str() == "v7")
+                            && matches!(values.as_slice(), [AstExpr::Index { .. }])
+                ));
+                assert!(matches!(
+                    &body.stmts[1],
+                    AstStmt::If { condition, .. }
+                        if matches!(condition, AstExpr::Unary { op: crate::ast::UnOp::Not, expr }
+                            if matches!(expr.as_ref(), AstExpr::Name(name) if name.as_str() == "v7"))
+                ));
+            }
+            _ => panic!("expected generic for"),
         }
     }
 

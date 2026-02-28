@@ -339,39 +339,37 @@ fn build_loop_indexes(
     (numeric_loops_by_base, generic_loops_by_base)
 }
 
-#[derive(Debug, Clone, Copy)]
-enum LinearExit {
-    Jump(usize),
-    Fallthrough(usize),
-    Other,
-}
-
-/// Follows a straight-line region until it reaches a non-trivial exit.
+/// Follows a branch until it reaches a candidate merge successor.
 ///
-/// This intentionally walks through unique fallthrough edges so `find_if_else_join`
-/// can reason about small diamonds without fully structuring the region first.
-fn linear_exit_from(start: usize, cfg: &ControlFlowGraph) -> LinearExit {
+/// This walks through unique fallthrough edges and loop prep blocks so `find_if_else_join`
+/// can reason about shared tails without fully structuring the region first.
+fn merge_target_from(start: usize, cfg: &ControlFlowGraph) -> Option<usize> {
     let mut seen = HashSet::new();
     let mut current = start;
 
     while seen.insert(current) {
-        let Some(block) = cfg.blocks.get(current) else {
-            return LinearExit::Other;
-        };
-
+        let block = cfg.blocks.get(current)?;
         match block.exit {
             BlockExit::Fallthrough(next)
                 if next == current + 1 && cfg.predecessors(next).len() <= 1 =>
             {
                 current = next;
             }
-            BlockExit::Fallthrough(next) => return LinearExit::Fallthrough(next),
-            BlockExit::Jump(target) => return LinearExit::Jump(target),
-            _ => return LinearExit::Other,
+            BlockExit::Fallthrough(next) | BlockExit::Jump(next) => return Some(next),
+            BlockExit::ForNPrep { base, loop_block } => {
+                let (_, _, exit_block) = resolve_numeric_for_tail(current, base, loop_block, cfg)?;
+                current = exit_block;
+            }
+            BlockExit::ForGPrep { base, loop_block } => {
+                let (_, _, exit_block, _) =
+                    resolve_generic_for_tail(current, base, loop_block, cfg)?;
+                current = exit_block;
+            }
+            _ => return (current != start).then_some(current),
         }
     }
 
-    LinearExit::Other
+    None
 }
 
 /// Attempts to find the merge block for a simple if/else diamond.
@@ -380,20 +378,19 @@ pub fn find_if_else_join(
     else_block: usize,
     cfg: &ControlFlowGraph,
 ) -> Option<usize> {
-    let then_exit = linear_exit_from(then_block, cfg);
-    let else_exit = linear_exit_from(else_block, cfg);
+    let then_target = merge_target_from(then_block, cfg);
+    let else_target = merge_target_from(else_block, cfg);
 
-    let candidate = match (then_exit, else_exit) {
-        (LinearExit::Jump(a), LinearExit::Fallthrough(b))
-        | (LinearExit::Fallthrough(a), LinearExit::Jump(b))
-            if a == b && a != then_block && a != else_block =>
-        {
-            a
-        }
+    let candidate = match (then_target, else_target) {
+        (Some(a), Some(b)) if a == b && a != then_block && a != else_block => a,
+        (Some(target), _) if target == else_block && then_block != else_block => else_block,
+        (_, Some(target)) if target == then_block && then_block != else_block => then_block,
         _ => return None,
     };
 
-    if cfg.dominates(candidate, then_block) || cfg.dominates(candidate, else_block) {
+    if (candidate != then_block && cfg.dominates(candidate, then_block))
+        || (candidate != else_block && cfg.dominates(candidate, else_block))
+    {
         return None;
     }
 
@@ -575,7 +572,7 @@ pub fn resolve_generic_for_tail(
         }
     }
 
-    candidates.into_iter().max_by_key(|(tail, body, exit, _)| {
+    let best = candidates.into_iter().max_by_key(|(tail, body, exit, _)| {
         let mut score = 0usize;
         if *tail == prep_target_block {
             score += 8;
@@ -590,7 +587,48 @@ pub fn resolve_generic_for_tail(
             score += 1;
         }
         score
-    })
+    })?;
+
+    let (tail, body, exit, result_count) = best;
+    let body = if linear_fallthrough_reaches(preferred_body, body, exit, cfg) {
+        preferred_body
+    } else {
+        body
+    };
+
+    Some((tail, body, exit, result_count))
+}
+
+/// Returns true when `start` reaches `target` through straight fallthrough-only blocks.
+fn linear_fallthrough_reaches(
+    start: usize,
+    target: usize,
+    stop_at: usize,
+    cfg: &ControlFlowGraph,
+) -> bool {
+    if start == target {
+        return true;
+    }
+    if start >= cfg.blocks.len() || target >= cfg.blocks.len() || start >= stop_at {
+        return false;
+    }
+
+    let mut seen = HashSet::new();
+    let mut current = start;
+
+    while seen.insert(current) && current < stop_at {
+        let Some(block) = cfg.blocks.get(current) else {
+            return false;
+        };
+
+        match block.exit {
+            BlockExit::Fallthrough(next) if next == target => return true,
+            BlockExit::Fallthrough(next) if next > current && next < stop_at => current = next,
+            _ => return false,
+        }
+    }
+
+    false
 }
 
 /// Resolves a relative branch target from the next instruction index.
@@ -800,6 +838,48 @@ fn take_pending_arg(
     }
 }
 
+/// Returns true when a pending MULTRET can feed a variadic CALL starting at `first_arg_reg`.
+fn pending_multret_feeds_variadic_call(
+    pending_multret_call: &Option<(u8, Expr)>,
+    first_arg_reg: u8,
+) -> bool {
+    pending_multret_call
+        .as_ref()
+        .is_some_and(|(src_reg, _)| *src_reg >= first_arg_reg)
+}
+
+/// Consumes a deferred MULTRET call for a variadic CALL with optional fixed-prefix args.
+fn take_variadic_call_args(
+    pending_multret_call: &mut Option<(u8, Expr)>,
+    first_arg_reg: u8,
+) -> Option<Vec<Expr>> {
+    match pending_multret_call.take() {
+        Some((src_reg, expr)) if src_reg >= first_arg_reg => {
+            let mut args = local_range(first_arg_reg, src_reg - first_arg_reg);
+            args.push(expr);
+            Some(args)
+        }
+        Some((src_reg, expr)) => {
+            *pending_multret_call = Some((src_reg, expr));
+            None
+        }
+        None => None,
+    }
+}
+
+/// Returns true when an instruction can appear between a pending MULTRET and its consumer.
+fn instr_preserves_pending_multret(instr: &Instr, pending_src_reg: u8) -> bool {
+    match instr {
+        Instr::FastCall1 { .. }
+        | Instr::FastCall2 { .. }
+        | Instr::FastCall2K { .. }
+        | Instr::FastCall3 { .. }
+        | Instr::FastCall { .. } => true,
+        Instr::GetImport { dest, .. } | Instr::GetGlobal { dest, .. } => *dest < pending_src_reg,
+        _ => false,
+    }
+}
+
 pub fn lift(instrs: &[Instr], consts: &[Constant]) -> Vec<Stmt> {
     let (mut stmts, pending_multret_call) = lift_with_context(instrs, consts, None, &[]);
     if let Some((_, expr)) = pending_multret_call {
@@ -858,40 +938,34 @@ fn lift_with_context(
                 .as_ref()
                 .is_some_and(|(nc_reg, _)| *nc_reg == func)
         };
-        let consumes_pending_multret = matches!(
-            instr,
+        let consumes_pending_multret = match instr {
             Instr::Call {
-                func,
-                arg_count: 0,
-                ..
-            } if pending_multret_call
+                func, arg_count: 0, ..
+            } => {
+                let first_arg_reg = if pending_namecall_for_func(*func) {
+                    *func + 2
+                } else {
+                    *func + 1
+                };
+                pending_multret_feeds_variadic_call(&pending_multret_call, first_arg_reg)
+            }
+            Instr::NameCall { dest, .. } => pending_multret_call
                 .as_ref()
-                .is_some_and(|(src_reg, _)| {
-                    *src_reg == *func + 1
-                        || (pending_namecall_for_func(*func) && *src_reg == *func + 2)
-                })
-        ) || matches!(
-            instr,
-            Instr::NameCall { dest, .. } if pending_multret_call
+                .is_some_and(|(src_reg, _)| *src_reg == *dest + 2),
+            Instr::SetList { base, count: 0, .. } => pending_multret_call
                 .as_ref()
-                .is_some_and(|(src_reg, _)| *src_reg == *dest + 2)
-        ) || matches!(
-            instr,
-            Instr::SetList {
-                base,
-                count: 0,
-                ..
-            } if pending_multret_call
+                .is_some_and(|(src_reg, _)| *src_reg == *base),
+            Instr::Return { base, count: 0 } => pending_multret_call
                 .as_ref()
-                .is_some_and(|(src_reg, _)| *src_reg == *base)
-        ) || matches!(
-            instr,
-            Instr::Return { base, count: 0 } if pending_multret_call
-                .as_ref()
-                .is_some_and(|(src_reg, _)| *src_reg == *base)
-        );
+                .is_some_and(|(src_reg, _)| *src_reg == *base),
+            _ => false,
+        };
 
-        if !consumes_pending_multret && let Some((_, expr)) = pending_multret_call.take() {
+        if !consumes_pending_multret
+            && let Some((src_reg, expr)) = pending_multret_call.as_ref().cloned()
+            && !instr_preserves_pending_multret(instr, src_reg)
+        {
+            pending_multret_call = None;
             stmts.push(call_stmt(expr));
         }
 
@@ -1002,10 +1076,11 @@ fn lift_with_context(
                         }
                     }
                     None => {
-                        if let Some(expr) = take_pending_arg(&mut pending_multret_call, first_arg_reg)
+                        if let Some(args) =
+                            take_variadic_call_args(&mut pending_multret_call, first_arg_reg)
                         {
                             consumed_multret = true;
-                            vec![expr]
+                            args
                         } else {
                             Vec::new()
                         }
@@ -1497,18 +1572,33 @@ fn build_cfg_with_context(
             | Instr::ForgPrep { offset, .. }
             | Instr::ForgPrepInext { offset, .. }
             | Instr::ForgPrepNext { offset, .. } => {
-                entries.insert(rel_target_plain_from_instr(i, *offset, instrs, instr_word_pcs));
+                entries.insert(rel_target_plain_from_instr(
+                    i,
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                ));
                 entries.insert(i + 1); // body entry
             }
             Instr::FornLoop { offset, .. } | Instr::ForgLoop { offset, .. } => {
-                entries.insert(rel_target_plain_from_instr(i, *offset, instrs, instr_word_pcs));
+                entries.insert(rel_target_plain_from_instr(
+                    i,
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                ));
                 entries.insert(i + 1); // loop exit entry
             }
             Instr::Jump { offset }
             | Instr::JumpBack { offset }
             | Instr::JumpIf { offset, .. }
             | Instr::JumpIfNot { offset, .. } => {
-                entries.insert(rel_target_plain_from_instr(i, *offset, instrs, instr_word_pcs));
+                entries.insert(rel_target_plain_from_instr(
+                    i,
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                ));
                 entries.insert(i + 1); // fallthrough is also an entry
             }
             Instr::JumpIfEq { offset, .. }
@@ -2116,6 +2206,102 @@ mod tests {
                 }
             }
             _ => panic!("expected final NAMECALL/CALL to stay a call statement"),
+        }
+    }
+
+    #[test]
+    fn lift_variadic_call_keeps_fixed_prefix_args_before_pending_multret() {
+        let instrs = vec![
+            Instr::Call {
+                func: 11,
+                arg_count: 3,
+                ret_count: 0,
+            },
+            Instr::Call {
+                func: 9,
+                arg_count: 0,
+                ret_count: 1,
+            },
+        ];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 1);
+
+        match &stmts[0] {
+            Stmt::Call { expr, args } => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0], Expr::Local(10)));
+                assert!(matches!(
+                    &args[1],
+                    Expr::Call(func, nested_args)
+                        if matches!(func.as_ref(), Expr::Local(11))
+                            && matches!(nested_args.as_slice(), [Expr::Local(12), Expr::Local(13)])
+                ));
+
+                match expr {
+                    Expr::Call(func, call_args) => {
+                        assert!(matches!(func.as_ref(), Expr::Local(9)));
+                        assert_eq!(call_args.len(), 2);
+                        assert!(matches!(&call_args[0], Expr::Local(10)));
+                        assert!(matches!(
+                            &call_args[1],
+                            Expr::Call(func, nested_args)
+                                if matches!(func.as_ref(), Expr::Local(11))
+                                    && matches!(nested_args.as_slice(), [Expr::Local(12), Expr::Local(13)])
+                        ));
+                    }
+                    _ => panic!("expected variadic outer call"),
+                }
+            }
+            _ => panic!("expected variadic call statement"),
+        }
+    }
+
+    #[test]
+    fn lift_variadic_call_survives_fastcall_scaffolding_before_consumer() {
+        let instrs = vec![
+            Instr::Call {
+                func: 11,
+                arg_count: 3,
+                ret_count: 0,
+            },
+            Instr::FastCall {
+                builtin: 52,
+                jump: 2,
+            },
+            Instr::GetImport {
+                dest: 9,
+                index: 0,
+                path: 0,
+            },
+            Instr::Call {
+                func: 9,
+                arg_count: 0,
+                ret_count: 1,
+            },
+        ];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 2);
+
+        match &stmts[1] {
+            Stmt::Call { expr, args } => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0], Expr::Local(10)));
+                assert!(matches!(
+                    &args[1],
+                    Expr::Call(func, nested_args)
+                        if matches!(func.as_ref(), Expr::Local(11))
+                            && matches!(nested_args.as_slice(), [Expr::Local(12), Expr::Local(13)])
+                ));
+                assert!(matches!(
+                    expr,
+                    Expr::Call(func, call_args)
+                        if matches!(func.as_ref(), Expr::Local(9))
+                            && call_args.len() == 2
+                ));
+            }
+            _ => panic!("expected outer call after FASTCALL scaffolding"),
         }
     }
 
@@ -2839,6 +3025,96 @@ mod tests {
     }
 
     #[test]
+    fn find_if_else_join_detects_single_branch_prelude_merge() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                Block {
+                    id: 0,
+                    stmts: vec![],
+                    exit: BlockExit::CondJump {
+                        cond: Expr::Local(0),
+                        then_block: 2,
+                        else_block: 1,
+                    },
+                },
+                Block {
+                    id: 1,
+                    stmts: vec![],
+                    exit: BlockExit::Fallthrough(2),
+                },
+                Block {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        assert_eq!(find_if_else_join(2, 1, &cfg), Some(2));
+    }
+
+    #[test]
+    fn find_if_else_join_detects_shared_tail_after_loop_preps() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                Block {
+                    id: 0,
+                    stmts: vec![],
+                    exit: BlockExit::CondJump {
+                        cond: Expr::Local(0),
+                        then_block: 1,
+                        else_block: 3,
+                    },
+                },
+                Block {
+                    id: 1,
+                    stmts: vec![],
+                    exit: BlockExit::ForNPrep {
+                        base: 4,
+                        loop_block: 2,
+                    },
+                },
+                Block {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::ForNLoop {
+                        base: 4,
+                        body_block: 2,
+                        exit_block: 5,
+                    },
+                },
+                Block {
+                    id: 3,
+                    stmts: vec![],
+                    exit: BlockExit::ForGPrep {
+                        base: 7,
+                        loop_block: 4,
+                    },
+                },
+                Block {
+                    id: 4,
+                    stmts: vec![],
+                    exit: BlockExit::ForGLoop {
+                        base: 7,
+                        body_block: 4,
+                        exit_block: 5,
+                        result_count: 2,
+                    },
+                },
+                Block {
+                    id: 5,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        assert_eq!(find_if_else_join(1, 3, &cfg), Some(5));
+    }
+
+    #[test]
     fn resolve_numeric_for_tail_uses_predecessor_metadata() {
         let cfg = ControlFlowGraph::new(
             vec![
@@ -2913,5 +3189,55 @@ mod tests {
         );
 
         assert_eq!(resolve_generic_for_tail(0, 1, 3, &cfg), Some((2, 1, 3, 2)));
+    }
+
+    #[test]
+    fn resolve_generic_for_tail_includes_linear_preheader_before_body() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                Block {
+                    id: 0,
+                    stmts: vec![],
+                    exit: BlockExit::ForGPrep {
+                        base: 4,
+                        loop_block: 3,
+                    },
+                },
+                Block {
+                    id: 1,
+                    stmts: vec![Stmt::Assign {
+                        left: Expr::Local(10),
+                        value: Expr::Local(3),
+                    }],
+                    exit: BlockExit::Fallthrough(2),
+                },
+                Block {
+                    id: 2,
+                    stmts: vec![Stmt::Call {
+                        expr: Expr::Call(Box::new(Expr::Local(9)), vec![Expr::Local(10)]),
+                        args: vec![Expr::Local(10)],
+                    }],
+                    exit: BlockExit::Fallthrough(3),
+                },
+                Block {
+                    id: 3,
+                    stmts: vec![],
+                    exit: BlockExit::ForGLoop {
+                        base: 4,
+                        body_block: 2,
+                        exit_block: 4,
+                        result_count: 2,
+                    },
+                },
+                Block {
+                    id: 4,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        assert_eq!(resolve_generic_for_tail(0, 4, 3, &cfg), Some((3, 1, 4, 2)));
     }
 }
