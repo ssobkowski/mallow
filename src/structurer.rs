@@ -44,6 +44,57 @@ struct HilWalker<'a> {
 }
 
 impl<'a> HilWalker<'a> {
+    /// When both `if` branches introduce the same synthetic local, hoist the declaration so
+    /// later statements can legally reference that name after the conditional merge.
+    fn hoist_matching_branch_local(
+        &mut self,
+        outer_stmts: &mut Vec<Stmt>,
+        then_stmts: &mut [Stmt],
+        else_stmts: &mut [Stmt],
+    ) {
+        let Some((then_name, then_value)) = Self::single_local_decl(then_stmts.first()) else {
+            return;
+        };
+        let Some((else_name, else_value)) = Self::single_local_decl(else_stmts.first()) else {
+            return;
+        };
+        if then_name != else_name || self.get_var(&then_name).is_some() {
+            return;
+        }
+
+        let scope = self.top_scope().expect("there should always be a scope");
+        scope.variables.push(Var {
+            name: then_name.clone(),
+        });
+        outer_stmts.push(Stmt::LocalDeclaration {
+            names: vec![then_name.clone()],
+            values: Vec::new(),
+        });
+
+        if let Some(first) = then_stmts.first_mut() {
+            *first = Stmt::Assignment {
+                lhs: Expr::Name(then_name.clone()),
+                rhs: then_value,
+            };
+        }
+        if let Some(first) = else_stmts.first_mut() {
+            *first = Stmt::Assignment {
+                lhs: Expr::Name(then_name),
+                rhs: else_value,
+            };
+        }
+    }
+
+    #[inline]
+    fn single_local_decl(stmt: Option<&Stmt>) -> Option<(Identifier, Expr)> {
+        match stmt? {
+            Stmt::LocalDeclaration { names, values } if names.len() == 1 && values.len() == 1 => {
+                Some((names[0].clone(), values[0].clone()))
+            }
+            _ => None,
+        }
+    }
+
     /// Returns true when `block` dominates one of its predecessors, which we treat as a loop header.
     fn is_loop_header(&self, block: usize, cfg: &ControlFlowGraph) -> bool {
         cfg.predecessors(block)
@@ -255,12 +306,6 @@ impl<'a> HilWalker<'a> {
                     .into_iter()
                     .map(|c| self.walk_expr(c))
                     .collect();
-                let mut params: Vec<_> = (0..proto.num_params)
-                    .map(|i| Parameter::Regular(self.local_ident(i)))
-                    .collect();
-                if proto.is_vararg {
-                    params.push(Parameter::Vararg);
-                }
 
                 if self.active_proto_stack.contains(&proto_idx) {
                     if verbose_enabled() {
@@ -270,7 +315,10 @@ impl<'a> HilWalker<'a> {
                         );
                     }
                     return Expr::AnonymousFunction {
-                        params,
+                        params: (0..proto.num_params)
+                            .map(|i| Parameter::Regular(Identifier::from(format!("v{}", i))))
+                            .chain(proto.is_vararg.then_some(Parameter::Vararg))
+                            .collect(),
                         body: Block::new(),
                     };
                 }
@@ -282,7 +330,10 @@ impl<'a> HilWalker<'a> {
                         );
                     }
                     return Expr::AnonymousFunction {
-                        params,
+                        params: (0..proto.num_params)
+                            .map(|i| Parameter::Regular(Identifier::from(format!("v{}", i))))
+                            .chain(proto.is_vararg.then_some(Parameter::Vararg))
+                            .collect(),
                         body: Block::new(),
                     };
                 }
@@ -308,10 +359,20 @@ impl<'a> HilWalker<'a> {
                     self.scopes = prev_scopes;
                     self.upvals = prev_upvalues;
                     return Expr::AnonymousFunction {
-                        params,
+                        params: (0..proto.num_params)
+                            .map(|i| Parameter::Regular(Identifier::from(format!("v{}", i))))
+                            .chain(proto.is_vararg.then_some(Parameter::Vararg))
+                            .collect(),
                         body: Block::new(),
                     };
                 };
+
+                let mut params: Vec<_> = (0..proto.num_params)
+                    .map(|i| Parameter::Regular(self.local_ident(i)))
+                    .collect();
+                if proto.is_vararg {
+                    params.push(Parameter::Vararg);
+                }
 
                 self.active_proto_stack.push(proto_idx);
                 let param_scope: Vec<Var> = params
@@ -490,6 +551,13 @@ impl<'a> HilWalker<'a> {
                     }
                     let then_stmts = self.structure_region(*then_block, merge_block, cfg);
                     let else_stmts = self.structure_region(*else_block, merge_block, cfg);
+                    let mut then_stmts = then_stmts;
+                    let mut else_stmts = else_stmts;
+                    self.hoist_matching_branch_local(
+                        &mut stmts,
+                        &mut then_stmts,
+                        &mut else_stmts,
+                    );
                     stmts.push(Stmt::If {
                         condition: self.walk_expr(cond.clone()),
                         then_body: Block::with_stmts(then_stmts),
@@ -510,13 +578,13 @@ impl<'a> HilWalker<'a> {
                 BlockExit::ForNPrep { base, loop_block } => {
                     let bounds = resolve_numeric_for_tail(curr_id, *base, *loop_block, cfg);
 
-                    if let Some((tail_block, body_block, exit_block)) = bounds {
-                        let body_stmts = self.structure_region(body_block, Some(tail_block), cfg);
+                    if let Some((_tail_block, body_block, exit_block)) = bounds {
+                        let body_stmts = self.structure_region(body_block, Some(exit_block), cfg);
 
                         stmts.push(Stmt::NumericFor {
                             var: self.local_ident(*base as u8 + 2),
-                            start: Expr::Name(self.local_ident(*base as u8)),
-                            end: Expr::Name(self.local_ident(*base as u8 + 1)),
+                            start: Expr::Name(self.local_ident(*base as u8 + 2)),
+                            end: Expr::Name(self.local_ident(*base as u8)),
                             step: None,
                             body: Block::with_stmts(body_stmts),
                         });
@@ -531,7 +599,7 @@ impl<'a> HilWalker<'a> {
                 BlockExit::ForGPrep { base, loop_block } => {
                     let bounds = resolve_generic_for_tail(curr_id, *base, *loop_block, cfg);
 
-                    if let Some((tail_block, body_block, exit_block, result_count)) = bounds {
+                    if let Some((_tail_block, body_block, exit_block, result_count)) = bounds {
                         let mut iter_expr = Expr::Name(self.local_ident(*base as u8));
 
                         if let Some(HilStmt::AssignMany { left, value }) = block.stmts.last() {
@@ -555,7 +623,7 @@ impl<'a> HilWalker<'a> {
                             vars.push(Identifier::from("_"));
                         }
 
-                        let body_stmts = self.structure_region(body_block, Some(tail_block), cfg);
+                        let body_stmts = self.structure_region(body_block, Some(exit_block), cfg);
                         stmts.push(Stmt::GenericFor {
                             vars,
                             exprs: vec![iter_expr],
@@ -786,6 +854,217 @@ mod tests {
                 if matches!(lhs, AstExpr::Name(name) if name.as_str() == "v2")
                     && matches!(rhs, AstExpr::Name(name) if name.as_str() == "v2_l0")
         ));
+    }
+
+    #[test]
+    fn structure_closure_params_do_not_shadow_captured_register_names() {
+        let parent_cfg = ControlFlowGraph::new(
+            vec![HilBlock {
+                id: 0,
+                stmts: vec![
+                    HilStmt::Assign {
+                        left: HilExpr::Local(0),
+                        value: HilExpr::Number(1.0),
+                    },
+                    HilStmt::Assign {
+                        left: HilExpr::Local(1),
+                        value: HilExpr::Closure {
+                            proto: 1,
+                            captures: vec![HilExpr::Local(0)],
+                        },
+                    },
+                ],
+                exit: BlockExit::Return(vec![]),
+            }],
+            0,
+        );
+        let child_cfg = ControlFlowGraph::new(
+            vec![HilBlock {
+                id: 0,
+                stmts: vec![HilStmt::Assign {
+                    left: HilExpr::Local(2),
+                    value: HilExpr::Upval(0),
+                }],
+                exit: BlockExit::Return(vec![HilExpr::Local(2)]),
+            }],
+            0,
+        );
+
+        let mut parent_proto = Proto::default();
+        parent_proto.num_params = 0;
+        let mut child_proto = Proto::default();
+        child_proto.num_params = 2;
+
+        let ast = structure(&[parent_cfg, child_cfg], 0, &[parent_proto, child_proto]);
+        let (params, body) = match &ast.stmts[1] {
+            AstStmt::LocalDeclaration { values, .. } => match values.as_slice() {
+                [AstExpr::AnonymousFunction { params, body }] => (params, body),
+                _ => panic!("expected closure value"),
+            },
+            _ => panic!("expected closure local declaration"),
+        };
+
+        assert!(matches!(
+            params.as_slice(),
+            [crate::ast::Parameter::Regular(a), crate::ast::Parameter::Regular(b)]
+                if a.as_str() == "v0_l0" && b.as_str() == "v1"
+        ));
+        assert!(matches!(
+            &body.stmts[0],
+            AstStmt::LocalDeclaration { names, values }
+                if matches!(names.as_slice(), [name] if name.as_str() == "v2")
+                    && matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == "v0")
+        ));
+    }
+
+    #[test]
+    fn structure_hoists_branch_local_before_if_merge() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                HilBlock {
+                    id: 0,
+                    stmts: vec![],
+                    exit: BlockExit::CondJump {
+                        cond: HilExpr::Binary(
+                            crate::ast::BinOp::Lt,
+                            Box::new(HilExpr::Local(3)),
+                            Box::new(HilExpr::Local(4)),
+                        ),
+                        then_block: 2,
+                        else_block: 1,
+                    },
+                },
+                HilBlock {
+                    id: 1,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(2),
+                        value: HilExpr::Bool(false),
+                    }],
+                    exit: BlockExit::Fallthrough(3),
+                },
+                HilBlock {
+                    id: 2,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(2),
+                        value: HilExpr::Bool(true),
+                    }],
+                    exit: BlockExit::Jump(3),
+                },
+                HilBlock {
+                    id: 3,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![HilExpr::Local(2)]),
+                },
+            ],
+            0,
+        );
+
+        let ast = structure(&[cfg], 0, &[Proto::default()]);
+        assert!(matches!(
+            &ast.stmts[0],
+            AstStmt::LocalDeclaration { names, values }
+                if matches!(names.as_slice(), [name] if name.as_str() == "v2") && values.is_empty()
+        ));
+
+        match &ast.stmts[1] {
+            AstStmt::If {
+                then_body,
+                else_body: Some(else_body),
+                ..
+            } => {
+                assert!(matches!(
+                    &then_body.stmts[0],
+                    AstStmt::Assignment { lhs, rhs }
+                        if matches!(lhs, AstExpr::Name(name) if name.as_str() == "v2")
+                            && matches!(rhs, AstExpr::Literal(crate::ast::Literal::Bool(true)))
+                ));
+                assert!(matches!(
+                    &else_body.stmts[0],
+                    AstStmt::Assignment { lhs, rhs }
+                        if matches!(lhs, AstExpr::Name(name) if name.as_str() == "v2")
+                            && matches!(rhs, AstExpr::Literal(crate::ast::Literal::Bool(false)))
+                ));
+            }
+            _ => panic!("expected if statement"),
+        }
+        assert!(matches!(
+            &ast.stmts[2],
+            AstStmt::Return { values }
+                if matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == "v2")
+        ));
+    }
+
+    #[test]
+    fn structure_numeric_for_keeps_tail_block_body_and_register_order() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                HilBlock {
+                    id: 0,
+                    stmts: vec![
+                        HilStmt::Assign {
+                            left: HilExpr::Local(6),
+                            value: HilExpr::Number(1.0),
+                        },
+                        HilStmt::Assign {
+                            left: HilExpr::Local(4),
+                            value: HilExpr::Local(2),
+                        },
+                        HilStmt::Assign {
+                            left: HilExpr::Local(5),
+                            value: HilExpr::Number(1.0),
+                        },
+                    ],
+                    exit: BlockExit::ForNPrep {
+                        base: 4,
+                        loop_block: 1,
+                    },
+                },
+                HilBlock {
+                    id: 1,
+                    stmts: vec![
+                        HilStmt::Assign {
+                            left: HilExpr::Local(7),
+                            value: HilExpr::GetIndex(
+                                Box::new(HilExpr::Local(1)),
+                                Box::new(HilExpr::Local(6)),
+                            ),
+                        },
+                        HilStmt::Assign {
+                            left: HilExpr::Local(3),
+                            value: HilExpr::Local(7),
+                        },
+                    ],
+                    exit: BlockExit::ForNLoop {
+                        base: 4,
+                        body_block: 1,
+                        exit_block: 2,
+                    },
+                },
+                HilBlock {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![HilExpr::Local(3)]),
+                },
+            ],
+            0,
+        );
+
+        let ast = structure(&[cfg], 0, &[Proto::default()]);
+        match &ast.stmts[3] {
+            AstStmt::NumericFor {
+                var,
+                start,
+                end,
+                body,
+                ..
+            } => {
+                assert_eq!(var.as_str(), "v6");
+                assert!(matches!(start, AstExpr::Name(name) if name.as_str() == "v6"));
+                assert!(matches!(end, AstExpr::Name(name) if name.as_str() == "v4"));
+                assert_eq!(body.stmts.len(), 2);
+            }
+            _ => panic!("expected numeric for"),
+        }
     }
 
     #[test]
