@@ -8,27 +8,17 @@ use crate::{
         resolve_generic_for_tail, resolve_numeric_for_tail,
     },
     logging::verbose_enabled,
+    scopes::{ScopeManager, Var},
 };
 
 const MAX_PROTO_RECURSION_DEPTH: usize = 128;
 const MAX_REGION_CALL_DEPTH: usize = 4096;
 
-#[derive(Debug)]
-struct Var {
-    name: Identifier,
-}
-
-#[derive(Debug)]
-struct Scope {
-    variables: Vec<Var>,
-}
-
 struct HilWalker<'a> {
     cfgs: &'a [ControlFlowGraph],
     protos: &'a [Proto],
 
-    /// A stack of scopes.
-    scopes: Vec<Scope>,
+    scopes: ScopeManager,
     /// A list of upvalues in the current function.
     upvals: Vec<Expr>,
     /// Per-function mapping from register -> printable local name.
@@ -58,14 +48,15 @@ impl<'a> HilWalker<'a> {
         let Some((else_name, else_value)) = Self::single_local_decl(else_stmts.first()) else {
             return;
         };
-        if then_name != else_name || self.get_var(&then_name).is_some() {
+        if then_name != else_name || self.scopes.get_var(&then_name).is_some() {
             return;
         }
 
-        let scope = self.top_scope().expect("there should always be a scope");
-        scope.variables.push(Var {
-            name: then_name.clone(),
-        });
+        let scope = self
+            .scopes
+            .top_scope()
+            .expect("there should always be a scope");
+        scope.add_var(Var::new(then_name.clone(), None));
         outer_stmts.push(Stmt::LocalDeclaration {
             names: vec![then_name.clone()],
             values: Vec::new(),
@@ -151,44 +142,6 @@ impl<'a> HilWalker<'a> {
         candidate
     }
 
-    /// Pushes a new scope onto the stack.
-    #[inline]
-    fn push_scope(&mut self) {
-        self.scopes.push(Scope {
-            variables: Vec::new(),
-        });
-    }
-
-    /// Pushes a scope onto the stack with the given variables.
-    #[inline]
-    fn push_scope_with(&mut self, vars: Vec<Var>) {
-        self.scopes.push(Scope { variables: vars });
-    }
-
-    /// Gets the current scope, if it exists.
-    #[inline]
-    fn top_scope(&mut self) -> Option<&mut Scope> {
-        self.scopes.last_mut()
-    }
-
-    /// Pops the current scope from the stack.
-    #[inline]
-    fn pop_scope(&mut self) {
-        self.scopes.pop();
-    }
-
-    /// Returns a variable from the current scope, if it exists.
-    /// If one cannot be found in the current scope, it will search
-    /// parent scopes until it finds one or exhausts all scopes.
-    fn get_var(&self, name: &Identifier) -> Option<&Var> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(var) = scope.variables.iter().find(|var| var.name == *name) {
-                return Some(var);
-            }
-        }
-        None
-    }
-
     /// Walks a HIL statement and translates it into an AST statement.
     fn walk_stmt(&mut self, stmt: HilStmt) -> Stmt {
         match stmt {
@@ -197,17 +150,17 @@ impl<'a> HilWalker<'a> {
                 match left {
                     HilExpr::Local(reg) => {
                         let ident = self.local_ident(reg);
-                        match self.get_var(&ident) {
+                        match self.scopes.get_var(&ident) {
                             Some(_) => Stmt::Assignment {
                                 lhs: Expr::Name(ident),
                                 rhs: self.walk_expr(value),
                             },
                             None => {
-                                let scope =
-                                    self.top_scope().expect("there should always be a scope");
-                                scope.variables.push(Var {
-                                    name: ident.clone(),
-                                });
+                                let scope = self
+                                    .scopes
+                                    .top_scope()
+                                    .expect("there should always be a scope");
+                                scope.add_var(Var::new(ident.clone(), None));
                                 Stmt::LocalDeclaration {
                                     names: vec![ident],
                                     values: vec![self.walk_expr(value)],
@@ -242,10 +195,11 @@ impl<'a> HilWalker<'a> {
                     })
                     .collect();
 
-                let scope = self.top_scope().expect("there should always be a scope");
-                scope
-                    .variables
-                    .extend(idents.iter().map(|id| Var { name: id.clone() }));
+                let scope = self
+                    .scopes
+                    .top_scope()
+                    .expect("there should always be a scope");
+                scope.add_vars(idents.iter().map(|id| Var::new(id.clone(), None)));
 
                 Stmt::LocalDeclaration {
                     names: idents,
@@ -302,10 +256,8 @@ impl<'a> HilWalker<'a> {
                         body: Block::new(),
                     };
                 };
-                let mapped_captures: Vec<Expr> = captures
-                    .into_iter()
-                    .map(|c| self.walk_expr(c))
-                    .collect();
+                let mapped_captures: Vec<Expr> =
+                    captures.into_iter().map(|c| self.walk_expr(c)).collect();
 
                 if self.active_proto_stack.contains(&proto_idx) {
                     if verbose_enabled() {
@@ -347,9 +299,9 @@ impl<'a> HilWalker<'a> {
                     );
                 }
                 let prev_upvalues = std::mem::replace(&mut self.upvals, mapped_captures);
-                let prev_scopes = std::mem::take(&mut self.scopes);
                 let prev_local_names = std::mem::take(&mut self.local_names);
                 let prev_used_names = std::mem::take(&mut self.used_names);
+                let prev_scopes = self.scopes.clone();
 
                 self.reserve_upvalue_names();
 
@@ -378,16 +330,16 @@ impl<'a> HilWalker<'a> {
                 let param_scope: Vec<Var> = params
                     .iter()
                     .filter_map(|param| match param {
-                        Parameter::Regular(name) => Some(Var { name: name.clone() }),
+                        Parameter::Regular(name) => Some(Var::new(name.clone(), None)),
                         Parameter::Vararg => None,
                     })
                     .collect();
-                self.push_scope_with(param_scope);
+                self.scopes.push_scope_with(param_scope);
 
                 let stmts = self.structure_region(cfg.entry_block, None, cfg);
                 let body = Block::with_stmts(stmts);
 
-                self.pop_scope();
+                self.scopes.pop_scope();
                 self.active_proto_stack.pop();
                 self.used_names = prev_used_names;
                 self.local_names = prev_local_names;
@@ -443,7 +395,11 @@ impl<'a> HilWalker<'a> {
         stop_at: Option<usize>,
         cfg: &ControlFlowGraph,
     ) -> Vec<Stmt> {
-        let current_proto = self.active_proto_stack.last().copied().unwrap_or(usize::MAX);
+        let current_proto = self
+            .active_proto_stack
+            .last()
+            .copied()
+            .unwrap_or(usize::MAX);
         let region_key = (current_proto, current, stop_at);
         if !self.active_regions.insert(region_key) {
             if verbose_enabled() {
@@ -473,7 +429,7 @@ impl<'a> HilWalker<'a> {
         let mut block_stmt_starts = HashMap::new();
         let is_loop_header = self.is_loop_header(current, cfg);
 
-        self.push_scope();
+        self.scopes.push_scope();
 
         if verbose_enabled() {
             let current_proto = self.active_proto_stack.last().copied();
@@ -553,11 +509,7 @@ impl<'a> HilWalker<'a> {
                     let else_stmts = self.structure_region(*else_block, merge_block, cfg);
                     let mut then_stmts = then_stmts;
                     let mut else_stmts = else_stmts;
-                    self.hoist_matching_branch_local(
-                        &mut stmts,
-                        &mut then_stmts,
-                        &mut else_stmts,
-                    );
+                    self.hoist_matching_branch_local(&mut stmts, &mut then_stmts, &mut else_stmts);
                     if then_stmts.is_empty() && else_stmts.is_empty() {
                         if let Some(m) = merge_block {
                             curr_id = m;
@@ -666,9 +618,7 @@ impl<'a> HilWalker<'a> {
             }
         }
 
-        if is_loop_header
-            && !stmts.is_empty()
-            && !matches!(stmts.as_slice(), [Stmt::While { .. }])
+        if is_loop_header && !stmts.is_empty() && !matches!(stmts.as_slice(), [Stmt::While { .. }])
         {
             stmts = vec![Stmt::While {
                 condition: Expr::Literal(Literal::Bool(true)),
@@ -676,7 +626,7 @@ impl<'a> HilWalker<'a> {
             }];
         }
 
-        self.pop_scope();
+        self.scopes.pop_scope();
         self.region_call_depth -= 1;
         self.active_regions.remove(&region_key);
         stmts
@@ -693,7 +643,7 @@ pub fn structure(cfgs: &[ControlFlowGraph], entry_proto: usize, protos: &[Proto]
     let mut walker = HilWalker {
         cfgs,
         protos,
-        scopes: Vec::new(),
+        scopes: ScopeManager::new(),
         upvals: Vec::new(),
         local_names: HashMap::new(),
         used_names: HashSet::new(),
@@ -1338,7 +1288,10 @@ mod tests {
 
         match &ast.stmts[0] {
             AstStmt::While { condition, body } => {
-                assert!(matches!(condition, AstExpr::Literal(crate::ast::Literal::Bool(true))));
+                assert!(matches!(
+                    condition,
+                    AstExpr::Literal(crate::ast::Literal::Bool(true))
+                ));
                 assert_eq!(body.stmts.len(), 2);
             }
             _ => panic!("expected while loop"),

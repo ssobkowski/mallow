@@ -4,6 +4,7 @@ mod hil;
 mod il;
 mod logging;
 mod printer;
+mod scopes;
 mod structurer;
 
 use std::path::PathBuf;
