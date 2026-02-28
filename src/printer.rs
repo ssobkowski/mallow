@@ -499,6 +499,7 @@ fn escape(s: &str) -> String {
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
             b'\0' => out.push_str("\\0"),
+            b'"' => out.push_str("\\\""),
             // printable ASCII (space through ~, excluding backslash already handled)
             0x20..=0x7E => out.push(byte as char),
             // control chars + high bytes
