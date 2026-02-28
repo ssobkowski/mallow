@@ -4,8 +4,8 @@ use crate::{
     ast::{Block, Expr, Identifier, Literal, Parameter, Stmt},
     disasm::Proto,
     hil::{
-        Block as HilBlock, BlockExit, ControlFlowGraph, Expr as HilExpr, Stmt as HilStmt,
-        find_if_else_join, resolve_generic_for_tail, resolve_numeric_for_tail,
+        BlockExit, ControlFlowGraph, Expr as HilExpr, Stmt as HilStmt, find_if_else_join,
+        resolve_generic_for_tail, resolve_numeric_for_tail,
     },
     logging::verbose_enabled,
 };
@@ -44,6 +44,14 @@ struct HilWalker<'a> {
 }
 
 impl<'a> HilWalker<'a> {
+    /// Returns true when `block` dominates one of its predecessors, which we treat as a loop header.
+    fn is_loop_header(&self, block: usize, cfg: &ControlFlowGraph) -> bool {
+        cfg.predecessors(block)
+            .iter()
+            .copied()
+            .any(|pred| pred != block && cfg.dominates(block, pred))
+    }
+
     /// Returns a stable fallback identifier for an upvalue register index.
     #[inline]
     fn upvalue_ident(up: u8) -> Identifier {
@@ -363,7 +371,11 @@ impl<'a> HilWalker<'a> {
         }
     }
 
-    /// Structures a region of the CFG, from `current` up to (but not including) `stop_at`.
+    /// Structures a linear CFG region into AST statements.
+    ///
+    /// `stop_at` is an optional exclusive block boundary used when a parent construct has
+    /// already identified the region merge point. Loop headers and back-edges are handled
+    /// here so the caller can recurse on plain block ids instead of a richer region type.
     fn structure_region(
         &mut self,
         current: usize,
@@ -397,6 +409,8 @@ impl<'a> HilWalker<'a> {
         let mut stmts = Vec::new();
         let mut curr_id = current;
         let mut visited_in_region = HashSet::new();
+        let mut block_stmt_starts = HashMap::new();
+        let is_loop_header = self.is_loop_header(current, cfg);
 
         self.push_scope();
 
@@ -410,7 +424,19 @@ impl<'a> HilWalker<'a> {
 
         // Keep walking until we hit the stop block, or run out of graph
         while Some(curr_id) != stop_at && curr_id < cfg.blocks.len() {
+            if curr_id != current && self.is_loop_header(curr_id, cfg) {
+                stmts.extend(self.structure_region(curr_id, stop_at, cfg));
+                break;
+            }
+
             if !visited_in_region.insert(curr_id) {
+                if curr_id == current && !stmts.is_empty() {
+                    let body = std::mem::take(&mut stmts);
+                    stmts.push(Stmt::While {
+                        condition: Expr::Literal(Literal::Bool(true)),
+                        body: Block::with_stmts(body),
+                    });
+                }
                 if verbose_enabled() {
                     let current_proto = self.active_proto_stack.last().copied();
                     eprintln!(
@@ -422,6 +448,7 @@ impl<'a> HilWalker<'a> {
             }
 
             let block = &cfg.blocks[curr_id];
+            block_stmt_starts.insert(curr_id, stmts.len());
 
             for hil_stmt in &block.stmts {
                 stmts.push(self.walk_stmt(hil_stmt.clone()));
@@ -429,6 +456,22 @@ impl<'a> HilWalker<'a> {
 
             match &block.exit {
                 BlockExit::Fallthrough(next) | BlockExit::Jump(next) => {
+                    if *next < current && cfg.dominates(*next, curr_id) {
+                        stmts.push(Stmt::Continue);
+                        break;
+                    }
+                    if *next < curr_id
+                        && visited_in_region.contains(next)
+                        && cfg.dominates(*next, curr_id)
+                        && let Some(&loop_stmt_start) = block_stmt_starts.get(next)
+                    {
+                        let body = stmts.split_off(loop_stmt_start);
+                        stmts.push(Stmt::While {
+                            condition: Expr::Literal(Literal::Bool(true)),
+                            body: Block::with_stmts(body),
+                        });
+                        break;
+                    }
                     curr_id = *next;
                 }
 
@@ -538,6 +581,16 @@ impl<'a> HilWalker<'a> {
                     break;
                 }
             }
+        }
+
+        if is_loop_header
+            && !stmts.is_empty()
+            && !matches!(stmts.as_slice(), [Stmt::While { .. }])
+        {
+            stmts = vec![Stmt::While {
+                condition: Expr::Literal(Literal::Bool(true)),
+                body: Block::with_stmts(stmts),
+            }];
         }
 
         self.pop_scope();
@@ -733,5 +786,41 @@ mod tests {
                 if matches!(lhs, AstExpr::Name(name) if name.as_str() == "v2")
                     && matches!(rhs, AstExpr::Name(name) if name.as_str() == "v2_l0")
         ));
+    }
+
+    #[test]
+    fn structure_wraps_backedge_as_while_true() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                HilBlock {
+                    id: 0,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(0),
+                        value: HilExpr::Number(1.0),
+                    }],
+                    exit: BlockExit::Fallthrough(1),
+                },
+                HilBlock {
+                    id: 1,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(1),
+                        value: HilExpr::Number(2.0),
+                    }],
+                    exit: BlockExit::Jump(0),
+                },
+            ],
+            0,
+        );
+
+        let ast = structure(&[cfg], 0, &[Proto::default()]);
+        assert_eq!(ast.stmts.len(), 1);
+
+        match &ast.stmts[0] {
+            AstStmt::While { condition, body } => {
+                assert!(matches!(condition, AstExpr::Literal(crate::ast::Literal::Bool(true))));
+                assert_eq!(body.stmts.len(), 2);
+            }
+            _ => panic!("expected while loop"),
+        }
     }
 }

@@ -129,6 +129,10 @@ impl ControlFlowGraph {
     }
 }
 
+/// Returns the explicit successor block ids for a block exit.
+///
+/// The fixed-size array keeps CFG construction simple: single-edge exits use slot 0,
+/// two-way exits use both slots, and `None` marks the absence of an edge.
 fn exit_targets(exit: &BlockExit) -> [Option<usize>; 2] {
     match *exit {
         BlockExit::Jump(target) | BlockExit::Fallthrough(target) => [Some(target), None],
@@ -154,6 +158,7 @@ fn exit_targets(exit: &BlockExit) -> [Option<usize>; 2] {
     }
 }
 
+/// Builds a forward adjacency list from the block exits.
 fn build_successors(blocks: &[Block]) -> Vec<Vec<usize>> {
     let len = blocks.len();
     let mut successors = vec![Vec::new(); len];
@@ -167,6 +172,7 @@ fn build_successors(blocks: &[Block]) -> Vec<Vec<usize>> {
     successors
 }
 
+/// Inverts the successor lists into predecessor lists.
 fn build_predecessors(len: usize, successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
     let mut predecessors = vec![Vec::new(); len];
     for (src, targets) in successors.iter().enumerate() {
@@ -177,6 +183,7 @@ fn build_predecessors(len: usize, successors: &[Vec<usize>]) -> Vec<Vec<usize>> 
     predecessors
 }
 
+/// Marks which CFG blocks are reachable from the entry block.
 fn reachable_blocks(entry_block: usize, successors: &[Vec<usize>]) -> Vec<bool> {
     let mut reachable = vec![false; successors.len()];
     let mut stack = Vec::new();
@@ -198,6 +205,11 @@ fn reachable_blocks(entry_block: usize, successors: &[Vec<usize>]) -> Vec<bool> 
     reachable
 }
 
+/// Computes dominator sets and immediate dominators for the CFG.
+///
+/// Returns:
+/// - `Vec<Vec<usize>>`: for each block, the set of block ids that dominate it
+/// - `Vec<Option<usize>>`: for each block, its immediate dominator, or `None` for the entry block
 fn build_dominator_metadata(
     entry_block: usize,
     successors: &[Vec<usize>],
@@ -298,6 +310,14 @@ fn build_dominator_metadata(
     (dominators, immediate_dominators)
 }
 
+/// Indexes loop-tail blocks by Luau loop base register.
+///
+/// Luau numeric and generic `for` opcodes use a shared base register layout, so later
+/// recovery passes can look up candidate loop tails from that base alone.
+///
+/// Returns:
+/// - `HashMap<usize, Vec<usize>>`: numeric-loop tails keyed by `FORNPREP/FORNLOOP` base register
+/// - `HashMap<usize, Vec<usize>>`: generic-loop tails keyed by `FORGPREP/FORGLOOP` base register
 fn build_loop_indexes(
     blocks: &[Block],
 ) -> (HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>) {
@@ -326,6 +346,10 @@ enum LinearExit {
     Other,
 }
 
+/// Follows a straight-line region until it reaches a non-trivial exit.
+///
+/// This intentionally walks through unique fallthrough edges so `find_if_else_join`
+/// can reason about small diamonds without fully structuring the region first.
 fn linear_exit_from(start: usize, cfg: &ControlFlowGraph) -> LinearExit {
     let mut seen = HashSet::new();
     let mut current = start;
@@ -350,6 +374,7 @@ fn linear_exit_from(start: usize, cfg: &ControlFlowGraph) -> LinearExit {
     LinearExit::Other
 }
 
+/// Attempts to find the merge block for a simple if/else diamond.
 pub fn find_if_else_join(
     then_block: usize,
     else_block: usize,
@@ -375,6 +400,16 @@ pub fn find_if_else_join(
     Some(candidate)
 }
 
+/// Resolves the tail block for a numeric `for` loop.
+///
+/// Returns:
+/// - `Some((tail_block, body_block, exit_block))` when the loop shape can be recovered
+/// - `None` when the CFG does not match a recoverable numeric-`for` pattern
+///
+/// Tuple fields:
+/// - `tail_block`: block containing `FORNLOOP`
+/// - `body_block`: first structured block inside the loop body
+/// - `exit_block`: block reached when the loop terminates
 pub fn resolve_numeric_for_tail(
     prep_block: usize,
     base: usize,
@@ -459,6 +494,17 @@ pub fn resolve_numeric_for_tail(
     })
 }
 
+/// Resolves the tail block for a generic `for` loop.
+///
+/// Returns:
+/// - `Some((tail_block, body_block, exit_block, result_count))` when the loop shape can be recovered
+/// - `None` when the CFG does not match a recoverable generic-`for` pattern
+///
+/// Tuple fields:
+/// - `tail_block`: block containing `FORGLOOP`
+/// - `body_block`: first structured block inside the loop body
+/// - `exit_block`: block reached when the loop terminates
+/// - `result_count`: number of loop variables produced by `FORGLOOP`
 pub fn resolve_generic_for_tail(
     prep_block: usize,
     base: usize,
@@ -547,12 +593,16 @@ pub fn resolve_generic_for_tail(
     })
 }
 
-fn rel_target(next_pc: usize, offset: i16, instr_len: usize) -> usize {
+/// Resolves a relative branch target from the next instruction index.
+///
+/// Some Luau compare-family jumps encode "no jump" as offset `1` instead of `0`;
+/// `bias` normalizes those opcodes back to a plain PC-relative target.
+fn rel_target_with_bias(next_pc: usize, offset: i16, bias: i16, instr_len: usize) -> usize {
     if instr_len == 0 {
         return 0;
     }
 
-    let target = next_pc.saturating_add_signed(offset as isize);
+    let target = next_pc.saturating_add_signed((offset - bias) as isize);
     if target >= instr_len {
         instr_len - 1
     } else {
@@ -560,9 +610,15 @@ fn rel_target(next_pc: usize, offset: i16, instr_len: usize) -> usize {
     }
 }
 
+/// Resolves a relative branch target from an instruction index.
+///
+/// When `instr_word_pcs` is available, offsets are applied in bytecode-word space so
+/// AUX words are counted correctly. `bias` has the same meaning as in
+/// [`rel_target_with_bias`].
 fn rel_target_from_instr(
     instr_idx: usize,
     offset: i16,
+    bias: i16,
     instrs: &[Instr],
     instr_word_pcs: Option<&[usize]>,
 ) -> usize {
@@ -571,15 +627,15 @@ fn rel_target_from_instr(
     }
 
     let Some(word_pcs) = instr_word_pcs else {
-        return rel_target(instr_idx + 1, offset, instrs.len());
+        return rel_target_with_bias(instr_idx + 1, offset, bias, instrs.len());
     };
 
     if instr_idx >= instrs.len() || word_pcs.len() != instrs.len() {
-        return rel_target(instr_idx + 1, offset, instrs.len());
+        return rel_target_with_bias(instr_idx + 1, offset, bias, instrs.len());
     }
 
     let next_word_pc = word_pcs[instr_idx].saturating_add(instrs[instr_idx].word_len());
-    let raw = next_word_pc as isize + offset as isize;
+    let raw = next_word_pc as isize + offset as isize - bias as isize;
     let target_word_pc = if raw < 0 { 0usize } else { raw as usize };
 
     match word_pcs.binary_search(&target_word_pc) {
@@ -590,6 +646,27 @@ fn rel_target_from_instr(
     }
 }
 
+/// Resolves the target of a jump opcode whose offset uses `0 == next instruction`.
+fn rel_target_plain_from_instr(
+    instr_idx: usize,
+    offset: i16,
+    instrs: &[Instr],
+    instr_word_pcs: Option<&[usize]>,
+) -> usize {
+    rel_target_from_instr(instr_idx, offset, 0, instrs, instr_word_pcs)
+}
+
+/// Resolves the target of a compare-family jump whose offset uses `1 == next instruction`.
+fn rel_target_compare_from_instr(
+    instr_idx: usize,
+    offset: i16,
+    instrs: &[Instr],
+    instr_word_pcs: Option<&[usize]>,
+) -> usize {
+    rel_target_from_instr(instr_idx, offset, 1, instrs, instr_word_pcs)
+}
+
+/// Maps an instruction PC to its containing basic block index.
 fn pc_to_block_idx(entries: &[usize], pc: usize) -> usize {
     entries.partition_point(|&e| e <= pc) - 1
 }
@@ -654,6 +731,9 @@ fn const_expr(consts: &[Constant], index: usize) -> Expr {
     }
 }
 
+/// Decodes Luau call/return counts.
+///
+/// Luau stores fixed counts as `n + 1` and uses `0` as the MULTRET sentinel.
 fn decoded_count(encoded: u8) -> Option<u8> {
     if encoded == 0 {
         None
@@ -662,12 +742,17 @@ fn decoded_count(encoded: u8) -> Option<u8> {
     }
 }
 
+/// Produces `Expr::Local` values for the half-open register range `[start, start + count)`.
 fn local_range(start: u8, count: u8) -> Vec<Expr> {
     (0..count)
         .map(|i| Expr::Local(start.wrapping_add(i)))
         .collect()
 }
 
+/// Produces the return-value expression list for a Luau `RETURN`.
+///
+/// For MULTRET returns this keeps the base register as a placeholder until a pending
+/// call result can be threaded into the return site.
 fn return_values(base: u8, count: u8) -> Vec<Expr> {
     match decoded_count(count) {
         Some(n) => local_range(base, n),
@@ -676,6 +761,7 @@ fn return_values(base: u8, count: u8) -> Vec<Expr> {
     }
 }
 
+/// Wraps a call expression as a statement while preserving the explicit argument list.
 fn call_stmt(expr: Expr) -> Stmt {
     let args = match &expr {
         Expr::Call(_, args) | Expr::MethodCall(_, _, args) => args.clone(),
@@ -684,16 +770,52 @@ fn call_stmt(expr: Expr) -> Stmt {
     Stmt::Call { expr, args }
 }
 
-pub fn lift(instrs: &[Instr], consts: &[Constant]) -> Vec<Stmt> {
-    lift_with_context(instrs, consts, None, &[])
+/// Reconstructs Luau's register-range `CONCAT` as a right-associated expression tree.
+///
+/// Luau encodes `A = B .. C .. D` as `CONCAT A B D`, so the helper expands the full
+/// inclusive register range `[start, end]`.
+fn concat_expr_range(start: u8, end: u8) -> Expr {
+    let mut expr = Expr::Local(end);
+    for reg in (start..end).rev() {
+        expr = Expr::Binary(BinOp::Concat, Box::new(Expr::Local(reg)), Box::new(expr));
+    }
+    expr
 }
 
+/// Consumes a deferred MULTRET call result if it lives in `expected_reg`.
+///
+/// This is used when a later `CALL`, `NAMECALL`, `SETLIST`, or `RETURN` pulls a pending
+/// expression out of a register slot instead of reading a plain local.
+fn take_pending_arg(
+    pending_multret_call: &mut Option<(u8, Expr)>,
+    expected_reg: u8,
+) -> Option<Expr> {
+    match pending_multret_call.take() {
+        Some((src_reg, expr)) if src_reg == expected_reg => Some(expr),
+        Some((src_reg, expr)) => {
+            *pending_multret_call = Some((src_reg, expr));
+            None
+        }
+        None => None,
+    }
+}
+
+pub fn lift(instrs: &[Instr], consts: &[Constant]) -> Vec<Stmt> {
+    let (mut stmts, pending_multret_call) = lift_with_context(instrs, consts, None, &[]);
+    if let Some((_, expr)) = pending_multret_call {
+        stmts.push(call_stmt(expr));
+    }
+    stmts
+}
+
+/// Resolves a `NEWCLOSURE` child-proto index to the absolute proto id.
 fn resolve_newclosure_proto(parent_proto: Option<&Proto>, proto_idx: u16) -> usize {
     parent_proto
         .and_then(|proto| proto.protos.get(usize::from(proto_idx)).copied())
         .unwrap_or(usize::from(proto_idx))
 }
 
+/// Resolves a `DUPCLOSURE` constant-table entry to the referenced proto id.
 fn resolve_dupclosure_proto(consts: &[Constant], k: u16) -> usize {
     match consts.get(usize::from(k)) {
         Some(Constant::Closure(proto_idx)) => usize::try_from(*proto_idx).unwrap_or(usize::from(k)),
@@ -701,6 +823,7 @@ fn resolve_dupclosure_proto(consts: &[Constant], k: u16) -> usize {
     }
 }
 
+/// Decodes Luau capture metadata into the captured HIL expression.
 fn decode_capture(capture_type: u8, reg: u8) -> Expr {
     match capture_type {
         0 | 1 => Expr::Local(reg),
@@ -709,12 +832,20 @@ fn decode_capture(capture_type: u8, reg: u8) -> Expr {
     }
 }
 
+/// Lifts flat bytecode instructions into HIL statements plus an optional deferred MULTRET call.
+///
+/// The returned pending call represents a call result that still lives "on the stack top"
+/// in Luau terms and may need to be consumed by a later `CALL`, `SETLIST`, or `RETURN`.
+///
+/// Returns:
+/// - `Vec<Stmt>`: lifted statements for the instruction slice
+/// - `Option<(u8, Expr)>`: a deferred MULTRET call as `(first_result_register, call_expr)`
 fn lift_with_context(
     instrs: &[Instr],
     consts: &[Constant],
     parent_proto: Option<&Proto>,
     all_protos: &[Proto],
-) -> Vec<Stmt> {
+) -> (Vec<Stmt>, Option<(u8, Expr)>) {
     let mut stmts = Vec::new();
 
     let mut pending_namecall: Option<(u8, String)> = None; // (func reg, method)
@@ -722,6 +853,11 @@ fn lift_with_context(
     let mut pending_closure_stmt: Option<(usize, usize)> = None; // (stmt index, remaining fixed captures)
 
     for (instr_idx, instr) in instrs.iter().enumerate() {
+        let pending_namecall_for_func = |func: u8| {
+            pending_namecall
+                .as_ref()
+                .is_some_and(|(nc_reg, _)| *nc_reg == func)
+        };
         let consumes_pending_multret = matches!(
             instr,
             Instr::Call {
@@ -730,7 +866,15 @@ fn lift_with_context(
                 ..
             } if pending_multret_call
                 .as_ref()
-                .is_some_and(|(src_reg, _)| *src_reg == *func + 1)
+                .is_some_and(|(src_reg, _)| {
+                    *src_reg == *func + 1
+                        || (pending_namecall_for_func(*func) && *src_reg == *func + 2)
+                })
+        ) || matches!(
+            instr,
+            Instr::NameCall { dest, .. } if pending_multret_call
+                .as_ref()
+                .is_some_and(|(src_reg, _)| *src_reg == *dest + 2)
         ) || matches!(
             instr,
             Instr::SetList {
@@ -738,6 +882,11 @@ fn lift_with_context(
                 count: 0,
                 ..
             } if pending_multret_call
+                .as_ref()
+                .is_some_and(|(src_reg, _)| *src_reg == *base)
+        ) || matches!(
+            instr,
+            Instr::Return { base, count: 0 } if pending_multret_call
                 .as_ref()
                 .is_some_and(|(src_reg, _)| *src_reg == *base)
         );
@@ -833,24 +982,30 @@ fn lift_with_context(
                 ret_count,
             } => {
                 let mut consumed_multret = false;
+                let is_namecall = pending_namecall
+                    .as_ref()
+                    .is_some_and(|(nc_reg, _)| *nc_reg == *func);
+                let first_arg_reg = if is_namecall { *func + 2 } else { *func + 1 };
 
                 let args = match decoded_count(*arg_count) {
                     Some(argc) => {
-                        if argc > 0 {
-                            local_range(*func + 1, argc)
+                        let explicit_arg_count = if is_namecall {
+                            argc.saturating_sub(1)
+                        } else {
+                            argc
+                        };
+
+                        if explicit_arg_count > 0 {
+                            local_range(first_arg_reg, explicit_arg_count)
                         } else {
                             Vec::new()
                         }
                     }
                     None => {
-                        if let Some((src_reg, expr)) = pending_multret_call.take() {
-                            if src_reg == *func + 1 {
-                                consumed_multret = true;
-                                vec![expr]
-                            } else {
-                                pending_multret_call = Some((src_reg, expr));
-                                Vec::new()
-                            }
+                        if let Some(expr) = take_pending_arg(&mut pending_multret_call, first_arg_reg)
+                        {
+                            consumed_multret = true;
+                            vec![expr]
                         } else {
                             Vec::new()
                         }
@@ -902,7 +1057,12 @@ fn lift_with_context(
                 }
             }
             Instr::Return { base, count } => {
-                let rets = return_values(*base, *count);
+                let rets = match decoded_count(*count) {
+                    None => take_pending_arg(&mut pending_multret_call, *base)
+                        .map(|expr| vec![expr])
+                        .unwrap_or_else(|| return_values(*base, *count)),
+                    Some(_) => return_values(*base, *count),
+                };
                 stmts.push(Stmt::Return(rets));
             }
             Instr::GetTableKS {
@@ -1136,11 +1296,7 @@ fn lift_with_context(
             }),
             Instr::Concat { dest, a, b } => stmts.push(Stmt::Assign {
                 left: Expr::Local(*dest),
-                value: Expr::Binary(
-                    BinOp::Concat,
-                    Box::new(Expr::Local(*a)),
-                    Box::new(Expr::Local(*b)),
-                ),
+                value: concat_expr_range(*a, *b),
             }),
             Instr::Not { dest, reg } => stmts.push(Stmt::Assign {
                 left: Expr::Local(*dest),
@@ -1300,21 +1456,23 @@ fn lift_with_context(
         }
     }
 
-    if let Some((_, expr)) = pending_multret_call.take() {
-        stmts.push(call_stmt(expr));
-    }
-
-    stmts
+    (stmts, pending_multret_call)
 }
 
+/// Builds a CFG for a standalone instruction stream without proto context.
 pub fn build_cfg(instrs: &[Instr], consts: &[Constant]) -> ControlFlowGraph {
     build_cfg_with_context(instrs, consts, None, &[])
 }
 
+/// Builds a CFG for a proto, preserving child-proto context for closure resolution.
 pub fn build_cfg_for_proto(proto: &Proto, all_protos: &[Proto]) -> ControlFlowGraph {
     build_cfg_with_context(&proto.instrs, &proto.consts, Some(proto), all_protos)
 }
 
+/// Splits a proto into basic blocks, lifts block bodies to HIL, and annotates exits.
+///
+/// This function is also responsible for threading trailing pending MULTRET calls into
+/// block exits such as `RETURN`, so blocks keep expression-level call structure when possible.
 fn build_cfg_with_context(
     instrs: &[Instr],
     consts: &[Constant],
@@ -1339,18 +1497,21 @@ fn build_cfg_with_context(
             | Instr::ForgPrep { offset, .. }
             | Instr::ForgPrepInext { offset, .. }
             | Instr::ForgPrepNext { offset, .. } => {
-                entries.insert(rel_target_from_instr(i, *offset, instrs, instr_word_pcs));
+                entries.insert(rel_target_plain_from_instr(i, *offset, instrs, instr_word_pcs));
                 entries.insert(i + 1); // body entry
             }
             Instr::FornLoop { offset, .. } | Instr::ForgLoop { offset, .. } => {
-                entries.insert(rel_target_from_instr(i, *offset, instrs, instr_word_pcs));
+                entries.insert(rel_target_plain_from_instr(i, *offset, instrs, instr_word_pcs));
                 entries.insert(i + 1); // loop exit entry
             }
             Instr::Jump { offset }
             | Instr::JumpBack { offset }
             | Instr::JumpIf { offset, .. }
-            | Instr::JumpIfNot { offset, .. }
-            | Instr::JumpIfEq { offset, .. }
+            | Instr::JumpIfNot { offset, .. } => {
+                entries.insert(rel_target_plain_from_instr(i, *offset, instrs, instr_word_pcs));
+                entries.insert(i + 1); // fallthrough is also an entry
+            }
+            Instr::JumpIfEq { offset, .. }
             | Instr::JumpIfLe { offset, .. }
             | Instr::JumpIfLt { offset, .. }
             | Instr::JumpIfNotEq { offset, .. }
@@ -1360,8 +1521,21 @@ fn build_cfg_with_context(
             | Instr::JumpXEqKB { offset, .. }
             | Instr::JumpXEqKN { offset, .. }
             | Instr::JumpXEqKS { offset, .. } => {
-                entries.insert(rel_target_from_instr(i, *offset, instrs, instr_word_pcs));
+                entries.insert(rel_target_compare_from_instr(
+                    i,
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                ));
                 entries.insert(i + 1); // fallthrough is also an entry
+            }
+            Instr::LoadB { jump, .. } if *jump > 0 => {
+                entries.insert(rel_target_plain_from_instr(
+                    i,
+                    i16::from(*jump),
+                    instrs,
+                    instr_word_pcs,
+                ));
             }
             _ => {}
         }
@@ -1401,23 +1575,40 @@ fn build_cfg_with_context(
             | Some(Instr::ForgPrepInext { .. })
             | Some(Instr::ForgPrepNext { .. })
             | Some(Instr::ForgLoop { .. }) => (&block_instrs[..block_instrs.len() - 1], last),
+            Some(Instr::LoadB { jump, .. }) if *jump > 0 => (block_instrs, last),
             _ => (block_instrs, None),
         };
 
+        let (mut lifted_body, mut pending_multret_call) =
+            lift_with_context(body, consts, parent_proto, all_protos);
+
         let exit = match exit_instr {
             Some(Instr::Return { base, count }) => {
-                let rets = return_values(*base, *count);
+                let rets = match decoded_count(*count) {
+                    None => take_pending_arg(&mut pending_multret_call, *base)
+                        .map(|expr| vec![expr])
+                        .unwrap_or_else(|| return_values(*base, *count)),
+                    Some(_) => return_values(*base, *count),
+                };
                 BlockExit::Return(rets)
             }
             Some(Instr::Jump { offset }) | Some(Instr::JumpBack { offset }) => {
-                let target =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let target = rel_target_plain_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let target_block = pc_to_block_idx(&entries_vec, target);
                 BlockExit::Jump(target_block)
             }
             Some(Instr::JumpIfNotLt { reg, aux, offset }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_compare_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 BlockExit::CondJump {
@@ -1426,35 +1617,47 @@ fn build_cfg_with_context(
                         Box::new(Expr::Local(*reg)),
                         Box::new(Expr::Local(*aux)),
                     ),
-                    then_block: fallthrough_block, // condition was TRUE, didn't jump
-                    else_block: taken_block,       // condition was FALSE, jumped
+                    then_block: fallthrough_block,
+                    else_block: taken_block,
                 }
             }
             Some(Instr::JumpIf { reg, offset }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_plain_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 BlockExit::CondJump {
                     cond: Expr::Local(*reg),
-                    then_block: taken_block,       // jumped
-                    else_block: fallthrough_block, // no jump
+                    then_block: taken_block,
+                    else_block: fallthrough_block,
                 }
             }
             Some(Instr::JumpIfNot { reg, offset }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_plain_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 BlockExit::CondJump {
                     cond: Expr::Local(*reg),
-                    then_block: fallthrough_block, // no jump
-                    else_block: taken_block,       // jumped
+                    then_block: fallthrough_block,
+                    else_block: taken_block,
                 }
             }
             Some(Instr::JumpIfEq { reg, aux, offset }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_compare_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 BlockExit::CondJump {
@@ -1463,13 +1666,17 @@ fn build_cfg_with_context(
                         Box::new(Expr::Local(*reg)),
                         Box::new(Expr::Local(*aux)),
                     ),
-                    then_block: taken_block,       // jumped
-                    else_block: fallthrough_block, // no jump
+                    then_block: taken_block,
+                    else_block: fallthrough_block,
                 }
             }
             Some(Instr::JumpIfLe { reg, aux, offset }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_compare_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 BlockExit::CondJump {
@@ -1478,13 +1685,17 @@ fn build_cfg_with_context(
                         Box::new(Expr::Local(*reg)),
                         Box::new(Expr::Local(*aux)),
                     ),
-                    then_block: taken_block,       // jumped
-                    else_block: fallthrough_block, // no jump
+                    then_block: taken_block,
+                    else_block: fallthrough_block,
                 }
             }
             Some(Instr::JumpIfLt { reg, aux, offset }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_compare_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 BlockExit::CondJump {
@@ -1493,13 +1704,17 @@ fn build_cfg_with_context(
                         Box::new(Expr::Local(*reg)),
                         Box::new(Expr::Local(*aux)),
                     ),
-                    then_block: taken_block,       // jumped
-                    else_block: fallthrough_block, // no jump
+                    then_block: taken_block,
+                    else_block: fallthrough_block,
                 }
             }
             Some(Instr::JumpIfNotEq { reg, aux, offset }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_compare_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 BlockExit::CondJump {
@@ -1508,13 +1723,17 @@ fn build_cfg_with_context(
                         Box::new(Expr::Local(*reg)),
                         Box::new(Expr::Local(*aux)),
                     ),
-                    then_block: fallthrough_block, // no jump
-                    else_block: taken_block,       // jumped
+                    then_block: fallthrough_block,
+                    else_block: taken_block,
                 }
             }
             Some(Instr::JumpIfNotLe { reg, aux, offset }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_compare_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 BlockExit::CondJump {
@@ -1523,8 +1742,8 @@ fn build_cfg_with_context(
                         Box::new(Expr::Local(*reg)),
                         Box::new(Expr::Local(*aux)),
                     ),
-                    then_block: fallthrough_block, // no jump
-                    else_block: taken_block,       // jumped
+                    then_block: fallthrough_block,
+                    else_block: taken_block,
                 }
             }
             Some(Instr::JumpXEqKNil {
@@ -1532,8 +1751,12 @@ fn build_cfg_with_context(
                 invert,
                 offset,
             }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_compare_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 let op = if *invert { BinOp::Ne } else { BinOp::Eq };
@@ -1550,8 +1773,12 @@ fn build_cfg_with_context(
                 invert,
                 offset,
             }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_compare_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 let op = if *invert { BinOp::Ne } else { BinOp::Eq };
@@ -1574,8 +1801,12 @@ fn build_cfg_with_context(
                 invert,
                 offset,
             }) => {
-                let taken =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let taken = rel_target_compare_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 let taken_block = pc_to_block_idx(&entries_vec, taken);
                 let fallthrough_block = block_idx + 1;
                 let op = if *invert { BinOp::Ne } else { BinOp::Eq };
@@ -1591,16 +1822,24 @@ fn build_cfg_with_context(
                 }
             }
             Some(Instr::FornPrep { base, offset }) => {
-                let target =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let target = rel_target_plain_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 BlockExit::ForNPrep {
                     base: usize::from(*base),
                     loop_block: pc_to_block_idx(&entries_vec, target),
                 }
             }
             Some(Instr::FornLoop { base, offset }) => {
-                let target =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let target = rel_target_plain_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 BlockExit::ForNLoop {
                     base: usize::from(*base),
                     body_block: pc_to_block_idx(&entries_vec, target),
@@ -1610,8 +1849,12 @@ fn build_cfg_with_context(
             Some(Instr::ForgPrep { base, offset })
             | Some(Instr::ForgPrepInext { base, offset })
             | Some(Instr::ForgPrepNext { base, offset }) => {
-                let target =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let target = rel_target_plain_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 BlockExit::ForGPrep {
                     base: usize::from(*base),
                     loop_block: pc_to_block_idx(&entries_vec, target),
@@ -1623,8 +1866,12 @@ fn build_cfg_with_context(
                 var_count,
                 ..
             }) => {
-                let target =
-                    rel_target_from_instr(end.saturating_sub(1), *offset, instrs, instr_word_pcs);
+                let target = rel_target_plain_from_instr(
+                    end.saturating_sub(1),
+                    *offset,
+                    instrs,
+                    instr_word_pcs,
+                );
                 BlockExit::ForGLoop {
                     base: usize::from(*base),
                     body_block: pc_to_block_idx(&entries_vec, target),
@@ -1632,15 +1879,25 @@ fn build_cfg_with_context(
                     result_count: usize::from(*var_count),
                 }
             }
-            _ => {
-                // no explicit jump, falls through
-                BlockExit::Fallthrough(block_idx + 1)
+            Some(Instr::LoadB { jump, .. }) if *jump > 0 => {
+                let target = rel_target_plain_from_instr(
+                    end.saturating_sub(1),
+                    i16::from(*jump),
+                    instrs,
+                    instr_word_pcs,
+                );
+                BlockExit::Jump(pc_to_block_idx(&entries_vec, target))
             }
+            _ => BlockExit::Fallthrough(block_idx + 1),
         };
+
+        if let Some((_, expr)) = pending_multret_call.take() {
+            lifted_body.push(call_stmt(expr));
+        }
 
         blocks.push(Block {
             id: block_idx,
-            stmts: lift_with_context(body, consts, parent_proto, all_protos),
+            stmts: lifted_body,
             exit,
         });
     }
@@ -1797,6 +2054,108 @@ mod tests {
     }
 
     #[test]
+    fn lift_namecall_consumes_pending_multret_at_first_user_arg() {
+        let consts = vec![
+            Constant::String("byte".to_string()),
+            Constant::String("format".to_string()),
+        ];
+        let instrs = vec![
+            Instr::NameCall {
+                dest: 3,
+                object: 0,
+                slot: 0,
+                method: 0,
+            },
+            Instr::Call {
+                func: 3,
+                arg_count: 1,
+                ret_count: 0,
+            },
+            Instr::NameCall {
+                dest: 1,
+                object: 1,
+                slot: 0,
+                method: 1,
+            },
+            Instr::Call {
+                func: 1,
+                arg_count: 0,
+                ret_count: 0,
+            },
+        ];
+
+        let stmts = lift(&instrs, &consts);
+        assert_eq!(stmts.len(), 3);
+
+        match &stmts[2] {
+            Stmt::Call { expr, args } => {
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    Expr::MethodCall(base, method, method_args) => {
+                        assert!(matches!(base.as_ref(), Expr::Local(4)));
+                        assert_eq!(method, "byte");
+                        assert!(method_args.is_empty());
+                    }
+                    _ => panic!("expected nested byte() call as format() arg"),
+                }
+
+                match expr {
+                    Expr::MethodCall(base, method, method_args) => {
+                        assert!(matches!(base.as_ref(), Expr::Local(2)));
+                        assert_eq!(method, "format");
+                        assert_eq!(method_args.len(), 1);
+                        assert!(matches!(
+                            &method_args[0],
+                            Expr::MethodCall(base, method, nested_args)
+                                if matches!(base.as_ref(), Expr::Local(4))
+                                    && method == "byte"
+                                    && nested_args.is_empty()
+                        ));
+                    }
+                    _ => panic!("expected format method call"),
+                }
+            }
+            _ => panic!("expected final NAMECALL/CALL to stay a call statement"),
+        }
+    }
+
+    #[test]
+    fn lift_return_consumes_pending_multret_call() {
+        let consts = vec![Constant::String("byte".to_string())];
+        let instrs = vec![
+            Instr::NameCall {
+                dest: 3,
+                object: 0,
+                slot: 0,
+                method: 0,
+            },
+            Instr::Call {
+                func: 3,
+                arg_count: 1,
+                ret_count: 0,
+            },
+            Instr::Return { base: 3, count: 0 },
+        ];
+
+        let stmts = lift(&instrs, &consts);
+        assert_eq!(stmts.len(), 2);
+
+        match &stmts[1] {
+            Stmt::Return(values) => {
+                assert_eq!(values.len(), 1);
+                assert!(matches!(
+                    &values[0],
+                    Expr::MethodCall(base, method, args)
+                        if matches!(base.as_ref(), Expr::Local(4))
+                            && method == "byte"
+                            && args.is_empty()
+                ));
+            }
+            _ => panic!("expected multret method call to feed RETURN"),
+        }
+    }
+
+    #[test]
     fn lift_andk_and_ork_use_constant_rhs() {
         let consts = vec![
             Constant::Boolean(false),
@@ -1842,6 +2201,36 @@ mod tests {
                 ));
             }
             _ => panic!("expected ORK assignment"),
+        }
+    }
+
+    #[test]
+    fn lift_concat_uses_full_register_range() {
+        let instrs = vec![Instr::Concat {
+            dest: 2,
+            a: 3,
+            b: 5,
+        }];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 1);
+
+        match &stmts[0] {
+            Stmt::Assign { left, value } => {
+                assert!(matches!(left, Expr::Local(2)));
+                assert!(matches!(
+                    value,
+                    Expr::Binary(BinOp::Concat, a, rest)
+                        if matches!(a.as_ref(), Expr::Local(3))
+                            && matches!(
+                                rest.as_ref(),
+                                Expr::Binary(BinOp::Concat, b, c)
+                                    if matches!(b.as_ref(), Expr::Local(4))
+                                        && matches!(c.as_ref(), Expr::Local(5))
+                            )
+                ));
+            }
+            _ => panic!("expected CONCAT assignment"),
         }
     }
 
@@ -2019,7 +2408,7 @@ mod tests {
         let instrs = vec![
             Instr::LoadN { reg: 0, value: 1 },
             Instr::JumpIfNotEq {
-                offset: 1,
+                offset: 2,
                 reg: 0,
                 aux: 1,
             },
@@ -2046,6 +2435,50 @@ mod tests {
                 ));
             }
             _ => panic!("expected conditional exit for JUMPIFNOTEQ"),
+        }
+    }
+
+    #[test]
+    fn build_cfg_uses_compare_jump_bias_and_loadb_jump_edges() {
+        let instrs = vec![
+            Instr::LoadN { reg: 0, value: 1 },
+            Instr::LoadN { reg: 1, value: 1 },
+            Instr::JumpIfEq {
+                reg: 0,
+                aux: 1,
+                offset: 2,
+            },
+            Instr::LoadB {
+                reg: 2,
+                value: false,
+                jump: 1,
+            },
+            Instr::LoadB {
+                reg: 2,
+                value: true,
+                jump: 0,
+            },
+            Instr::Return { base: 2, count: 1 },
+        ];
+
+        let cfg = build_cfg(&instrs, &[]);
+        assert_eq!(cfg.blocks.len(), 4);
+
+        match &cfg.blocks[0].exit {
+            BlockExit::CondJump {
+                then_block,
+                else_block,
+                ..
+            } => {
+                assert_eq!(*then_block, 2);
+                assert_eq!(*else_block, 1);
+            }
+            _ => panic!("expected conditional exit for JUMPIFEQ"),
+        }
+
+        match &cfg.blocks[1].exit {
+            BlockExit::Jump(target) => assert_eq!(*target, 3),
+            _ => panic!("expected LOADB jump to become an unconditional edge"),
         }
     }
 
@@ -2225,7 +2658,7 @@ mod tests {
                 reg: 0,
                 k: 0,
                 invert: false,
-                offset: 1,
+                offset: 2,
             },
             Instr::LoadN { reg: 1, value: 1 },
             Instr::Return { base: 0, count: 1 },
