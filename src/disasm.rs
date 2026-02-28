@@ -58,9 +58,7 @@ impl FromLeBytes for String {
 
         let mut buf = vec![0; len];
         cursor.read_exact(&mut buf).map_err(DisasmError::IoError)?;
-        String::from_utf8(buf).map_err(|err| {
-            DisasmError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
-        })
+        Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 }
 
@@ -100,6 +98,13 @@ pub struct Disassembly {
     pub version: u8,
     pub protos: Vec<Proto>,
     pub entry_proto: u64,
+}
+
+impl Disassembly {
+    #[inline]
+    pub fn entry(&self) -> &Proto {
+        &self.protos[self.entry_proto as usize]
+    }
 }
 
 struct Disassembler<'a> {

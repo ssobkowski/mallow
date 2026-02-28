@@ -700,11 +700,6 @@ impl Instr {
         Ok(instr)
     }
 
-    pub fn decode_stream(words: &[u32]) -> Result<Vec<Self>, String> {
-        let (instrs, _) = Self::decode_stream_with_word_pcs(words)?;
-        Ok(instrs)
-    }
-
     pub fn decode_stream_with_word_pcs(words: &[u32]) -> Result<(Vec<Self>, Vec<usize>), String> {
         let mut out = Vec::new();
         let mut word_pcs = Vec::new();

@@ -1,15 +1,18 @@
-mod codegen;
+mod ast;
 mod disasm;
 mod hil;
 mod il;
+mod logging;
+mod printer;
+mod structurer;
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
 use crate::{
-    codegen::Emitter,
     il::{Constant, Instr},
+    printer::print,
 };
 
 #[derive(Debug, Parser)]
@@ -51,6 +54,7 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+    logging::set_verbose(cli.verbose);
 
     match cli.command {
         Commands::Disasm { input, output } => {
@@ -76,24 +80,39 @@ fn main() {
                     return;
                 }
             };
-
-            let entry_proto = usize::try_from(disassembled.entry_proto).ok();
-            let protos = disassembled.protos;
-            let mut emitter = Emitter::new();
-            for (idx, proto) in protos.iter().enumerate() {
-                if Some(idx) != entry_proto {
-                    emitter.emit_proto(proto, &protos);
+            if logging::verbose_enabled() {
+                eprintln!(
+                    "[decompile] protos={}, entry={}",
+                    disassembled.protos.len(),
+                    disassembled.entry_proto
+                );
+                for proto in &disassembled.protos {
+                    eprintln!(
+                        "[decompile] proto {}: instrs={}, consts={}, child_protos={}, params={}, upvals={}, vararg={}",
+                        proto.index,
+                        proto.instrs.len(),
+                        proto.consts.len(),
+                        proto.protos.len(),
+                        proto.num_params,
+                        proto.num_upvals,
+                        proto.is_vararg
+                    );
                 }
             }
-            if let Some(entry_idx) = entry_proto
-                && let Some(entry) = protos.get(entry_idx)
-            {
-                emitter.emit_entry_proto(entry, &protos);
-            }
-            let decompiled = emitter.take();
 
-            if let Err(e) = write_output(output, &decompiled) {
-                eprintln!("Error writing decompile output: {e}");
+            let proto_cfgs = disassembled
+                .protos
+                .iter()
+                .map(|proto| hil::build_cfg_for_proto(proto, &disassembled.protos))
+                .collect::<Vec<_>>();
+            let ast = structurer::structure(
+                &proto_cfgs,
+                disassembled.entry_proto as usize,
+                &disassembled.protos,
+            );
+            let src = print(&ast);
+            if let Err(e) = write_output(output, &src) {
+                eprintln!("Error writing decompiled output: {e}");
             }
         }
     }
@@ -128,7 +147,7 @@ fn format_disassembly_plaintext(disassembly: &disasm::Disassembly) -> String {
 
         for instr in &proto.instrs {
             out.push_str("0: ");
-            out.push_str(&format_instruction(&instr, &proto.consts));
+            out.push_str(&format_instruction(instr, &proto.consts));
             out.push('\n');
         }
     }

@@ -1,33 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::ast::{BinOp, UnOp};
 use crate::disasm::Proto;
 use crate::il::{Constant, Instr};
-
-#[derive(Debug, Clone)]
-pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Pow,
-    Eq,
-    Ne,
-    Lt,
-    Lte,
-    Gt,
-    Gte,
-    And,
-    Or,
-    Concat,
-}
-
-#[derive(Debug, Clone)]
-pub enum UnaryOp {
-    Minus,
-    Length,
-    Not,
-}
+use crate::logging::verbose_enabled;
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -45,37 +21,27 @@ pub enum Expr {
     Call(Box<Expr>, Vec<Expr>),
     MethodCall(Box<Expr>, String, Vec<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
-    Unary(UnaryOp, Box<Expr>),
+    Unary(UnOp, Box<Expr>),
     Table(Vec<Expr>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Stmt {
-    Assign {
-        left: Expr,
-        value: Expr,
-    },
-    AssignMany {
-        left: Vec<Expr>,
-        value: Expr,
-    },
-    Call(Expr),
-    SetField {
-        table: usize,
-        key: String,
-        value: Expr,
-    },
+    Assign { left: Expr, value: Expr },
+    AssignMany { left: Vec<Expr>, value: Expr },
+    Call { expr: Expr, args: Vec<Expr> },
+    SetField { table: u8, key: String, value: Expr },
     Return(Vec<Expr>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Block {
     pub id: usize,
     pub stmts: Vec<Stmt>,
     pub exit: BlockExit,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BlockExit {
     Jump(usize), // unconditional -> block id
     CondJump {
@@ -110,6 +76,475 @@ pub enum BlockExit {
 pub struct ControlFlowGraph {
     pub blocks: Vec<Block>,
     pub entry_block: usize,
+    pub successors: Vec<Vec<usize>>,
+    pub predecessors: Vec<Vec<usize>>,
+    pub dominators: Vec<Vec<usize>>,
+    pub immediate_dominators: Vec<Option<usize>>,
+    numeric_loops_by_base: HashMap<usize, Vec<usize>>,
+    generic_loops_by_base: HashMap<usize, Vec<usize>>,
+}
+
+impl ControlFlowGraph {
+    pub fn new(blocks: Vec<Block>, entry_block: usize) -> Self {
+        let successors = build_successors(&blocks);
+        let predecessors = build_predecessors(successors.len(), &successors);
+        let (dominators, immediate_dominators) =
+            build_dominator_metadata(entry_block, &successors, &predecessors);
+        let (numeric_loops_by_base, generic_loops_by_base) = build_loop_indexes(&blocks);
+
+        ControlFlowGraph {
+            blocks,
+            entry_block,
+            successors,
+            predecessors,
+            dominators,
+            immediate_dominators,
+            numeric_loops_by_base,
+            generic_loops_by_base,
+        }
+    }
+
+    pub fn successors(&self, block: usize) -> &[usize] {
+        self.successors
+            .get(block)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn predecessors(&self, block: usize) -> &[usize] {
+        self.predecessors
+            .get(block)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn dominates(&self, dom: usize, node: usize) -> bool {
+        self.dominators
+            .get(node)
+            .is_some_and(|doms| doms.contains(&dom))
+    }
+
+    pub fn immediate_dominator(&self, block: usize) -> Option<usize> {
+        self.immediate_dominators.get(block).copied().flatten()
+    }
+}
+
+fn exit_targets(exit: &BlockExit) -> [Option<usize>; 2] {
+    match *exit {
+        BlockExit::Jump(target) | BlockExit::Fallthrough(target) => [Some(target), None],
+        BlockExit::CondJump {
+            then_block,
+            else_block,
+            ..
+        } => [Some(then_block), Some(else_block)],
+        BlockExit::ForNPrep { loop_block, .. } | BlockExit::ForGPrep { loop_block, .. } => {
+            [Some(loop_block), None]
+        }
+        BlockExit::ForNLoop {
+            body_block,
+            exit_block,
+            ..
+        }
+        | BlockExit::ForGLoop {
+            body_block,
+            exit_block,
+            ..
+        } => [Some(body_block), Some(exit_block)],
+        BlockExit::Return(_) => [None, None],
+    }
+}
+
+fn build_successors(blocks: &[Block]) -> Vec<Vec<usize>> {
+    let len = blocks.len();
+    let mut successors = vec![Vec::new(); len];
+    for (idx, block) in blocks.iter().enumerate() {
+        for target in exit_targets(&block.exit).into_iter().flatten() {
+            if target < len {
+                successors[idx].push(target);
+            }
+        }
+    }
+    successors
+}
+
+fn build_predecessors(len: usize, successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut predecessors = vec![Vec::new(); len];
+    for (src, targets) in successors.iter().enumerate() {
+        for &target in targets {
+            predecessors[target].push(src);
+        }
+    }
+    predecessors
+}
+
+fn reachable_blocks(entry_block: usize, successors: &[Vec<usize>]) -> Vec<bool> {
+    let mut reachable = vec![false; successors.len()];
+    let mut stack = Vec::new();
+    if entry_block < successors.len() {
+        stack.push(entry_block);
+    }
+
+    while let Some(block) = stack.pop() {
+        if reachable[block] {
+            continue;
+        }
+        reachable[block] = true;
+        for &next in &successors[block] {
+            if !reachable[next] {
+                stack.push(next);
+            }
+        }
+    }
+    reachable
+}
+
+fn build_dominator_metadata(
+    entry_block: usize,
+    successors: &[Vec<usize>],
+    predecessors: &[Vec<usize>],
+) -> (Vec<Vec<usize>>, Vec<Option<usize>>) {
+    let len = successors.len();
+    let reachable = reachable_blocks(entry_block, successors);
+    let reachable_ids: Vec<usize> = reachable
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &is_reachable)| is_reachable.then_some(idx))
+        .collect();
+
+    let mut dom = vec![vec![false; len]; len];
+    for block in 0..len {
+        if !reachable[block] {
+            continue;
+        }
+        if block == entry_block {
+            dom[block][entry_block] = true;
+        } else {
+            for &r in &reachable_ids {
+                dom[block][r] = true;
+            }
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &block in &reachable_ids {
+            if block == entry_block {
+                continue;
+            }
+
+            let mut next_dom = vec![false; len];
+            for &r in &reachable_ids {
+                next_dom[r] = true;
+            }
+
+            let mut had_pred = false;
+            for &pred in &predecessors[block] {
+                if !reachable[pred] {
+                    continue;
+                }
+                had_pred = true;
+                for &r in &reachable_ids {
+                    next_dom[r] &= dom[pred][r];
+                }
+            }
+
+            if !had_pred {
+                for &r in &reachable_ids {
+                    next_dom[r] = false;
+                }
+            }
+            next_dom[block] = true;
+
+            if next_dom != dom[block] {
+                dom[block] = next_dom;
+                changed = true;
+            }
+        }
+    }
+
+    let dominators: Vec<Vec<usize>> = dom
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .filter_map(|(idx, &is_dom)| is_dom.then_some(idx))
+                .collect()
+        })
+        .collect();
+
+    let mut immediate_dominators = vec![None; len];
+    for &block in &reachable_ids {
+        if block == entry_block {
+            continue;
+        }
+
+        let strict_doms: Vec<usize> = dominators[block]
+            .iter()
+            .copied()
+            .filter(|&d| d != block)
+            .collect();
+
+        let idom = strict_doms.iter().copied().find(|&candidate| {
+            strict_doms
+                .iter()
+                .copied()
+                .filter(|&other| other != candidate)
+                .all(|other| !dom[other][candidate])
+        });
+        immediate_dominators[block] = idom;
+    }
+
+    (dominators, immediate_dominators)
+}
+
+fn build_loop_indexes(
+    blocks: &[Block],
+) -> (HashMap<usize, Vec<usize>>, HashMap<usize, Vec<usize>>) {
+    let mut numeric_loops_by_base: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut generic_loops_by_base: HashMap<usize, Vec<usize>> = HashMap::new();
+
+    for (idx, block) in blocks.iter().enumerate() {
+        match block.exit {
+            BlockExit::ForNLoop { base, .. } => {
+                numeric_loops_by_base.entry(base).or_default().push(idx)
+            }
+            BlockExit::ForGLoop { base, .. } => {
+                generic_loops_by_base.entry(base).or_default().push(idx)
+            }
+            _ => {}
+        }
+    }
+
+    (numeric_loops_by_base, generic_loops_by_base)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LinearExit {
+    Jump(usize),
+    Fallthrough(usize),
+    Other,
+}
+
+fn linear_exit_from(start: usize, cfg: &ControlFlowGraph) -> LinearExit {
+    let mut seen = HashSet::new();
+    let mut current = start;
+
+    while seen.insert(current) {
+        let Some(block) = cfg.blocks.get(current) else {
+            return LinearExit::Other;
+        };
+
+        match block.exit {
+            BlockExit::Fallthrough(next)
+                if next == current + 1 && cfg.predecessors(next).len() <= 1 =>
+            {
+                current = next;
+            }
+            BlockExit::Fallthrough(next) => return LinearExit::Fallthrough(next),
+            BlockExit::Jump(target) => return LinearExit::Jump(target),
+            _ => return LinearExit::Other,
+        }
+    }
+
+    LinearExit::Other
+}
+
+pub fn find_if_else_join(
+    then_block: usize,
+    else_block: usize,
+    cfg: &ControlFlowGraph,
+) -> Option<usize> {
+    let then_exit = linear_exit_from(then_block, cfg);
+    let else_exit = linear_exit_from(else_block, cfg);
+
+    let candidate = match (then_exit, else_exit) {
+        (LinearExit::Jump(a), LinearExit::Fallthrough(b))
+        | (LinearExit::Fallthrough(a), LinearExit::Jump(b))
+            if a == b && a != then_block && a != else_block =>
+        {
+            a
+        }
+        _ => return None,
+    };
+
+    if cfg.dominates(candidate, then_block) || cfg.dominates(candidate, else_block) {
+        return None;
+    }
+
+    Some(candidate)
+}
+
+pub fn resolve_numeric_for_tail(
+    prep_block: usize,
+    base: usize,
+    prep_target_block: usize,
+    cfg: &ControlFlowGraph,
+) -> Option<(usize, usize, usize)> {
+    let preferred_body = prep_block + 1;
+    let mut candidates: HashSet<(usize, usize, usize)> = HashSet::new();
+
+    if let Some(block) = cfg.blocks.get(prep_target_block)
+        && let BlockExit::ForNLoop {
+            base: loop_base,
+            body_block,
+            exit_block,
+        } = block.exit
+        && loop_base == base
+    {
+        candidates.insert((prep_target_block, body_block, exit_block));
+    }
+
+    for &pred in cfg.predecessors(prep_target_block) {
+        if let Some(block) = cfg.blocks.get(pred)
+            && let BlockExit::ForNLoop {
+                base: loop_base,
+                body_block,
+                exit_block,
+            } = block.exit
+            && loop_base == base
+            && exit_block == prep_target_block
+        {
+            candidates.insert((pred, body_block, exit_block));
+        }
+    }
+
+    if preferred_body < cfg.blocks.len() {
+        for &pred in cfg.predecessors(preferred_body) {
+            if let Some(block) = cfg.blocks.get(pred)
+                && let BlockExit::ForNLoop {
+                    base: loop_base,
+                    body_block,
+                    exit_block,
+                } = block.exit
+                && loop_base == base
+                && body_block == preferred_body
+            {
+                candidates.insert((pred, body_block, exit_block));
+            }
+        }
+    }
+
+    if candidates.is_empty()
+        && let Some(loop_tails) = cfg.numeric_loops_by_base.get(&base)
+    {
+        for &tail in loop_tails {
+            if let Some(block) = cfg.blocks.get(tail)
+                && let BlockExit::ForNLoop {
+                    body_block,
+                    exit_block,
+                    ..
+                } = block.exit
+            {
+                candidates.insert((tail, body_block, exit_block));
+            }
+        }
+    }
+
+    candidates.into_iter().max_by_key(|(tail, body, exit)| {
+        let mut score = 0usize;
+        if *tail == prep_target_block {
+            score += 8;
+        }
+        if *exit == prep_target_block {
+            score += 4;
+        }
+        if *body == preferred_body {
+            score += 2;
+        }
+        if cfg.dominates(prep_block, *body) {
+            score += 1;
+        }
+        score
+    })
+}
+
+pub fn resolve_generic_for_tail(
+    prep_block: usize,
+    base: usize,
+    prep_target_block: usize,
+    cfg: &ControlFlowGraph,
+) -> Option<(usize, usize, usize, usize)> {
+    let preferred_body = prep_block + 1;
+    let mut candidates: HashSet<(usize, usize, usize, usize)> = HashSet::new();
+
+    if let Some(block) = cfg.blocks.get(prep_target_block)
+        && let BlockExit::ForGLoop {
+            base: loop_base,
+            body_block,
+            exit_block,
+            result_count,
+        } = block.exit
+        && loop_base == base
+    {
+        candidates.insert((prep_target_block, body_block, exit_block, result_count));
+    }
+
+    for &pred in cfg.predecessors(prep_target_block) {
+        if let Some(block) = cfg.blocks.get(pred)
+            && let BlockExit::ForGLoop {
+                base: loop_base,
+                body_block,
+                exit_block,
+                result_count,
+            } = block.exit
+            && loop_base == base
+            && exit_block == prep_target_block
+        {
+            candidates.insert((pred, body_block, exit_block, result_count));
+        }
+    }
+
+    if preferred_body < cfg.blocks.len() {
+        for &pred in cfg.predecessors(preferred_body) {
+            if let Some(block) = cfg.blocks.get(pred)
+                && let BlockExit::ForGLoop {
+                    base: loop_base,
+                    body_block,
+                    exit_block,
+                    result_count,
+                } = block.exit
+                && loop_base == base
+                && body_block == preferred_body
+            {
+                candidates.insert((pred, body_block, exit_block, result_count));
+            }
+        }
+    }
+
+    if candidates.is_empty()
+        && let Some(loop_tails) = cfg.generic_loops_by_base.get(&base)
+    {
+        for &tail in loop_tails {
+            if let Some(block) = cfg.blocks.get(tail)
+                && let BlockExit::ForGLoop {
+                    body_block,
+                    exit_block,
+                    result_count,
+                    ..
+                } = block.exit
+            {
+                candidates.insert((tail, body_block, exit_block, result_count));
+            }
+        }
+    }
+
+    candidates.into_iter().max_by_key(|(tail, body, exit, _)| {
+        let mut score = 0usize;
+        if *tail == prep_target_block {
+            score += 8;
+        }
+        if *exit == prep_target_block {
+            score += 4;
+        }
+        if *body == preferred_body {
+            score += 2;
+        }
+        if cfg.dominates(prep_block, *body) {
+            score += 1;
+        }
+        score
+    })
 }
 
 fn rel_target(next_pc: usize, offset: i16, instr_len: usize) -> usize {
@@ -117,16 +552,11 @@ fn rel_target(next_pc: usize, offset: i16, instr_len: usize) -> usize {
         return 0;
     }
 
-    let raw = next_pc as isize + offset as isize;
-    if raw < 0 {
-        0
+    let target = next_pc.saturating_add_signed(offset as isize);
+    if target >= instr_len {
+        instr_len - 1
     } else {
-        let target = raw as usize;
-        if target >= instr_len {
-            instr_len - 1
-        } else {
-            target
-        }
+        target
     }
 }
 
@@ -246,6 +676,14 @@ fn return_values(base: u8, count: u8) -> Vec<Expr> {
     }
 }
 
+fn call_stmt(expr: Expr) -> Stmt {
+    let args = match &expr {
+        Expr::Call(_, args) | Expr::MethodCall(_, _, args) => args.clone(),
+        _ => Vec::new(),
+    };
+    Stmt::Call { expr, args }
+}
+
 pub fn lift(instrs: &[Instr], consts: &[Constant]) -> Vec<Stmt> {
     lift_with_context(instrs, consts, None, &[])
 }
@@ -283,7 +721,7 @@ fn lift_with_context(
     let mut pending_multret_call: Option<(u8, Expr)> = None; // (first result reg, call expr)
     let mut pending_closure_stmt: Option<(usize, usize)> = None; // (stmt index, remaining fixed captures)
 
-    for instr in instrs {
+    for (instr_idx, instr) in instrs.iter().enumerate() {
         let consumes_pending_multret = matches!(
             instr,
             Instr::Call {
@@ -305,7 +743,7 @@ fn lift_with_context(
         );
 
         if !consumes_pending_multret && let Some((_, expr)) = pending_multret_call.take() {
-            stmts.push(Stmt::Call(expr));
+            stmts.push(call_stmt(expr));
         }
 
         if !matches!(instr, Instr::Call { .. } | Instr::NameCall { .. }) {
@@ -431,7 +869,7 @@ fn lift_with_context(
                     let method_call =
                         Expr::MethodCall(Box::new(Expr::Local(*func + 1)), method, method_args);
                     match decoded_count(*ret_count) {
-                        Some(0) => stmts.push(Stmt::Call(method_call)),
+                        Some(0) => stmts.push(call_stmt(method_call)),
                         Some(1) => stmts.push(Stmt::Assign {
                             left: Expr::Local(*func),
                             value: method_call,
@@ -449,7 +887,7 @@ fn lift_with_context(
 
                 let call = Expr::Call(Box::new(Expr::Local(*func)), args);
                 match decoded_count(*ret_count) {
-                    Some(0) => stmts.push(Stmt::Call(call)),
+                    Some(0) => stmts.push(call_stmt(call)),
                     Some(1) => stmts.push(Stmt::Assign {
                         left: Expr::Local(*func),
                         value: call,
@@ -500,7 +938,7 @@ fn lift_with_context(
                 src, table, key, ..
             } => {
                 stmts.push(Stmt::SetField {
-                    table: usize::from(*table),
+                    table: *table,
                     key: const_string(consts, *key),
                     value: Expr::Local(*src),
                 });
@@ -706,15 +1144,15 @@ fn lift_with_context(
             }),
             Instr::Not { dest, reg } => stmts.push(Stmt::Assign {
                 left: Expr::Local(*dest),
-                value: Expr::Unary(UnaryOp::Not, Box::new(Expr::Local(*reg))),
+                value: Expr::Unary(UnOp::Not, Box::new(Expr::Local(*reg))),
             }),
             Instr::Minus { dest, reg } => stmts.push(Stmt::Assign {
                 left: Expr::Local(*dest),
-                value: Expr::Unary(UnaryOp::Minus, Box::new(Expr::Local(*reg))),
+                value: Expr::Unary(UnOp::Minus, Box::new(Expr::Local(*reg))),
             }),
             Instr::Length { dest, reg } => stmts.push(Stmt::Assign {
                 left: Expr::Local(*dest),
-                value: Expr::Unary(UnaryOp::Length, Box::new(Expr::Local(*reg))),
+                value: Expr::Unary(UnOp::Length, Box::new(Expr::Local(*reg))),
             }),
             Instr::NewTable {
                 dest, array_size, ..
@@ -836,12 +1274,34 @@ fn lift_with_context(
                     }
                 }
             }
-            other => eprintln!("Unsupported instruction: {:#?}", other),
+            Instr::CloseUpvals { reg } => {
+                if verbose_enabled() {
+                    let proto = parent_proto
+                        .map(|p| p.index.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    eprintln!(
+                        "[lift] ignored CLOSEUPVALS in proto {proto} at instr #{instr_idx}: reg={reg}"
+                    );
+                }
+            }
+            other => {
+                if verbose_enabled() {
+                    let proto = parent_proto
+                        .map(|p| p.index.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    eprintln!(
+                        "[lift] unsupported instruction in proto {proto} at instr #{instr_idx}: {:#?}",
+                        other
+                    );
+                } else {
+                    eprintln!("Unsupported instruction: {:#?}", other);
+                }
+            }
         }
     }
 
     if let Some((_, expr)) = pending_multret_call.take() {
-        stmts.push(Stmt::Call(expr));
+        stmts.push(call_stmt(expr));
     }
 
     stmts
@@ -1185,15 +1645,15 @@ fn build_cfg_with_context(
         });
     }
 
-    ControlFlowGraph {
-        blocks,
-        entry_block: 0,
-    }
+    ControlFlowGraph::new(blocks, 0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BinOp, BlockExit, Expr, Stmt, build_cfg, build_cfg_for_proto, lift};
+    use super::{
+        BinOp, Block, BlockExit, ControlFlowGraph, Expr, Stmt, build_cfg, build_cfg_for_proto,
+        find_if_else_join, lift, resolve_generic_for_tail, resolve_numeric_for_tail,
+    };
     use crate::disasm::Proto;
     use crate::il::{Constant, Instr};
 
@@ -1219,7 +1679,7 @@ mod tests {
 
         match &stmts[0] {
             Stmt::Assign { left, value } => {
-                assert!(matches!(*left, Expr::Local(1)));
+                assert!(matches!(left, Expr::Local(1)));
                 assert!(matches!(value, Expr::Local(2)));
             }
             _ => panic!("expected NAMECALL receiver move"),
@@ -1227,7 +1687,7 @@ mod tests {
 
         match &stmts[1] {
             Stmt::Assign { left, value } => {
-                assert!(matches!(*left, Expr::Local(0)));
+                assert!(matches!(left, Expr::Local(0)));
 
                 match value {
                     Expr::MethodCall(base, method, args) => {
@@ -1256,7 +1716,7 @@ mod tests {
 
         match &stmts[0] {
             Stmt::Assign { left, value } => {
-                assert!(matches!(*left, Expr::Local(3)));
+                assert!(matches!(left, Expr::Local(3)));
                 match value {
                     Expr::Call(func, args) => {
                         assert!(matches!(func.as_ref(), Expr::Local(3)));
@@ -1267,6 +1727,72 @@ mod tests {
                 }
             }
             _ => panic!("expected assignment"),
+        }
+    }
+
+    #[test]
+    fn lift_plain_call_stmt_keeps_args() {
+        let instrs = vec![Instr::Call {
+            func: 3,
+            arg_count: 3,
+            ret_count: 1,
+        }];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0] {
+            Stmt::Call { expr, args } => {
+                assert_eq!(args.len(), 2);
+                assert!(matches!(args[0], Expr::Local(4)));
+                assert!(matches!(args[1], Expr::Local(5)));
+                match expr {
+                    Expr::Call(func, call_args) => {
+                        assert!(matches!(func.as_ref(), Expr::Local(3)));
+                        assert_eq!(call_args.len(), 2);
+                        assert!(matches!(call_args[0], Expr::Local(4)));
+                        assert!(matches!(call_args[1], Expr::Local(5)));
+                    }
+                    _ => panic!("expected call expression"),
+                }
+            }
+            _ => panic!("expected call statement"),
+        }
+    }
+
+    #[test]
+    fn lift_namecall_stmt_keeps_explicit_args() {
+        let consts = vec![Constant::String("FindFirstChild".to_string())];
+        let instrs = vec![
+            Instr::NameCall {
+                dest: 0,
+                object: 2,
+                slot: 0,
+                method: 0,
+            },
+            Instr::Call {
+                func: 0,
+                arg_count: 3,
+                ret_count: 1,
+            },
+        ];
+
+        let stmts = lift(&instrs, &consts);
+        assert_eq!(stmts.len(), 2);
+        match &stmts[1] {
+            Stmt::Call { expr, args } => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Expr::Local(2)));
+                match expr {
+                    Expr::MethodCall(base, method, method_args) => {
+                        assert!(matches!(base.as_ref(), Expr::Local(1)));
+                        assert_eq!(method, "FindFirstChild");
+                        assert_eq!(method_args.len(), 1);
+                        assert!(matches!(method_args[0], Expr::Local(2)));
+                    }
+                    _ => panic!("expected method call expression"),
+                }
+            }
+            _ => panic!("expected call statement"),
         }
     }
 
@@ -1294,7 +1820,7 @@ mod tests {
 
         match &stmts[0] {
             Stmt::Assign { left, value } => {
-                assert!(matches!(*left, Expr::Local(0)));
+                assert!(matches!(left, Expr::Local(0)));
                 assert!(matches!(
                     value,
                     Expr::Binary(BinOp::And, a, b)
@@ -1307,7 +1833,7 @@ mod tests {
 
         match &stmts[1] {
             Stmt::Assign { left, value } => {
-                assert!(matches!(*left, Expr::Local(2)));
+                assert!(matches!(left, Expr::Local(2)));
                 assert!(matches!(
                     value,
                     Expr::Binary(BinOp::Or, a, b)
@@ -1338,7 +1864,7 @@ mod tests {
 
         match &stmts[0] {
             Stmt::Assign { left, value } => {
-                assert!(matches!(*left, Expr::Local(5)));
+                assert!(matches!(left, Expr::Local(5)));
                 assert!(matches!(value, Expr::Import(name) if name == "game.ReplicatedStorage"));
             }
             _ => panic!("expected GETIMPORT assignment"),
@@ -1808,5 +2334,151 @@ mod tests {
             }),
             "jump target block did not resolve to the expected instruction start"
         );
+    }
+
+    #[test]
+    fn cfg_populates_successors_predecessors_and_dominators() {
+        let instrs = vec![
+            Instr::LoadB {
+                reg: 0,
+                value: true,
+                jump: 0,
+            },
+            Instr::JumpIfNot { reg: 0, offset: 1 },
+            Instr::LoadB {
+                reg: 1,
+                value: true,
+                jump: 0,
+            },
+            Instr::Return { base: 0, count: 1 },
+        ];
+
+        let cfg = build_cfg(&instrs, &[]);
+        assert_eq!(cfg.successors(0), &[1, 2]);
+        assert_eq!(cfg.successors(1), &[2]);
+        assert_eq!(cfg.successors(2), &[]);
+
+        assert_eq!(cfg.predecessors(0), &[]);
+        assert_eq!(cfg.predecessors(1), &[0]);
+        assert_eq!(cfg.predecessors(2), &[0, 1]);
+
+        assert_eq!(cfg.dominators[0], vec![0]);
+        assert_eq!(cfg.dominators[1], vec![0, 1]);
+        assert_eq!(cfg.dominators[2], vec![0, 2]);
+        assert_eq!(cfg.immediate_dominator(0), None);
+        assert_eq!(cfg.immediate_dominator(1), Some(0));
+        assert_eq!(cfg.immediate_dominator(2), Some(0));
+    }
+
+    #[test]
+    fn find_if_else_join_detects_diamond_merge() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                Block {
+                    id: 0,
+                    stmts: vec![],
+                    exit: BlockExit::CondJump {
+                        cond: Expr::Local(0),
+                        then_block: 1,
+                        else_block: 2,
+                    },
+                },
+                Block {
+                    id: 1,
+                    stmts: vec![],
+                    exit: BlockExit::Jump(3),
+                },
+                Block {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::Fallthrough(3),
+                },
+                Block {
+                    id: 3,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        assert_eq!(find_if_else_join(1, 2, &cfg), Some(3));
+    }
+
+    #[test]
+    fn resolve_numeric_for_tail_uses_predecessor_metadata() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                Block {
+                    id: 0,
+                    stmts: vec![],
+                    exit: BlockExit::ForNPrep {
+                        base: 0,
+                        loop_block: 3,
+                    },
+                },
+                Block {
+                    id: 1,
+                    stmts: vec![],
+                    exit: BlockExit::Fallthrough(2),
+                },
+                Block {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::ForNLoop {
+                        base: 0,
+                        body_block: 1,
+                        exit_block: 3,
+                    },
+                },
+                Block {
+                    id: 3,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        assert_eq!(resolve_numeric_for_tail(0, 0, 3, &cfg), Some((2, 1, 3)));
+    }
+
+    #[test]
+    fn resolve_generic_for_tail_uses_predecessor_metadata() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                Block {
+                    id: 0,
+                    stmts: vec![],
+                    exit: BlockExit::ForGPrep {
+                        base: 1,
+                        loop_block: 3,
+                    },
+                },
+                Block {
+                    id: 1,
+                    stmts: vec![],
+                    exit: BlockExit::Fallthrough(2),
+                },
+                Block {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::ForGLoop {
+                        base: 1,
+                        body_block: 1,
+                        exit_block: 3,
+                        result_count: 2,
+                    },
+                },
+                Block {
+                    id: 3,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        assert_eq!(resolve_generic_for_tail(0, 1, 3, &cfg), Some((2, 1, 3, 2)));
     }
 }
