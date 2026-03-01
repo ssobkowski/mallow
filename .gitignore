@@ -3,6 +3,8 @@
 !.gitignore
 !src/
 !src/**/*
+!tests
+!tests/**/*
 !Cargo.lock
 !Cargo.toml
 !README.md
