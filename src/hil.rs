@@ -24,6 +24,7 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Table(Vec<Expr>),
+    VarArgs,
 }
 
 #[derive(Debug, Clone)]
@@ -858,7 +859,7 @@ fn concat_expr_range(start: u8, end: u8) -> Expr {
     expr
 }
 
-/// Consumes a deferred MULTRET call result if it lives in `expected_reg`.
+/// Consumes a deferred variadic result if it lives in `expected_reg`.
 ///
 /// This is used when a later `CALL`, `NAMECALL`, `SETLIST`, or `RETURN` pulls a pending
 /// expression out of a register slot instead of reading a plain local.
@@ -876,7 +877,7 @@ fn take_pending_arg(
     }
 }
 
-/// Returns true when a pending MULTRET can feed a variadic CALL starting at `first_arg_reg`.
+/// Returns true when a pending variadic source can feed a variadic CALL starting at `first_arg_reg`.
 fn pending_multret_feeds_variadic_call(
     pending_multret_call: &Option<(u8, Expr)>,
     first_arg_reg: u8,
@@ -886,7 +887,7 @@ fn pending_multret_feeds_variadic_call(
         .is_some_and(|(src_reg, _)| *src_reg >= first_arg_reg)
 }
 
-/// Consumes a deferred MULTRET call for a variadic sequence with optional fixed-prefix locals.
+/// Consumes a deferred variadic source for a variadic sequence with optional fixed-prefix locals.
 fn take_variadic_multret_values(
     pending_multret_call: &mut Option<(u8, Expr)>,
     first_arg_reg: u8,
@@ -905,12 +906,79 @@ fn take_variadic_multret_values(
     }
 }
 
-/// Consumes a deferred MULTRET call for a variadic CALL with optional fixed-prefix args.
+/// Consumes a deferred variadic source for a variadic CALL with optional fixed-prefix args.
 fn take_variadic_call_args(
     pending_multret_call: &mut Option<(u8, Expr)>,
     first_arg_reg: u8,
 ) -> Option<Vec<Expr>> {
     take_variadic_multret_values(pending_multret_call, first_arg_reg)
+}
+
+fn find_latest_local_assignment(stmts: &[Stmt], reg: u8) -> Option<(usize, &Expr)> {
+    stmts.iter().enumerate().rev().find_map(|(idx, stmt)| match stmt {
+        Stmt::Assign {
+            left: Expr::Local(r),
+            value,
+        } if *r == reg => Some((idx, value)),
+        _ => None,
+    })
+}
+
+fn snapshot_table_value_with_history(
+    stmts: &[Stmt],
+    expr: &Expr,
+    visited: &mut HashSet<u8>,
+) -> Option<Expr> {
+    match expr {
+        Expr::Nil
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Bool(_)
+        | Expr::Upval(_)
+        | Expr::Closure { .. }
+        | Expr::Global(_)
+        | Expr::Import(_)
+        | Expr::VarArgs => Some(expr.clone()),
+        Expr::CaptureValue(inner) => snapshot_table_value_with_history(stmts, inner, visited)
+            .map(|inner| Expr::CaptureValue(Box::new(inner))),
+        Expr::Local(reg) => {
+            if !visited.insert(*reg) {
+                return Some(Expr::Local(*reg));
+            }
+
+            let snapshot = find_latest_local_assignment(stmts, *reg)
+                .and_then(|(idx, value)| {
+                    snapshot_table_value_with_history(&stmts[..idx], value, visited)
+                })
+                .unwrap_or(Expr::Local(*reg));
+
+            visited.remove(reg);
+            Some(snapshot)
+        }
+        Expr::Binary(op, left, right) => {
+            let left = snapshot_table_value_with_history(stmts, left, visited)?;
+            let right = snapshot_table_value_with_history(stmts, right, visited)?;
+            Some(Expr::Binary(op.clone(), Box::new(left), Box::new(right)))
+        }
+        Expr::Unary(op, inner) => {
+            let inner = snapshot_table_value_with_history(stmts, inner, visited)?;
+            Some(Expr::Unary(op.clone(), Box::new(inner)))
+        }
+        Expr::Table(items) => {
+            let mut snapped = Vec::with_capacity(items.len());
+            for item in items {
+                snapped.push(snapshot_table_value_with_history(stmts, item, visited)?);
+            }
+            Some(Expr::Table(snapped))
+        }
+        Expr::GetField(_, _) | Expr::GetIndex(_, _) | Expr::Call(_, _) | Expr::MethodCall(_, _, _) => {
+            None
+        }
+    }
+}
+
+fn snapshot_table_value(stmts: &[Stmt], expr: Expr) -> Expr {
+    snapshot_table_value_with_history(stmts, &expr, &mut HashSet::new()).unwrap_or(expr)
 }
 
 /// Returns true when an instruction can appear between a pending MULTRET and its consumer.
@@ -921,15 +989,29 @@ fn instr_preserves_pending_multret(instr: &Instr, pending_src_reg: u8) -> bool {
         | Instr::FastCall2K { .. }
         | Instr::FastCall3 { .. }
         | Instr::FastCall { .. } => true,
-        Instr::GetImport { dest, .. } | Instr::GetGlobal { dest, .. } => *dest < pending_src_reg,
+        Instr::GetImport { dest, .. }
+        | Instr::GetGlobal { dest, .. }
+        | Instr::GetUpval { dest, .. }
+        | Instr::Move { dest, .. } => *dest < pending_src_reg,
         _ => false,
+    }
+}
+
+fn flush_pending_variadic_source(src_reg: u8, expr: Expr, stmts: &mut Vec<Stmt>) {
+    match expr {
+        Expr::Call(_, _) | Expr::MethodCall(_, _, _) => stmts.push(call_stmt(expr)),
+        Expr::VarArgs => stmts.push(Stmt::Assign {
+            left: Expr::Local(src_reg),
+            value: Expr::VarArgs,
+        }),
+        _ => unreachable!("unexpected deferred variadic source"),
     }
 }
 
 pub fn lift(instrs: &[Instr], consts: &[Constant]) -> Vec<Stmt> {
     let (mut stmts, _, pending_multret_call) = lift_with_context(instrs, consts, None, &[], None);
-    if let Some((_, expr)) = pending_multret_call {
-        stmts.push(call_stmt(expr));
+    if let Some((src_reg, expr)) = pending_multret_call {
+        flush_pending_variadic_source(src_reg, expr, &mut stmts);
     }
     stmts
 }
@@ -959,15 +1041,16 @@ fn decode_capture(capture_type: u8, reg: u8) -> Expr {
     }
 }
 
-/// Lifts flat bytecode instructions into HIL statements plus an optional deferred MULTRET call.
+/// Lifts flat bytecode instructions into HIL statements plus an optional deferred variadic source.
 ///
-/// The returned pending call represents a call result that still lives "on the stack top"
-/// in Luau terms and may need to be consumed by a later `CALL`, `SETLIST`, or `RETURN`.
+/// The returned pending source represents either a MULTRET call result or raw `...` values that
+/// still live "on the stack top" in Luau terms and may need to be consumed by a later `CALL`,
+/// `SETLIST`, or `RETURN`.
 ///
 /// Returns:
 /// - `Vec<Stmt>`: lifted statements for the instruction slice
 /// - `Vec<usize>`: the originating bytecode word pc for each lifted statement
-/// - `Option<(u8, Expr)>`: a deferred MULTRET call as `(first_result_register, call_expr)`
+/// - `Option<(u8, Expr)>`: a deferred variadic source as `(first_result_register, expr)`
 fn lift_with_context(
     instrs: &[Instr],
     consts: &[Constant],
@@ -979,7 +1062,7 @@ fn lift_with_context(
     let mut stmt_word_pcs = Vec::new();
 
     let mut pending_namecall: Option<(u8, String)> = None; // (func reg, method)
-    let mut pending_multret_call: Option<(u8, Expr)> = None; // (first result reg, call expr)
+    let mut pending_multret_call: Option<(u8, Expr)> = None; // (first variadic result reg, expr)
     let mut pending_closure_stmt: Option<(usize, usize)> = None; // (stmt index, remaining fixed captures)
 
     for (instr_idx, instr) in instrs.iter().enumerate() {
@@ -1010,7 +1093,7 @@ fn lift_with_context(
                 .is_some_and(|(src_reg, _)| *src_reg >= *base),
             Instr::Return { base, count: 0 } => pending_multret_call
                 .as_ref()
-                .is_some_and(|(src_reg, _)| *src_reg == *base),
+                .is_some_and(|(src_reg, _)| *src_reg >= *base),
             _ => false,
         };
 
@@ -1019,7 +1102,7 @@ fn lift_with_context(
             && !instr_preserves_pending_multret(instr, src_reg)
         {
             pending_multret_call = None;
-            stmts.push(call_stmt(expr));
+            flush_pending_variadic_source(src_reg, expr, &mut stmts);
         }
 
         if !matches!(instr, Instr::Call { .. } | Instr::NameCall { .. }) {
@@ -1186,8 +1269,7 @@ fn lift_with_context(
             }
             Instr::Return { base, count } => {
                 let rets = match decoded_count(*count) {
-                    None => take_pending_arg(&mut pending_multret_call, *base)
-                        .map(|expr| vec![expr])
+                    None => take_variadic_multret_values(&mut pending_multret_call, *base)
                         .unwrap_or_else(|| return_values(*base, *count)),
                     Some(_) => return_values(*base, *count),
                 };
@@ -1529,6 +1611,10 @@ fn lift_with_context(
                         // pad with nils if the table is shorter than the insertion index
                         items.resize(*index as usize - 1, Expr::Nil);
                     }
+                    values = values
+                        .into_iter()
+                        .map(|value| snapshot_table_value(&stmts, value))
+                        .collect();
                     items.append(&mut values);
                     stmts.push(Stmt::Assign {
                         left: Expr::Local(*table),
@@ -1611,6 +1697,20 @@ fn lift_with_context(
                     );
                 }
             }
+            Instr::GetVarArgs { dest, count } => match count {
+                0 => {
+                    // GETVARARGS A 0 leaves a variadic sequence starting at A. Consumers like
+                    // CALL/SETLIST/RETURN decide how that sequence is materialized.
+                    pending_multret_call = Some((*dest, Expr::VarArgs));
+                }
+                n => {
+                    let args = local_range(*dest, *n);
+                    stmts.push(Stmt::AssignMany {
+                        left: args,
+                        value: Expr::VarArgs,
+                    });
+                }
+            },
             other => {
                 if verbose_enabled() {
                     let proto = parent_proto
@@ -1644,7 +1744,7 @@ pub fn build_cfg_for_proto(proto: &Proto, all_protos: &[Proto]) -> ControlFlowGr
 
 /// Splits a proto into basic blocks, lifts block bodies to HIL, and annotates exits.
 ///
-/// This function is also responsible for threading trailing pending MULTRET calls into
+/// This function is also responsible for threading trailing pending variadic sources into
 /// block exits such as `RETURN`, so blocks keep expression-level call structure when possible.
 fn build_cfg_with_context(
     instrs: &[Instr],
@@ -1787,8 +1887,7 @@ fn build_cfg_with_context(
         let exit = match exit_instr {
             Some(Instr::Return { base, count }) => {
                 let rets = match decoded_count(*count) {
-                    None => take_pending_arg(&mut pending_multret_call, *base)
-                        .map(|expr| vec![expr])
+                    None => take_variadic_multret_values(&mut pending_multret_call, *base)
                         .unwrap_or_else(|| return_values(*base, *count)),
                     Some(_) => return_values(*base, *count),
                 };
@@ -2093,8 +2192,8 @@ fn build_cfg_with_context(
             _ => BlockExit::Fallthrough(block_idx + 1),
         };
 
-        if let Some((_, expr)) = pending_multret_call.take() {
-            lifted_body.push(call_stmt(expr));
+        if let Some((src_reg, expr)) = pending_multret_call.take() {
+            flush_pending_variadic_source(src_reg, expr, &mut lifted_body);
             lifted_stmt_pcs.push(exit_word_pc);
         }
 
@@ -2453,6 +2552,84 @@ mod tests {
                 ));
             }
             _ => panic!("expected multret method call to feed RETURN"),
+        }
+    }
+
+    #[test]
+    fn lift_return_keeps_pending_multret_through_getupval_callee_load() {
+        let instrs = vec![
+            Instr::Call {
+                func: 3,
+                arg_count: 3,
+                ret_count: 0,
+            },
+            Instr::GetUpval { dest: 2, upval: 0 },
+            Instr::Call {
+                func: 2,
+                arg_count: 0,
+                ret_count: 0,
+            },
+            Instr::Return { base: 2, count: 0 },
+        ];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 2);
+
+        match &stmts[0] {
+            Stmt::Assign { left, value } => {
+                assert!(matches!(left, Expr::Local(2)));
+                assert!(matches!(value, Expr::Upval(0)));
+            }
+            _ => panic!("expected callee load into R2"),
+        }
+
+        match &stmts[1] {
+            Stmt::Return(values) => {
+                assert_eq!(values.len(), 1);
+                assert!(matches!(
+                    &values[0],
+                    Expr::Call(func, args)
+                        if matches!(func.as_ref(), Expr::Local(2))
+                            && matches!(
+                                args.as_slice(),
+                                [Expr::Call(inner_func, inner_args)]
+                                    if matches!(inner_func.as_ref(), Expr::Local(3))
+                                        && matches!(inner_args.as_slice(), [Expr::Local(4), Expr::Local(5)])
+                            )
+                ));
+            }
+            _ => panic!("expected nested call chain to survive until RETURN"),
+        }
+    }
+
+    #[test]
+    fn lift_return_keeps_fixed_prefix_values_before_pending_multret_call() {
+        let instrs = vec![
+            Instr::Call {
+                func: 13,
+                arg_count: 3,
+                ret_count: 0,
+            },
+            Instr::Return { base: 10, count: 0 },
+        ];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 1);
+
+        match &stmts[0] {
+            Stmt::Return(values) => {
+                assert_eq!(values.len(), 4);
+                assert!(matches!(&values[0], Expr::Local(10)));
+                assert!(matches!(&values[1], Expr::Local(11)));
+                assert!(matches!(&values[2], Expr::Local(12)));
+                assert!(matches!(
+                    &values[3],
+                    Expr::Call(func, args)
+                        if matches!(func.as_ref(), Expr::Local(13))
+                            && matches!(args.as_slice(), [Expr::Local(14), Expr::Local(15)])
+                ));
+            }
+            _ => panic!("expected return statement"),
         }
     }
 
@@ -2965,6 +3142,131 @@ mod tests {
                         ));
                     }
                     _ => panic!("expected SETLIST to fold into a table constructor"),
+                }
+            }
+            _ => panic!("expected SETLIST assignment"),
+        }
+    }
+
+    #[test]
+    fn lift_setlist_variadic_consumes_pending_varargs() {
+        let instrs = vec![
+            Instr::NewTable {
+                dest: 3,
+                hash_size: 0,
+                array_size: 0,
+            },
+            Instr::GetVarArgs { dest: 4, count: 0 },
+            Instr::SetList {
+                table: 3,
+                base: 4,
+                count: 0,
+                index: 1,
+            },
+        ];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 1);
+
+        match &stmts[0] {
+            Stmt::Assign { left, value } => {
+                assert!(matches!(left, Expr::Local(3)));
+                match value {
+                    Expr::Table(items) => {
+                        assert_eq!(items.len(), 1);
+                        assert!(matches!(&items[0], Expr::VarArgs));
+                    }
+                    _ => panic!("expected GETVARARGS/SETLIST to fold into a table constructor"),
+                }
+            }
+            _ => panic!("expected folded NEWTABLE assignment"),
+        }
+    }
+
+    #[test]
+    fn lift_setlist_variadic_keeps_fixed_prefix_values_before_pending_varargs() {
+        let instrs = vec![
+            Instr::NewTable {
+                dest: 4,
+                hash_size: 0,
+                array_size: 0,
+            },
+            Instr::Move { dest: 5, src: 1 },
+            Instr::GetVarArgs { dest: 6, count: 0 },
+            Instr::SetList {
+                table: 4,
+                base: 5,
+                count: 0,
+                index: 1,
+            },
+        ];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 2);
+
+        match &stmts[1] {
+            Stmt::Assign { left, value } => {
+                assert!(matches!(left, Expr::Local(4)));
+                match value {
+                    Expr::Table(items) => {
+                        assert_eq!(items.len(), 2);
+                        assert!(matches!(&items[0], Expr::Local(5)));
+                        assert!(matches!(&items[1], Expr::VarArgs));
+                    }
+                    _ => panic!("expected SETLIST to fold fixed prefix values plus varargs"),
+                }
+            }
+            _ => panic!("expected folded SETLIST assignment"),
+        }
+    }
+
+    #[test]
+    fn lift_setlist_table_constructor_snapshots_reused_register_values() {
+        let consts = vec![
+            Constant::Number(1.0),
+            Constant::Number(2.0),
+            Constant::Number(3.0),
+            Constant::Number(4.0),
+        ];
+        let instrs = vec![
+            Instr::NewTable {
+                dest: 19,
+                hash_size: 0,
+                array_size: 4,
+            },
+            Instr::LoadK { reg: 20, index: 0 },
+            Instr::LoadK { reg: 21, index: 1 },
+            Instr::SetList {
+                table: 19,
+                base: 20,
+                count: 3,
+                index: 1,
+            },
+            Instr::LoadK { reg: 20, index: 2 },
+            Instr::LoadK { reg: 21, index: 3 },
+            Instr::SetList {
+                table: 19,
+                base: 20,
+                count: 3,
+                index: 3,
+            },
+        ];
+
+        let stmts = lift(&instrs, &consts);
+        assert_eq!(stmts.len(), 5);
+
+        match &stmts[4] {
+            Stmt::Assign { left, value } => {
+                assert!(matches!(left, Expr::Local(19)));
+                match value {
+                    Expr::Table(items) => {
+                        assert_eq!(items.len(), 4);
+                        assert!(matches!(&items[0], Expr::Number(n) if *n == 1.0));
+                        assert!(matches!(&items[1], Expr::Number(n) if *n == 2.0));
+                        assert!(matches!(&items[2], Expr::Number(n) if *n == 3.0));
+                        assert!(matches!(&items[3], Expr::Number(n) if *n == 4.0));
+                    }
+                    _ => panic!("expected folded table constructor"),
                 }
             }
             _ => panic!("expected SETLIST assignment"),

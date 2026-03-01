@@ -22,7 +22,7 @@ const MAX_REGION_CALL_DEPTH: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LocalBindingKey {
     /// Fallback when no debug lifetime information exists for the current register use.
-    Synthetic(u8),
+    Synthetic { reg: u8, version: usize },
     /// A debug-described local whose lifetime covers the current bytecode PC.
     Debug {
         reg: u8,
@@ -30,6 +30,15 @@ enum LocalBindingKey {
         end_pc: usize,
         slot: usize,
     },
+}
+
+impl LocalBindingKey {
+    #[inline]
+    fn reg(self) -> u8 {
+        match self {
+            LocalBindingKey::Synthetic { reg, .. } | LocalBindingKey::Debug { reg, .. } => reg,
+        }
+    }
 }
 
 /// Metadata extracted from the synthetic iterator setup that appears right before `ForGPrep`.
@@ -41,6 +50,21 @@ enum LocalBindingKey {
 struct GenericForPreheader<'a> {
     iter_source: &'a HilExpr,
     pc: usize,
+}
+
+/// Metadata extracted from the synthetic counter setup that appears right before `ForNPrep`.
+///
+/// Luau lowers `for i = a, b, c do` into three assignments that seed the limit, step, and
+/// current-value registers, followed by `ForNPrep`. Those assignments are not source-level locals,
+/// so the structurer should fold their RHS expressions into the loop header.
+#[derive(Debug, Clone, Copy)]
+struct NumericForPreheader<'a> {
+    start_source: &'a HilExpr,
+    end_source: &'a HilExpr,
+    step_source: &'a HilExpr,
+    start_pc: usize,
+    end_pc: usize,
+    step_pc: usize,
 }
 
 /// Extra statements plus remapped capture expressions needed before emitting a closure literal.
@@ -98,10 +122,67 @@ fn generic_for_preheader<'a>(
     })
 }
 
+fn numeric_for_preheader<'a>(
+    block: &'a crate::hil::Block,
+    base: usize,
+    stmt_pcs: Option<&'a [usize]>,
+) -> Option<NumericForPreheader<'a>> {
+    let mut start = None;
+    let mut end = None;
+    let mut step = None;
+
+    for stmt_idx in block.stmts.len().saturating_sub(3)..block.stmts.len() {
+        let Some(HilStmt::Assign {
+            left: HilExpr::Local(reg),
+            value,
+        }) = block.stmts.get(stmt_idx)
+        else {
+            return None;
+        };
+
+        let pc = stmt_pcs
+            .and_then(|pcs| pcs.get(stmt_idx).copied())
+            .unwrap_or(0);
+
+        match usize::from(*reg) {
+            r if r == base => end = Some((value, pc)),
+            r if r == base + 1 => step = Some((value, pc)),
+            r if r == base + 2 => start = Some((value, pc)),
+            _ => return None,
+        }
+    }
+
+    let (start_source, start_pc) = start?;
+    let (end_source, end_pc) = end?;
+    let (step_source, step_pc) = step?;
+
+    Some(NumericForPreheader {
+        start_source,
+        end_source,
+        step_source,
+        start_pc,
+        end_pc,
+        step_pc,
+    })
+}
+
 /// Returns a stable fallback identifier for an upvalue register index.
 #[inline]
 fn upvalue_ident(up: u8) -> Identifier {
     Identifier::from(format!("_up{}", up))
+}
+
+fn closure_captures_local_reg(expr: &HilExpr, reg: u8) -> bool {
+    match expr {
+        HilExpr::Closure { captures, .. } => captures.iter().any(|capture| match capture {
+            HilExpr::Local(captured) => *captured == reg,
+            HilExpr::CaptureValue(inner) => {
+                matches!(inner.as_ref(), HilExpr::Local(captured) if *captured == reg)
+            }
+            _ => false,
+        }),
+        _ => false,
+    }
 }
 
 struct HilWalker<'a> {
@@ -115,6 +196,10 @@ struct HilWalker<'a> {
     local_names: HashMap<LocalBindingKey, Identifier>,
     /// Names that cannot be reused (locals and referenced upvalue names).
     used_names: HashSet<Identifier>,
+    /// Generation for synthetic register bindings without debug lifetime info.
+    synthetic_versions: HashMap<u8, usize>,
+    /// Locals captured by child closures in the current function.
+    captured_names: HashSet<Identifier>,
     /// Active proto expansion stack while structuring nested closures.
     active_proto_stack: Vec<usize>,
     /// Active structure-region calls to detect recursive region expansion.
@@ -135,43 +220,52 @@ impl<'a> HilWalker<'a> {
 
     /// When both `if` branches introduce the same synthetic local, hoist the declaration so
     /// later statements can legally reference that name after the conditional merge.
-    fn hoist_matching_branch_local(
+    fn hoist_matching_branch_locals(
         &mut self,
         outer_stmts: &mut Vec<Stmt>,
         then_stmts: &mut [Stmt],
         else_stmts: &mut [Stmt],
     ) {
-        let Some((then_name, then_value)) = single_local_decl(then_stmts.first()) else {
-            return;
-        };
-        let Some((else_name, else_value)) = single_local_decl(else_stmts.first()) else {
-            return;
-        };
-        if then_name != else_name || self.scopes.get_var(&then_name).is_some() {
+        let else_locals: HashSet<_> = else_stmts
+            .iter()
+            .filter_map(|stmt| single_local_decl(Some(stmt)).map(|(name, _)| name))
+            .collect();
+        let hoisted: Vec<_> = then_stmts
+            .iter()
+            .filter_map(|stmt| single_local_decl(Some(stmt)).map(|(name, _)| name))
+            .filter(|name| else_locals.contains(name) && self.scopes.get_var(name).is_none())
+            .collect();
+
+        if hoisted.is_empty() {
             return;
         }
 
+        let hoisted_set: HashSet<_> = hoisted.iter().cloned().collect();
         let scope = self
             .scopes
             .top_scope()
             .expect("there should always be a scope");
-        scope.add_var(Var::new(then_name.clone(), None));
-        outer_stmts.push(Stmt::LocalDeclaration {
-            names: vec![then_name.clone()],
-            values: Vec::new(),
-        });
-
-        if let Some(first) = then_stmts.first_mut() {
-            *first = Stmt::Assignment {
-                lhs: Expr::Name(then_name.clone()),
-                rhs: then_value,
-            };
+        for name in &hoisted {
+            scope.add_var(Var::new(name.clone(), None));
+            outer_stmts.push(Stmt::LocalDeclaration {
+                names: vec![name.clone()],
+                values: Vec::new(),
+            });
         }
-        if let Some(first) = else_stmts.first_mut() {
-            *first = Stmt::Assignment {
-                lhs: Expr::Name(then_name),
-                rhs: else_value,
-            };
+
+        for stmts in [&mut *then_stmts, &mut *else_stmts] {
+            for stmt in stmts.iter_mut() {
+                let Some((name, value)) = single_local_decl(Some(stmt)) else {
+                    continue;
+                };
+                if !hoisted_set.contains(&name) {
+                    continue;
+                }
+                *stmt = Stmt::Assignment {
+                    lhs: Expr::Name(name),
+                    rhs: value,
+                };
+            }
         }
     }
 
@@ -212,7 +306,10 @@ impl<'a> HilWalker<'a> {
     /// That prevents output like `v3 = v9` from reusing the printed name of an older `R3` binding.
     fn local_binding_key(&self, reg: u8) -> LocalBindingKey {
         let Some(proto) = self.current_proto() else {
-            return LocalBindingKey::Synthetic(reg);
+            return LocalBindingKey::Synthetic {
+                reg,
+                version: self.synthetic_versions.get(&reg).copied().unwrap_or(0),
+            };
         };
 
         proto
@@ -231,7 +328,15 @@ impl<'a> HilWalker<'a> {
                 end_pc: local.end_pc,
                 slot,
             })
-            .unwrap_or(LocalBindingKey::Synthetic(reg))
+            .unwrap_or(LocalBindingKey::Synthetic {
+                reg,
+                version: self.synthetic_versions.get(&reg).copied().unwrap_or(0),
+            })
+    }
+
+    fn fresh_synthetic_binding(&mut self, reg: u8) {
+        let version = self.synthetic_versions.entry(reg).or_insert(0);
+        *version += 1;
     }
 
     /// Returns a stable printable local identifier for a register in this function.
@@ -239,6 +344,16 @@ impl<'a> HilWalker<'a> {
         let key = self.local_binding_key(reg);
         if let Some(existing) = self.local_names.get(&key) {
             return existing.clone();
+        }
+
+        if matches!(key, LocalBindingKey::Synthetic { version: 0, .. })
+            && let Some((_, existing)) = self.local_names.iter().find(|(existing_key, name)| {
+                existing_key.reg() == reg && self.scopes.get_var(name).is_some()
+            })
+        {
+            let existing = existing.clone();
+            self.local_names.insert(key, existing.clone());
+            return existing;
         }
 
         let mut candidate = Identifier::from(format!("v{}", reg));
@@ -314,9 +429,16 @@ impl<'a> HilWalker<'a> {
                         names: vec![ident.clone()],
                         values: vec![value],
                     });
+                    self.captured_names.insert(ident.clone());
                     prepared.captures.push(Expr::Name(ident));
                 }
-                other => prepared.captures.push(self.walk_expr(other)),
+                other => {
+                    let capture = self.walk_expr(other);
+                    if let Expr::Name(name) = &capture {
+                        self.captured_names.insert(name.clone());
+                    }
+                    prepared.captures.push(capture);
+                }
             }
         }
 
@@ -330,7 +452,17 @@ impl<'a> HilWalker<'a> {
                 // local, global, upval, getindex
                 match left {
                     HilExpr::Local(reg) => {
-                        let ident = self.local_ident(reg);
+                        let mut ident = self.local_ident(reg);
+                        if matches!(
+                            self.local_binding_key(reg),
+                            LocalBindingKey::Synthetic { .. }
+                        ) && self.scopes.get_var(&ident).is_some()
+                            && self.captured_names.contains(&ident)
+                            && !closure_captures_local_reg(&value, reg)
+                        {
+                            self.fresh_synthetic_binding(reg);
+                            ident = self.local_ident(reg);
+                        }
                         let LoweredClosureExpr {
                             mut prologue,
                             expr: rhs,
@@ -345,21 +477,20 @@ impl<'a> HilWalker<'a> {
                                 expr: self.walk_expr(other),
                             },
                         };
-                        let stmt = match self.scopes.get_var(&ident) {
-                            Some(_) => Stmt::Assignment {
+                        let stmt = if self.scopes.get_var(&ident).is_some() {
+                            Stmt::Assignment {
                                 lhs: Expr::Name(ident),
                                 rhs,
-                            },
-                            None => {
-                                let scope = self
-                                    .scopes
-                                    .top_scope()
-                                    .expect("there should always be a scope");
-                                scope.add_var(Var::new(ident.clone(), None));
-                                Stmt::LocalDeclaration {
-                                    names: vec![ident],
-                                    values: vec![rhs],
-                                }
+                            }
+                        } else {
+                            let scope = self
+                                .scopes
+                                .top_scope()
+                                .expect("there should always be a scope");
+                            scope.add_var(Var::new(ident.clone(), None));
+                            Stmt::LocalDeclaration {
+                                names: vec![ident],
+                                values: vec![rhs],
                             }
                         };
                         prologue.push(stmt);
@@ -501,6 +632,8 @@ impl<'a> HilWalker<'a> {
         let prev_upvalues = std::mem::replace(&mut self.upvals, mapped_captures);
         let prev_local_names = std::mem::take(&mut self.local_names);
         let prev_used_names = std::mem::take(&mut self.used_names);
+        let prev_synthetic_versions = std::mem::take(&mut self.synthetic_versions);
+        let prev_captured_names = std::mem::take(&mut self.captured_names);
         let prev_scopes = std::mem::replace(&mut self.scopes, ScopeManager::new());
         let prev_current_pc = self.current_pc;
 
@@ -509,6 +642,8 @@ impl<'a> HilWalker<'a> {
         let Some(cfg) = self.cfgs.get(proto_idx) else {
             self.used_names = prev_used_names;
             self.local_names = prev_local_names;
+            self.synthetic_versions = prev_synthetic_versions;
+            self.captured_names = prev_captured_names;
             self.scopes = prev_scopes;
             self.upvals = prev_upvalues;
             self.current_pc = prev_current_pc;
@@ -550,6 +685,8 @@ impl<'a> HilWalker<'a> {
         self.active_proto_stack.pop();
         self.used_names = prev_used_names;
         self.local_names = prev_local_names;
+        self.synthetic_versions = prev_synthetic_versions;
+        self.captured_names = prev_captured_names;
         self.scopes = prev_scopes;
         self.upvals = prev_upvalues;
         self.current_pc = prev_current_pc;
@@ -571,6 +708,7 @@ impl<'a> HilWalker<'a> {
             HilExpr::Number(num) => Expr::Literal(Literal::Number(num)),
             HilExpr::String(str) => Expr::Literal(Literal::String(str.into())),
             HilExpr::Bool(b) => Expr::Literal(Literal::Bool(b)),
+            HilExpr::VarArgs => Expr::Vararg,
             HilExpr::CaptureValue(expr) => self.walk_expr(*expr),
             HilExpr::Local(reg) => Expr::Name(self.local_ident(reg)),
             HilExpr::Global(name) => Expr::Name(name.into()),
@@ -707,11 +845,20 @@ impl<'a> HilWalker<'a> {
                 }
                 _ => None,
             };
+            let numeric_for_preheader = match &block.exit {
+                BlockExit::ForNPrep { base, .. } => {
+                    numeric_for_preheader(block, *base, stmt_pcs.map(Vec::as_slice))
+                }
+                _ => None,
+            };
             for (stmt_idx, hil_stmt) in block.stmts.iter().enumerate() {
                 // Skip the synthetic iterator-state declaration that Luau inserts before `ForGPrep`.
                 // We still read its RHS later when building the `for ... in ...` expression, but we
                 // must not declare its LHS registers as normal locals in the surrounding scope.
                 if generic_for_preheader.is_some() && stmt_idx + 1 == block.stmts.len() {
+                    continue;
+                }
+                if numeric_for_preheader.is_some() && stmt_idx + 3 >= block.stmts.len() {
                     continue;
                 }
                 self.current_pc = stmt_pcs
@@ -763,7 +910,7 @@ impl<'a> HilWalker<'a> {
                     let else_stmts = self.structure_region(*else_block, merge_block, cfg);
                     let mut then_stmts = then_stmts;
                     let mut else_stmts = else_stmts;
-                    self.hoist_matching_branch_local(&mut stmts, &mut then_stmts, &mut else_stmts);
+                    self.hoist_matching_branch_locals(&mut stmts, &mut then_stmts, &mut else_stmts);
                     if then_stmts.is_empty() && else_stmts.is_empty() {
                         if let Some(m) = merge_block {
                             curr_id = m;
@@ -801,12 +948,31 @@ impl<'a> HilWalker<'a> {
 
                     if let Some((_tail_block, body_block, exit_block)) = bounds {
                         let body_stmts = self.structure_region(body_block, Some(exit_block), cfg);
+                        let (start, end, step) = if let Some(preheader) = numeric_for_preheader {
+                            self.current_pc = preheader.start_pc;
+                            let start = self.walk_expr(preheader.start_source.clone());
+                            self.current_pc = preheader.end_pc;
+                            let end = self.walk_expr(preheader.end_source.clone());
+                            self.current_pc = preheader.step_pc;
+                            let step = self.walk_expr(preheader.step_source.clone());
+                            (start, end, Some(step))
+                        } else {
+                            (
+                                Expr::Name(self.local_ident(*base as u8 + 2)),
+                                Expr::Name(self.local_ident(*base as u8)),
+                                Some(Expr::Name(self.local_ident(*base as u8 + 1))),
+                            )
+                        };
+                        let step = match step {
+                            Some(Expr::Literal(Literal::Number(n))) if n == 1.0 => None,
+                            other => other,
+                        };
 
                         stmts.push(Stmt::NumericFor {
                             var: self.local_ident(*base as u8 + 2),
-                            start: Expr::Name(self.local_ident(*base as u8 + 2)),
-                            end: Expr::Name(self.local_ident(*base as u8)),
-                            step: None,
+                            start,
+                            end,
+                            step,
                             body: Block::with_stmts(body_stmts),
                         });
 
@@ -898,6 +1064,8 @@ pub fn structure(cfgs: &[ControlFlowGraph], entry_proto: usize, protos: &[Proto]
         upvals: Vec::new(),
         local_names: HashMap::new(),
         used_names: HashSet::new(),
+        synthetic_versions: HashMap::new(),
+        captured_names: HashSet::new(),
         active_proto_stack: vec![entry_proto],
         active_regions: HashSet::new(),
         region_call_depth: 0,
@@ -1519,7 +1687,8 @@ mod tests {
         );
 
         let ast = structure(&[cfg], 0, &[Proto::default()]);
-        match &ast.stmts[3] {
+        assert_eq!(ast.stmts.len(), 2);
+        match &ast.stmts[0] {
             AstStmt::NumericFor {
                 var,
                 start,
@@ -1528,12 +1697,167 @@ mod tests {
                 ..
             } => {
                 assert_eq!(var.as_str(), "v6");
-                assert!(matches!(start, AstExpr::Name(name) if name.as_str() == "v6"));
-                assert!(matches!(end, AstExpr::Name(name) if name.as_str() == "v4"));
+                assert!(matches!(
+                    start,
+                    AstExpr::Literal(crate::ast::Literal::Number(n)) if *n == 1.0
+                ));
+                assert!(matches!(end, AstExpr::Name(name) if name.as_str() == "v2"));
                 assert_eq!(body.stmts.len(), 2);
             }
             _ => panic!("expected numeric for"),
         }
+    }
+
+    #[test]
+    fn structure_numeric_for_preserves_explicit_step_expression() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                HilBlock {
+                    id: 0,
+                    stmts: vec![
+                        HilStmt::Assign {
+                            left: HilExpr::Local(6),
+                            value: HilExpr::Local(9),
+                        },
+                        HilStmt::Assign {
+                            left: HilExpr::Local(4),
+                            value: HilExpr::Local(2),
+                        },
+                        HilStmt::Assign {
+                            left: HilExpr::Local(5),
+                            value: HilExpr::Number(-1.0),
+                        },
+                    ],
+                    exit: BlockExit::ForNPrep {
+                        base: 4,
+                        loop_block: 1,
+                    },
+                },
+                HilBlock {
+                    id: 1,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(3),
+                        value: HilExpr::Local(6),
+                    }],
+                    exit: BlockExit::ForNLoop {
+                        base: 4,
+                        body_block: 1,
+                        exit_block: 2,
+                    },
+                },
+                HilBlock {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![HilExpr::Local(3)]),
+                },
+            ],
+            0,
+        );
+
+        let ast = structure(&[cfg], 0, &[Proto::default()]);
+        assert_eq!(ast.stmts.len(), 2);
+
+        match &ast.stmts[0] {
+            AstStmt::NumericFor {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                assert_eq!(var.as_str(), "v6");
+                assert!(matches!(start, AstExpr::Name(name) if name.as_str() == "v9"));
+                assert!(matches!(end, AstExpr::Name(name) if name.as_str() == "v2"));
+                assert!(matches!(
+                    step,
+                    Some(AstExpr::Literal(crate::ast::Literal::Number(n))) if *n == -1.0
+                ));
+                assert_eq!(body.stmts.len(), 1);
+            }
+            _ => panic!("expected numeric for"),
+        }
+    }
+
+    #[test]
+    fn structure_captured_synthetic_local_rebind_gets_fresh_name() {
+        let parent_cfg = ControlFlowGraph::new(
+            vec![HilBlock {
+                id: 0,
+                stmts: vec![
+                    HilStmt::Assign {
+                        left: HilExpr::Local(16),
+                        value: HilExpr::Global("to_bits".to_string()),
+                    },
+                    HilStmt::Assign {
+                        left: HilExpr::Local(8),
+                        value: HilExpr::Closure {
+                            proto: 1,
+                            captures: vec![HilExpr::Local(16)],
+                        },
+                    },
+                    HilStmt::Assign {
+                        left: HilExpr::Local(16),
+                        value: HilExpr::Global("str2lei".to_string()),
+                    },
+                ],
+                exit: BlockExit::Return(vec![HilExpr::Local(8)]),
+            }],
+            0,
+        );
+        let child_cfg = ControlFlowGraph::new(
+            vec![HilBlock {
+                id: 0,
+                stmts: vec![],
+                exit: BlockExit::Return(vec![HilExpr::Upval(0)]),
+            }],
+            0,
+        );
+
+        let child_proto = Proto {
+            num_upvals: 1,
+            ..Proto::default()
+        };
+
+        let ast = structure(
+            &[parent_cfg, child_cfg],
+            0,
+            &[Proto::default(), child_proto],
+        );
+        assert_eq!(ast.stmts.len(), 4);
+
+        assert!(matches!(
+            &ast.stmts[0],
+            AstStmt::LocalDeclaration { names, values }
+                if matches!(names.as_slice(), [name] if name.as_str() == "v16")
+                    && matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == "to_bits")
+        ));
+        match &ast.stmts[1] {
+            AstStmt::LocalDeclaration { names, values } => {
+                assert!(matches!(names.as_slice(), [name] if name.as_str() == "v8"));
+                match values.as_slice() {
+                    [AstExpr::AnonymousFunction { body, .. }] => {
+                        assert!(matches!(
+                            body.stmts.as_slice(),
+                            [AstStmt::Return { values }]
+                                if matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == "v16")
+                        ));
+                    }
+                    _ => panic!("expected closure"),
+                }
+            }
+            _ => panic!("expected closure declaration"),
+        }
+        assert!(matches!(
+            &ast.stmts[2],
+            AstStmt::LocalDeclaration { names, values }
+                if matches!(names.as_slice(), [name] if name.as_str() == "v16_l0")
+                    && matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == "str2lei")
+        ));
+        assert!(matches!(
+            &ast.stmts[3],
+            AstStmt::Return { values }
+                if matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == "v8")
+        ));
     }
 
     #[test]

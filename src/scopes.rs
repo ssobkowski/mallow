@@ -105,10 +105,24 @@ impl ScopeManager {
         self.scopes.last_mut()
     }
 
+    /// Returns whether the current scope already contains the given name.
+    #[inline]
+    pub fn current_scope_has(&self, name: &Identifier) -> bool {
+        self.scopes
+            .last()
+            .is_some_and(|scope| scope.variables.iter().any(|var| var.name == *name))
+    }
+
     /// Pops the current scope from the stack.
     #[inline]
     pub fn pop_scope(&mut self) {
         self.scopes.pop();
+    }
+
+    /// Returns the current lexical scope depth.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.scopes.len()
     }
 
     /// Returns a variable from the current scope, if it exists.
