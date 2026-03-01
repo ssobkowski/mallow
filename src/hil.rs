@@ -846,6 +846,11 @@ fn call_stmt(expr: Expr) -> Stmt {
 /// Luau encodes `A = B .. C .. D` as `CONCAT A B D`, so the helper expands the full
 /// inclusive register range `[start, end]`.
 fn concat_expr_range(start: u8, end: u8) -> Expr {
+    debug_assert!(
+        start <= end,
+        "invalid CONCAT register range: {start}..{end}"
+    );
+
     let mut expr = Expr::Local(end);
     for reg in (start..end).rev() {
         expr = Expr::Binary(BinOp::Concat, Box::new(Expr::Local(reg)), Box::new(expr));
@@ -881,8 +886,8 @@ fn pending_multret_feeds_variadic_call(
         .is_some_and(|(src_reg, _)| *src_reg >= first_arg_reg)
 }
 
-/// Consumes a deferred MULTRET call for a variadic CALL with optional fixed-prefix args.
-fn take_variadic_call_args(
+/// Consumes a deferred MULTRET call for a variadic sequence with optional fixed-prefix locals.
+fn take_variadic_multret_values(
     pending_multret_call: &mut Option<(u8, Expr)>,
     first_arg_reg: u8,
 ) -> Option<Vec<Expr>> {
@@ -898,6 +903,14 @@ fn take_variadic_call_args(
         }
         None => None,
     }
+}
+
+/// Consumes a deferred MULTRET call for a variadic CALL with optional fixed-prefix args.
+fn take_variadic_call_args(
+    pending_multret_call: &mut Option<(u8, Expr)>,
+    first_arg_reg: u8,
+) -> Option<Vec<Expr>> {
+    take_variadic_multret_values(pending_multret_call, first_arg_reg)
 }
 
 /// Returns true when an instruction can appear between a pending MULTRET and its consumer.
@@ -994,7 +1007,7 @@ fn lift_with_context(
                 .is_some_and(|(src_reg, _)| *src_reg == *dest + 2),
             Instr::SetList { base, count: 0, .. } => pending_multret_call
                 .as_ref()
-                .is_some_and(|(src_reg, _)| *src_reg == *base),
+                .is_some_and(|(src_reg, _)| *src_reg >= *base),
             Instr::Return { base, count: 0 } => pending_multret_call
                 .as_ref()
                 .is_some_and(|(src_reg, _)| *src_reg == *base),
@@ -1455,17 +1468,9 @@ fn lift_with_context(
                 left: Expr::Local(*dest),
                 value: Expr::Unary(UnOp::Length, Box::new(Expr::Local(*reg))),
             }),
-            Instr::NewTable {
-                dest, array_size, ..
-            } => stmts.push(Stmt::Assign {
+            Instr::NewTable { dest, .. } => stmts.push(Stmt::Assign {
                 left: Expr::Local(*dest),
-                value: Expr::Call(
-                    Box::new(Expr::GetField(
-                        Box::new(Expr::Global("table".to_string())),
-                        "create".to_string(),
-                    )),
-                    vec![Expr::Number(*array_size as f64)],
-                ),
+                value: Expr::Table(Vec::new()),
             }),
             Instr::DupTable { dest, .. } => stmts.push(Stmt::Assign {
                 left: Expr::Local(*dest),
@@ -1486,37 +1491,58 @@ fn lift_with_context(
                 count,
                 index,
             } => {
-                let start = *index;
-                match decoded_count(*count) {
-                    Some(n) => {
-                        for i in 0..n {
-                            stmts.push(Stmt::Assign {
-                                left: Expr::GetIndex(
-                                    Box::new(Expr::Local(*table)),
-                                    Box::new(Expr::Number((start + u32::from(i)) as f64)),
-                                ),
-                                value: Expr::Local(base.wrapping_add(i)),
-                            });
-                        }
-                    }
-                    None => {
-                        let value = if let Some((src_reg, expr)) = pending_multret_call.take() {
-                            if src_reg == *base {
-                                expr
-                            } else {
-                                pending_multret_call = Some((src_reg, expr));
-                                Expr::Local(*base)
-                            }
-                        } else {
-                            Expr::Local(*base)
-                        };
+                let mut values = match decoded_count(*count) {
+                    Some(n) => local_range(*base, n),
+                    None => take_variadic_multret_values(&mut pending_multret_call, *base)
+                        .unwrap_or_else(|| vec![Expr::Local(*base)]),
+                };
 
+                let mut table_definition_index = None;
+                for (idx, stmt) in stmts.iter_mut().enumerate().rev() {
+                    match stmt {
+                        Stmt::Assign {
+                            left: Expr::Local(r),
+                            value: Expr::Table(items),
+                        } if *r == *table => {
+                            table_definition_index = Some(idx);
+                        }
+                        // If the table register was assigned to something else, we must stop scanning
+                        Stmt::Assign {
+                            left: Expr::Local(r),
+                            ..
+                        } if *r == *table => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(idx) = table_definition_index {
+                    let newtable = stmts.remove(idx);
+                    let mut items = match newtable {
+                        Stmt::Assign {
+                            value: Expr::Table(items),
+                            ..
+                        } => items,
+                        _ => unreachable!(),
+                    };
+                    if items.len() < (*index as usize) - 1 {
+                        // pad with nils if the table is shorter than the insertion index
+                        items.resize(*index as usize - 1, Expr::Nil);
+                    }
+                    items.append(&mut values);
+                    stmts.push(Stmt::Assign {
+                        left: Expr::Local(*table),
+                        value: Expr::Table(items),
+                    });
+                } else {
+                    let start = *index;
+                    for (i, val) in values.into_iter().enumerate() {
                         stmts.push(Stmt::Assign {
                             left: Expr::GetIndex(
                                 Box::new(Expr::Local(*table)),
-                                Box::new(Expr::Number(start as f64)),
+                                Box::new(Expr::Number((start + i as u32) as f64)),
                             ),
-                            value,
+                            value: val,
                         });
                     }
                 }
@@ -2894,6 +2920,51 @@ mod tests {
                         assert!(args.is_empty());
                     }
                     _ => panic!("expected variadic CALL expression to feed SETLIST"),
+                }
+            }
+            _ => panic!("expected SETLIST assignment"),
+        }
+    }
+
+    #[test]
+    fn lift_setlist_variadic_keeps_fixed_prefix_values_before_pending_multret() {
+        let instrs = vec![
+            Instr::NewTable {
+                dest: 4,
+                hash_size: 0,
+                array_size: 0,
+            },
+            Instr::Move { dest: 5, src: 1 },
+            Instr::Call {
+                func: 6,
+                arg_count: 1,
+                ret_count: 0,
+            },
+            Instr::SetList {
+                table: 4,
+                base: 5,
+                count: 0,
+                index: 1,
+            },
+        ];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 2);
+
+        match &stmts[1] {
+            Stmt::Assign { left, value } => {
+                assert!(matches!(left, Expr::Local(4)));
+                match value {
+                    Expr::Table(items) => {
+                        assert_eq!(items.len(), 2);
+                        assert!(matches!(&items[0], Expr::Local(5)));
+                        assert!(matches!(
+                            &items[1],
+                            Expr::Call(func, args)
+                                if matches!(func.as_ref(), Expr::Local(6)) && args.is_empty()
+                        ));
+                    }
+                    _ => panic!("expected SETLIST to fold into a table constructor"),
                 }
             }
             _ => panic!("expected SETLIST assignment"),

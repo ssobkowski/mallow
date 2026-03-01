@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, UnOp},
+    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableConstructorField, UnOp},
     disasm::Proto,
     hil::{
         BlockExit, ControlFlowGraph, Expr as HilExpr, Stmt as HilStmt, find_if_else_join,
@@ -265,7 +265,8 @@ impl<'a> HilWalker<'a> {
             _ => "_cap".to_string(),
         };
         let mut candidate = Identifier::from(base);
-        if self.used_names.contains(&candidate) || reserved_names.iter().any(|name| name == &candidate)
+        if self.used_names.contains(&candidate)
+            || reserved_names.iter().any(|name| name == &candidate)
         {
             let stem = candidate.as_str().to_string();
             let mut suffix = 1usize;
@@ -330,14 +331,15 @@ impl<'a> HilWalker<'a> {
                 match left {
                     HilExpr::Local(reg) => {
                         let ident = self.local_ident(reg);
-                        let LoweredClosureExpr { mut prologue, expr: rhs } = match value {
-                            HilExpr::Closure { proto, captures } => {
-                                self.walk_closure_expr(
-                                    proto,
-                                    captures,
-                                    std::slice::from_ref(&ident),
-                                )
-                            }
+                        let LoweredClosureExpr {
+                            mut prologue,
+                            expr: rhs,
+                        } = match value {
+                            HilExpr::Closure { proto, captures } => self.walk_closure_expr(
+                                proto,
+                                captures,
+                                std::slice::from_ref(&ident),
+                            ),
                             other => LoweredClosureExpr {
                                 prologue: Vec::new(),
                                 expr: self.walk_expr(other),
@@ -604,7 +606,14 @@ impl<'a> HilWalker<'a> {
                 op,
                 expr: Box::new(self.walk_expr(*expr)),
             },
-            HilExpr::Table(_) => Expr::Table { fields: Vec::new() },
+            HilExpr::Table(values) => Expr::Table {
+                fields: values
+                    .into_iter()
+                    .map(|expr| TableConstructorField::Implicit {
+                        value: self.walk_expr(expr),
+                    })
+                    .collect(),
+            },
         }
     }
 
@@ -710,7 +719,11 @@ impl<'a> HilWalker<'a> {
                     .unwrap_or(0);
                 stmts.extend(self.walk_stmt(hil_stmt.clone()));
             }
-            self.current_pc = cfg.exit_word_pcs.get(curr_id).copied().unwrap_or(self.current_pc);
+            self.current_pc = cfg
+                .exit_word_pcs
+                .get(curr_id)
+                .copied()
+                .unwrap_or(self.current_pc);
 
             match &block.exit {
                 BlockExit::Fallthrough(next) | BlockExit::Jump(next) => {
@@ -1267,7 +1280,11 @@ mod tests {
             num_upvals: 1,
             ..Proto::default()
         };
-        let ast = structure(&[parent_cfg, child_cfg], 0, &[Proto::default(), child_proto]);
+        let ast = structure(
+            &[parent_cfg, child_cfg],
+            0,
+            &[Proto::default(), child_proto],
+        );
         assert!(ast.stmts.len() >= 4);
 
         let snapshot_name = ast
