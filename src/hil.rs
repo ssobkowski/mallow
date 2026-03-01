@@ -11,6 +11,7 @@ pub enum Expr {
     Number(f64),
     String(String),
     Bool(bool),
+    CaptureValue(Box<Expr>),
     Local(u8),
     Upval(u8),
     Closure { proto: usize, captures: Vec<Expr> },
@@ -76,6 +77,8 @@ pub enum BlockExit {
 pub struct ControlFlowGraph {
     pub blocks: Vec<Block>,
     pub entry_block: usize,
+    pub stmt_word_pcs: Vec<Vec<usize>>,
+    pub exit_word_pcs: Vec<usize>,
     pub successors: Vec<Vec<usize>>,
     pub predecessors: Vec<Vec<usize>>,
     pub dominators: Vec<Vec<usize>>,
@@ -86,15 +89,45 @@ pub struct ControlFlowGraph {
 
 impl ControlFlowGraph {
     pub fn new(blocks: Vec<Block>, entry_block: usize) -> Self {
+        let stmt_word_pcs = blocks
+            .iter()
+            .map(|block| vec![0; block.stmts.len()])
+            .collect();
+        let exit_word_pcs = vec![0; blocks.len()];
+        Self::with_pcs(blocks, entry_block, stmt_word_pcs, exit_word_pcs)
+    }
+
+    pub fn with_pcs(
+        blocks: Vec<Block>,
+        entry_block: usize,
+        mut stmt_word_pcs: Vec<Vec<usize>>,
+        mut exit_word_pcs: Vec<usize>,
+    ) -> Self {
         let successors = build_successors(&blocks);
         let predecessors = build_predecessors(successors.len(), &successors);
         let (dominators, immediate_dominators) =
             build_dominator_metadata(entry_block, &successors, &predecessors);
         let (numeric_loops_by_base, generic_loops_by_base) = build_loop_indexes(&blocks);
+        if stmt_word_pcs.len() != blocks.len() {
+            stmt_word_pcs = blocks
+                .iter()
+                .map(|block| vec![0; block.stmts.len()])
+                .collect();
+        }
+        for (pcs, block) in stmt_word_pcs.iter_mut().zip(&blocks) {
+            if pcs.len() != block.stmts.len() {
+                pcs.resize(block.stmts.len(), 0);
+            }
+        }
+        if exit_word_pcs.len() != blocks.len() {
+            exit_word_pcs = vec![0; blocks.len()];
+        }
 
         ControlFlowGraph {
             blocks,
             entry_block,
+            stmt_word_pcs,
+            exit_word_pcs,
             successors,
             predecessors,
             dominators,
@@ -881,7 +914,7 @@ fn instr_preserves_pending_multret(instr: &Instr, pending_src_reg: u8) -> bool {
 }
 
 pub fn lift(instrs: &[Instr], consts: &[Constant]) -> Vec<Stmt> {
-    let (mut stmts, pending_multret_call) = lift_with_context(instrs, consts, None, &[]);
+    let (mut stmts, _, pending_multret_call) = lift_with_context(instrs, consts, None, &[], None);
     if let Some((_, expr)) = pending_multret_call {
         stmts.push(call_stmt(expr));
     }
@@ -906,7 +939,8 @@ fn resolve_dupclosure_proto(consts: &[Constant], k: u16) -> usize {
 /// Decodes Luau capture metadata into the captured HIL expression.
 fn decode_capture(capture_type: u8, reg: u8) -> Expr {
     match capture_type {
-        0 | 1 => Expr::Local(reg),
+        0 => Expr::CaptureValue(Box::new(Expr::Local(reg))),
+        1 => Expr::Local(reg),
         2 => Expr::Upval(reg),
         _ => Expr::Local(reg),
     }
@@ -919,20 +953,26 @@ fn decode_capture(capture_type: u8, reg: u8) -> Expr {
 ///
 /// Returns:
 /// - `Vec<Stmt>`: lifted statements for the instruction slice
+/// - `Vec<usize>`: the originating bytecode word pc for each lifted statement
 /// - `Option<(u8, Expr)>`: a deferred MULTRET call as `(first_result_register, call_expr)`
 fn lift_with_context(
     instrs: &[Instr],
     consts: &[Constant],
     parent_proto: Option<&Proto>,
     all_protos: &[Proto],
-) -> (Vec<Stmt>, Option<(u8, Expr)>) {
+    instr_word_pcs: Option<&[usize]>,
+) -> (Vec<Stmt>, Vec<usize>, Option<(u8, Expr)>) {
     let mut stmts = Vec::new();
+    let mut stmt_word_pcs = Vec::new();
 
     let mut pending_namecall: Option<(u8, String)> = None; // (func reg, method)
     let mut pending_multret_call: Option<(u8, Expr)> = None; // (first result reg, call expr)
     let mut pending_closure_stmt: Option<(usize, usize)> = None; // (stmt index, remaining fixed captures)
 
     for (instr_idx, instr) in instrs.iter().enumerate() {
+        let instr_pc = instr_word_pcs
+            .and_then(|pcs| pcs.get(instr_idx).copied())
+            .unwrap_or(instr_idx);
         let pending_namecall_for_func = |func: u8| {
             pending_namecall
                 .as_ref()
@@ -1337,6 +1377,36 @@ fn lift_with_context(
                     ),
                 });
             }
+            Instr::SubRK { dest, k, reg } => {
+                let num = match consts[*k as usize] {
+                    Constant::Number(x) => x,
+                    _ => unreachable!("SubRK can only be used with constant numbers"),
+                };
+
+                stmts.push(Stmt::Assign {
+                    left: Expr::Local(*dest),
+                    value: Expr::Binary(
+                        BinOp::Sub,
+                        Box::new(Expr::Number(num)),
+                        Box::new(Expr::Local(*reg)),
+                    ),
+                });
+            }
+            Instr::DivRK { dest, k, reg } => {
+                let num = match consts[*k as usize] {
+                    Constant::Number(x) => x,
+                    _ => unreachable!("DivRK can only be used with constant numbers"),
+                };
+
+                stmts.push(Stmt::Assign {
+                    left: Expr::Local(*dest),
+                    value: Expr::Binary(
+                        BinOp::Div,
+                        Box::new(Expr::Number(num)),
+                        Box::new(Expr::Local(*reg)),
+                    ),
+                });
+            }
             Instr::And { dest, a, b } => stmts.push(Stmt::Assign {
                 left: Expr::Local(*dest),
                 value: Expr::Binary(
@@ -1529,9 +1599,11 @@ fn lift_with_context(
                 }
             }
         }
+
+        stmt_word_pcs.resize(stmts.len(), instr_pc);
     }
 
-    (stmts, pending_multret_call)
+    (stmts, stmt_word_pcs, pending_multret_call)
 }
 
 /// Builds a CFG for a standalone instruction stream without proto context.
@@ -1633,6 +1705,8 @@ fn build_cfg_with_context(
 
     let entries_vec: Vec<usize> = entries.into_iter().collect(); // already sorted, BTreeSet
     let mut blocks = Vec::new();
+    let mut block_stmt_word_pcs = Vec::new();
+    let mut block_exit_word_pcs = Vec::new();
 
     for (block_idx, &start) in entries_vec.iter().enumerate() {
         let end = entries_vec
@@ -1669,8 +1743,20 @@ fn build_cfg_with_context(
             _ => (block_instrs, None),
         };
 
-        let (mut lifted_body, mut pending_multret_call) =
-            lift_with_context(body, consts, parent_proto, all_protos);
+        let (mut lifted_body, mut lifted_stmt_pcs, mut pending_multret_call) = lift_with_context(
+            body,
+            consts,
+            parent_proto,
+            all_protos,
+            instr_word_pcs.and_then(|pcs| pcs.get(start..start + body.len())),
+        );
+        let exit_word_pc = if end == 0 {
+            0
+        } else {
+            instr_word_pcs
+                .and_then(|pcs| pcs.get(end.saturating_sub(1)).copied())
+                .unwrap_or(end.saturating_sub(1))
+        };
 
         let exit = match exit_instr {
             Some(Instr::Return { base, count }) => {
@@ -1983,6 +2069,7 @@ fn build_cfg_with_context(
 
         if let Some((_, expr)) = pending_multret_call.take() {
             lifted_body.push(call_stmt(expr));
+            lifted_stmt_pcs.push(exit_word_pc);
         }
 
         blocks.push(Block {
@@ -1990,9 +2077,11 @@ fn build_cfg_with_context(
             stmts: lifted_body,
             exit,
         });
+        block_stmt_word_pcs.push(lifted_stmt_pcs);
+        block_exit_word_pcs.push(exit_word_pc);
     }
 
-    ControlFlowGraph::new(blocks, 0)
+    ControlFlowGraph::with_pcs(blocks, 0, block_stmt_word_pcs, block_exit_word_pcs)
 }
 
 #[cfg(test)]
@@ -2909,7 +2998,8 @@ mod tests {
                 value: Expr::Closure { proto: 1, captures }
             } if matches!(
                 captures.as_slice(),
-                [Expr::Local(2), Expr::Upval(3)]
+                [Expr::CaptureValue(expr), Expr::Upval(3)]
+                    if matches!(expr.as_ref(), Expr::Local(2))
             )
         ));
     }

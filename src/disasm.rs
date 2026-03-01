@@ -63,6 +63,14 @@ impl FromLeBytes for String {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct LocalDebug {
+    pub name: String,
+    pub start_pc: usize,
+    pub end_pc: usize,
+    pub register: u8,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct Proto {
     pub index: u64,
     pub max_stack_size: u8,
@@ -75,6 +83,7 @@ pub struct Proto {
     pub instr_word_pcs: Vec<usize>,
     pub consts: Vec<Constant>,
     pub protos: Vec<usize>,
+    pub locals: Vec<LocalDebug>,
 }
 
 #[derive(Debug, Error)]
@@ -207,12 +216,23 @@ impl<'a> Disassembler<'a> {
         // local variables and upvalues
         if self.read::<u8>()? == 1 {
             let num_locals = self.read_varint()?;
+            proto.locals = Vec::with_capacity(num_locals as usize);
 
             for _ in 0..num_locals {
-                self.read_varint()?; // var name index
-                self.read_varint()?; // start pc
-                self.read_varint()?; // end pc
-                self.read::<u8>()?; // register
+                let name_idx = self.read_varint()?;
+                let start_pc = self.read_varint()? as usize;
+                let end_pc = self.read_varint()? as usize;
+                let register = self.read::<u8>()?;
+                let name = strings
+                    .get(name_idx.saturating_sub(1) as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                proto.locals.push(LocalDebug {
+                    name,
+                    start_pc,
+                    end_pc,
+                    register,
+                });
             }
 
             let num_upvals = self.read_varint()?;

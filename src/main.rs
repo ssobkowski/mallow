@@ -113,7 +113,7 @@ fn main() {
                 &disassembled.protos,
             );
 
-            let ast = passes::run_all(ast);
+            // let ast = passes::run_all(ast); CURRENTLY BROKEN; DO NOT UNCOMMENT
             let src = print(&ast);
 
             if let Err(e) = write_output(output, &src) {
