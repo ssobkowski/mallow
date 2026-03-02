@@ -565,37 +565,3 @@ local function test_sha256()
  end
 
  all_tests_sha2()
-
-
-
- local function benchmark()
-
-    print("Benchmarking (calculating SHA512 of 1KByte string of letters 'a')...")
-
-    local time_intervals = {}
-
-    local length = 2^10
-    local part = ("a"):rep(2^4)
-    local N = length/#part
-    local result
-
-    local k = 2
-    for j = 1, 2*k-1 do
-       local clk0 = os.clock()
-       local x = sha2.sha512()
-       for j = 1, N do
-          x(part)
-       end
-       result = x()
-       time_intervals[j] = os.clock() - clk0
-    end
-
-    --print("Result = "..result)
-
-    -- get median time
-    table.sort(time_intervals)
-    print('CPU seconds:', time_intervals[k])
-
- end
-
- benchmark()
