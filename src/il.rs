@@ -91,10 +91,10 @@ pub enum Instr {
         slot: u8,
         key: u32,
     },
-    /// Table read with immediate integer key (1-indexed).
-    GetTableN { dest: u8, table: u8, index: u8 },
-    /// Table write with immediate integer key (1-indexed).
-    SetTableN { src: u8, table: u8, index: u8 },
+    /// Table read with immediate integer key (1-indexed, range 1..=256).
+    GetTableN { dest: u8, table: u8, index: u16 },
+    /// Table write with immediate integer key (1-indexed, range 1..=256).
+    SetTableN { src: u8, table: u8, index: u16 },
     /// Create a new closure from a proto.
     NewClosure { dest: u8, proto: u16 },
     /// Method call setup: dest+1 = object, dest = object[method]
@@ -435,12 +435,12 @@ impl Instr {
             17 => Instr::GetTableN {
                 dest: a,
                 table: b,
-                index: c.wrapping_add(1),
+                index: u16::from(c) + 1,
             },
             18 => Instr::SetTableN {
                 src: a,
                 table: b,
-                index: c.wrapping_add(1),
+                index: u16::from(c) + 1,
             },
             19 => Instr::NewClosure {
                 dest: a,
@@ -742,5 +742,29 @@ impl Instr {
 impl From<u32> for Instr {
     fn from(value: u32) -> Self {
         Self::decode_header(value, None).unwrap_or_else(|err| panic!("{err}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Instr;
+
+    #[test]
+    fn decode_settablen_preserves_256_index() {
+        let opcode = 18u32;
+        let a = 1u32 << 8;
+        let b = 2u32 << 16;
+        let c = 255u32 << 24;
+
+        let instr = Instr::from(opcode | a | b | c);
+
+        assert!(matches!(
+            instr,
+            Instr::SetTableN {
+                src: 1,
+                table: 2,
+                index: 256
+            }
+        ));
     }
 }

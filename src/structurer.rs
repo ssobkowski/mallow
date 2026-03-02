@@ -88,6 +88,15 @@ struct LoweredClosureExpr {
     expr: Expr,
 }
 
+/// Extracts a single-name local declaration from `stmt`.
+///
+/// Several structuring passes only care about the simple `local x = value` shape, for example
+/// branch-local hoisting and condition-temp folding. This helper centralizes that pattern match so
+/// those passes can stay focused on control-flow logic.
+///
+/// Returns:
+/// - `Some((name, value))` when `stmt` is exactly one local name initialized by one expression
+/// - `None` for every other statement shape
 #[inline]
 fn single_local_decl(stmt: Option<&Stmt>) -> Option<(Identifier, Expr)> {
     match stmt? {
@@ -98,6 +107,16 @@ fn single_local_decl(stmt: Option<&Stmt>) -> Option<(Identifier, Expr)> {
     }
 }
 
+/// Reads the synthetic iterator setup that Luau places immediately before `ForGPrep`.
+///
+/// Generic `for` loops are lowered through an `AssignMany` into hidden iterator-state registers.
+/// The structurer uses this helper to recover the iterator source expression without emitting those
+/// internal registers as fake source-level locals.
+///
+/// Returns:
+/// - `Some(GenericForPreheader)` when the last statement in `block` matches the expected setup for
+///   `base`
+/// - `None` when `block` does not look like a generic-for preheader
 fn generic_for_preheader<'a>(
     block: &'a crate::hil::Block,
     base: usize,
@@ -122,6 +141,16 @@ fn generic_for_preheader<'a>(
     })
 }
 
+/// Reads the synthetic counter setup that Luau places immediately before `ForNPrep`.
+///
+/// Numeric `for` loops seed limit, step, and current-value registers in the preheader block. The
+/// structurer folds those hidden register writes back into the printed `for i = start, finish,
+/// step` header with the correct source PCs for local lifetime lookup.
+///
+/// Returns:
+/// - `Some(NumericForPreheader)` when the tail of `block` matches the expected three-register setup
+///   for `base`
+/// - `None` when `block` does not encode a recoverable numeric-for preheader
 fn numeric_for_preheader<'a>(
     block: &'a crate::hil::Block,
     base: usize,
@@ -172,6 +201,15 @@ fn upvalue_ident(up: u8) -> Identifier {
     Identifier::from(format!("_up{}", up))
 }
 
+/// Returns whether `expr` is a closure that captures local register `reg`.
+///
+/// Register reuse needs this guard before assigning a fresh synthetic local name. If the incoming
+/// closure still captures the current register, renaming the binding would sever the intended
+/// closure/upvalue relationship.
+///
+/// Returns:
+/// - `true` when `expr` is a closure whose capture list references `reg`
+/// - `false` for every non-closure expression or closures that do not capture `reg`
 fn closure_captures_local_reg(expr: &HilExpr, reg: u8) -> bool {
     match expr {
         HilExpr::Closure { captures, .. } => captures.iter().any(|capture| match capture {
@@ -183,6 +221,145 @@ fn closure_captures_local_reg(expr: &HilExpr, reg: u8) -> bool {
         }),
         _ => false,
     }
+}
+
+/// Returns whether `expr` references `name` anywhere inside its tree.
+///
+/// Condition folding uses this to decide whether a trailing temporary assignment can be inlined
+/// into the condition or must remain as a standalone statement. Without this check we would remove
+/// assignments that still provide values used by later code.
+///
+/// Returns:
+/// - `true` when `expr` contains at least one `Expr::Name` equal to `name`
+/// - `false` when `name` does not appear anywhere inside `expr`
+fn expr_mentions_name(expr: &Expr, name: &Identifier) -> bool {
+    match expr {
+        Expr::Name(candidate) => candidate == name,
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_mentions_name(lhs, name) || expr_mentions_name(rhs, name)
+        }
+        Expr::Unary { expr, .. } => expr_mentions_name(expr, name),
+        _ => false,
+    }
+}
+
+/// Replaces every textual use of `name` inside `expr` with `replacement`.
+///
+/// This is used immediately after `expr_mentions_name` says a temporary condition variable is safe
+/// to fold away. The helper keeps the resulting condition equivalent while letting the structurer
+/// delete the now-redundant assignment statement.
+///
+/// Returns:
+/// - a cloned expression tree where each matching `Expr::Name(name)` node became `replacement`
+/// - the original structure for subtrees that do not mention `name`
+fn replace_name_in_expr(expr: Expr, name: &Identifier, replacement: &Expr) -> Expr {
+    match expr {
+        Expr::Name(candidate) if &candidate == name => replacement.clone(),
+        Expr::Binary { lhs, op, rhs } => Expr::Binary {
+            lhs: Box::new(replace_name_in_expr(*lhs, name, replacement)),
+            op,
+            rhs: Box::new(replace_name_in_expr(*rhs, name, replacement)),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op,
+            expr: Box::new(replace_name_in_expr(*expr, name, replacement)),
+        },
+        other => other,
+    }
+}
+
+/// Produces the logical negation of a structured condition expression.
+///
+/// Loop and branch recovery frequently need to swap which CFG successor is treated as the "exit"
+/// side. We prefer to flip simple equality tests directly so the printed Luau stays readable, and
+/// fall back to wrapping the expression in `not` for everything else.
+///
+/// Returns:
+/// - a simplified inverted comparison for `==` and `~=`
+/// - `not <expr>` for every other condition shape
+fn invert_condition(expr: Expr) -> Expr {
+    match expr {
+        Expr::Binary { lhs, op, rhs } => match op {
+            crate::ast::BinOp::Eq => Expr::Binary {
+                lhs,
+                op: crate::ast::BinOp::Ne,
+                rhs,
+            },
+            crate::ast::BinOp::Ne => Expr::Binary {
+                lhs,
+                op: crate::ast::BinOp::Eq,
+                rhs,
+            },
+            _ => Expr::Unary {
+                op: UnOp::Not,
+                expr: Box::new(Expr::Binary { lhs, op, rhs }),
+            },
+        },
+        other => Expr::Unary {
+            op: UnOp::Not,
+            expr: Box::new(other),
+        },
+    }
+}
+
+/// Removes a trailing `continue` emitted while structuring a loop body region.
+///
+/// Region walking naturally emits an explicit `continue` when it sees a backedge. Once that region
+/// becomes the body of a recovered `while`, the final `continue` is redundant and would add noise
+/// or change formatting without changing semantics.
+///
+/// Returns:
+/// - nothing; `stmts` is updated in place and may lose its last statement when it is `continue`
+fn strip_terminal_continue(stmts: &mut Vec<Stmt>) {
+    if matches!(stmts.last(), Some(Stmt::Continue)) {
+        stmts.pop();
+    }
+}
+
+/// Returns whether `stmt` already stops control flow for the current block.
+///
+/// Branch-merging helpers use this before appending a synthetic `break`. We only want to add that
+/// `break` when the branch would otherwise fall through, not when it already returns or continues.
+///
+/// Returns:
+/// - `true` for `break`, `continue`, and `return`
+/// - `false` for every non-terminal statement
+fn stmt_is_terminal(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Break | Stmt::Continue | Stmt::Return { .. })
+}
+
+/// Appends `break` when a structured branch body would otherwise fall through.
+///
+/// Some loop-exit reconstructions build a branch body out of a CFG slice that originally reached
+/// the loop latch. In structured Luau that slice must end with an explicit `break` so execution
+/// leaves the recovered loop at the same point as the source CFG.
+///
+/// Returns:
+/// - nothing; `stmts` is updated in place and gains a trailing `break` only when needed
+fn ensure_terminal_break(stmts: &mut Vec<Stmt>) {
+    if !matches!(stmts.last(), Some(stmt) if stmt_is_terminal(stmt)) {
+        stmts.push(Stmt::Break);
+    }
+}
+
+/// Returns whether `stmts` is only a conditional break guard.
+///
+/// Nested loop recovery sometimes structures a post-body latch block as `if cond then break`.
+/// Wrapping that guard in another `while true` would create a spurious inner loop even though
+/// the guard is meant to remain inside an already-recovered enclosing loop body.
+///
+/// Returns:
+/// - `true` when `stmts` is exactly one `if` whose then-body is a single `break`
+/// - `false` for every other statement shape
+fn stmts_are_break_guard_only(stmts: &[Stmt]) -> bool {
+    matches!(
+        stmts,
+        [Stmt::If {
+            then_body,
+            else_body: None,
+            ..
+        }] if matches!(then_body.stmts.as_slice(), [Stmt::Break])
+    )
 }
 
 struct HilWalker<'a> {
@@ -277,6 +454,258 @@ impl<'a> HilWalker<'a> {
             .any(|pred| pred != block && cfg.dominates(block, pred))
     }
 
+    /// Returns whether `start` can reach `target` through a non-`for` backedge.
+    ///
+    /// This is used to decide whether one side of a conditional is the body of a source-level
+    /// `while` loop. We intentionally ignore `FORNLOOP`/`FORGLOOP` edges here so an enclosing
+    /// numeric or generic `for` does not make an unrelated exit branch look like the loop body.
+    ///
+    /// Returns:
+    /// - `true` when some block reachable from `start` jumps directly back to `target` without
+    ///   that jump being emitted by a Luau `for` loop tail
+    /// - `false` when no such plain backedge exists
+    fn branch_has_plain_backedge(
+        &self,
+        start: usize,
+        target: usize,
+        cfg: &ControlFlowGraph,
+    ) -> bool {
+        let mut stack = vec![start];
+        let mut seen = HashSet::new();
+
+        while let Some(block) = stack.pop() {
+            if !seen.insert(block) {
+                continue;
+            }
+
+            if cfg.successors(block).contains(&target)
+                && !matches!(
+                    cfg.blocks.get(block).map(|b| &b.exit),
+                    Some(BlockExit::ForNLoop { .. } | BlockExit::ForGLoop { .. })
+                )
+            {
+                return true;
+            }
+
+            for &succ in cfg.successors(block) {
+                if succ != target && cfg.dominates(target, succ) {
+                    stack.push(succ);
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Collects forward-reachable blocks from `start` without stepping onto `target`.
+    ///
+    /// Loop exit detection compares the blocks reachable from the exit side and the backedge side
+    /// of a candidate loop header. Their overlap approximates the rejoin point where both sides
+    /// converge after the loop terminates.
+    ///
+    /// Returns:
+    /// - the set of blocks reachable from `start` while staying inside the region dominated by
+    ///   `target` and never visiting `target` itself
+    fn forward_reachable_without_target(
+        &self,
+        start: usize,
+        target: usize,
+        cfg: &ControlFlowGraph,
+    ) -> HashSet<usize> {
+        let mut stack = vec![start];
+        let mut seen = HashSet::new();
+
+        while let Some(block) = stack.pop() {
+            if block == target || !seen.insert(block) {
+                continue;
+            }
+
+            for &succ in cfg.successors(block) {
+                if succ != target && cfg.dominates(target, succ) {
+                    stack.push(succ);
+                }
+            }
+        }
+
+        seen
+    }
+
+    /// Chooses the first block where a candidate loop exit and loop body can both reach.
+    ///
+    /// After identifying which conditional successor behaves like the backedge, we still need to
+    /// know where structured emission should continue once the loop ends. The earliest shared
+    /// reachable block is a practical approximation of that post-loop join.
+    ///
+    /// Returns:
+    /// - the smallest shared reachable block id when both branches reconverge
+    /// - `exit_branch` when no shared successor exists inside the dominated region
+    fn find_loop_exit_block(
+        &self,
+        header: usize,
+        exit_branch: usize,
+        backedge_branch: usize,
+        cfg: &ControlFlowGraph,
+    ) -> usize {
+        let exit_reachable = self.forward_reachable_without_target(exit_branch, header, cfg);
+        let backedge_reachable =
+            self.forward_reachable_without_target(backedge_branch, header, cfg);
+
+        exit_reachable
+            .intersection(&backedge_reachable)
+            .copied()
+            .min()
+            .unwrap_or(exit_branch)
+    }
+
+    /// Finds the structured exit block for a CFG block that acts like a loop header.
+    ///
+    /// This is the entry point used when region walking encounters a later block that should be
+    /// emitted as a recovered loop before continuing with the surrounding function body.
+    ///
+    /// Returns:
+    /// - `Some(exit_block)` when exactly one conditional successor behaves like the loop backedge
+    /// - `None` when the header does not have a recoverable while-loop shape
+    fn loop_header_exit_block(&self, header: usize, cfg: &ControlFlowGraph) -> Option<usize> {
+        let block = cfg.blocks.get(header)?;
+        match &block.exit {
+            BlockExit::CondJump {
+                then_block,
+                else_block,
+                ..
+            } => {
+                let then_backedges = self.branch_has_plain_backedge(*then_block, header, cfg);
+                let else_backedges = self.branch_has_plain_backedge(*else_block, header, cfg);
+                if then_backedges == else_backedges {
+                    return None;
+                }
+                let (loop_block, exit_branch) = if then_backedges {
+                    (*then_block, *else_block)
+                } else {
+                    (*else_block, *then_block)
+                };
+                Some(self.find_loop_exit_block(header, exit_branch, loop_block, cfg))
+            }
+            _ => None,
+        }
+    }
+
+    /// Finds the innermost loop header that dominates `block`.
+    ///
+    /// Nested loop recovery needs to know which surrounding loop a conditional belongs to. Using
+    /// the nearest dominating header lets us distinguish exits from the current inner region from
+    /// branches that merely continue an enclosing loop.
+    ///
+    /// Returns:
+    /// - `Some(header)` for the closest dominating loop header
+    /// - `None` when `block` is not nested inside any recoverable loop header
+    fn nearest_dominating_loop_header(
+        &self,
+        block: usize,
+        cfg: &ControlFlowGraph,
+    ) -> Option<usize> {
+        let mut best = None;
+
+        for candidate in 0..cfg.blocks.len() {
+            if candidate == block || !self.is_loop_header(candidate, cfg) {
+                continue;
+            }
+            if !cfg.dominates(candidate, block) {
+                continue;
+            }
+            match best {
+                Some(current_best) if !cfg.dominates(current_best, candidate) => {}
+                _ => best = Some(candidate),
+            }
+        }
+
+        best
+    }
+
+    /// Returns whether `start` is just an empty jump chain back to `target`.
+    ///
+    /// The nested-loop exit heuristic uses this to distinguish a real loop-body tail from a
+    /// synthetic `continue` edge. If the branch contains assignments, calls, or another
+    /// conditional split before re-entering the loop header, we must keep structuring that
+    /// branch as part of the loop body instead of collapsing the current condition into
+    /// `if cond then break end`.
+    ///
+    /// Returns:
+    /// - `true` when every block reachable from `start` before `target` is empty and advances
+    ///   through a single unconditional edge toward `target`
+    /// - `false` when the branch has executable statements, another conditional, or exits
+    ///   somewhere other than `target`
+    fn branch_is_trivial_continue(
+        &self,
+        start: usize,
+        target: usize,
+        cfg: &ControlFlowGraph,
+    ) -> bool {
+        let mut stack = vec![start];
+        let mut seen = HashSet::new();
+
+        while let Some(block) = stack.pop() {
+            if block == target || !seen.insert(block) {
+                continue;
+            }
+
+            let Some(branch_block) = cfg.blocks.get(block) else {
+                return false;
+            };
+            if !branch_block.stmts.is_empty() {
+                return false;
+            }
+
+            match branch_block.exit {
+                BlockExit::Jump(next) | BlockExit::Fallthrough(next) => {
+                    if next != target && cfg.dominates(target, next) {
+                        stack.push(next);
+                    } else if next != target {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+
+        true
+    }
+
+    /// Inlines a trailing temporary assignment into `condition` when it is only used there.
+    ///
+    /// Luau often materializes a boolean or comparison result into a temporary register just before
+    /// a branch. Keeping that assignment in the structured output produces noisy patterns like
+    /// `local t = a < b; if t then`. Folding it back into the condition recovers the more natural
+    /// source form.
+    ///
+    /// Returns:
+    /// - the original `condition` when the last statement does not define a usable temporary
+    /// - a rewritten condition with the temporary substituted, after removing the trailing
+    ///   assignment or local declaration from `stmts`
+    fn fold_trailing_condition_temp(&mut self, stmts: &mut Vec<Stmt>, condition: Expr) -> Expr {
+        let Some((name, value, was_local_decl)) = stmts.last().and_then(|stmt| match stmt {
+            Stmt::LocalDeclaration { names, values } if names.len() == 1 && values.len() == 1 => {
+                Some((names[0].clone(), values[0].clone(), true))
+            }
+            Stmt::Assignment {
+                lhs: Expr::Name(name),
+                rhs,
+            } => Some((name.clone(), rhs.clone(), false)),
+            _ => None,
+        }) else {
+            return condition;
+        };
+
+        if !expr_mentions_name(&condition, &name) {
+            return condition;
+        }
+
+        stmts.pop();
+        if was_local_decl {
+            self.scopes.remove_var(&name);
+        }
+        replace_name_in_expr(condition, &name, &value)
+    }
+
     /// Resolves an upvalue expression in the current function context.
     #[inline]
     fn resolve_upvalue_expr(&self, up: u8) -> Expr {
@@ -334,6 +763,14 @@ impl<'a> HilWalker<'a> {
             })
     }
 
+    /// Advances the synthetic lifetime version for `reg`.
+    ///
+    /// When a register is reused after a captured local is still visible, the printer needs a fresh
+    /// synthetic name so the new binding does not alias the old captured one. Bumping the version
+    /// changes the `LocalBindingKey` used by `local_ident`.
+    ///
+    /// Returns:
+    /// - nothing; the synthetic version map is updated in place for `reg`
     fn fresh_synthetic_binding(&mut self, reg: u8) {
         let version = self.synthetic_versions.entry(reg).or_insert(0);
         *version += 1;
@@ -374,6 +811,15 @@ impl<'a> HilWalker<'a> {
         candidate
     }
 
+    /// Chooses a fresh local name for a captured-by-value snapshot.
+    ///
+    /// Snapshot locals are emitted in the parent scope immediately before closure creation. They
+    /// must avoid colliding with already-used names and with any names reserved by the destination
+    /// closure binding so the generated source stays readable and unambiguous.
+    ///
+    /// Returns:
+    /// - a unique identifier derived from the captured value when possible
+    /// - a fallback `_cap...`-style identifier when the captured value has no obvious base name
     fn fresh_capture_ident(&mut self, value: &Expr, reserved_names: &[Identifier]) -> Identifier {
         let base = match value {
             Expr::Name(name) => format!("{}_l0", name.as_str()),
@@ -403,12 +849,16 @@ impl<'a> HilWalker<'a> {
 
     /// Prepares parent-scope statements and upvalue expressions for a closure literal.
     ///
-    /// For `CAPTURE VAL`, we emit `local snapshot = current_value` before the closure and pass
-    /// `snapshot` into the child. For `CAPTURE REF`/upvalues we can pass the expression directly.
+    /// For ordinary `CAPTURE VAL`, we emit `local snapshot = current_value` before the closure
+    /// and pass `snapshot` into the child so the nested function sees the pre-closure value.
+    /// When Luau captures the destination local of the closure being assigned, however, the
+    /// capture is the closure's own binding, not the register's previous value, so we reuse the
+    /// final local name directly instead of snapshotting stale data like an overwritten callee.
     fn prepare_closure_captures(
         &mut self,
         captures: Vec<HilExpr>,
         reserved_names: &[Identifier],
+        closure_target: Option<(u8, Identifier)>,
     ) -> PreparedClosureCaptures {
         let mut prepared = PreparedClosureCaptures {
             prologue: Vec::new(),
@@ -418,6 +868,14 @@ impl<'a> HilWalker<'a> {
         for capture in captures {
             match capture {
                 HilExpr::CaptureValue(expr) => {
+                    if let Some((target_reg, target_ident)) = closure_target.as_ref()
+                        && matches!(expr.as_ref(), HilExpr::Local(reg) if reg == target_reg)
+                    {
+                        self.captured_names.insert(target_ident.clone());
+                        prepared.captures.push(Expr::Name(target_ident.clone()));
+                        continue;
+                    }
+
                     let value = self.walk_expr(*expr);
                     let ident = self.fresh_capture_ident(&value, reserved_names);
                     let scope = self
@@ -471,6 +929,7 @@ impl<'a> HilWalker<'a> {
                                 proto,
                                 captures,
                                 std::slice::from_ref(&ident),
+                                Some((reg, ident.clone())),
                             ),
                             other => LoweredClosureExpr {
                                 prologue: Vec::new(),
@@ -564,11 +1023,22 @@ impl<'a> HilWalker<'a> {
         }
     }
 
+    /// Lowers a HIL closure expression into parent-scope setup statements plus an AST closure.
+    ///
+    /// Closure lowering is more than recursively structuring the child proto: it also has to map
+    /// captures into the child context, reserve names so upvalues are not shadowed, and guard
+    /// against recursive proto descent when a closure references itself.
+    ///
+    /// Returns:
+    /// - a `LoweredClosureExpr` containing parent-scope prologue statements for capture setup
+    /// - an `Expr::AnonymousFunction` for the closure body, or an empty fallback closure when the
+    ///   child proto cannot be safely descended into
     fn walk_closure_expr(
         &mut self,
         proto_idx: usize,
         captures: Vec<HilExpr>,
         reserved_names: &[Identifier],
+        closure_target: Option<(u8, Identifier)>,
     ) -> LoweredClosureExpr {
         let Some(proto) = self.protos.get(proto_idx) else {
             return LoweredClosureExpr {
@@ -582,7 +1052,7 @@ impl<'a> HilWalker<'a> {
         let PreparedClosureCaptures {
             prologue: capture_prologue,
             captures: mapped_captures,
-        } = self.prepare_closure_captures(captures, reserved_names);
+        } = self.prepare_closure_captures(captures, reserved_names, closure_target);
 
         if self.active_proto_stack.contains(&proto_idx) {
             if verbose_enabled() {
@@ -714,7 +1184,7 @@ impl<'a> HilWalker<'a> {
             HilExpr::Global(name) => Expr::Name(name.into()),
             HilExpr::Upval(up) => self.resolve_upvalue_expr(up),
             HilExpr::Closure { proto, captures } => {
-                self.walk_closure_expr(proto, captures, &[]).expr
+                self.walk_closure_expr(proto, captures, &[], None).expr
             }
             // this is a hack but the import thing is just really retarded
             HilExpr::Import(im) => Expr::Name(im.into()),
@@ -798,6 +1268,7 @@ impl<'a> HilWalker<'a> {
         let mut curr_id = current;
         let mut visited_in_region = HashSet::new();
         let mut block_stmt_starts = HashMap::new();
+        let mut emitted_explicit_loop = false;
         let is_loop_header = self.is_loop_header(current, cfg);
 
         self.scopes.push_scope();
@@ -812,11 +1283,6 @@ impl<'a> HilWalker<'a> {
 
         // Keep walking until we hit the stop block, or run out of graph
         while Some(curr_id) != stop_at && curr_id < cfg.blocks.len() {
-            if curr_id != current && self.is_loop_header(curr_id, cfg) {
-                stmts.extend(self.structure_region(curr_id, stop_at, cfg));
-                break;
-            }
-
             if !visited_in_region.insert(curr_id) {
                 if curr_id == current && !stmts.is_empty() {
                     let body = std::mem::take(&mut stmts);
@@ -875,7 +1341,9 @@ impl<'a> HilWalker<'a> {
             match &block.exit {
                 BlockExit::Fallthrough(next) | BlockExit::Jump(next) => {
                     if *next < current && cfg.dominates(*next, curr_id) {
-                        stmts.push(Stmt::Continue);
+                        if is_loop_header || stop_at.is_some() {
+                            stmts.push(Stmt::Continue);
+                        }
                         break;
                     }
                     if *next < curr_id
@@ -890,6 +1358,24 @@ impl<'a> HilWalker<'a> {
                         });
                         break;
                     }
+                    if !is_loop_header && *next > curr_id && self.is_loop_header(*next, cfg) {
+                        if let Some(loop_exit) = self.loop_header_exit_block(*next, cfg) {
+                            stmts.extend(self.structure_region(*next, Some(loop_exit), cfg));
+                            curr_id = loop_exit;
+                            continue;
+                        }
+                        stmts.extend(self.structure_region(*next, stop_at, cfg));
+                        break;
+                    }
+                    if *next > curr_id
+                        && *next != current
+                        && self.is_loop_header(*next, cfg)
+                        && let Some(loop_exit) = self.loop_header_exit_block(*next, cfg)
+                    {
+                        stmts.extend(self.structure_region(*next, Some(loop_exit), cfg));
+                        curr_id = loop_exit;
+                        continue;
+                    }
                     curr_id = *next;
                 }
 
@@ -898,6 +1384,194 @@ impl<'a> HilWalker<'a> {
                     then_block,
                     else_block,
                 } => {
+                    let block_stmt_start = block_stmt_starts
+                        .get(&curr_id)
+                        .copied()
+                        .unwrap_or(stmts.len());
+                    let then_backedges = self.branch_has_plain_backedge(*then_block, curr_id, cfg);
+                    let else_backedges = self.branch_has_plain_backedge(*else_block, curr_id, cfg);
+                    if then_backedges != else_backedges {
+                        let (loop_block, exit_branch, exit_is_then) = if then_backedges {
+                            (*then_block, *else_block, false)
+                        } else {
+                            (*else_block, *then_block, true)
+                        };
+                        let exit_block = if exit_is_then {
+                            self.find_loop_exit_block(curr_id, exit_branch, loop_block, cfg)
+                        } else {
+                            self.find_loop_exit_block(curr_id, exit_branch, loop_block, cfg)
+                        };
+                        let mut loop_prefix = stmts.split_off(block_stmt_start);
+                        let mut continue_condition = self.walk_expr(cond.clone());
+                        if exit_is_then {
+                            continue_condition = invert_condition(continue_condition);
+                        }
+
+                        if loop_prefix.is_empty() {
+                            continue_condition = self
+                                .fold_trailing_condition_temp(&mut loop_prefix, continue_condition);
+                            let mut body_stmts =
+                                self.structure_region(loop_block, Some(curr_id), cfg);
+                            strip_terminal_continue(&mut body_stmts);
+                            stmts.push(Stmt::While {
+                                condition: continue_condition,
+                                body: Block::with_stmts(body_stmts),
+                            });
+                            emitted_explicit_loop = true;
+                            curr_id = exit_block;
+                            continue;
+                        }
+
+                        let mut exit_condition = self.walk_expr(cond.clone());
+                        if !exit_is_then {
+                            exit_condition = invert_condition(exit_condition);
+                        }
+                        exit_condition =
+                            self.fold_trailing_condition_temp(&mut loop_prefix, exit_condition);
+
+                        let mut exit_stmts =
+                            self.structure_region(exit_branch, Some(exit_block), cfg);
+                        let mut body_stmts =
+                            self.structure_region(loop_block, Some(curr_id), cfg);
+                        ensure_terminal_break(&mut exit_stmts);
+                        strip_terminal_continue(&mut body_stmts);
+
+                        loop_prefix.push(Stmt::If {
+                            condition: exit_condition,
+                            then_body: Block::with_stmts(exit_stmts),
+                            else_body: if body_stmts.is_empty() {
+                                None
+                            } else {
+                                Some(Block::with_stmts(body_stmts))
+                            },
+                        });
+                        stmts.push(Stmt::While {
+                            condition: Expr::Literal(Literal::Bool(true)),
+                            body: Block::with_stmts(loop_prefix),
+                        });
+                        emitted_explicit_loop = true;
+                        curr_id = exit_block;
+                        continue;
+                    }
+
+                    let then_back_to_region_start = current != curr_id
+                        && self.branch_has_plain_backedge(*then_block, current, cfg);
+                    let else_back_to_region_start = current != curr_id
+                        && self.branch_has_plain_backedge(*else_block, current, cfg);
+                    let then_continues_to_region_start =
+                        current != curr_id && self.branch_is_trivial_continue(*then_block, current, cfg);
+                    let else_continues_to_region_start =
+                        current != curr_id && self.branch_is_trivial_continue(*else_block, current, cfg);
+                    if self.is_loop_header(current, cfg)
+                        && then_continues_to_region_start != else_continues_to_region_start
+                    {
+                        let (next_block, should_invert_condition) = if then_continues_to_region_start {
+                            (*else_block, false)
+                        } else {
+                            (*then_block, true)
+                        };
+
+                        let mut continue_condition = self.walk_expr(cond.clone());
+                        if should_invert_condition {
+                            continue_condition = invert_condition(continue_condition);
+                        }
+                        continue_condition =
+                            self.fold_trailing_condition_temp(&mut stmts, continue_condition);
+                        stmts.push(Stmt::If {
+                            condition: continue_condition,
+                            then_body: Block::with_stmts(vec![Stmt::Continue]),
+                            else_body: None,
+                        });
+                        curr_id = next_block;
+                        continue;
+                    }
+                    if then_back_to_region_start != else_back_to_region_start {
+                        let (exit_block, should_invert_condition) = if then_back_to_region_start {
+                            (*else_block, true)
+                        } else {
+                            (*then_block, false)
+                        };
+
+                        let mut exit_condition = self.walk_expr(cond.clone());
+                        if should_invert_condition {
+                            exit_condition = invert_condition(exit_condition);
+                        }
+                        exit_condition =
+                            self.fold_trailing_condition_temp(&mut stmts, exit_condition);
+                        stmts.push(Stmt::If {
+                            condition: exit_condition,
+                            then_body: Block::with_stmts(vec![Stmt::Break]),
+                            else_body: None,
+                        });
+                        stmts = vec![Stmt::While {
+                            condition: Expr::Literal(Literal::Bool(true)),
+                            body: Block::with_stmts(stmts),
+                        }];
+                        emitted_explicit_loop = true;
+                        curr_id = exit_block;
+                        continue;
+                    }
+
+                    if let Some(loop_header) = self.nearest_dominating_loop_header(curr_id, cfg) {
+                        let then_back_to_loop =
+                            self.branch_has_plain_backedge(*then_block, loop_header, cfg);
+                        let else_back_to_loop =
+                            self.branch_has_plain_backedge(*else_block, loop_header, cfg);
+                        let then_is_trivial_continue =
+                            self.branch_is_trivial_continue(*then_block, loop_header, cfg);
+                        let else_is_trivial_continue =
+                            self.branch_is_trivial_continue(*else_block, loop_header, cfg);
+                        if curr_id != loop_header
+                            && then_back_to_loop != else_back_to_loop
+                            && (then_is_trivial_continue || else_is_trivial_continue)
+                            && !(then_back_to_region_start != else_back_to_region_start)
+                        {
+                            let mut exit_condition = self.walk_expr(cond.clone());
+                            if then_back_to_loop {
+                                exit_condition = invert_condition(exit_condition);
+                            }
+                            exit_condition =
+                                self.fold_trailing_condition_temp(&mut stmts, exit_condition);
+                            stmts.push(Stmt::If {
+                                condition: exit_condition,
+                                then_body: Block::with_stmts(vec![Stmt::Break]),
+                                else_body: None,
+                            });
+                            break;
+                        }
+                    }
+
+                    if let Some(stop_block) = stop_at {
+                        let then_hits_stop = *then_block == stop_block;
+                        let else_hits_stop = *else_block == stop_block;
+                        if then_hits_stop != else_hits_stop
+                            && let Some(loop_header) =
+                                self.nearest_dominating_loop_header(curr_id, cfg)
+                        {
+                            let loop_branch = if then_hits_stop {
+                                *else_block
+                            } else {
+                                *then_block
+                            };
+                            if self.branch_has_plain_backedge(loop_branch, loop_header, cfg)
+                                && self.branch_is_trivial_continue(loop_branch, loop_header, cfg)
+                            {
+                                let mut exit_condition = self.walk_expr(cond.clone());
+                                if else_hits_stop {
+                                    exit_condition = invert_condition(exit_condition);
+                                }
+                                exit_condition =
+                                    self.fold_trailing_condition_temp(&mut stmts, exit_condition);
+                                stmts.push(Stmt::If {
+                                    condition: exit_condition,
+                                    then_body: Block::with_stmts(vec![Stmt::Break]),
+                                    else_body: None,
+                                });
+                                break;
+                            }
+                        }
+                    }
+
                     let merge_block = find_if_else_join(*then_block, *else_block, cfg);
                     if verbose_enabled() {
                         let current_proto = self.active_proto_stack.last().copied();
@@ -910,7 +1584,13 @@ impl<'a> HilWalker<'a> {
                     let else_stmts = self.structure_region(*else_block, merge_block, cfg);
                     let mut then_stmts = then_stmts;
                     let mut else_stmts = else_stmts;
-                    self.hoist_matching_branch_locals(&mut stmts, &mut then_stmts, &mut else_stmts);
+                    if merge_block.is_some() {
+                        self.hoist_matching_branch_locals(
+                            &mut stmts,
+                            &mut then_stmts,
+                            &mut else_stmts,
+                        );
+                    }
                     if then_stmts.is_empty() && else_stmts.is_empty() {
                         if let Some(m) = merge_block {
                             curr_id = m;
@@ -1035,7 +1715,11 @@ impl<'a> HilWalker<'a> {
             }
         }
 
-        if is_loop_header && !stmts.is_empty() && !matches!(stmts.as_slice(), [Stmt::While { .. }])
+        if is_loop_header
+            && !emitted_explicit_loop
+            && !stmts.is_empty()
+            && !stmts_are_break_guard_only(&stmts)
+            && !matches!(stmts.as_slice(), [Stmt::While { .. }])
         {
             stmts = vec![Stmt::While {
                 condition: Expr::Literal(Literal::Bool(true)),
@@ -1491,6 +2175,70 @@ mod tests {
             &closure_body.stmts[0],
             AstStmt::Return { values }
                 if matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == snapshot_name)
+        ));
+    }
+
+    #[test]
+    fn structure_self_capture_value_uses_closure_binding() {
+        let parent_cfg = ControlFlowGraph::new(
+            vec![HilBlock {
+                id: 0,
+                stmts: vec![
+                    HilStmt::Assign {
+                        left: HilExpr::Local(3),
+                        value: HilExpr::Global("unpack".to_string()),
+                    },
+                    HilStmt::Assign {
+                        left: HilExpr::Local(3),
+                        value: HilExpr::Closure {
+                            proto: 1,
+                            captures: vec![HilExpr::CaptureValue(Box::new(HilExpr::Local(3)))],
+                        },
+                    },
+                ],
+                exit: BlockExit::Return(vec![HilExpr::Local(3)]),
+            }],
+            0,
+        );
+        let child_cfg = ControlFlowGraph::new(
+            vec![HilBlock {
+                id: 0,
+                stmts: vec![],
+                exit: BlockExit::Return(vec![HilExpr::Upval(0)]),
+            }],
+            0,
+        );
+
+        let child_proto = Proto {
+            num_upvals: 1,
+            ..Proto::default()
+        };
+        let ast = structure(
+            &[parent_cfg, child_cfg],
+            0,
+            &[Proto::default(), child_proto],
+        );
+
+        let closure_body = ast
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                AstStmt::Assignment { lhs, rhs }
+                    if matches!(lhs, AstExpr::Name(name) if name.as_str() == "v3") =>
+                {
+                    match rhs {
+                        AstExpr::AnonymousFunction { body, .. } => Some(body),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("expected self-referential closure assignment for v3");
+
+        assert!(matches!(
+            &closure_body.stmts[0],
+            AstStmt::Return { values }
+                if matches!(values.as_slice(), [AstExpr::Name(name)] if name.as_str() == "v3")
         ));
     }
 
@@ -2104,7 +2852,7 @@ mod tests {
             then_body,
             else_body: Some(else_body),
             ..
-        } = &ast.stmts[2]
+        } = &ast.stmts[1]
         else {
             panic!("expected if after generic for");
         };
@@ -2161,4 +2909,193 @@ mod tests {
             _ => panic!("expected while loop"),
         }
     }
+
+    #[test]
+    fn structure_conditional_backedge_as_while_without_pulling_in_preheader() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                HilBlock {
+                    id: 0,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(0),
+                        value: HilExpr::Number(4.0),
+                    }],
+                    exit: BlockExit::Fallthrough(1),
+                },
+                HilBlock {
+                    id: 1,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(2),
+                        value: HilExpr::Local(0),
+                    }],
+                    exit: BlockExit::CondJump {
+                        cond: HilExpr::Binary(
+                            crate::ast::BinOp::Eq,
+                            Box::new(HilExpr::Local(2)),
+                            Box::new(HilExpr::Number(0.0)),
+                        ),
+                        then_block: 3,
+                        else_block: 2,
+                    },
+                },
+                HilBlock {
+                    id: 2,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(0),
+                        value: HilExpr::Binary(
+                            crate::ast::BinOp::Sub,
+                            Box::new(HilExpr::Local(0)),
+                            Box::new(HilExpr::Number(1.0)),
+                        ),
+                    }],
+                    exit: BlockExit::Jump(1),
+                },
+                HilBlock {
+                    id: 3,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(4),
+                        value: HilExpr::Local(0),
+                    }],
+                    exit: BlockExit::Return(vec![HilExpr::Local(4)]),
+                },
+            ],
+            0,
+        );
+
+        let ast = structure(&[cfg], 0, &[Proto::default()]);
+        assert!(matches!(
+            &ast.stmts[0],
+            AstStmt::LocalDeclaration { names, values }
+                if matches!(names.as_slice(), [name] if name.as_str() == "v0")
+                    && matches!(values.as_slice(), [AstExpr::Literal(crate::ast::Literal::Number(n))] if *n == 4.0)
+        ));
+        match &ast.stmts[1] {
+            AstStmt::While { condition, body } => {
+                let header_tested = matches!(
+                    condition,
+                    AstExpr::Binary { lhs, op: crate::ast::BinOp::Ne, rhs }
+                        if matches!(lhs.as_ref(), AstExpr::Name(name) if name.as_str() == "v0")
+                            && matches!(rhs.as_ref(), AstExpr::Literal(crate::ast::Literal::Number(n)) if *n == 0.0)
+                ) || matches!(
+                    condition,
+                    AstExpr::Unary { op: crate::ast::UnOp::Not, expr }
+                        if matches!(expr.as_ref(), AstExpr::Binary { lhs, op: crate::ast::BinOp::Eq, rhs }
+                            if matches!(lhs.as_ref(), AstExpr::Name(name) if name.as_str() == "v0")
+                                && matches!(rhs.as_ref(), AstExpr::Literal(crate::ast::Literal::Number(n)) if *n == 0.0))
+                );
+                let post_tested = matches!(
+                    condition,
+                    AstExpr::Literal(crate::ast::Literal::Bool(true))
+                ) && matches!(
+                    body.stmts.as_slice(),
+                    [AstStmt::If { condition, then_body, else_body: Some(else_body) }]
+                        if matches!(
+                            condition,
+                            AstExpr::Binary { lhs, op: crate::ast::BinOp::Eq, rhs }
+                                if matches!(lhs.as_ref(), AstExpr::Name(name) if name.as_str() == "v0")
+                                    && matches!(rhs.as_ref(), AstExpr::Literal(crate::ast::Literal::Number(n)) if *n == 0.0)
+                        )
+                            && matches!(then_body.stmts.as_slice(), [AstStmt::Break])
+                            && matches!(
+                                else_body.stmts.as_slice(),
+                                [AstStmt::Assignment { lhs, rhs }]
+                                    if matches!(lhs, AstExpr::Name(name) if name.as_str() == "v0")
+                                        && matches!(rhs, AstExpr::Binary { op: crate::ast::BinOp::Sub, .. })
+                            )
+                );
+                assert!(header_tested || post_tested);
+            }
+            _ => panic!("expected while loop"),
+        }
+    }
+
+    #[test]
+    fn structure_ignores_outer_for_backedge_when_recovering_inner_while() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                HilBlock {
+                    id: 0,
+                    stmts: vec![
+                        HilStmt::Assign {
+                            left: HilExpr::Local(6),
+                            value: HilExpr::Number(1.0),
+                        },
+                        HilStmt::Assign {
+                            left: HilExpr::Local(4),
+                            value: HilExpr::Number(3.0),
+                        },
+                        HilStmt::Assign {
+                            left: HilExpr::Local(5),
+                            value: HilExpr::Number(1.0),
+                        },
+                    ],
+                    exit: BlockExit::ForNPrep {
+                        base: 4,
+                        loop_block: 5,
+                    },
+                },
+                HilBlock {
+                    id: 1,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(7),
+                        value: HilExpr::Local(6),
+                    }],
+                    exit: BlockExit::CondJump {
+                        cond: HilExpr::Local(7),
+                        then_block: 4,
+                        else_block: 2,
+                    },
+                },
+                HilBlock {
+                    id: 2,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(6),
+                        value: HilExpr::Binary(
+                            crate::ast::BinOp::Sub,
+                            Box::new(HilExpr::Local(6)),
+                            Box::new(HilExpr::Number(1.0)),
+                        ),
+                    }],
+                    exit: BlockExit::Fallthrough(3),
+                },
+                HilBlock {
+                    id: 3,
+                    stmts: vec![],
+                    exit: BlockExit::Jump(1),
+                },
+                HilBlock {
+                    id: 4,
+                    stmts: vec![HilStmt::Assign {
+                        left: HilExpr::Local(8),
+                        value: HilExpr::Local(6),
+                    }],
+                    exit: BlockExit::Fallthrough(5),
+                },
+                HilBlock {
+                    id: 5,
+                    stmts: vec![],
+                    exit: BlockExit::ForNLoop {
+                        base: 4,
+                        body_block: 1,
+                        exit_block: 6,
+                    },
+                },
+                HilBlock {
+                    id: 6,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![HilExpr::Local(8)]),
+                },
+            ],
+            0,
+        );
+
+        let ast = structure(&[cfg], 0, &[Proto::default()]);
+
+        let AstStmt::NumericFor { body, .. } = &ast.stmts[0] else {
+            panic!("expected numeric for");
+        };
+
+        assert!(matches!(body.stmts.first(), Some(AstStmt::While { .. })));
+    }
+
 }

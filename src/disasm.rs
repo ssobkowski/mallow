@@ -58,7 +58,7 @@ impl FromLeBytes for String {
 
         let mut buf = vec![0; len];
         cursor.read_exact(&mut buf).map_err(DisasmError::IoError)?;
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+        Ok(buf.into_iter().map(char::from).collect())
     }
 }
 

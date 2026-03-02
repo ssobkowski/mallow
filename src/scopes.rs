@@ -62,6 +62,14 @@ impl Scope {
         }
     }
 
+    /// Removes a variable from this scope entirely.
+    #[inline]
+    pub fn remove_var(&mut self, name: &Identifier) -> bool {
+        let len_before = self.variables.len();
+        self.variables.retain(|var| var.name != *name);
+        self.variables.len() != len_before
+    }
+
     /// Clears aliases that depend on the given identifier.
     #[inline]
     pub fn invalidate_references_to(&mut self, name: &Identifier) {
@@ -157,6 +165,15 @@ impl ScopeManager {
     pub fn kill_var(&mut self, name: &Identifier) {
         for scope in self.scopes.iter_mut().rev() {
             if scope.kill_var(name) {
+                return;
+            }
+        }
+    }
+
+    /// Removes the nearest matching variable from visible scopes.
+    pub fn remove_var(&mut self, name: &Identifier) {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.remove_var(name) {
                 return;
             }
         }

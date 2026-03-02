@@ -492,7 +492,9 @@ fn unary_symbol(op: &UnOp) -> &'static str {
 
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
-    for byte in s.bytes() {
+    for ch in s.chars() {
+        let code = u32::from(ch);
+        let byte = u8::try_from(code).unwrap_or(b'?');
         match byte {
             b'\\' => out.push_str("\\\\"),
             b'\n' => out.push_str("\\n"),
@@ -510,4 +512,15 @@ fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape;
+
+    #[test]
+    fn escape_preserves_high_byte_values() {
+        let value: String = [b'A', 0x80, 0xFF].into_iter().map(char::from).collect();
+        assert_eq!(escape(&value), "A\\128\\255");
+    }
 }

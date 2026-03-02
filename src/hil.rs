@@ -384,6 +384,25 @@ fn merge_target_from(start: usize, cfg: &ControlFlowGraph) -> Option<usize> {
     while seen.insert(current) {
         let block = cfg.blocks.get(current)?;
         match block.exit {
+            BlockExit::CondJump {
+                then_block,
+                else_block,
+                ..
+            } => {
+                let then_target = merge_target_from(then_block, cfg);
+                let else_target = merge_target_from(else_block, cfg);
+
+                return match (then_target, else_target) {
+                    (Some(a), Some(b)) if a == b && a != then_block && a != else_block => Some(a),
+                    (Some(target), _) if target == else_block && then_block != else_block => {
+                        Some(else_block)
+                    }
+                    (_, Some(target)) if target == then_block && then_block != else_block => {
+                        Some(then_block)
+                    }
+                    _ => None,
+                };
+            }
             BlockExit::Fallthrough(next)
                 if next == current + 1 && cfg.predecessors(next).len() <= 1 =>
             {
@@ -982,13 +1001,19 @@ fn snapshot_table_value(stmts: &[Stmt], expr: Expr) -> Expr {
 }
 
 /// Returns true when an instruction can appear between a pending MULTRET and its consumer.
+///
+/// This keeps deferred call/vararg sources alive across instructions that do not mutate the
+/// variadic register sequence or otherwise force it to materialize yet. We need this because
+/// Luau can insert bookkeeping opcodes such as `CLOSEUPVALS` between a variadic call and the
+/// eventual `RETURN`, and flushing there would turn `return f()()` into `f()(); return tmp`.
 fn instr_preserves_pending_multret(instr: &Instr, pending_src_reg: u8) -> bool {
     match instr {
         Instr::FastCall1 { .. }
         | Instr::FastCall2 { .. }
         | Instr::FastCall2K { .. }
         | Instr::FastCall3 { .. }
-        | Instr::FastCall { .. } => true,
+        | Instr::FastCall { .. }
+        | Instr::CloseUpvals { .. } => true,
         Instr::GetImport { dest, .. }
         | Instr::GetGlobal { dest, .. }
         | Instr::GetUpval { dest, .. }
@@ -1573,6 +1598,7 @@ fn lift_with_context(
                 count,
                 index,
             } => {
+                let values_are_variadic = decoded_count(*count).is_none();
                 let mut values = match decoded_count(*count) {
                     Some(n) => local_range(*base, n),
                     None => take_variadic_multret_values(&mut pending_multret_call, *base)
@@ -1611,10 +1637,12 @@ fn lift_with_context(
                         // pad with nils if the table is shorter than the insertion index
                         items.resize(*index as usize - 1, Expr::Nil);
                     }
-                    values = values
-                        .into_iter()
-                        .map(|value| snapshot_table_value(&stmts, value))
-                        .collect();
+                    if !values_are_variadic {
+                        values = values
+                            .into_iter()
+                            .map(|value| snapshot_table_value(&stmts, value))
+                            .collect();
+                    }
                     items.append(&mut values);
                     stmts.push(Stmt::Assign {
                         left: Expr::Local(*table),
@@ -1766,6 +1794,11 @@ fn build_cfg_with_context(
 
     for (i, instr) in instrs.iter().enumerate() {
         match instr {
+            Instr::Return { .. } => {
+                if i + 1 < instrs.len() {
+                    entries.insert(i + 1); // unreachable tail after return still starts a new block
+                }
+            }
             Instr::FornPrep { offset, .. }
             | Instr::ForgPrep { offset, .. }
             | Instr::ForgPrepInext { offset, .. }
@@ -2603,6 +2636,41 @@ mod tests {
     }
 
     #[test]
+    fn lift_return_keeps_pending_multret_through_closeupvals() {
+        let instrs = vec![
+            Instr::Move { dest: 6, src: 5 },
+            Instr::Move { dest: 7, src: 1 },
+            Instr::Call {
+                func: 6,
+                arg_count: 2,
+                ret_count: 2,
+            },
+            Instr::Call {
+                func: 6,
+                arg_count: 1,
+                ret_count: 0,
+            },
+            Instr::CloseUpvals { reg: 2 },
+            Instr::Return { base: 6, count: 0 },
+        ];
+
+        let stmts = lift(&instrs, &[]);
+        assert_eq!(stmts.len(), 4);
+
+        match &stmts[3] {
+            Stmt::Return(values) => {
+                assert_eq!(values.len(), 1);
+                assert!(matches!(
+                    &values[0],
+                    Expr::Call(func, args)
+                        if matches!(func.as_ref(), Expr::Local(6)) && args.is_empty()
+                ));
+            }
+            _ => panic!("expected nested zero-arg call to survive until RETURN"),
+        }
+    }
+
+    #[test]
     fn lift_return_keeps_fixed_prefix_values_before_pending_multret_call() {
         let instrs = vec![
             Instr::Call {
@@ -3419,6 +3487,33 @@ mod tests {
     }
 
     #[test]
+    fn build_cfg_splits_unreachable_tail_after_return() {
+        let instrs = vec![
+            Instr::LoadN { reg: 0, value: 1 },
+            Instr::Return { base: 0, count: 2 },
+            Instr::Return { base: 0, count: 0 },
+        ];
+
+        let cfg = build_cfg(&instrs, &[]);
+        assert_eq!(cfg.blocks.len(), 2);
+
+        assert!(cfg.blocks[0].stmts.iter().all(|stmt| {
+            !matches!(stmt, Stmt::Return(_))
+        }));
+        assert!(matches!(
+            cfg.blocks[0].exit,
+            BlockExit::Return(ref values)
+                if matches!(values.as_slice(), [Expr::Local(0)])
+        ));
+        assert!(cfg.blocks[1].stmts.is_empty());
+        assert!(matches!(
+            cfg.blocks[1].exit,
+            BlockExit::Return(ref values)
+                if matches!(values.as_slice(), [Expr::Local(0)])
+        ));
+    }
+
+    #[test]
     fn cfg_populates_successors_predecessors_and_dominators() {
         let instrs = vec![
             Instr::LoadB {
@@ -3575,6 +3670,45 @@ mod tests {
         );
 
         assert_eq!(find_if_else_join(1, 3, &cfg), Some(5));
+    }
+
+    #[test]
+    fn find_if_else_join_detects_nested_branch_prelude_merge() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                Block {
+                    id: 0,
+                    stmts: vec![],
+                    exit: BlockExit::CondJump {
+                        cond: Expr::Local(0),
+                        then_block: 1,
+                        else_block: 3,
+                    },
+                },
+                Block {
+                    id: 1,
+                    stmts: vec![],
+                    exit: BlockExit::CondJump {
+                        cond: Expr::Local(1),
+                        then_block: 3,
+                        else_block: 2,
+                    },
+                },
+                Block {
+                    id: 2,
+                    stmts: vec![],
+                    exit: BlockExit::Jump(3),
+                },
+                Block {
+                    id: 3,
+                    stmts: vec![],
+                    exit: BlockExit::Return(vec![]),
+                },
+            ],
+            0,
+        );
+
+        assert_eq!(find_if_else_join(1, 3, &cfg), Some(3));
     }
 
     #[test]
