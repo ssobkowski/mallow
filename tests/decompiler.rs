@@ -140,12 +140,29 @@ fn cases_root() -> PathBuf {
         .join("cases")
 }
 
+/// Returns the path to the `luau` executable.
+/// Checks the repo root first, then falls back to looking it up on PATH.
 fn luau_exe() -> PathBuf {
-    repo_root().join(exe_name("luau"))
+    find_external_exe("luau")
 }
 
+/// Returns the path to the `luau-compile` executable.
+/// Checks the repo root first, then falls back to looking it up on PATH.
 fn luau_compile_exe() -> PathBuf {
-    repo_root().join(exe_name("luau-compile"))
+    find_external_exe("luau-compile")
+}
+
+/// Resolves an external executable by name. First checks whether it exists in
+/// the repo root (for users who placed it there), and if not, returns just the
+/// bare executable name so the OS will resolve it from `PATH`.
+fn find_external_exe(stem: &str) -> PathBuf {
+    let local = repo_root().join(exe_name(stem));
+    if local.is_file() {
+        return local;
+    }
+
+    // Fall back to bare name — Command will search PATH for it.
+    PathBuf::from(exe_name(stem))
 }
 
 fn luaudec_exe() -> PathBuf {
