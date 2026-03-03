@@ -3,7 +3,7 @@ mod disasm;
 mod hil;
 mod il;
 mod logging;
-mod passes;
+// mod passes;
 mod printer;
 mod scopes;
 mod structurer;
@@ -113,7 +113,6 @@ fn main() {
                 &disassembled.protos,
             );
 
-            // let ast = passes::run_all(ast); CURRENTLY BROKEN; DO NOT UNCOMMENT
             let src = print(&ast);
 
             if let Err(e) = write_output(output, &src) {

@@ -1,61 +1,78 @@
-use crate::ast::{Expr, Identifier};
+use std::collections::HashMap;
+use std::hash::Hash;
 
+/// Represents a single lexical scope, tracking variable names and
+/// their associated values (if any).
 #[derive(Debug, Clone)]
-pub struct Var {
-    pub name: Identifier,
-    pub value: Option<Expr>,
+pub struct Scope<K: Hash + Eq, V> {
+    variables: HashMap<K, V>,
 }
 
-impl Var {
-    /// Creates a new variable with the given name and value.
-    #[inline]
-    pub fn new(name: Identifier, value: Option<Expr>) -> Self {
-        Var { name, value }
+impl<K: Hash + Eq, V> Default for Scope<K, V> {
+    fn default() -> Self {
+        Self {
+            variables: HashMap::new(),
+        }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Scope {
-    variables: Vec<Var>,
-}
-
-impl Scope {
+impl<K: Hash + Eq, V> Scope<K, V> {
     /// Creates a new empty scope.
     #[inline]
     pub fn new() -> Self {
-        Scope {
-            variables: Vec::new(),
+        Self::default()
+    }
+
+    /// Creates a new scope with the given variables.
+    #[inline]
+    pub fn with_vars(vars: impl IntoIterator<Item = (K, V)>) -> Self {
+        Self {
+            variables: vars.into_iter().collect(),
         }
     }
 
     /// Adds a variable to the scope.
     #[inline]
-    pub fn add_var(&mut self, var: Var) {
-        self.variables.push(var);
+    pub fn declare(&mut self, name: K, value: V) {
+        self.variables.insert(name, value);
     }
 
     /// Adds multiple variables to the scope.
     #[inline]
-    pub fn add_vars<T: IntoIterator<Item = Var>>(&mut self, iter: T) {
+    pub fn declare_many(&mut self, iter: impl IntoIterator<Item = (K, V)>) {
         self.variables.extend(iter);
     }
 
-    /// Updates a variable in the scope, if it exists.
-    /// If it does not exist, it will be added to the scope.
+    /// Gets a variable from the scope, if it exists.
     #[inline]
-    pub fn update_var(&mut self, var: Var) {
-        if let Some(existing_var) = self.variables.iter_mut().find(|v| v.name == var.name) {
-            *existing_var = var;
-        } else {
-            self.add_var(var);
-        }
+    #[must_use]
+    pub fn get(&self, name: &K) -> Option<&V> {
+        self.variables.get(name)
     }
 
-    /// Clears the tracked value for a variable in this scope.
+    /// Gets a variable from the scope mutably, if it exists.
     #[inline]
-    pub fn kill_var(&mut self, name: &Identifier) -> bool {
-        if let Some(existing_var) = self.variables.iter_mut().find(|v| v.name == *name) {
-            existing_var.value = None;
+    #[must_use]
+    pub fn get_mut(&mut self, name: &K) -> Option<&mut V> {
+        self.variables.get_mut(name)
+    }
+
+    /// Returns whether the scope contains a variable with the given name.
+    #[inline]
+    #[must_use]
+    pub fn contains(&self, name: &K) -> bool {
+        self.variables.contains_key(name)
+    }
+
+    /// Updates a variable in the scope, if it exists.
+    ///
+    /// # Returns
+    /// Whether a variable with the given name was found and updated.
+    #[inline]
+    #[must_use]
+    pub fn set(&mut self, name: &K, value: V) -> bool {
+        if let Some(v) = self.variables.get_mut(name) {
+            *v = value;
             true
         } else {
             false
@@ -63,68 +80,76 @@ impl Scope {
     }
 
     /// Removes a variable from this scope entirely.
+    ///
+    /// # Returns
+    /// Whether a variable with the given name was found and removed.
     #[inline]
-    pub fn remove_var(&mut self, name: &Identifier) -> bool {
-        let len_before = self.variables.len();
-        self.variables.retain(|var| var.name != *name);
-        self.variables.len() != len_before
-    }
-
-    /// Clears aliases that depend on the given identifier.
-    #[inline]
-    pub fn invalidate_references_to(&mut self, name: &Identifier) {
-        for var in &mut self.variables {
-            if matches!(var.value.as_ref(), Some(Expr::Name(alias)) if alias == name) {
-                var.value = None;
-            }
-        }
+    #[must_use]
+    pub fn remove(&mut self, name: &K) -> bool {
+        self.variables.remove(name).is_some()
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ScopeManager {
-    scopes: Vec<Scope>,
+pub struct ScopeManager<K: Hash + Eq, V> {
+    scopes: Vec<Scope<K, V>>,
 }
 
-impl ScopeManager {
+impl<K: Hash + Eq, V> Default for ScopeManager<K, V> {
+    fn default() -> Self {
+        Self { scopes: Vec::new() }
+    }
+}
+
+impl<K: Hash + Eq, V> ScopeManager<K, V> {
     /// Creates a new scope manager with no scopes.
     #[inline]
     pub fn new() -> Self {
-        ScopeManager { scopes: Vec::new() }
+        Self::default()
     }
 
     /// Pushes a new scope onto the stack.
     #[inline]
-    pub fn push_scope(&mut self) -> &mut Scope {
-        let scope = Scope::new();
-        self.scopes.push(scope);
-        self.scopes.last_mut().unwrap()
+    pub fn push_scope(&mut self) -> &mut Scope<K, V> {
+        self.scopes.push(Scope::new());
+        self.scopes.last_mut().expect("scope was just pushed")
     }
 
     /// Pushes a scope onto the stack with the given variables.
     #[inline]
-    pub fn push_scope_with(&mut self, vars: Vec<Var>) {
-        self.scopes.push(Scope { variables: vars });
+    pub fn push_scope_with(&mut self, vars: impl IntoIterator<Item = (K, V)>) -> &mut Scope<K, V> {
+        self.scopes.push(Scope::with_vars(vars));
+        self.scopes.last_mut().expect("scope was just pushed")
     }
 
     /// Gets the current scope, if it exists.
     #[inline]
-    pub fn top_scope(&mut self) -> Option<&mut Scope> {
+    pub fn top_scope(&self) -> Option<&Scope<K, V>> {
+        self.scopes.last()
+    }
+
+    /// Gets the current scope mutably, if it exists.
+    #[inline]
+    pub fn top_scope_mut(&mut self) -> Option<&mut Scope<K, V>> {
         self.scopes.last_mut()
     }
 
-    /// Returns whether the current scope already contains the given name.
+    /// Returns an iterator over the scopes from innermost to outermost.
     #[inline]
-    pub fn current_scope_has(&self, name: &Identifier) -> bool {
-        self.scopes
-            .last()
-            .is_some_and(|scope| scope.variables.iter().any(|var| var.name == *name))
+    pub fn iter(&self) -> impl Iterator<Item = &Scope<K, V>> {
+        self.scopes.iter().rev()
+    }
+
+    /// Returns an iterator over the scopes from innermost to outermost, allowing mutation.
+    #[inline]
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Scope<K, V>> {
+        self.scopes.iter_mut().rev()
     }
 
     /// Pops the current scope from the stack.
     #[inline]
-    pub fn pop_scope(&mut self) {
-        self.scopes.pop();
+    pub fn pop_scope(&mut self) -> Option<Scope<K, V>> {
+        self.scopes.pop()
     }
 
     /// Returns the current lexical scope depth.
@@ -133,56 +158,45 @@ impl ScopeManager {
         self.scopes.len()
     }
 
+    /// Returns whether the scope manager has no scopes.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.scopes.is_empty()
+    }
+
+    /// Declares a variable in the current scope. Returns false if no scope exists.
+    #[inline]
+    pub fn declare_var(&mut self, name: K, value: V) -> bool {
+        if let Some(scope) = self.top_scope_mut() {
+            scope.declare(name, value);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns a variable from the current scope, if it exists.
     /// If one cannot be found in the current scope, it will search
     /// parent scopes until it finds one or exhausts all scopes.
-    pub fn get_var(&self, name: &Identifier) -> Option<&Var> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(var) = scope.variables.iter().find(|var| var.name == *name) {
-                return Some(var);
-            }
-        }
-        None
+    #[must_use]
+    pub fn get_var(&self, name: &K) -> Option<&V> {
+        self.iter().find_map(|s| s.get(name))
     }
 
-    /// Updates the nearest visible variable with the given name.
-    /// Returns whether a visible variable was found.
-    pub fn update_var(&mut self, var: Var) -> bool {
-        for scope in self.scopes.iter_mut().rev() {
-            if scope
-                .variables
-                .iter()
-                .any(|existing| existing.name == var.name)
-            {
-                scope.update_var(var);
+    /// Updates the nearest visible binding. Returns false if not found.
+    pub fn set_var(&mut self, name: &K, value: V) -> bool {
+        for scope in self.iter_mut() {
+            if let Some(v) = scope.get_mut(name) {
+                *v = value;
                 return true;
             }
         }
         false
     }
 
-    /// Clears the tracked value for the nearest matching variable.
-    pub fn kill_var(&mut self, name: &Identifier) {
-        for scope in self.scopes.iter_mut().rev() {
-            if scope.kill_var(name) {
-                return;
-            }
-        }
-    }
-
     /// Removes the nearest matching variable from visible scopes.
-    pub fn remove_var(&mut self, name: &Identifier) {
-        for scope in self.scopes.iter_mut().rev() {
-            if scope.remove_var(name) {
-                return;
-            }
-        }
-    }
-
-    /// Clears aliases that depend on the given identifier in any visible scope.
-    pub fn invalidate_references_to(&mut self, name: &Identifier) {
-        for scope in self.scopes.iter_mut().rev() {
-            scope.invalidate_references_to(name);
-        }
+    #[inline]
+    pub fn remove_var(&mut self, name: &K) -> bool {
+        self.iter_mut().any(|s| s.remove(name))
     }
 }

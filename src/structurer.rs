@@ -8,7 +8,7 @@ use crate::{
         resolve_generic_for_tail, resolve_numeric_for_tail,
     },
     logging::verbose_enabled,
-    scopes::{ScopeManager, Var},
+    scopes::ScopeManager,
 };
 
 const MAX_PROTO_RECURSION_DEPTH: usize = 128;
@@ -366,7 +366,7 @@ struct HilWalker<'a> {
     cfgs: &'a [ControlFlowGraph],
     protos: &'a [Proto],
 
-    scopes: ScopeManager,
+    scopes: ScopeManager<Identifier, ()>,
     /// A list of upvalues in the current function.
     upvals: Vec<Expr>,
     /// Per-function mapping from local lifetime -> printable local name.
@@ -420,10 +420,10 @@ impl<'a> HilWalker<'a> {
         let hoisted_set: HashSet<_> = hoisted.iter().cloned().collect();
         let scope = self
             .scopes
-            .top_scope()
+            .top_scope_mut()
             .expect("there should always be a scope");
         for name in &hoisted {
-            scope.add_var(Var::new(name.clone(), None));
+            scope.declare(name.clone(), ());
             outer_stmts.push(Stmt::LocalDeclaration {
                 names: vec![name.clone()],
                 values: Vec::new(),
@@ -880,9 +880,9 @@ impl<'a> HilWalker<'a> {
                     let ident = self.fresh_capture_ident(&value, reserved_names);
                     let scope = self
                         .scopes
-                        .top_scope()
+                        .top_scope_mut()
                         .expect("there should always be a scope");
-                    scope.add_var(Var::new(ident.clone(), None));
+                    scope.declare(ident.clone(), ());
                     prepared.prologue.push(Stmt::LocalDeclaration {
                         names: vec![ident.clone()],
                         values: vec![value],
@@ -944,9 +944,9 @@ impl<'a> HilWalker<'a> {
                         } else {
                             let scope = self
                                 .scopes
-                                .top_scope()
+                                .top_scope_mut()
                                 .expect("there should always be a scope");
-                            scope.add_var(Var::new(ident.clone(), None));
+                            scope.declare(ident.clone(), ());
                             Stmt::LocalDeclaration {
                                 names: vec![ident],
                                 values: vec![rhs],
@@ -984,9 +984,9 @@ impl<'a> HilWalker<'a> {
 
                 let scope = self
                     .scopes
-                    .top_scope()
+                    .top_scope_mut()
                     .expect("there should always be a scope");
-                scope.add_vars(idents.iter().map(|id| Var::new(id.clone(), None)));
+                scope.declare_many(idents.iter().map(|iden| (iden.clone(), ())));
 
                 vec![Stmt::LocalDeclaration {
                     names: idents,
@@ -1139,10 +1139,10 @@ impl<'a> HilWalker<'a> {
         self.reserve_local_names(reserved_names.iter());
 
         self.active_proto_stack.push(proto_idx);
-        let param_scope: Vec<Var> = params
+        let param_scope: Vec<_> = params
             .iter()
             .filter_map(|param| match param {
-                Parameter::Regular(name) => Some(Var::new(name.clone(), None)),
+                Parameter::Regular(name) => Some((name.clone(), ())),
                 Parameter::Vararg => None,
             })
             .collect();
@@ -1431,8 +1431,7 @@ impl<'a> HilWalker<'a> {
 
                         let mut exit_stmts =
                             self.structure_region(exit_branch, Some(exit_block), cfg);
-                        let mut body_stmts =
-                            self.structure_region(loop_block, Some(curr_id), cfg);
+                        let mut body_stmts = self.structure_region(loop_block, Some(curr_id), cfg);
                         ensure_terminal_break(&mut exit_stmts);
                         strip_terminal_continue(&mut body_stmts);
 
@@ -1458,18 +1457,19 @@ impl<'a> HilWalker<'a> {
                         && self.branch_has_plain_backedge(*then_block, current, cfg);
                     let else_back_to_region_start = current != curr_id
                         && self.branch_has_plain_backedge(*else_block, current, cfg);
-                    let then_continues_to_region_start =
-                        current != curr_id && self.branch_is_trivial_continue(*then_block, current, cfg);
-                    let else_continues_to_region_start =
-                        current != curr_id && self.branch_is_trivial_continue(*else_block, current, cfg);
+                    let then_continues_to_region_start = current != curr_id
+                        && self.branch_is_trivial_continue(*then_block, current, cfg);
+                    let else_continues_to_region_start = current != curr_id
+                        && self.branch_is_trivial_continue(*else_block, current, cfg);
                     if self.is_loop_header(current, cfg)
                         && then_continues_to_region_start != else_continues_to_region_start
                     {
-                        let (next_block, should_invert_condition) = if then_continues_to_region_start {
-                            (*else_block, false)
-                        } else {
-                            (*then_block, true)
-                        };
+                        let (next_block, should_invert_condition) =
+                            if then_continues_to_region_start {
+                                (*else_block, false)
+                            } else {
+                                (*then_block, true)
+                            };
 
                         let mut continue_condition = self.walk_expr(cond.clone());
                         if should_invert_condition {
@@ -3097,5 +3097,4 @@ mod tests {
 
         assert!(matches!(body.stmts.first(), Some(AstStmt::While { .. })));
     }
-
 }

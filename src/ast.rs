@@ -1,7 +1,7 @@
 use smol_str::SmolStr;
 
 /// An identifier such as `foo`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct Identifier(pub SmolStr);
 
 impl Identifier {

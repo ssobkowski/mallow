@@ -42,7 +42,7 @@ impl Inliner {
     fn record_local_declaration(&mut self, names: &[Identifier], values: &[Expr]) {
         let scope = self
             .scopes
-            .top_scope()
+            .top_scope_mut()
             .expect("inliner requires an active scope");
 
         for (index, name) in names.iter().enumerate() {
