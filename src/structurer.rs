@@ -993,23 +993,9 @@ impl<'a> HilWalker<'a> {
                     values: vec![self.walk_expr(value)],
                 }]
             }
-            HilStmt::Call { expr, args } => {
-                let expr = self.walk_expr(expr);
-                let args: Vec<_> = args.into_iter().map(|arg| self.walk_expr(arg)).collect();
-                debug_assert!(
-                    match &expr {
-                        Expr::FunctionCall {
-                            args: expr_args, ..
-                        }
-                        | Expr::MethodCall {
-                            args: expr_args, ..
-                        } => expr_args == &args,
-                        _ => args.is_empty(),
-                    },
-                    "HilStmt::Call must carry a call expression consistent with args"
-                );
-                vec![Stmt::Expression { expr }]
-            }
+            HilStmt::Call(expr) => vec![Stmt::Expression {
+                expr: self.walk_expr(expr),
+            }],
             HilStmt::SetField { table, key, value } => vec![Stmt::Assignment {
                 lhs: Expr::Index {
                     base: Box::new(Expr::Name(self.local_ident(table))),
@@ -1780,13 +1766,10 @@ mod tests {
         let cfg = ControlFlowGraph::new(
             vec![HilBlock {
                 id: 0,
-                stmts: vec![HilStmt::Call {
-                    expr: HilExpr::Call(
-                        Box::new(HilExpr::Local(4)),
-                        vec![HilExpr::Local(5), HilExpr::Local(6)],
-                    ),
-                    args: vec![HilExpr::Local(5), HilExpr::Local(6)],
-                }],
+                stmts: vec![HilStmt::Call(HilExpr::Call(
+                    Box::new(HilExpr::Local(4)),
+                    vec![HilExpr::Local(5), HilExpr::Local(6)],
+                ))],
                 exit: BlockExit::Return(vec![]),
             }],
             0,
@@ -2636,13 +2619,10 @@ mod tests {
                 },
                 HilBlock {
                     id: 2,
-                    stmts: vec![HilStmt::Call {
-                        expr: HilExpr::Call(
-                            Box::new(HilExpr::Global("table.insert".to_string())),
-                            vec![HilExpr::Local(10), HilExpr::Local(8)],
-                        ),
-                        args: vec![HilExpr::Local(10), HilExpr::Local(8)],
-                    }],
+                    stmts: vec![HilStmt::Call(HilExpr::Call(
+                        Box::new(HilExpr::Global("table.insert".to_string())),
+                        vec![HilExpr::Local(10), HilExpr::Local(8)],
+                    ))],
                     exit: BlockExit::Fallthrough(3),
                 },
                 HilBlock {

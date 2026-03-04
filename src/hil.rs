@@ -94,7 +94,7 @@ pub enum Expr {
 pub enum Stmt {
     Assign { left: Expr, value: Expr },
     AssignMany { left: Vec<Expr>, value: Expr },
-    Call { expr: Expr, args: Vec<Expr> },
+    Call(Expr),
     SetField { table: u8, key: String, value: Expr },
     Return(Vec<Expr>),
 }
@@ -929,19 +929,6 @@ fn return_values(base: u8, count: u8) -> Vec<Expr> {
     }
 }
 
-/// Wraps a call expression as a statement while preserving the explicit argument list.
-fn call_stmt(expr: Expr) -> Stmt {
-    debug_assert!(
-        matches!(expr, Expr::Call(..) | Expr::MethodCall(..)),
-        "call_stmt called with non-call expr"
-    );
-    let args = match &expr {
-        Expr::Call(_, args) | Expr::MethodCall(_, _, args) => args.clone(),
-        _ => unreachable!(),
-    };
-    Stmt::Call { expr, args }
-}
-
 /// Reconstructs Luau's register-range `CONCAT` as a right-associated expression tree.
 ///
 /// Luau encodes `A = B .. C .. D` as `CONCAT A B D`, so the helper expands the full
@@ -1102,7 +1089,7 @@ fn instr_preserves_pending_multret(instr: &Instr, pending_src_reg: u8) -> bool {
 
 fn flush_pending_variadic_source(src_reg: u8, expr: Expr, stmts: &mut Vec<Stmt>) {
     match expr {
-        Expr::Call(_, _) | Expr::MethodCall(_, _, _) => stmts.push(call_stmt(expr)),
+        Expr::Call(_, _) | Expr::MethodCall(_, _, _) => stmts.push(Stmt::Call(expr)),
         Expr::VarArgs => stmts.push(Stmt::Assign {
             left: Expr::Local(src_reg),
             value: Expr::VarArgs,
@@ -1340,7 +1327,7 @@ fn lift_with_context(
                     let method_call =
                         Expr::MethodCall(Box::new(Expr::Local(*func + 1)), method, method_args);
                     match decoded_count(*ret_count) {
-                        Some(0) => stmts.push(call_stmt(method_call)),
+                        Some(0) => stmts.push(Stmt::Call(method_call)),
                         Some(1) => stmts.push(Stmt::Assign {
                             left: Expr::Local(*func),
                             value: method_call,
@@ -1358,7 +1345,7 @@ fn lift_with_context(
 
                 let call = Expr::Call(Box::new(Expr::Local(*func)), args);
                 match decoded_count(*ret_count) {
-                    Some(0) => stmts.push(call_stmt(call)),
+                    Some(0) => stmts.push(Stmt::Call(call)),
                     Some(1) => stmts.push(Stmt::Assign {
                         left: Expr::Local(*func),
                         value: call,
@@ -2216,19 +2203,11 @@ mod tests {
         let stmts = lift(&instrs, &[]);
         assert_eq!(stmts.len(), 1);
         match &stmts[0] {
-            Stmt::Call { expr, args } => {
+            Stmt::Call(Expr::Call(func, args)) => {
+                assert!(matches!(func.as_ref(), Expr::Local(3)));
                 assert_eq!(args.len(), 2);
                 assert!(matches!(args[0], Expr::Local(4)));
                 assert!(matches!(args[1], Expr::Local(5)));
-                match expr {
-                    Expr::Call(func, call_args) => {
-                        assert!(matches!(func.as_ref(), Expr::Local(3)));
-                        assert_eq!(call_args.len(), 2);
-                        assert!(matches!(call_args[0], Expr::Local(4)));
-                        assert!(matches!(call_args[1], Expr::Local(5)));
-                    }
-                    _ => panic!("expected call expression"),
-                }
             }
             _ => panic!("expected call statement"),
         }
@@ -2254,18 +2233,11 @@ mod tests {
         let stmts = lift(&instrs, &consts);
         assert_eq!(stmts.len(), 2);
         match &stmts[1] {
-            Stmt::Call { expr, args } => {
+            Stmt::Call(Expr::MethodCall(base, method, args)) => {
+                assert!(matches!(base.as_ref(), Expr::Local(1)));
+                assert_eq!(method, "FindFirstChild");
                 assert_eq!(args.len(), 1);
                 assert!(matches!(args[0], Expr::Local(2)));
-                match expr {
-                    Expr::MethodCall(base, method, method_args) => {
-                        assert!(matches!(base.as_ref(), Expr::Local(1)));
-                        assert_eq!(method, "FindFirstChild");
-                        assert_eq!(method_args.len(), 1);
-                        assert!(matches!(method_args[0], Expr::Local(2)));
-                    }
-                    _ => panic!("expected method call expression"),
-                }
             }
             _ => panic!("expected call statement"),
         }
@@ -2306,32 +2278,17 @@ mod tests {
         assert_eq!(stmts.len(), 3);
 
         match &stmts[2] {
-            Stmt::Call { expr, args } => {
+            Stmt::Call(Expr::MethodCall(base, method, args)) => {
+                assert!(matches!(base.as_ref(), Expr::Local(2)));
+                assert_eq!(method, "format");
                 assert_eq!(args.len(), 1);
-                match &args[0] {
-                    Expr::MethodCall(base, method, method_args) => {
-                        assert!(matches!(base.as_ref(), Expr::Local(4)));
-                        assert_eq!(method, "byte");
-                        assert!(method_args.is_empty());
-                    }
-                    _ => panic!("expected nested byte() call as format() arg"),
-                }
-
-                match expr {
-                    Expr::MethodCall(base, method, method_args) => {
-                        assert!(matches!(base.as_ref(), Expr::Local(2)));
-                        assert_eq!(method, "format");
-                        assert_eq!(method_args.len(), 1);
-                        assert!(matches!(
-                            &method_args[0],
-                            Expr::MethodCall(base, method, nested_args)
-                                if matches!(base.as_ref(), Expr::Local(4))
-                                    && method == "byte"
-                                    && nested_args.is_empty()
-                        ));
-                    }
-                    _ => panic!("expected format method call"),
-                }
+                assert!(matches!(
+                    &args[0],
+                    Expr::MethodCall(nested_base, nested_method, nested_args)
+                        if matches!(nested_base.as_ref(), Expr::Local(4))
+                            && nested_method == "byte"
+                            && nested_args.is_empty()
+                ));
             }
             _ => panic!("expected final NAMECALL/CALL to stay a call statement"),
         }
@@ -2356,30 +2313,16 @@ mod tests {
         assert_eq!(stmts.len(), 1);
 
         match &stmts[0] {
-            Stmt::Call { expr, args } => {
+            Stmt::Call(Expr::Call(func, args)) => {
+                assert!(matches!(func.as_ref(), Expr::Local(9)));
                 assert_eq!(args.len(), 2);
                 assert!(matches!(&args[0], Expr::Local(10)));
                 assert!(matches!(
                     &args[1],
-                    Expr::Call(func, nested_args)
-                        if matches!(func.as_ref(), Expr::Local(11))
+                    Expr::Call(nested_func, nested_args)
+                        if matches!(nested_func.as_ref(), Expr::Local(11))
                             && matches!(nested_args.as_slice(), [Expr::Local(12), Expr::Local(13)])
                 ));
-
-                match expr {
-                    Expr::Call(func, call_args) => {
-                        assert!(matches!(func.as_ref(), Expr::Local(9)));
-                        assert_eq!(call_args.len(), 2);
-                        assert!(matches!(&call_args[0], Expr::Local(10)));
-                        assert!(matches!(
-                            &call_args[1],
-                            Expr::Call(func, nested_args)
-                                if matches!(func.as_ref(), Expr::Local(11))
-                                    && matches!(nested_args.as_slice(), [Expr::Local(12), Expr::Local(13)])
-                        ));
-                    }
-                    _ => panic!("expected variadic outer call"),
-                }
             }
             _ => panic!("expected variadic call statement"),
         }
@@ -2413,20 +2356,15 @@ mod tests {
         assert_eq!(stmts.len(), 2);
 
         match &stmts[1] {
-            Stmt::Call { expr, args } => {
+            Stmt::Call(Expr::Call(func, args)) => {
+                assert!(matches!(func.as_ref(), Expr::Local(9)));
                 assert_eq!(args.len(), 2);
                 assert!(matches!(&args[0], Expr::Local(10)));
                 assert!(matches!(
                     &args[1],
-                    Expr::Call(func, nested_args)
-                        if matches!(func.as_ref(), Expr::Local(11))
+                    Expr::Call(nested_func, nested_args)
+                        if matches!(nested_func.as_ref(), Expr::Local(11))
                             && matches!(nested_args.as_slice(), [Expr::Local(12), Expr::Local(13)])
-                ));
-                assert!(matches!(
-                    expr,
-                    Expr::Call(func, call_args)
-                        if matches!(func.as_ref(), Expr::Local(9))
-                            && call_args.len() == 2
                 ));
             }
             _ => panic!("expected outer call after FASTCALL scaffolding"),
@@ -3694,10 +3632,10 @@ mod tests {
                 },
                 Block {
                     id: 2,
-                    stmts: vec![Stmt::Call {
-                        expr: Expr::Call(Box::new(Expr::Local(9)), vec![Expr::Local(10)]),
-                        args: vec![Expr::Local(10)],
-                    }],
+                    stmts: vec![Stmt::Call(Expr::Call(
+                        Box::new(Expr::Local(9)),
+                        vec![Expr::Local(10)],
+                    ))],
                     exit: BlockExit::Fallthrough(3),
                 },
                 Block {
