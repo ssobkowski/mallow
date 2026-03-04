@@ -1644,7 +1644,7 @@ impl<'a> HilWalker<'a> {
                             )
                         };
                         let step = match step {
-                            Some(Expr::Literal(Literal::Number(n))) if n == 1.0 => None,
+                            Some(Expr::Literal(Literal::Number(1.0))) => None,
                             other => other,
                         };
 

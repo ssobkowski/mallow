@@ -5,6 +5,69 @@ use crate::disasm::Proto;
 use crate::il::{Constant, Instr};
 use crate::logging::verbose_enabled;
 
+macro_rules! push_binop_rr {
+    ($stmts:expr, $dest:expr, $a:expr, $b:expr, $op:expr) => {{
+        $stmts.push(Stmt::Assign {
+            left: Expr::Local(*$dest),
+            value: Expr::Binary(
+                $op,
+                Box::new(Expr::Local(*$a)),
+                Box::new(Expr::Local(*$b)),
+            ),
+        });
+    }};
+}
+
+macro_rules! push_binop_rk_num {
+    ($stmts:expr, $consts:expr, $name:literal, $dest:expr, $reg:expr, $k:expr, $op:expr) => {{
+        let num = match $consts[*$k as usize] {
+            Constant::Number(x) => x,
+            _ => unreachable!(concat!($name, " can only be used with constant numbers")),
+        };
+
+        $stmts.push(Stmt::Assign {
+            left: Expr::Local(*$dest),
+            value: Expr::Binary(
+                $op,
+                Box::new(Expr::Local(*$reg)),
+                Box::new(Expr::Number(num)),
+            ),
+        });
+    }};
+}
+
+macro_rules! push_binop_kr_num {
+    ($stmts:expr, $consts:expr, $name:literal, $dest:expr, $k:expr, $reg:expr, $op:expr) => {{
+        let num = match $consts[*$k as usize] {
+            Constant::Number(x) => x,
+            _ => unreachable!(concat!($name, " can only be used with constant numbers")),
+        };
+
+        $stmts.push(Stmt::Assign {
+            left: Expr::Local(*$dest),
+            value: Expr::Binary(
+                $op,
+                Box::new(Expr::Number(num)),
+                Box::new(Expr::Local(*$reg)),
+            ),
+        });
+    }};
+}
+
+macro_rules! push_binop_rk_expr {
+    ($stmts:expr, $consts:expr, $const_expr:expr, $dest:expr, $reg:expr, $k:expr, $op:expr) => {{
+        $stmts.push(Stmt::Assign {
+            left: Expr::Local(*$dest),
+            value: Expr::Binary(
+                $op,
+                Box::new(Expr::Local(*$reg)),
+                Box::new($const_expr($consts, usize::from(*$k))),
+            ),
+        });
+    }};
+}
+
+ 
 #[derive(Debug, Clone)]
 pub enum Expr {
     Nil,
@@ -102,26 +165,21 @@ impl ControlFlowGraph {
         blocks: Vec<Block>,
         entry_block: usize,
         mut stmt_word_pcs: Vec<Vec<usize>>,
-        mut exit_word_pcs: Vec<usize>,
+        exit_word_pcs: Vec<usize>,
     ) -> Self {
+        debug_assert_eq!(stmt_word_pcs.len(), blocks.len());
+        debug_assert_eq!(exit_word_pcs.len(), blocks.len());
+
         let successors = build_successors(&blocks);
         let predecessors = build_predecessors(successors.len(), &successors);
         let (dominators, immediate_dominators) =
             build_dominator_metadata(entry_block, &successors, &predecessors);
         let (numeric_loops_by_base, generic_loops_by_base) = build_loop_indexes(&blocks);
-        if stmt_word_pcs.len() != blocks.len() {
-            stmt_word_pcs = blocks
-                .iter()
-                .map(|block| vec![0; block.stmts.len()])
-                .collect();
-        }
+
         for (pcs, block) in stmt_word_pcs.iter_mut().zip(&blocks) {
             if pcs.len() != block.stmts.len() {
                 pcs.resize(block.stmts.len(), 0);
             }
-        }
-        if exit_word_pcs.len() != blocks.len() {
-            exit_word_pcs = vec![0; blocks.len()];
         }
 
         ControlFlowGraph {
@@ -198,6 +256,10 @@ fn build_successors(blocks: &[Block]) -> Vec<Vec<usize>> {
     let mut successors = vec![Vec::new(); len];
     for (idx, block) in blocks.iter().enumerate() {
         for target in exit_targets(&block.exit).into_iter().flatten() {
+            debug_assert!(
+                target <= len,
+                "successor target {target} out of range for {len} blocks"
+            );
             if target < len {
                 successors[idx].push(target);
             }
@@ -466,6 +528,10 @@ pub fn resolve_numeric_for_tail(
     prep_target_block: usize,
     cfg: &ControlFlowGraph,
 ) -> Option<(usize, usize, usize)> {
+    if prep_block >= cfg.blocks.len() {
+        return None;
+    }
+
     let preferred_body = prep_block + 1;
     let mut candidates: HashSet<(usize, usize, usize)> = HashSet::new();
 
@@ -561,6 +627,10 @@ pub fn resolve_generic_for_tail(
     prep_target_block: usize,
     cfg: &ControlFlowGraph,
 ) -> Option<(usize, usize, usize, usize)> {
+    if prep_block >= cfg.blocks.len() {
+        return None;
+    }
+
     let preferred_body = prep_block + 1;
     let mut candidates: HashSet<(usize, usize, usize, usize)> = HashSet::new();
 
@@ -759,6 +829,8 @@ fn rel_target_compare_from_instr(
 
 /// Maps an instruction PC to its containing basic block index.
 fn pc_to_block_idx(entries: &[usize], pc: usize) -> usize {
+    assert!(!entries.is_empty());
+    assert!(entries[0] <= pc);
     entries.partition_point(|&e| e <= pc) - 1
 }
 
@@ -835,6 +907,11 @@ fn decoded_count(encoded: u8) -> Option<u8> {
 
 /// Produces `Expr::Local` values for the half-open register range `[start, start + count)`.
 fn local_range(start: u8, count: u8) -> Vec<Expr> {
+    debug_assert!(
+        start.checked_add(count).is_some(),
+        "local_range overflow: start={start} count={count}"
+    );
+
     (0..count)
         .map(|i| Expr::Local(start.wrapping_add(i)))
         .collect()
@@ -854,9 +931,13 @@ fn return_values(base: u8, count: u8) -> Vec<Expr> {
 
 /// Wraps a call expression as a statement while preserving the explicit argument list.
 fn call_stmt(expr: Expr) -> Stmt {
+    debug_assert!(
+        matches!(expr, Expr::Call(..) | Expr::MethodCall(..)),
+        "call_stmt called with non-call expr"
+    );
     let args = match &expr {
         Expr::Call(_, args) | Expr::MethodCall(_, _, args) => args.clone(),
-        _ => Vec::new(),
+        _ => unreachable!(),
     };
     Stmt::Call { expr, args }
 }
@@ -925,22 +1006,18 @@ fn take_variadic_multret_values(
     }
 }
 
-/// Consumes a deferred variadic source for a variadic CALL with optional fixed-prefix args.
-fn take_variadic_call_args(
-    pending_multret_call: &mut Option<(u8, Expr)>,
-    first_arg_reg: u8,
-) -> Option<Vec<Expr>> {
-    take_variadic_multret_values(pending_multret_call, first_arg_reg)
-}
-
 fn find_latest_local_assignment(stmts: &[Stmt], reg: u8) -> Option<(usize, &Expr)> {
-    stmts.iter().enumerate().rev().find_map(|(idx, stmt)| match stmt {
-        Stmt::Assign {
-            left: Expr::Local(r),
-            value,
-        } if *r == reg => Some((idx, value)),
-        _ => None,
-    })
+    stmts
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, stmt)| match stmt {
+            Stmt::Assign {
+                left: Expr::Local(r),
+                value,
+            } if *r == reg => Some((idx, value)),
+            _ => None,
+        })
 }
 
 fn snapshot_table_value_with_history(
@@ -990,9 +1067,10 @@ fn snapshot_table_value_with_history(
             }
             Some(Expr::Table(snapped))
         }
-        Expr::GetField(_, _) | Expr::GetIndex(_, _) | Expr::Call(_, _) | Expr::MethodCall(_, _, _) => {
-            None
-        }
+        Expr::GetField(_, _)
+        | Expr::GetIndex(_, _)
+        | Expr::Call(_, _)
+        | Expr::MethodCall(_, _, _) => None,
     }
 }
 
@@ -1062,7 +1140,8 @@ fn decode_capture(capture_type: u8, reg: u8) -> Expr {
         0 => Expr::CaptureValue(Box::new(Expr::Local(reg))),
         1 => Expr::Local(reg),
         2 => Expr::Upval(reg),
-        _ => Expr::Local(reg),
+        // TODO: maybe don't panic here
+        _ => unreachable!("unknown capture type: {capture_type}"),
     }
 }
 
@@ -1089,6 +1168,7 @@ fn lift_with_context(
     let mut pending_namecall: Option<(u8, String)> = None; // (func reg, method)
     let mut pending_multret_call: Option<(u8, Expr)> = None; // (first variadic result reg, expr)
     let mut pending_closure_stmt: Option<(usize, usize)> = None; // (stmt index, remaining fixed captures)
+    let mut pending_table_stmt: Option<(u8, usize)> = None; // (reg, stmt index)
 
     for (instr_idx, instr) in instrs.iter().enumerate() {
         let instr_pc = instr_word_pcs
@@ -1238,7 +1318,7 @@ fn lift_with_context(
                     }
                     None => {
                         if let Some(args) =
-                            take_variadic_call_args(&mut pending_multret_call, first_arg_reg)
+                            take_variadic_multret_values(&mut pending_multret_call, first_arg_reg)
                         {
                             consumed_multret = true;
                             args
@@ -1347,218 +1427,24 @@ fn lift_with_context(
                     value: Expr::Local(*src),
                 });
             }
-            Instr::Add { dest, a, b } => {
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Add,
-                        Box::new(Expr::Local(*a)),
-                        Box::new(Expr::Local(*b)),
-                    ),
-                });
-            }
-            Instr::Sub { dest, a, b } => {
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Sub,
-                        Box::new(Expr::Local(*a)),
-                        Box::new(Expr::Local(*b)),
-                    ),
-                });
-            }
-            Instr::Mul { dest, a, b } => {
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Mul,
-                        Box::new(Expr::Local(*a)),
-                        Box::new(Expr::Local(*b)),
-                    ),
-                });
-            }
-            Instr::Div { dest, a, b } => {
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Div,
-                        Box::new(Expr::Local(*a)),
-                        Box::new(Expr::Local(*b)),
-                    ),
-                });
-            }
-            Instr::Mod { dest, a, b } => {
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Mod,
-                        Box::new(Expr::Local(*a)),
-                        Box::new(Expr::Local(*b)),
-                    ),
-                });
-            }
-            Instr::Pow { dest, a, b } => {
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Pow,
-                        Box::new(Expr::Local(*a)),
-                        Box::new(Expr::Local(*b)),
-                    ),
-                });
-            }
-            Instr::AddK { dest, reg, k } => {
-                let num = match consts[*k as usize] {
-                    Constant::Number(x) => x,
-                    _ => unreachable!("AddK can only be used with constant numbers"),
-                };
-
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Add,
-                        Box::new(Expr::Local(*reg)),
-                        Box::new(Expr::Number(num)),
-                    ),
-                });
-            }
-            Instr::SubK { dest, reg, k } => {
-                let num = match consts[*k as usize] {
-                    Constant::Number(x) => x,
-                    _ => unreachable!("SubK can only be used with constant numbers"),
-                };
-
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Sub,
-                        Box::new(Expr::Local(*reg)),
-                        Box::new(Expr::Number(num)),
-                    ),
-                });
-            }
-            Instr::MulK { dest, reg, k } => {
-                let num = match consts[*k as usize] {
-                    Constant::Number(x) => x,
-                    _ => unreachable!("MulK can only be used with constant numbers"),
-                };
-
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Mul,
-                        Box::new(Expr::Local(*reg)),
-                        Box::new(Expr::Number(num)),
-                    ),
-                });
-            }
-            Instr::DivK { dest, reg, k } => {
-                let num = match consts[*k as usize] {
-                    Constant::Number(x) => x,
-                    _ => unreachable!("DivK can only be used with constant numbers"),
-                };
-
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Div,
-                        Box::new(Expr::Local(*reg)),
-                        Box::new(Expr::Number(num)),
-                    ),
-                });
-            }
-            Instr::ModK { dest, reg, k } => {
-                let num = match consts[*k as usize] {
-                    Constant::Number(x) => x,
-                    _ => unreachable!("ModK can only be used with constant numbers"),
-                };
-
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Mod,
-                        Box::new(Expr::Local(*reg)),
-                        Box::new(Expr::Number(num)),
-                    ),
-                });
-            }
-            Instr::PowK { dest, reg, k } => {
-                let num = match consts[*k as usize] {
-                    Constant::Number(x) => x,
-                    _ => unreachable!("PowK can only be used with constant numbers"),
-                };
-
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Pow,
-                        Box::new(Expr::Local(*reg)),
-                        Box::new(Expr::Number(num)),
-                    ),
-                });
-            }
-            Instr::SubRK { dest, k, reg } => {
-                let num = match consts[*k as usize] {
-                    Constant::Number(x) => x,
-                    _ => unreachable!("SubRK can only be used with constant numbers"),
-                };
-
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Sub,
-                        Box::new(Expr::Number(num)),
-                        Box::new(Expr::Local(*reg)),
-                    ),
-                });
-            }
-            Instr::DivRK { dest, k, reg } => {
-                let num = match consts[*k as usize] {
-                    Constant::Number(x) => x,
-                    _ => unreachable!("DivRK can only be used with constant numbers"),
-                };
-
-                stmts.push(Stmt::Assign {
-                    left: Expr::Local(*dest),
-                    value: Expr::Binary(
-                        BinOp::Div,
-                        Box::new(Expr::Number(num)),
-                        Box::new(Expr::Local(*reg)),
-                    ),
-                });
-            }
-            Instr::And { dest, a, b } => stmts.push(Stmt::Assign {
-                left: Expr::Local(*dest),
-                value: Expr::Binary(
-                    BinOp::And,
-                    Box::new(Expr::Local(*a)),
-                    Box::new(Expr::Local(*b)),
-                ),
-            }),
-            Instr::Or { dest, a, b } => stmts.push(Stmt::Assign {
-                left: Expr::Local(*dest),
-                value: Expr::Binary(
-                    BinOp::Or,
-                    Box::new(Expr::Local(*a)),
-                    Box::new(Expr::Local(*b)),
-                ),
-            }),
-            Instr::AndK { dest, reg, k } => stmts.push(Stmt::Assign {
-                left: Expr::Local(*dest),
-                value: Expr::Binary(
-                    BinOp::And,
-                    Box::new(Expr::Local(*reg)),
-                    Box::new(const_expr(consts, usize::from(*k))),
-                ),
-            }),
-            Instr::OrK { dest, reg, k } => stmts.push(Stmt::Assign {
-                left: Expr::Local(*dest),
-                value: Expr::Binary(
-                    BinOp::Or,
-                    Box::new(Expr::Local(*reg)),
-                    Box::new(const_expr(consts, usize::from(*k))),
-                ),
-            }),
+            Instr::Add { dest, a, b } => push_binop_rr!(stmts, dest, a, b, BinOp::Add),
+            Instr::Sub { dest, a, b } => push_binop_rr!(stmts, dest, a, b, BinOp::Sub),
+            Instr::Mul { dest, a, b } => push_binop_rr!(stmts, dest, a, b, BinOp::Mul),
+            Instr::Div { dest, a, b } => push_binop_rr!(stmts, dest, a, b, BinOp::Div),
+            Instr::Mod { dest, a, b } => push_binop_rr!(stmts, dest, a, b, BinOp::Mod),
+            Instr::Pow { dest, a, b } => push_binop_rr!(stmts, dest, a, b, BinOp::Pow),
+            Instr::AddK { dest, reg, k } => push_binop_rk_num!(stmts, consts, "AddK", dest, reg, k, BinOp::Add),
+            Instr::SubK { dest, reg, k } => push_binop_rk_num!(stmts, consts, "SubK", dest, reg, k, BinOp::Sub),
+            Instr::MulK { dest, reg, k } => push_binop_rk_num!(stmts, consts, "MulK", dest, reg, k, BinOp::Mul),
+            Instr::DivK { dest, reg, k } => push_binop_rk_num!(stmts, consts, "DivK", dest, reg, k, BinOp::Div),
+            Instr::ModK { dest, reg, k } => push_binop_rk_num!(stmts, consts, "ModK", dest, reg, k, BinOp::Mod),
+            Instr::PowK { dest, reg, k } => push_binop_rk_num!(stmts, consts, "PowK", dest, reg, k, BinOp::Pow),
+            Instr::SubRK { dest, k, reg } => push_binop_kr_num!(stmts, consts, "SubRK", dest, k, reg, BinOp::Sub),
+            Instr::DivRK { dest, k, reg } => push_binop_kr_num!(stmts, consts, "DivRK", dest, k, reg, BinOp::Div),
+            Instr::And { dest, a, b } => push_binop_rr!(stmts, dest, a, b, BinOp::And),
+            Instr::Or { dest, a, b } => push_binop_rr!(stmts, dest, a, b, BinOp::Or),
+            Instr::AndK { dest, reg, k } => push_binop_rk_expr!(stmts, consts, const_expr, dest, reg, k, BinOp::And),
+            Instr::OrK { dest, reg, k } => push_binop_rk_expr!(stmts, consts, const_expr, dest, reg, k, BinOp::Or),
             Instr::Concat { dest, a, b } => stmts.push(Stmt::Assign {
                 left: Expr::Local(*dest),
                 value: concat_expr_range(*a, *b),
@@ -1575,14 +1461,20 @@ fn lift_with_context(
                 left: Expr::Local(*dest),
                 value: Expr::Unary(UnOp::Length, Box::new(Expr::Local(*reg))),
             }),
-            Instr::NewTable { dest, .. } => stmts.push(Stmt::Assign {
-                left: Expr::Local(*dest),
-                value: Expr::Table(Vec::new()),
-            }),
-            Instr::DupTable { dest, .. } => stmts.push(Stmt::Assign {
-                left: Expr::Local(*dest),
-                value: Expr::Table(Vec::new()),
-            }),
+            Instr::NewTable { dest, .. } => {
+                stmts.push(Stmt::Assign {
+                    left: Expr::Local(*dest),
+                    value: Expr::Table(Vec::new()),
+                });
+                pending_table_stmt = Some((*dest, stmts.len() - 1));
+            }
+            Instr::DupTable { dest, .. } => {
+                stmts.push(Stmt::Assign {
+                    left: Expr::Local(*dest),
+                    value: Expr::Table(Vec::new()),
+                });
+                pending_table_stmt = Some((*dest, stmts.len() - 1));
+            }
             Instr::SetTable { src, table, key } => {
                 stmts.push(Stmt::Assign {
                     left: Expr::GetIndex(
@@ -1605,25 +1497,8 @@ fn lift_with_context(
                         .unwrap_or_else(|| vec![Expr::Local(*base)]),
                 };
 
-                let mut table_definition_index = None;
-                for (idx, stmt) in stmts.iter_mut().enumerate().rev() {
-                    match stmt {
-                        Stmt::Assign {
-                            left: Expr::Local(r),
-                            value: Expr::Table(items),
-                        } if *r == *table => {
-                            table_definition_index = Some(idx);
-                        }
-                        // If the table register was assigned to something else, we must stop scanning
-                        Stmt::Assign {
-                            left: Expr::Local(r),
-                            ..
-                        } if *r == *table => {
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
+                let table_definition_index =
+                    pending_table_stmt.and_then(|(reg, idx)| (reg == *table).then_some(idx));
                 if let Some(idx) = table_definition_index {
                     let newtable = stmts.remove(idx);
                     let mut items = match newtable {
@@ -1648,6 +1523,7 @@ fn lift_with_context(
                         left: Expr::Local(*table),
                         value: Expr::Table(items),
                     });
+                    pending_table_stmt = Some((*table, stmts.len() - 1));
                 } else {
                     let start = *index;
                     for (i, val) in values.into_iter().enumerate() {
@@ -1699,6 +1575,11 @@ fn lift_with_context(
             | Instr::FastCall { .. }
             | Instr::PrepVarArgs { .. } => {}
             Instr::Capture { capture_type, reg } => {
+                assert!(
+                    pending_closure_stmt.is_some(),
+                    "CAPTURE without preceding NEWCLOSURE/DUPCLOSURE at instr #{instr_idx}"
+                );
+
                 if let Some((stmt_idx, remaining)) = pending_closure_stmt
                     && let Some(Stmt::Assign {
                         value: Expr::Closure { captures, .. },
@@ -3497,9 +3378,12 @@ mod tests {
         let cfg = build_cfg(&instrs, &[]);
         assert_eq!(cfg.blocks.len(), 2);
 
-        assert!(cfg.blocks[0].stmts.iter().all(|stmt| {
-            !matches!(stmt, Stmt::Return(_))
-        }));
+        assert!(
+            cfg.blocks[0]
+                .stmts
+                .iter()
+                .all(|stmt| { !matches!(stmt, Stmt::Return(_)) })
+        );
         assert!(matches!(
             cfg.blocks[0].exit,
             BlockExit::Return(ref values)
