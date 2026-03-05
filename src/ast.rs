@@ -249,7 +249,7 @@ pub enum Parameter {
 }
 
 /// Binary operator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
     Add,
     Sub,
@@ -284,7 +284,7 @@ impl BinOp {
 }
 
 /// Compound assignment operator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompoundBinOp {
     Add,
     Sub,

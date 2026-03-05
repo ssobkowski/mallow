@@ -1,4 +1,5 @@
 mod ast;
+mod common;
 mod disasm;
 mod hil;
 mod il;
@@ -12,10 +13,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::{
-    il::{Constant, Instr},
-    printer::print,
-};
+use crate::il::{Constant, Instr};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -52,6 +50,11 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    Debug {
+        /// Path to the bytecode file
+        #[arg(short, long)]
+        input: PathBuf,
+    },
 }
 
 fn main() {
@@ -73,6 +76,9 @@ fn main() {
             }
         }
         Commands::Decompile { input, output } => {
+            todo!("in works")
+        }
+        Commands::Debug { input } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
 
             let disassembled = match disasm::disassemble(&bytecode) {
@@ -82,42 +88,30 @@ fn main() {
                     return;
                 }
             };
-            if logging::verbose_enabled() {
-                eprintln!(
-                    "[decompile] protos={}, entry={}",
-                    disassembled.protos.len(),
-                    disassembled.entry_proto
-                );
-                for proto in &disassembled.protos {
-                    eprintln!(
-                        "[decompile] proto {}: instrs={}, consts={}, child_protos={}, params={}, upvals={}, vararg={}",
-                        proto.index,
-                        proto.instrs.len(),
-                        proto.consts.len(),
-                        proto.protos.len(),
-                        proto.num_params,
-                        proto.num_upvals,
-                        proto.is_vararg
-                    );
-                }
-            }
 
-            let proto_cfgs = disassembled
+            let (regions, cfgs) = disassembled
                 .protos
                 .iter()
-                .map(|proto| hil::build_cfg_for_proto(proto, &disassembled.protos))
-                .collect::<Vec<_>>();
+                .map(|proto| {
+                    let cfg = hil::cflow::graph::ControlFlowGraph::from_proto(
+                        proto,
+                        &disassembled.protos,
+                    );
+                    let mut region = hil::cflow::region::RegionBuilder::new(&cfg);
+                    (region.build_region(cfg.entry_block, None), cfg)
+                })
+                .collect::<(Vec<_>, Vec<_>)>();
+
+            println!("{:#?}", regions);
+
             let ast = structurer::structure(
-                &proto_cfgs,
+                &regions,
+                &cfgs,
                 disassembled.entry_proto as usize,
                 &disassembled.protos,
             );
-
-            let src = print(&ast);
-
-            if let Err(e) = write_output(output, &src) {
-                eprintln!("Error writing decompiled output: {e}");
-            }
+            let code = printer::print(&ast);
+            println!("{}", code);
         }
     }
 }

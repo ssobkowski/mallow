@@ -39,7 +39,7 @@ pub enum Count {
     All, // Multiret
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Instr {
     // Keep variant order in sync with LuauOpcode in Bytecode.h.
     // 0..6: basic loads/moves

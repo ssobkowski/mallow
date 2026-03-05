@@ -1,4 +1,7 @@
-use crate::ast::{BinOp, Block, Expr, Literal, Parameter, Stmt, TableConstructorField, UnOp};
+use crate::{
+    ast::{BinOp, Block, Expr, Literal, Parameter, Stmt, TableConstructorField, UnOp},
+    common::escape_string,
+};
 
 pub fn print(block: &Block) -> String {
     let mut printer = AstPrinter::new();
@@ -387,7 +390,7 @@ impl AstPrinter {
             }
             Literal::String(value) => {
                 self.write("\"");
-                self.write(&escape(value));
+                self.write(&escape_string(value));
                 self.write("\"");
             }
             Literal::Bool(value) => self.write(if *value { "true" } else { "false" }),
@@ -490,37 +493,13 @@ fn unary_symbol(op: &UnOp) -> &'static str {
     }
 }
 
-fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for ch in s.chars() {
-        let code = u32::from(ch);
-        let byte = u8::try_from(code).unwrap_or(b'?');
-        match byte {
-            b'\\' => out.push_str("\\\\"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            b'\0' => out.push_str("\\0"),
-            b'"' => out.push_str("\\\""),
-            // printable ASCII (space through ~, excluding backslash already handled)
-            0x20..=0x7E => out.push(byte as char),
-            // control chars + high bytes
-            _ => {
-                use std::fmt::Write;
-                write!(out, "\\{byte}").unwrap();
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::escape;
+    use super::escape_string;
 
     #[test]
     fn escape_preserves_high_byte_values() {
         let value: String = [b'A', 0x80, 0xFF].into_iter().map(char::from).collect();
-        assert_eq!(escape(&value), "A\\128\\255");
+        assert_eq!(escape_string(&value), "A\\128\\255");
     }
 }
