@@ -3,18 +3,13 @@ use crate::{
     disasm::Proto,
     hil::{
         cflow::{
-            graph::{Block as CfgBlock, BlockExit, ControlFlowGraph},
+            graph::{Block as CfgBlock, ControlFlowGraph},
             region::{RegionBlock, RegionNode},
         },
         ir::{HilExpr, HilStmt},
     },
     scopes::ScopeManager,
 };
-
-struct GenericForPreheader<'a> {
-    exprs: Vec<&'a HilExpr>,
-    consumed_stmt_count: usize,
-}
 
 struct Structurer<'a> {
     regions: &'a [RegionBlock],
@@ -113,33 +108,26 @@ impl<'a> Structurer<'a> {
                 header, base, body, ..
             } => {
                 let block = &cfg.blocks[*header];
-                let Some((start, end, step)) = numeric_for_preheader(block, *base) else {
-                    panic!("failed to resolve numeric for preheader");
-                };
-                let step = match self.lower_expr(step) {
-                    Expr::Literal(Literal::Number(1.0)) => None,
-                    other => Some(other),
+                let step_reg = *base as u8 + 1;
+                let step = match last_local_assign(block, step_reg) {
+                    Some(HilExpr::Number(1.0)) => None,
+                    _ => Some(Expr::Name(local_ident(step_reg))),
                 };
 
                 out.push(Stmt::NumericFor {
                     var: local_ident(*base as u8 + 2),
-                    start: self.lower_expr(start),
-                    end: self.lower_expr(end),
+                    start: Expr::Name(local_ident(*base as u8 + 2)),
+                    end: Expr::Name(local_ident(*base as u8)),
                     step,
                     body: self.lower_region(body, cfg),
                 })
             }
             RegionNode::GenericFor {
-                header,
                 base,
                 result_count,
                 body,
                 ..
             } => {
-                let block = &cfg.blocks[*header];
-                let Some(preheader) = generic_for_preheader(block, *base) else {
-                    panic!("failed to resolve generic for preheader");
-                };
                 let mut vars: Vec<_> = (0..*result_count)
                     .map(|i| local_ident(*base as u8 + 3 + i as u8))
                     .collect();
@@ -149,11 +137,11 @@ impl<'a> Structurer<'a> {
 
                 out.push(Stmt::GenericFor {
                     vars,
-                    exprs: preheader
-                        .exprs
-                        .into_iter()
-                        .map(|expr| self.lower_expr(expr))
-                        .collect(),
+                    exprs: vec![
+                        Expr::Name(local_ident(*base as u8)),
+                        Expr::Name(local_ident(*base as u8 + 1)),
+                        Expr::Name(local_ident(*base as u8 + 2)),
+                    ],
                     body: self.lower_region(body, cfg),
                 });
             }
@@ -171,7 +159,7 @@ impl<'a> Structurer<'a> {
             return;
         };
 
-        for stmt in &block.stmts[..visible_stmt_count(block)] {
+        for stmt in &block.stmts {
             self.lower_stmt_into(&stmt.inner, out);
         }
     }
@@ -229,7 +217,12 @@ impl<'a> Structurer<'a> {
         let rhs = self.lower_expr(value);
         match left {
             HilExpr::Local(reg) => {
-                if self.is_declared(*reg) {
+                if self
+                    .scopes
+                    .top_scope()
+                    .expect("there has to be at least one scope")
+                    .contains(reg)
+                {
                     out.push(Stmt::Assignment {
                         lhs: Expr::Name(local_ident(*reg)),
                         rhs,
@@ -274,10 +267,9 @@ impl<'a> Structurer<'a> {
             HilExpr::Number(value) => Expr::Literal(Literal::Number(*value)),
             HilExpr::String(value) => Expr::Literal(Literal::String(value.clone().into())),
             HilExpr::Bool(value) => Expr::Literal(Literal::Bool(*value)),
-            HilExpr::CaptureValue(inner) => self.lower_expr(inner),
             HilExpr::Local(reg) => Expr::Name(local_ident(*reg)),
             HilExpr::Upval(up) => Expr::Name(upvalue_ident(*up)),
-            HilExpr::Closure { proto, .. } => self.lower_closure_expr(*proto),
+            HilExpr::Closure { proto, captures } => self.lower_closure_expr(*proto, captures),
             HilExpr::Global(name) | HilExpr::Import(name) => {
                 Expr::Name(Identifier::from(name.clone()))
             }
@@ -320,11 +312,16 @@ impl<'a> Structurer<'a> {
                     .collect(),
             },
             HilExpr::VarArgs => Expr::Vararg,
+            HilExpr::CaptureValue(inner) => {
+                unreachable!("unexpected capture value expression in structured region: {inner:?}")
+            }
         }
     }
 
-    fn lower_closure_expr(&mut self, proto_idx: usize) -> Expr {
+    fn lower_closure_expr(&mut self, proto_idx: usize, captures: &[HilExpr]) -> Expr {
         let proto = &self.protos[proto_idx];
+        debug_assert_eq!(proto.num_upvals as usize, captures.len());
+
         let params = proto_parameters(proto);
         let body = self.structure_proto(proto_idx);
         Expr::AnonymousFunction { params, body }
@@ -366,95 +363,13 @@ fn proto_parameters(proto: &Proto) -> Vec<Parameter> {
     params
 }
 
-fn visible_stmt_count(block: &CfgBlock) -> usize {
-    block
-        .stmts
-        .len()
-        .saturating_sub(synthetic_preheader_stmt_count(block))
-}
-
-fn synthetic_preheader_stmt_count(block: &CfgBlock) -> usize {
-    match &block.exit {
-        BlockExit::ForNPrep { base, .. } => {
-            usize::from(numeric_for_preheader(block, *base).is_some()) * 3
-        }
-        BlockExit::ForGPrep { base, .. } => {
-            generic_for_preheader(block, *base).map_or(0, |preheader| preheader.consumed_stmt_count)
-        }
-        _ => 0,
-    }
-}
-
-fn numeric_for_preheader(block: &CfgBlock, base: usize) -> Option<(&HilExpr, &HilExpr, &HilExpr)> {
-    let mut start = None;
-    let mut end = None;
-    let mut step = None;
-
-    for stmt_idx in block.stmts.len().saturating_sub(3)..block.stmts.len() {
-        let HilStmt::Assign {
-            left: HilExpr::Local(reg),
+fn last_local_assign(block: &CfgBlock, reg: u8) -> Option<&HilExpr> {
+    block.stmts.iter().rev().find_map(|stmt| match &stmt.inner {
+        HilStmt::Assign {
+            left: HilExpr::Local(stmt_reg),
             value,
-        } = &block.stmts.get(stmt_idx)?.inner
-        else {
-            return None;
-        };
-
-        match *reg as usize {
-            r if r == base => end = Some(value),
-            r if r == base + 1 => step = Some(value),
-            r if r == base + 2 => start = Some(value),
-            _ => return None,
-        }
-    }
-
-    Some((start?, end?, step?))
-}
-
-fn generic_for_preheader(block: &CfgBlock, base: usize) -> Option<GenericForPreheader<'_>> {
-    if let Some(last) = block.stmts.last()
-        && let HilStmt::AssignMany { left, value } = &last.inner
-        && let Some(HilExpr::Local(reg)) = left.first()
-        && *reg as usize == base
-    {
-        return Some(GenericForPreheader {
-            exprs: vec![value],
-            consumed_stmt_count: 1,
-        });
-    }
-
-    let mut generator = None;
-    let mut state = None;
-    let mut control = None;
-
-    for stmt_idx in block.stmts.len().saturating_sub(3)..block.stmts.len() {
-        let HilStmt::Assign {
-            left: HilExpr::Local(reg),
-            value,
-        } = &block.stmts.get(stmt_idx)?.inner
-        else {
-            return None;
-        };
-
-        match *reg as usize {
-            r if r == base => generator = Some(value),
-            r if r == base + 1 => state = Some(value),
-            r if r == base + 2 => control = Some(value),
-            _ => return None,
-        }
-    }
-
-    let generator = generator?;
-    let state = state?;
-    let control = control?;
-    let exprs = if matches!(state, HilExpr::Nil) && matches!(control, HilExpr::Nil) {
-        vec![generator]
-    } else {
-        vec![generator, state, control]
-    };
-
-    Some(GenericForPreheader {
-        exprs,
-        consumed_stmt_count: 3,
+        } if *stmt_reg == reg => Some(value),
+        _ => None,
     })
 }
 
@@ -470,7 +385,7 @@ mod tests {
             },
             ir::{HilExpr, HilStmt, Spanned},
         },
-        structurer::{generic_for_preheader, structure},
+        structurer::structure,
     };
 
     #[test]
@@ -595,34 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_for_preheader_accepts_assign_many_source() {
-        let block = CfgBlock::new(
-            0,
-            vec![Spanned::new(
-                HilStmt::AssignMany {
-                    left: vec![HilExpr::Local(2), HilExpr::Local(3), HilExpr::Local(4)],
-                    value: HilExpr::Global("pairs".to_string()),
-                },
-                0,
-            )],
-            BlockExit::ForGPrep {
-                base: 2,
-                loop_block: 1,
-            },
-        );
-
-        let preheader = generic_for_preheader(&block, 2).expect("expected generic-for preheader");
-
-        assert_eq!(preheader.exprs.len(), 1);
-        assert_eq!(preheader.consumed_stmt_count, 1);
-        assert!(matches!(
-            preheader.exprs.as_slice(),
-            [HilExpr::Global(name)] if name == "pairs"
-        ));
-    }
-
-    #[test]
-    fn structure_lowers_generic_for_and_skips_synthetic_preheader_assignments() {
+    fn structure_lowers_generic_for_and_emits_preheader_assignments() {
         let cfg = ControlFlowGraph::new(
             vec![
                 CfgBlock::new(
@@ -695,7 +583,7 @@ mod tests {
 
         let ast = structure(&[region], &[cfg], 0, &[Proto::default()]);
 
-        assert_eq!(ast.stmts.len(), 3);
+        assert_eq!(ast.stmts.len(), 6);
         assert!(matches!(
             &ast.stmts[0],
             AstStmt::LocalDeclaration { names, .. }
@@ -703,12 +591,30 @@ mod tests {
         ));
         assert!(matches!(
             &ast.stmts[1],
+            AstStmt::LocalDeclaration { names, .. }
+                if matches!(names.as_slice(), [name] if name.as_str() == "r1")
+        ));
+        assert!(matches!(
+            &ast.stmts[2],
+            AstStmt::LocalDeclaration { names, .. }
+                if matches!(names.as_slice(), [name] if name.as_str() == "r2")
+        ));
+        assert!(matches!(
+            &ast.stmts[3],
+            AstStmt::LocalDeclaration { names, .. }
+                if matches!(names.as_slice(), [name] if name.as_str() == "r3")
+        ));
+        assert!(matches!(
+            &ast.stmts[4],
             AstStmt::GenericFor { vars, exprs, .. }
                 if vars.len() == 2
                     && vars[0].as_str() == "r4"
                     && vars[1].as_str() == "r5"
-                    && matches!(exprs.as_slice(), [AstExpr::Name(name)] if name.as_str() == "r0")
+                    && exprs.len() == 3
+                    && matches!(&exprs[0], AstExpr::Name(name) if name.as_str() == "r1")
+                    && matches!(&exprs[1], AstExpr::Name(name) if name.as_str() == "r2")
+                    && matches!(&exprs[2], AstExpr::Name(name) if name.as_str() == "r3")
         ));
-        assert!(matches!(&ast.stmts[2], AstStmt::Return { values } if values.is_empty()));
+        assert!(matches!(&ast.stmts[5], AstStmt::Return { values } if values.is_empty()));
     }
 }
