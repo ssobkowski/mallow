@@ -50,11 +50,6 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    Debug {
-        /// Path to the bytecode file
-        #[arg(short, long)]
-        input: PathBuf,
-    },
 }
 
 fn main() {
@@ -76,9 +71,6 @@ fn main() {
             }
         }
         Commands::Decompile { input, output } => {
-            todo!("in works")
-        }
-        Commands::Debug { input } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
 
             let disassembled = match disasm::disassemble(&bytecode) {
@@ -102,8 +94,6 @@ fn main() {
                 })
                 .collect::<(Vec<_>, Vec<_>)>();
 
-            println!("{:#?}", regions);
-
             let ast = structurer::structure(
                 &regions,
                 &cfgs,
@@ -111,7 +101,10 @@ fn main() {
                 &disassembled.protos,
             );
             let code = printer::print(&ast);
-            println!("{}", code);
+
+            if let Err(e) = write_output(output, &code) {
+                eprintln!("Error writing decompilation output: {e}");
+            }
         }
     }
 }

@@ -83,7 +83,7 @@ pub enum RegionNode {
 /// Stateful region builder used to avoid recursive region expansion loops.
 pub struct RegionBuilder<'a> {
     cfg: &'a ControlFlowGraph,
-    active_regions: HashSet<(usize, Option<usize>)>,
+    active_regions: HashSet<(usize, Option<usize>, Option<usize>)>,
 }
 
 impl<'a> RegionBuilder<'a> {
@@ -97,7 +97,16 @@ impl<'a> RegionBuilder<'a> {
 
     /// Structures a linear CFG region into canonical region nodes.
     pub fn build_region(&mut self, current: usize, stop_at: Option<usize>) -> RegionBlock {
-        let key = (current, stop_at);
+        self.build_region_with_loop(current, stop_at, None)
+    }
+
+    fn build_region_with_loop(
+        &mut self,
+        current: usize,
+        stop_at: Option<usize>,
+        loop_exit: Option<usize>,
+    ) -> RegionBlock {
+        let key = (current, stop_at, loop_exit);
         if !self.active_regions.insert(key) {
             return RegionBlock::default();
         }
@@ -125,6 +134,13 @@ impl<'a> RegionBuilder<'a> {
                         });
                         break;
                     }
+                    if Some(*next) == loop_exit {
+                        nodes.push(RegionNode::Break {
+                            from_block: curr_id,
+                            target_exit: *next,
+                        });
+                        break;
+                    }
                     curr_id = *next;
                 }
                 BlockExit::CondJump {
@@ -144,7 +160,11 @@ impl<'a> RegionBuilder<'a> {
                         let exit_block =
                             find_loop_exit_block(curr_id, exit_branch, loop_block, self.cfg);
 
-                        let body = self.build_region(loop_block, Some(curr_id));
+                        let body = self.build_region_with_loop(
+                            loop_block,
+                            Some(curr_id),
+                            Some(exit_block),
+                        );
                         let condition = if loop_branch_is_then {
                             cond.clone()
                         } else {
@@ -163,8 +183,10 @@ impl<'a> RegionBuilder<'a> {
                     }
 
                     let merge_block = find_if_else_join(*then_block, *else_block, self.cfg);
-                    let then_branch = self.build_region(*then_block, merge_block);
-                    let else_branch = self.build_region(*else_block, merge_block);
+                    let then_branch =
+                        self.build_branch_region(curr_id, *then_block, merge_block, loop_exit);
+                    let else_branch =
+                        self.build_branch_region(curr_id, *else_block, merge_block, loop_exit);
 
                     nodes.push(RegionNode::If {
                         header: curr_id,
@@ -184,7 +206,11 @@ impl<'a> RegionBuilder<'a> {
                     if let Some((_tail_block, body_block, exit_block)) =
                         resolve_numeric_for_tail(curr_id, *base, *loop_block, self.cfg)
                     {
-                        let body = self.build_region(body_block, Some(exit_block));
+                        let body = self.build_region_with_loop(
+                            body_block,
+                            Some(exit_block),
+                            Some(exit_block),
+                        );
                         nodes.push(RegionNode::NumericFor {
                             header: curr_id,
                             base: *base,
@@ -204,7 +230,11 @@ impl<'a> RegionBuilder<'a> {
                     if let Some((_tail_block, body_block, exit_block, result_count)) =
                         resolve_generic_for_tail(curr_id, *base, *loop_block, self.cfg)
                     {
-                        let body = self.build_region(body_block, Some(exit_block));
+                        let body = self.build_region_with_loop(
+                            body_block,
+                            Some(exit_block),
+                            Some(exit_block),
+                        );
                         nodes.push(RegionNode::GenericFor {
                             header: curr_id,
                             base: *base,
@@ -237,6 +267,25 @@ impl<'a> RegionBuilder<'a> {
 
         self.active_regions.remove(&key);
         RegionBlock { nodes }
+    }
+
+    fn build_branch_region(
+        &mut self,
+        from_block: usize,
+        branch_start: usize,
+        stop_at: Option<usize>,
+        loop_exit: Option<usize>,
+    ) -> RegionBlock {
+        if Some(branch_start) == loop_exit {
+            return RegionBlock {
+                nodes: vec![RegionNode::Break {
+                    from_block,
+                    target_exit: branch_start,
+                }],
+            };
+        }
+
+        self.build_region_with_loop(branch_start, stop_at, loop_exit)
     }
 }
 
@@ -306,6 +355,70 @@ mod tests {
         assert!(matches!(
             body.nodes.as_slice(),
             [RegionNode::BasicBlock { block: 1 }]
+        ));
+    }
+
+    #[test]
+    fn build_region_emits_break_for_direct_loop_exit_branch() {
+        let cfg = ControlFlowGraph::new(
+            vec![
+                Block::new(
+                    0,
+                    Vec::new(),
+                    BlockExit::CondJump {
+                        cond: HilExpr::Local(0),
+                        then_block: 1,
+                        else_block: 3,
+                    },
+                ),
+                Block::new(
+                    1,
+                    Vec::new(),
+                    BlockExit::CondJump {
+                        cond: HilExpr::Local(1),
+                        then_block: 3,
+                        else_block: 2,
+                    },
+                ),
+                Block::new(2, Vec::new(), BlockExit::Jump(0)),
+                Block::new(3, Vec::new(), BlockExit::Return(Vec::new())),
+            ],
+            0,
+        );
+
+        let mut builder = RegionBuilder::new(&cfg);
+        let region = builder.build_region(0, None);
+
+        let RegionNode::While {
+            body, exit_block, ..
+        } = &region.nodes[0]
+        else {
+            panic!("expected while");
+        };
+        assert_eq!(*exit_block, 3);
+
+        let RegionNode::If {
+            then_branch,
+            else_branch,
+            ..
+        } = &body.nodes[0]
+        else {
+            panic!("expected break-if inside while");
+        };
+
+        assert!(matches!(
+            then_branch.nodes.as_slice(),
+            [RegionNode::Break {
+                from_block: 1,
+                target_exit: 3
+            }]
+        ));
+        assert!(matches!(
+            else_branch.nodes.as_slice(),
+            [RegionNode::Continue {
+                from_block: 2,
+                target_loop_header: 0
+            }]
         ));
     }
 }
