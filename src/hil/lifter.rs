@@ -4,7 +4,7 @@ use crate::{
     disasm::Proto,
     hil::{
         common::{const_expr, decoded_count, local_range, return_values},
-        ir::{HilExpr, HilStmt, Spanned, ToSpanned},
+        ir::{HilCapture, HilExpr, HilStmt, Spanned, ToSpanned},
     },
     il::{Constant, Count, Instr},
 };
@@ -41,12 +41,14 @@ fn concat_expr_range(start: u8, end: u8) -> HilExpr {
     expr
 }
 
-/// Decodes Luau capture metadata into the captured HIL expression.
-fn decode_capture(capture_type: u8, reg: u8) -> HilExpr {
+/// Decodes Luau capture metadata into the captured HIL capture operand.
+fn decode_capture(capture_type: u8, reg: u8) -> HilCapture {
     match capture_type {
-        0 => HilExpr::CaptureValue(Box::new(HilExpr::Local(reg))),
-        1 => HilExpr::Local(reg),
-        2 => HilExpr::Upval(reg),
+        // Luau splits local captures into by-value (0) and by-ref (1), but
+        // both decompile to capturing the same local name.
+        0 | 1 => HilCapture::Local(reg),
+        // Capture an already-existing parent upvalue.
+        2 => HilCapture::Upval(reg),
         _ => unreachable!("unknown capture type: {capture_type}"),
     }
 }
@@ -587,7 +589,7 @@ impl<'a> Lifter<'a> {
     ///
     /// # Panics
     /// Panics if any expected instruction is not a `CAPTURE`.
-    fn consume_captures(&mut self, count: u8) -> Vec<HilExpr> {
+    fn consume_captures(&mut self, count: u8) -> Vec<HilCapture> {
         if count == 0 {
             return Vec::new();
         }

@@ -6,9 +6,9 @@ use crate::{
             graph::{Block as CfgBlock, ControlFlowGraph},
             region::{RegionBlock, RegionNode},
         },
-        ir::{HilExpr, HilStmt},
+        ir::{HilCapture, HilExpr, HilStmt},
     },
-    scopes::ScopeManager,
+    scopes::{Scope, ScopeManager},
 };
 
 struct Structurer<'a> {
@@ -16,7 +16,13 @@ struct Structurer<'a> {
     cfgs: &'a [ControlFlowGraph],
     entry: usize,
     protos: &'a [Proto],
+
     scopes: ScopeManager<u8, ()>,
+
+    // upvalue index -> captured register
+    upvalues: Scope<u8, u8>,
+    // aliases GETUPVALUEs
+    register_overrides: Scope<u8, u8>,
 }
 
 pub fn structure(
@@ -31,16 +37,15 @@ pub fn structure(
         entry,
         protos,
         scopes: ScopeManager::new(),
+        upvalues: Scope::new(),
+        register_overrides: Scope::new(),
     };
     structurer.structure_entry()
 }
 
 impl<'a> Structurer<'a> {
     fn structure_entry(&mut self) -> Block {
-        self.scopes.push_scope();
-        let block = self.structure_proto(self.entry);
-        self.scopes.pop_scope();
-        block
+        self.structure_proto(self.entry)
     }
 
     fn structure_proto(&mut self, proto_idx: usize) -> Block {
@@ -51,27 +56,17 @@ impl<'a> Structurer<'a> {
             return Block::new();
         };
 
-        self.scopes.push_scope();
-        let block = self.lower_region(region, cfg);
-        self.scopes.pop_scope();
-        block
+        self.lower_region(region, cfg)
     }
 
     fn lower_region(&mut self, region: &RegionBlock, cfg: &ControlFlowGraph) -> Block {
+        self.scopes.push_scope();
         let mut stmts = Vec::new();
-        self.lower_region_into(region, cfg, &mut stmts);
-        Block::with_stmts(stmts)
-    }
-
-    fn lower_region_into(
-        &mut self,
-        region: &RegionBlock,
-        cfg: &ControlFlowGraph,
-        out: &mut Vec<Stmt>,
-    ) {
         for node in &region.nodes {
-            self.lower_node_into(node, cfg, out);
+            self.lower_node_into(node, cfg, &mut stmts);
         }
+        self.scopes.pop_scope();
+        Block::with_stmts(stmts)
     }
 
     fn lower_node_into(&mut self, node: &RegionNode, cfg: &ControlFlowGraph, out: &mut Vec<Stmt>) {
@@ -83,21 +78,24 @@ impl<'a> Structurer<'a> {
                 else_branch,
                 ..
             } => {
-                let else_body =
-                    (!else_branch.nodes.is_empty()).then(|| self.lower_region(else_branch, cfg));
+                let else_body = if !else_branch.nodes.is_empty() {
+                    Some(self.lower_region(else_branch, cfg))
+                } else {
+                    None
+                };
+                let then_body = self.lower_region(then_branch, cfg);
                 out.push(Stmt::If {
                     condition: self.lower_expr(condition),
-                    then_body: self.lower_region(then_branch, cfg),
+                    then_body,
                     else_body,
                 });
             }
             RegionNode::While {
                 condition, body, ..
             } => {
-                out.push(Stmt::While {
-                    condition: self.lower_expr(condition),
-                    body: self.lower_region(body, cfg),
-                });
+                let condition = self.lower_expr(condition);
+                let body = self.lower_region(body, cfg);
+                out.push(Stmt::While { condition, body });
             }
             RegionNode::Continue { .. } => out.push(Stmt::Continue),
             RegionNode::Break { .. } => out.push(Stmt::Break),
@@ -114,12 +112,13 @@ impl<'a> Structurer<'a> {
                     _ => Some(Expr::Name(local_ident(step_reg))),
                 };
 
+                let body = self.lower_region(body, cfg);
                 out.push(Stmt::NumericFor {
                     var: local_ident(*base as u8 + 2),
                     start: Expr::Name(local_ident(*base as u8 + 2)),
                     end: Expr::Name(local_ident(*base as u8)),
                     step,
-                    body: self.lower_region(body, cfg),
+                    body,
                 })
             }
             RegionNode::GenericFor {
@@ -135,6 +134,7 @@ impl<'a> Structurer<'a> {
                     vars.push(Identifier::from("_"));
                 }
 
+                let body = self.lower_region(body, cfg);
                 out.push(Stmt::GenericFor {
                     vars,
                     exprs: vec![
@@ -142,7 +142,7 @@ impl<'a> Structurer<'a> {
                         Expr::Name(local_ident(*base as u8 + 1)),
                         Expr::Name(local_ident(*base as u8 + 2)),
                     ],
-                    body: self.lower_region(body, cfg),
+                    body,
                 });
             }
             RegionNode::Jump { .. } => unreachable!("unexpected jump node in structured region"),
@@ -181,7 +181,7 @@ impl<'a> Structurer<'a> {
             }
             HilStmt::SetField { table, key, value } => out.push(Stmt::Assignment {
                 lhs: Expr::Index {
-                    base: Box::new(Expr::Name(local_ident(*table))),
+                    base: Box::new(Expr::Name(local_ident(self.resolve_reg(*table)))),
                     index: Box::new(Expr::Literal(Literal::String(key.clone().into()))),
                 },
                 rhs: self.lower_expr(value),
@@ -195,7 +195,7 @@ impl<'a> Structurer<'a> {
                 for (offset, value) in values.iter().enumerate() {
                     out.push(Stmt::Assignment {
                         lhs: Expr::Index {
-                            base: Box::new(Expr::Name(local_ident(*table))),
+                            base: Box::new(Expr::Name(local_ident(self.resolve_reg(*table)))),
                             index: Box::new(Expr::Literal(Literal::Number(
                                 f64::from(*index) + offset as f64,
                             ))),
@@ -214,23 +214,38 @@ impl<'a> Structurer<'a> {
     }
 
     fn lower_assign_into(&mut self, left: &HilExpr, value: &HilExpr, out: &mut Vec<Stmt>) {
-        let rhs = self.lower_expr(value);
+        let rhs = match value {
+            HilExpr::Upval(up_reg) => {
+                // GETUPVAL: alias the destination register to the canonical parent register,
+                // because we can't simply reproduce the bytecode's "capture by reference".
+                // No statement is emitted; all subsequent reads/writes of dest use the
+                // canonical name transparently via resolve_reg.
+                let target_reg = match left {
+                    HilExpr::Local(reg) => reg,
+                    _ => unimplemented!("assigning upvalue to non-local"),
+                };
+
+                let canonical = self.upvalues.get(up_reg).copied().unwrap_or_else(|| {
+                    panic!("GETUPVAL references upvalue {up_reg} that is not in the upvalue table")
+                });
+                self.register_overrides.declare(*target_reg, canonical);
+                return;
+            }
+            _ => self.lower_expr(value),
+        };
+
         match left {
             HilExpr::Local(reg) => {
-                if self
-                    .scopes
-                    .top_scope()
-                    .expect("there has to be at least one scope")
-                    .contains(reg)
-                {
+                let resolved = self.resolve_reg(*reg);
+                if self.is_declared(*reg) {
                     out.push(Stmt::Assignment {
-                        lhs: Expr::Name(local_ident(*reg)),
+                        lhs: Expr::Name(local_ident(resolved)),
                         rhs,
                     });
                 } else {
                     self.declare_local(*reg);
                     out.push(Stmt::LocalDeclaration {
-                        names: vec![local_ident(*reg)],
+                        names: vec![local_ident(resolved)],
                         values: vec![rhs],
                     });
                 }
@@ -239,10 +254,24 @@ impl<'a> Structurer<'a> {
                 lhs: Expr::Name(Identifier::from(name.clone())),
                 rhs,
             }),
-            HilExpr::Upval(up) => out.push(Stmt::Assignment {
-                lhs: Expr::Name(upvalue_ident(*up)),
-                rhs,
-            }),
+            HilExpr::Upval(up) => {
+                // SETUPVAL: write back to the canonical parent variable
+                let &resolved = self.upvalues.get(up).unwrap_or_else(|| {
+                    panic!("SETUPVAL references upvalue {up} that is not in the upvalue table")
+                });
+
+                let lhs_name = local_ident(resolved);
+                // Skip self-assignments: these arise when SETUPVAL follows a GETUPVAL on the
+                // same upvalue/register pair — the aliased write already happened.
+                if matches!(&rhs, Expr::Name(n) if n == &lhs_name) {
+                    return;
+                }
+
+                out.push(Stmt::Assignment {
+                    lhs: Expr::Name(lhs_name),
+                    rhs,
+                });
+            }
             HilExpr::GetField { obj, field } => out.push(Stmt::Assignment {
                 lhs: Expr::Field {
                     base: Box::new(self.lower_expr(obj)),
@@ -267,8 +296,7 @@ impl<'a> Structurer<'a> {
             HilExpr::Number(value) => Expr::Literal(Literal::Number(*value)),
             HilExpr::String(value) => Expr::Literal(Literal::String(value.clone().into())),
             HilExpr::Bool(value) => Expr::Literal(Literal::Bool(*value)),
-            HilExpr::Local(reg) => Expr::Name(local_ident(*reg)),
-            HilExpr::Upval(up) => Expr::Name(upvalue_ident(*up)),
+            HilExpr::Local(reg) => Expr::Name(local_ident(self.resolve_reg(*reg))),
             HilExpr::Closure { proto, captures } => self.lower_closure_expr(*proto, captures),
             HilExpr::Global(name) | HilExpr::Import(name) => {
                 Expr::Name(Identifier::from(name.clone()))
@@ -312,18 +340,47 @@ impl<'a> Structurer<'a> {
                     .collect(),
             },
             HilExpr::VarArgs => Expr::Vararg,
-            HilExpr::CaptureValue(inner) => {
-                unreachable!("unexpected capture value expression in structured region: {inner:?}")
-            }
+            HilExpr::Upval(_) => unreachable!("unexpected upvalue expression"),
         }
     }
 
-    fn lower_closure_expr(&mut self, proto_idx: usize, captures: &[HilExpr]) -> Expr {
+    fn lower_closure_expr(&mut self, proto_idx: usize, captures: &[HilCapture]) -> Expr {
         let proto = &self.protos[proto_idx];
         debug_assert_eq!(proto.num_upvals as usize, captures.len());
 
+        let old_upvalues = std::mem::take(&mut self.upvalues);
+        let old_overrides = std::mem::take(&mut self.register_overrides);
+
+        for (up_index, cap) in captures.iter().enumerate() {
+            match cap {
+                // the proto captures a local from the current frame directly.
+                HilCapture::Local(reg) => {
+                    self.upvalues.declare(up_index as u8, *reg);
+                }
+                // the proto re-exports one of our own upvalues. propagate the canonical
+                // register so the chain resolves all the way to the outermost declaration.
+                HilCapture::Upval(parent_upval_idx) => {
+                    let resolved =
+                        old_upvalues
+                            .get(parent_upval_idx)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "closure at proto {proto_idx} captures parent upvalue \
+                                    {parent_upval_idx} but parent upvalue table has no such entry"
+                                )
+                            });
+                    self.upvalues.declare(up_index as u8, resolved);
+                }
+            }
+        }
+
         let params = proto_parameters(proto);
         let body = self.structure_proto(proto_idx);
+
+        self.upvalues = old_upvalues;
+        self.register_overrides = old_overrides;
+
         Expr::AnonymousFunction { params, body }
     }
 
@@ -334,16 +391,16 @@ impl<'a> Structurer<'a> {
     }
 
     fn is_declared(&self, reg: u8) -> bool {
-        self.scopes.get_var(&reg).is_some()
+        self.register_overrides.get(&reg).is_some() || self.scopes.get_var(&reg).is_some()
+    }
+
+    fn resolve_reg(&self, reg: u8) -> u8 {
+        self.register_overrides.get(&reg).copied().unwrap_or(reg)
     }
 }
 
 fn local_ident(reg: u8) -> Identifier {
     Identifier::from(format!("r{reg}"))
-}
-
-fn upvalue_ident(up: u8) -> Identifier {
-    Identifier::from(format!("_up{up}"))
 }
 
 fn local_reg(expr: &HilExpr) -> u8 {

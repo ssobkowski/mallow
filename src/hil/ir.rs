@@ -24,8 +24,6 @@ pub enum HilExpr {
     String(String),
     /// A boolean literal.
     Bool(bool),
-    /// A value captured by a closure.
-    CaptureValue(Box<HilExpr>),
     /// A local variable, identified by its register index.
     Local(u8),
     /// An upvalue, identified by its index in the function's upvalue list.
@@ -33,7 +31,7 @@ pub enum HilExpr {
     /// A closure literal and the proto/captures needed to rebuild nested functions.
     Closure {
         proto: usize,
-        captures: Vec<HilExpr>,
+        captures: Vec<HilCapture>,
     },
     /// A global variable, identified by its name.
     Global(String),
@@ -69,6 +67,15 @@ pub enum HilExpr {
     Table { items: Vec<HilExpr> },
     /// Vararg expression (`...`).
     VarArgs,
+}
+
+/// One closure capture operand attached to a nested function literal.
+#[derive(Debug, Clone)]
+pub enum HilCapture {
+    /// Capture a local from the current frame.
+    Local(u8),
+    /// Capture an upvalue from the parent closure.
+    Upval(u8),
 }
 
 /// A statement in the high-level intermediate representation.
