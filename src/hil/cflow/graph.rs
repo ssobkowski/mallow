@@ -254,9 +254,9 @@ impl ControlFlowGraph {
                     );
                     BlockExit::CondJump {
                         cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Local(*reg)),
+                            lhs: Box::new(HilExpr::Reg(*reg)),
                             op: BinOp::Lt,
-                            rhs: Box::new(HilExpr::Local(*aux)),
+                            rhs: Box::new(HilExpr::Reg(*aux)),
                         },
                         then_block: block_idx + 1,
                         else_block: pc_to_block_idx(&entries_vec, target),
@@ -270,7 +270,7 @@ impl ControlFlowGraph {
                         instr_word_pcs,
                     );
                     BlockExit::CondJump {
-                        cond: HilExpr::Local(*reg),
+                        cond: HilExpr::Reg(*reg),
                         then_block: pc_to_block_idx(&entries_vec, target),
                         else_block: block_idx + 1,
                     }
@@ -283,7 +283,7 @@ impl ControlFlowGraph {
                         instr_word_pcs,
                     );
                     BlockExit::CondJump {
-                        cond: HilExpr::Local(*reg),
+                        cond: HilExpr::Reg(*reg),
                         then_block: block_idx + 1,
                         else_block: pc_to_block_idx(&entries_vec, target),
                     }
@@ -297,9 +297,9 @@ impl ControlFlowGraph {
                     );
                     BlockExit::CondJump {
                         cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Local(*reg)),
+                            lhs: Box::new(HilExpr::Reg(*reg)),
                             op: BinOp::Eq,
-                            rhs: Box::new(HilExpr::Local(*aux)),
+                            rhs: Box::new(HilExpr::Reg(*aux)),
                         },
                         then_block: pc_to_block_idx(&entries_vec, target),
                         else_block: block_idx + 1,
@@ -314,9 +314,9 @@ impl ControlFlowGraph {
                     );
                     BlockExit::CondJump {
                         cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Local(*reg)),
+                            lhs: Box::new(HilExpr::Reg(*reg)),
                             op: BinOp::Lte,
-                            rhs: Box::new(HilExpr::Local(*aux)),
+                            rhs: Box::new(HilExpr::Reg(*aux)),
                         },
                         then_block: pc_to_block_idx(&entries_vec, target),
                         else_block: block_idx + 1,
@@ -331,9 +331,9 @@ impl ControlFlowGraph {
                     );
                     BlockExit::CondJump {
                         cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Local(*reg)),
+                            lhs: Box::new(HilExpr::Reg(*reg)),
                             op: BinOp::Lt,
-                            rhs: Box::new(HilExpr::Local(*aux)),
+                            rhs: Box::new(HilExpr::Reg(*aux)),
                         },
                         then_block: pc_to_block_idx(&entries_vec, target),
                         else_block: block_idx + 1,
@@ -348,9 +348,9 @@ impl ControlFlowGraph {
                     );
                     BlockExit::CondJump {
                         cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Local(*reg)),
+                            lhs: Box::new(HilExpr::Reg(*reg)),
                             op: BinOp::Eq,
-                            rhs: Box::new(HilExpr::Local(*aux)),
+                            rhs: Box::new(HilExpr::Reg(*aux)),
                         },
                         then_block: block_idx + 1,
                         else_block: pc_to_block_idx(&entries_vec, target),
@@ -365,9 +365,9 @@ impl ControlFlowGraph {
                     );
                     BlockExit::CondJump {
                         cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Local(*reg)),
+                            lhs: Box::new(HilExpr::Reg(*reg)),
                             op: BinOp::Lte,
-                            rhs: Box::new(HilExpr::Local(*aux)),
+                            rhs: Box::new(HilExpr::Reg(*aux)),
                         },
                         then_block: block_idx + 1,
                         else_block: pc_to_block_idx(&entries_vec, target),
@@ -387,7 +387,7 @@ impl ControlFlowGraph {
                     let op = if *invert { BinOp::Ne } else { BinOp::Eq };
                     BlockExit::CondJump {
                         cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Local(*reg)),
+                            lhs: Box::new(HilExpr::Reg(*reg)),
                             op,
                             rhs: Box::new(HilExpr::Nil),
                         },
@@ -410,7 +410,7 @@ impl ControlFlowGraph {
                     let op = if *invert { BinOp::Ne } else { BinOp::Eq };
                     BlockExit::CondJump {
                         cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Local(*reg)),
+                            lhs: Box::new(HilExpr::Reg(*reg)),
                             op,
                             rhs: Box::new(HilExpr::Bool(*k)),
                         },
@@ -439,7 +439,7 @@ impl ControlFlowGraph {
                     let op = if *invert { BinOp::Ne } else { BinOp::Eq };
                     BlockExit::CondJump {
                         cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Local(*reg)),
+                            lhs: Box::new(HilExpr::Reg(*reg)),
                             op,
                             rhs: Box::new(const_expr(&proto.consts, *k as usize)),
                         },

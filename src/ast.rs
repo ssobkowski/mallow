@@ -16,14 +16,11 @@ impl Identifier {
     }
 }
 
-impl From<&str> for Identifier {
-    fn from(value: &str) -> Self {
-        Identifier::new(value)
-    }
-}
-
-impl From<String> for Identifier {
-    fn from(value: String) -> Self {
+impl<T> From<T> for Identifier
+where
+    T: Into<SmolStr>,
+{
+    fn from(value: T) -> Self {
         Identifier::new(value)
     }
 }
@@ -206,8 +203,8 @@ pub enum Expr {
     },
     /// Table constructor expression.
     Table {
-        /// Table fields.
-        fields: Vec<TableConstructorField>,
+        /// Table items.
+        items: Vec<TableItem>,
     },
     /// Vararg expression (`...`).
     Vararg,
@@ -230,7 +227,7 @@ pub enum Literal {
 
 /// A field in a table constructor.
 #[derive(Debug, Clone, PartialEq)]
-pub enum TableConstructorField {
+pub enum TableItem {
     /// Named field (`foo = value`).
     Named { name: Identifier, value: Expr },
     /// Indexed field (`[key] = value`).

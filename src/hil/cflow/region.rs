@@ -323,8 +323,8 @@ mod tests {
                     1,
                     vec![Spanned::new(
                         HilStmt::Assign {
-                            left: HilExpr::Local(4),
-                            value: HilExpr::Local(2),
+                            left: HilExpr::Reg(4),
+                            value: HilExpr::Reg(2),
                         },
                         0,
                     )],
@@ -366,7 +366,7 @@ mod tests {
                     0,
                     Vec::new(),
                     BlockExit::CondJump {
-                        cond: HilExpr::Local(0),
+                        cond: HilExpr::Reg(0),
                         then_block: 1,
                         else_block: 3,
                     },
@@ -375,7 +375,7 @@ mod tests {
                     1,
                     Vec::new(),
                     BlockExit::CondJump {
-                        cond: HilExpr::Local(1),
+                        cond: HilExpr::Reg(1),
                         then_block: 3,
                         else_block: 2,
                     },

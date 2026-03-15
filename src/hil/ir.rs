@@ -1,3 +1,5 @@
+use smol_str::SmolStr;
+
 use crate::ast::{BinOp, UnOp};
 
 /// A wrapper that attaches a bytecode PC to any IR node.
@@ -24,21 +26,23 @@ pub enum HilExpr {
     String(String),
     /// A boolean literal.
     Bool(bool),
-    /// A local variable, identified by its register index.
-    Local(u8),
+    /// A register, identified by its index.
+    Reg(u8),
     /// An upvalue, identified by its index in the function's upvalue list.
     Upval(u8),
+    /// A local variable, identified by its name. Used internally for non-register locals.
+    Local(SmolStr),
     /// A closure literal and the proto/captures needed to rebuild nested functions.
     Closure {
         proto: usize,
         captures: Vec<HilCapture>,
     },
     /// A global variable, identified by its name.
-    Global(String),
+    Global(SmolStr),
     /// A Luau import path, identified by its printable source name.
-    Import(String),
+    Import(SmolStr),
     /// A field access expression (`obj.field`).
-    GetField { obj: Box<HilExpr>, field: String },
+    GetField { obj: Box<HilExpr>, field: SmolStr },
     /// An index access expression (`obj[index]`).
     GetIndex {
         obj: Box<HilExpr>,
@@ -52,7 +56,7 @@ pub enum HilExpr {
     /// A method call expression (`obj:method(args...)`).
     MethodCall {
         object: Box<HilExpr>,
-        method: String,
+        method: SmolStr,
         args: Vec<HilExpr>,
     },
     /// A binary expression.
@@ -64,7 +68,7 @@ pub enum HilExpr {
     /// An unary expression.
     Unary { op: UnOp, expr: Box<HilExpr> },
     /// A table constructor with a list of implicit values.
-    Table { items: Vec<HilExpr> },
+    Table { items: Vec<HilTableItem> },
     /// Vararg expression (`...`).
     VarArgs,
 }
@@ -78,6 +82,18 @@ pub enum HilCapture {
     Upval(u8),
 }
 
+/// An entry in the table constructor.
+#[derive(Debug, Clone)]
+pub enum HilTableItem {
+    /// An array-part value, e.g., `value` in `{ value }`
+    List(HilExpr),
+    /// A generic expression-keyed dictionary value, e.g., `[key] = value`
+    Index(HilExpr, HilExpr),
+    /// An array of packed expressions, that needs to be unpacked into the target
+    /// table. Used to carry over multirets into the table constructor.
+    Packed(HilExpr),
+}
+
 /// A statement in the high-level intermediate representation.
 #[derive(Debug, Clone)]
 pub enum HilStmt {
@@ -88,7 +104,7 @@ pub enum HilStmt {
     /// A table-field assignment lowered from opcodes such as `SETTABLEKS`.
     SetField {
         table: u8,
-        key: String,
+        key: SmolStr,
         value: HilExpr,
     },
     /// A bulk array write lowered from `SETLIST`.
@@ -102,6 +118,24 @@ pub enum HilStmt {
     Call(HilExpr),
     /// A return statement.
     Return(Vec<HilExpr>),
+}
+
+impl HilStmt {
+    /// Returns whether this statement writes _directly_ to
+    /// a local register with a given index.
+    pub fn writes_to(&self, index: u8) -> bool {
+        match self {
+            HilStmt::Assign {
+                value: HilExpr::Reg(reg),
+                ..
+            } => *reg == index,
+            HilStmt::AssignMany { left, .. } => left.iter().any(|lv| match lv {
+                HilExpr::Reg(reg) => *reg == index,
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
 }
 
 pub trait ToSpanned {

@@ -525,7 +525,7 @@ mod tests {
                     0,
                     vec![],
                     BlockExit::CondJump {
-                        cond: HilExpr::Local(0),
+                        cond: HilExpr::Reg(0),
                         then_block: 1,
                         else_block: 2,
                     },

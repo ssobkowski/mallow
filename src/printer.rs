@@ -1,5 +1,5 @@
 use crate::{
-    ast::{BinOp, Block, Expr, Literal, Parameter, Stmt, TableConstructorField, UnOp},
+    ast::{BinOp, Block, Expr, Literal, Parameter, Stmt, TableItem, UnOp},
     common::escape_string,
 };
 
@@ -353,7 +353,7 @@ impl AstPrinter {
                     self.write(")");
                 }
             }
-            Expr::Table { fields } => self.write_table(fields),
+            Expr::Table { items } => self.write_table(items),
             Expr::Vararg => self.write("..."),
             Expr::Literal(lit) => self.write_literal(lit),
         }
@@ -397,8 +397,8 @@ impl AstPrinter {
         }
     }
 
-    fn write_table(&mut self, fields: &[TableConstructorField]) {
-        if fields.is_empty() {
+    fn write_table(&mut self, items: &[TableItem]) {
+        if items.is_empty() {
             self.write("{}");
             return;
         }
@@ -406,25 +406,25 @@ impl AstPrinter {
         self.write("{");
         self.newline();
         self.indent += 1;
-        for (i, field) in fields.iter().enumerate() {
+        for (i, item) in items.iter().enumerate() {
             self.write("");
-            match field {
-                TableConstructorField::Named { name, value } => {
+            match item {
+                TableItem::Named { name, value } => {
                     self.write(name.as_str());
                     self.write(" = ");
                     self.walk_expr(value, 0, Side::None);
                 }
-                TableConstructorField::Indexed { index, value } => {
+                TableItem::Indexed { index, value } => {
                     self.write("[");
                     self.walk_expr(index, 0, Side::None);
                     self.write("] = ");
                     self.walk_expr(value, 0, Side::None);
                 }
-                TableConstructorField::Implicit { value } => {
+                TableItem::Implicit { value } => {
                     self.walk_expr(value, 0, Side::None);
                 }
             }
-            if i + 1 < fields.len() {
+            if i + 1 < items.len() {
                 self.write(",");
             }
             self.newline();

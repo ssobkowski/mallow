@@ -1,15 +1,23 @@
+use smol_str::SmolStr;
+
 use crate::{
-    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableConstructorField},
+    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem},
     disasm::Proto,
     hil::{
         cflow::{
             graph::{Block as CfgBlock, ControlFlowGraph},
             region::{RegionBlock, RegionNode},
         },
-        ir::{HilCapture, HilExpr, HilStmt},
+        ir::{HilCapture, HilExpr, HilStmt, HilTableItem},
     },
     scopes::{Scope, ScopeManager},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Var {
+    Reg(u8),
+    Local(SmolStr),
+}
 
 struct Structurer<'a> {
     regions: &'a [RegionBlock],
@@ -17,7 +25,7 @@ struct Structurer<'a> {
     entry: usize,
     protos: &'a [Proto],
 
-    scopes: ScopeManager<u8, ()>,
+    scopes: ScopeManager<Var, ()>,
 
     // upvalue index -> captured register
     upvalues: Scope<u8, u8>,
@@ -171,7 +179,7 @@ impl<'a> Structurer<'a> {
                 let regs: Vec<_> = left.iter().map(local_reg).collect();
                 let names: Vec<_> = regs.iter().copied().map(local_ident).collect();
                 for reg in regs {
-                    self.declare_local(reg);
+                    self.declare_var(Var::Reg(reg));
                 }
 
                 out.push(Stmt::LocalDeclaration {
@@ -182,7 +190,7 @@ impl<'a> Structurer<'a> {
             HilStmt::SetField { table, key, value } => out.push(Stmt::Assignment {
                 lhs: Expr::Index {
                     base: Box::new(Expr::Name(local_ident(self.resolve_reg(*table)))),
-                    index: Box::new(Expr::Literal(Literal::String(key.clone().into()))),
+                    index: Box::new(Expr::Literal(Literal::String(key.clone()))),
                 },
                 rhs: self.lower_expr(value),
             }),
@@ -221,7 +229,7 @@ impl<'a> Structurer<'a> {
                 // No statement is emitted; all subsequent reads/writes of dest use the
                 // canonical name transparently via resolve_reg.
                 let target_reg = match left {
-                    HilExpr::Local(reg) => reg,
+                    HilExpr::Reg(reg) => reg,
                     _ => unimplemented!("assigning upvalue to non-local"),
                 };
 
@@ -235,17 +243,33 @@ impl<'a> Structurer<'a> {
         };
 
         match left {
-            HilExpr::Local(reg) => {
+            HilExpr::Reg(reg) => {
                 let resolved = self.resolve_reg(*reg);
-                if self.is_declared(*reg) {
+                let var = Var::Reg(*reg);
+                if self.is_declared(&var) {
                     out.push(Stmt::Assignment {
                         lhs: Expr::Name(local_ident(resolved)),
                         rhs,
                     });
                 } else {
-                    self.declare_local(*reg);
+                    self.declare_var(var);
                     out.push(Stmt::LocalDeclaration {
                         names: vec![local_ident(resolved)],
+                        values: vec![rhs],
+                    });
+                }
+            }
+            HilExpr::Local(name) => {
+                let var = Var::Local(name.clone());
+                if self.is_declared(&var) {
+                    out.push(Stmt::Assignment {
+                        lhs: Expr::Name(Identifier::from(name.clone())),
+                        rhs,
+                    });
+                } else {
+                    self.declare_var(var);
+                    out.push(Stmt::LocalDeclaration {
+                        names: vec![Identifier::from(name.clone())],
                         values: vec![rhs],
                     });
                 }
@@ -296,7 +320,8 @@ impl<'a> Structurer<'a> {
             HilExpr::Number(value) => Expr::Literal(Literal::Number(*value)),
             HilExpr::String(value) => Expr::Literal(Literal::String(value.clone().into())),
             HilExpr::Bool(value) => Expr::Literal(Literal::Bool(*value)),
-            HilExpr::Local(reg) => Expr::Name(local_ident(self.resolve_reg(*reg))),
+            HilExpr::Reg(reg) => Expr::Name(local_ident(self.resolve_reg(*reg))),
+            HilExpr::Local(name) => Expr::Name(Identifier::from(name.clone())),
             HilExpr::Closure { proto, captures } => self.lower_closure_expr(*proto, captures),
             HilExpr::Global(name) | HilExpr::Import(name) => {
                 Expr::Name(Identifier::from(name.clone()))
@@ -332,11 +357,9 @@ impl<'a> Structurer<'a> {
                 expr: Box::new(self.lower_expr(expr)),
             },
             HilExpr::Table { items } => Expr::Table {
-                fields: items
+                items: items
                     .iter()
-                    .map(|item| TableConstructorField::Implicit {
-                        value: self.lower_expr(item),
-                    })
+                    .map(|item| self.lower_table_item(item))
                     .collect(),
             },
             HilExpr::VarArgs => Expr::Vararg,
@@ -350,6 +373,7 @@ impl<'a> Structurer<'a> {
 
         let old_upvalues = std::mem::take(&mut self.upvalues);
         let old_overrides = std::mem::take(&mut self.register_overrides);
+        let old_scopes = std::mem::take(&mut self.scopes);
 
         for (up_index, cap) in captures.iter().enumerate() {
             match cap {
@@ -380,18 +404,45 @@ impl<'a> Structurer<'a> {
 
         self.upvalues = old_upvalues;
         self.register_overrides = old_overrides;
+        self.scopes = old_scopes;
 
         Expr::AnonymousFunction { params, body }
     }
 
-    fn declare_local(&mut self, reg: u8) {
-        if !self.is_declared(reg) {
-            self.scopes.declare_var(reg, ());
+    fn lower_table_item(&mut self, item: &HilTableItem) -> TableItem {
+        match item {
+            HilTableItem::List(value) => TableItem::Implicit {
+                value: self.lower_expr(value),
+            },
+            HilTableItem::Index(index, value) => TableItem::Indexed {
+                index: self.lower_expr(index),
+                value: self.lower_expr(value),
+            },
+            HilTableItem::Packed(expr) => TableItem::Implicit {
+                value: Expr::FunctionCall {
+                    func: Box::new(Expr::Field {
+                        base: Box::new(Expr::Name("table".into())),
+                        field: "unpack".into(),
+                    }),
+                    args: vec![self.lower_expr(expr)],
+                },
+            },
         }
     }
 
-    fn is_declared(&self, reg: u8) -> bool {
-        self.register_overrides.get(&reg).is_some() || self.scopes.get_var(&reg).is_some()
+    fn declare_var(&mut self, var: Var) {
+        if !self.is_declared(&var) {
+            self.scopes.declare_var(var, ());
+        }
+    }
+
+    fn is_declared(&self, var: &Var) -> bool {
+        match var {
+            Var::Reg(reg) => {
+                self.register_overrides.get(reg).is_some() || self.scopes.get_var(var).is_some()
+            }
+            Var::Local(_) => self.scopes.get_var(var).is_some(),
+        }
     }
 
     fn resolve_reg(&self, reg: u8) -> u8 {
@@ -405,7 +456,7 @@ fn local_ident(reg: u8) -> Identifier {
 
 fn local_reg(expr: &HilExpr) -> u8 {
     match expr {
-        HilExpr::Local(reg) => *reg,
+        HilExpr::Reg(reg) => *reg,
         _ => unreachable!("expected local register, got {expr:?}"),
     }
 }
@@ -423,7 +474,7 @@ fn proto_parameters(proto: &Proto) -> Vec<Parameter> {
 fn last_local_assign(block: &CfgBlock, reg: u8) -> Option<&HilExpr> {
     block.stmts.iter().rev().find_map(|stmt| match &stmt.inner {
         HilStmt::Assign {
-            left: HilExpr::Local(stmt_reg),
+            left: HilExpr::Reg(stmt_reg),
             value,
         } if *stmt_reg == reg => Some(value),
         _ => None,
@@ -452,7 +503,7 @@ mod tests {
                 0,
                 vec![Spanned::new(
                     HilStmt::Assign {
-                        left: HilExpr::Local(0),
+                        left: HilExpr::Reg(0),
                         value: HilExpr::Number(1.0),
                     },
                     0,
@@ -492,7 +543,7 @@ mod tests {
                     0,
                     Vec::new(),
                     BlockExit::CondJump {
-                        cond: HilExpr::Local(0),
+                        cond: HilExpr::Reg(0),
                         then_block: 1,
                         else_block: 2,
                     },
@@ -501,7 +552,7 @@ mod tests {
                     1,
                     vec![Spanned::new(
                         HilStmt::Assign {
-                            left: HilExpr::Local(1),
+                            left: HilExpr::Reg(1),
                             value: HilExpr::Bool(true),
                         },
                         1,
@@ -512,7 +563,7 @@ mod tests {
                     2,
                     vec![Spanned::new(
                         HilStmt::Assign {
-                            left: HilExpr::Local(2),
+                            left: HilExpr::Reg(2),
                             value: HilExpr::Bool(false),
                         },
                         2,
@@ -527,7 +578,7 @@ mod tests {
             nodes: vec![
                 RegionNode::If {
                     header: 0,
-                    condition: HilExpr::Local(0),
+                    condition: HilExpr::Reg(0),
                     then_branch: RegionBlock {
                         nodes: vec![RegionNode::BasicBlock { block: 1 }],
                     },
@@ -575,28 +626,28 @@ mod tests {
                     vec![
                         Spanned::new(
                             HilStmt::Assign {
-                                left: HilExpr::Local(0),
+                                left: HilExpr::Reg(0),
                                 value: HilExpr::Table { items: Vec::new() },
                             },
                             0,
                         ),
                         Spanned::new(
                             HilStmt::Assign {
-                                left: HilExpr::Local(1),
-                                value: HilExpr::Local(0),
+                                left: HilExpr::Reg(1),
+                                value: HilExpr::Reg(0),
                             },
                             1,
                         ),
                         Spanned::new(
                             HilStmt::Assign {
-                                left: HilExpr::Local(2),
+                                left: HilExpr::Reg(2),
                                 value: HilExpr::Nil,
                             },
                             2,
                         ),
                         Spanned::new(
                             HilStmt::Assign {
-                                left: HilExpr::Local(3),
+                                left: HilExpr::Reg(3),
                                 value: HilExpr::Nil,
                             },
                             3,

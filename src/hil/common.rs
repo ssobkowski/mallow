@@ -34,7 +34,7 @@ pub fn local_range(start: u8, count: u8) -> Vec<HilExpr> {
         "local_range overflow: start={start} count={count}"
     );
 
-    (0..count).map(|i| HilExpr::Local(start + i)).collect()
+    (0..count).map(|i| HilExpr::Reg(start + i)).collect()
 }
 
 /// Produces return expressions for one `RETURN` opcode.
@@ -46,6 +46,6 @@ pub fn local_range(start: u8, count: u8) -> Vec<HilExpr> {
 pub fn return_values(base: u8, count: u8) -> Vec<HilExpr> {
     match decoded_count(count) {
         Count::Number(n) => local_range(base, n),
-        _ => vec![HilExpr::Local(base)],
+        _ => vec![HilExpr::Reg(base)],
     }
 }
