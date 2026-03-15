@@ -120,24 +120,6 @@ pub enum HilStmt {
     Return(Vec<HilExpr>),
 }
 
-impl HilStmt {
-    /// Returns whether this statement writes _directly_ to
-    /// a local register with a given index.
-    pub fn writes_to(&self, index: u8) -> bool {
-        match self {
-            HilStmt::Assign {
-                value: HilExpr::Reg(reg),
-                ..
-            } => *reg == index,
-            HilStmt::AssignMany { left, .. } => left.iter().any(|lv| match lv {
-                HilExpr::Reg(reg) => *reg == index,
-                _ => false,
-            }),
-            _ => false,
-        }
-    }
-}
-
 pub trait ToSpanned {
     fn to_spanned(self, pc: usize) -> Spanned<Self>
     where
