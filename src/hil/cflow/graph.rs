@@ -5,43 +5,28 @@ use std::{
 
 use bitvec::vec::BitVec;
 
-use crate::ast::BinOp;
 use crate::disasm::Proto;
 use crate::hil::common::{const_expr, return_values};
 use crate::hil::ir::{HilExpr, HilStmt, Spanned};
 use crate::hil::lifter;
 use crate::il::Instr;
+use crate::{ast::BinOp, hil::ir::ToSpanned};
 
 /// One basic block in the per-proto control-flow graph.
 #[derive(Debug, Clone)]
 pub struct Block {
+    // this is kept for debugging purposes
+    #[allow(dead_code)]
     pub id: usize,
     pub stmts: Vec<Spanned<HilStmt>>,
     pub exit: BlockExit,
-    pub exit_word_pc: usize,
 }
 
 impl Block {
     /// Creates a new block with a synthetic exit PC.
     #[must_use]
     pub fn new(id: usize, stmts: Vec<Spanned<HilStmt>>, exit: BlockExit) -> Self {
-        Self::with_exit_pc(id, stmts, exit, 0)
-    }
-
-    /// Creates a new block with an explicit exit PC.
-    #[must_use]
-    pub fn with_exit_pc(
-        id: usize,
-        stmts: Vec<Spanned<HilStmt>>,
-        exit: BlockExit,
-        exit_word_pc: usize,
-    ) -> Self {
-        Self {
-            id,
-            stmts,
-            exit,
-            exit_word_pc,
-        }
+        Self { id, stmts, exit }
     }
 }
 
@@ -525,16 +510,13 @@ impl ControlFlowGraph {
                 proto,
                 all_protos,
             );
-            let exit_word_pc = if end == 0 {
-                0
-            } else {
-                instr_word_pcs[end.saturating_sub(1)]
-            };
 
-            blocks.push(Block::with_exit_pc(block_idx, lifted, exit, exit_word_pc));
+            blocks.push(Block::new(block_idx, lifted, exit));
         }
 
-        Self::new(blocks, 0)
+        let mut graph = Self::new(blocks, 0);
+        graph.fold_short_circuits();
+        graph
     }
 
     /// Returns all successor block ids for `block`.
@@ -594,6 +576,86 @@ impl ControlFlowGraph {
     #[must_use]
     pub fn immediate_dominator(&self, block: usize) -> Option<usize> {
         self.immediate_dominators.get(block).copied().flatten()
+    }
+
+    fn fold_short_circuits(&mut self) {
+        // Folds Lua's `and/or` ternary pattern into a single conditional expression.
+        //
+        // Lua itself lacks a native ternary operator, so `cond and x or y` compiles into
+        // a diamond-shaped CFG: the condition is checked first, and if truthy, the result
+        // register is checked again to guard against falsy `x` values.
+        //
+        //     A: if cond → B, C
+        //     B: if x    → D, C   (x = MOVE of cond result; the "truthy guard")
+        //     C: <fallback>
+        //     D: <continuation>
+        //
+        // When we detect this shape (A and B share the same else-block C), we can
+        // collapse it: emit `result = cond and x` into A, then re-target A's exit
+        // to jump directly to D or C - eliminating the redundant block B in the process.
+
+        for i in 0..self.blocks.len() {
+            let (then_b, else_b, cond) = match &self.blocks[i].exit {
+                BlockExit::CondJump {
+                    then_block,
+                    else_block,
+                    cond,
+                } => (*then_block, *else_block, cond.clone()),
+                _ => continue,
+            };
+
+            let (then_d, else_e) = match &self.blocks[then_b].exit {
+                BlockExit::CondJump {
+                    then_block,
+                    else_block,
+                    ..
+                } => (*then_block, *else_block),
+                _ => continue,
+            };
+
+            if else_b != else_e {
+                continue;
+            }
+
+            // This will match only if the then block has a single assignment
+            // of a register to a register, which is the "truthy check" (Luau
+            // needs to MOVE this register before the jump)
+            if let [
+                Spanned {
+                    inner:
+                        HilStmt::Assign {
+                            left: HilExpr::Reg(result_reg),
+                            value: HilExpr::Reg(cond_expr),
+                        },
+                    ..
+                },
+            ] = &self.blocks[then_b].stmts[..]
+            {
+                // copy out before the borrow dies
+                let result_reg = *result_reg;
+                let cond_expr = *cond_expr;
+                // immutable borrow of self.blocks[then_b] ends here
+
+                self.blocks[i].stmts.push(
+                    HilStmt::Assign {
+                        left: HilExpr::Reg(result_reg),
+                        value: HilExpr::Binary {
+                            lhs: Box::new(cond),
+                            op: BinOp::And,
+                            rhs: Box::new(HilExpr::Reg(cond_expr)),
+                        },
+                    }
+                    .to_spanned(0),
+                );
+
+                // TODO: Explore inverting the condition and blocks
+                self.blocks[i].exit = BlockExit::CondJump {
+                    cond: HilExpr::Reg(result_reg),
+                    then_block: then_d,
+                    else_block: else_b,
+                };
+            }
+        }
     }
 }
 

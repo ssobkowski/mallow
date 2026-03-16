@@ -324,16 +324,6 @@ fn linear_fallthrough_reaches(
     false
 }
 
-/// Returns whether `block` is a natural loop header.
-/// A block that dominates one of its predecessors marks the start of a natural loop region.
-#[must_use]
-pub fn is_loop_header(block: usize, cfg: &ControlFlowGraph) -> bool {
-    cfg.predecessors(block)
-        .iter()
-        .copied()
-        .any(|pred| pred != block && cfg.dominates(block, pred))
-}
-
 /// Returns whether `start` can reach `target` through a non-`for` backedge.
 #[must_use]
 pub fn branch_has_plain_backedge(start: usize, target: usize, cfg: &ControlFlowGraph) -> bool {
@@ -412,102 +402,6 @@ pub fn find_loop_exit_block(
         .copied()
         .min()
         .unwrap_or(exit_branch)
-}
-
-/// Finds the structured exit block for a candidate loop header.
-///
-/// # Returns
-/// - `Some(exit_block)` when exactly one conditional successor acts as loop backedge.
-/// - `None` when no recoverable while-shape exists.
-#[must_use]
-pub fn loop_header_exit_block(header: usize, cfg: &ControlFlowGraph) -> Option<usize> {
-    let block = cfg.blocks.get(header)?;
-
-    match &block.exit {
-        BlockExit::CondJump {
-            then_block,
-            else_block,
-            ..
-        } => {
-            let then_backedges = branch_has_plain_backedge(*then_block, header, cfg);
-            let else_backedges = branch_has_plain_backedge(*else_block, header, cfg);
-            if then_backedges == else_backedges {
-                return None;
-            }
-
-            let (loop_block, exit_branch) = if then_backedges {
-                (*then_block, *else_block)
-            } else {
-                (*else_block, *then_block)
-            };
-
-            Some(find_loop_exit_block(header, exit_branch, loop_block, cfg))
-        }
-        _ => None,
-    }
-}
-
-/// Finds the innermost loop header that dominates `block`.
-///
-/// # Returns
-/// - `Some(header)` for the nearest dominating loop header.
-/// - `None` when `block` is outside all recoverable loop headers.
-#[must_use]
-pub fn nearest_dominating_loop_header(block: usize, cfg: &ControlFlowGraph) -> Option<usize> {
-    let mut best = None;
-
-    for candidate in 0..cfg.blocks.len() {
-        if candidate == block || !is_loop_header(candidate, cfg) {
-            continue;
-        }
-        if !cfg.dominates(candidate, block) {
-            continue;
-        }
-
-        match best {
-            Some(current_best) if !cfg.dominates(current_best, candidate) => {}
-            _ => best = Some(candidate),
-        }
-    }
-
-    best
-}
-
-/// Returns whether `start` is only an empty jump chain that rejoins `target`.
-///
-/// # Returns
-/// - `true` when every block before `target` is empty and has one unconditional successor.
-/// - `false` when executable statements, conditional splits, or off-target exits are present.
-#[must_use]
-pub fn branch_is_trivial_continue(start: usize, target: usize, cfg: &ControlFlowGraph) -> bool {
-    let mut stack = vec![start];
-    let mut seen = HashSet::new();
-
-    while let Some(block) = stack.pop() {
-        if block == target || !seen.insert(block) {
-            continue;
-        }
-
-        let Some(branch_block) = cfg.blocks.get(block) else {
-            return false;
-        };
-        if !branch_block.stmts.is_empty() {
-            return false;
-        }
-
-        match branch_block.exit {
-            BlockExit::Jump(next) | BlockExit::Fallthrough(next) => {
-                if next != target && cfg.dominates(target, next) {
-                    stack.push(next);
-                } else if next != target {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-
-    true
 }
 
 #[cfg(test)]
