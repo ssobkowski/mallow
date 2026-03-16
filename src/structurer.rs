@@ -5,7 +5,7 @@ use crate::{
     disasm::Proto,
     hil::{
         cflow::{
-            graph::{Block as CfgBlock, ControlFlowGraph},
+            graph::ControlFlowGraph,
             region::{RegionBlock, RegionNode},
         },
         ir::{HilCapture, HilExpr, HilStmt, HilTableItem},
@@ -30,7 +30,7 @@ struct Structurer<'a> {
     // upvalue index -> captured register
     upvalues: Scope<u8, u8>,
     // aliases GETUPVALUEs
-    register_overrides: Scope<u8, u8>,
+    register_overrides: ScopeManager<u8, u8>,
 }
 
 pub fn structure(
@@ -46,7 +46,7 @@ pub fn structure(
         protos,
         scopes: ScopeManager::new(),
         upvalues: Scope::new(),
-        register_overrides: Scope::new(),
+        register_overrides: ScopeManager::new(),
     };
     structurer.structure_entry()
 }
@@ -78,6 +78,7 @@ impl<'a> Structurer<'a> {
         init_vars: &[Var],
     ) -> Block {
         self.scopes.push_scope();
+        self.register_overrides.push_scope();
         for var in init_vars {
             self.declare_var(var.clone());
         }
@@ -86,6 +87,7 @@ impl<'a> Structurer<'a> {
             self.lower_node_into(node, cfg, &mut stmts);
         }
         self.scopes.pop_scope();
+        self.register_overrides.pop_scope();
         Block::with_stmts(stmts)
     }
 
@@ -228,6 +230,7 @@ impl<'a> Structurer<'a> {
     }
 
     fn lower_assign_into(&mut self, left: &HilExpr, value: &HilExpr, out: &mut Vec<Stmt>) {
+        let mut force_declaration = false;
         let rhs = match value {
             HilExpr::Upval(up_reg) => {
                 // GETUPVAL: alias the destination register to the canonical parent register,
@@ -242,8 +245,25 @@ impl<'a> Structurer<'a> {
                 let canonical = self.upvalues.get(up_reg).copied().unwrap_or_else(|| {
                     panic!("GETUPVAL references upvalue {up_reg} that is not in the upvalue table")
                 });
-                self.register_overrides.declare(*target_reg, canonical);
+                self.register_overrides
+                    .top_scope_mut()
+                    .expect("there must be a scope")
+                    .declare(*target_reg, canonical);
                 return;
+            }
+            HilExpr::Call { fun, .. } => {
+                // If we call a captured upvalue, we must not override it by accident
+                if let HilExpr::Reg(fun_reg) = fun.as_ref()
+                    && self
+                        .register_overrides
+                        .top_scope()
+                        .expect("there must be a scope")
+                        .contains(fun_reg)
+                {
+                    force_declaration = true;
+                };
+
+                self.lower_expr(value)
             }
             _ => self.lower_expr(value),
         };
@@ -252,16 +272,16 @@ impl<'a> Structurer<'a> {
             HilExpr::Reg(reg) => {
                 let resolved = self.resolve_reg(*reg);
                 let var = Var::Reg(*reg);
-                if self.is_declared(&var) {
-                    out.push(Stmt::Assignment {
-                        lhs: Expr::Name(local_ident(resolved)),
-                        rhs,
-                    });
-                } else {
+                if force_declaration || !self.is_declared(&var) {
                     self.declare_var(var);
                     out.push(Stmt::LocalDeclaration {
                         names: vec![local_ident(resolved)],
                         values: vec![rhs],
+                    });
+                } else {
+                    out.push(Stmt::Assignment {
+                        lhs: Expr::Name(local_ident(resolved)),
+                        rhs,
                     });
                 }
             }
@@ -390,16 +410,10 @@ impl<'a> Structurer<'a> {
                 // the proto re-exports one of our own upvalues. propagate the canonical
                 // register so the chain resolves all the way to the outermost declaration.
                 HilCapture::Upval(parent_upval_idx) => {
-                    let resolved =
-                        old_upvalues
-                            .get(parent_upval_idx)
-                            .copied()
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "closure at proto {proto_idx} captures parent upvalue \
-                                    {parent_upval_idx} but parent upvalue table has no such entry"
-                                )
-                            });
+                    let resolved = old_upvalues.get(parent_upval_idx).copied().expect(
+                        "closure at proto {proto_idx} captures parent upvalue \
+                         {parent_upval_idx} but parent upvalue table has no such entry",
+                    );
                     self.upvalues.declare(up_index as u8, resolved);
                 }
             }
@@ -451,14 +465,24 @@ impl<'a> Structurer<'a> {
     fn is_declared(&self, var: &Var) -> bool {
         match var {
             Var::Reg(reg) => {
-                self.register_overrides.get(reg).is_some() || self.scopes.get_var(var).is_some()
+                self.register_overrides
+                    .top_scope()
+                    .expect("there must be a scope")
+                    .get(reg)
+                    .is_some()
+                    || self.scopes.get_var(var).is_some()
             }
             Var::Local(_) => self.scopes.get_var(var).is_some(),
         }
     }
 
     fn resolve_reg(&self, reg: u8) -> u8 {
-        self.register_overrides.get(&reg).copied().unwrap_or(reg)
+        self.register_overrides
+            .top_scope()
+            .expect("there must be a scope")
+            .get(&reg)
+            .copied()
+            .unwrap_or(reg)
     }
 }
 

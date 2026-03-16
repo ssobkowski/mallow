@@ -36,7 +36,6 @@ pub enum Value {
 pub enum Count {
     Number(u8),
     Variadic,
-    All, // Multiret
 }
 
 #[derive(Debug, Clone, Copy)]

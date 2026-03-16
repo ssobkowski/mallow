@@ -449,7 +449,7 @@ impl<'a> Lifter<'a> {
 
     fn lift_return(&mut self, base: u8, count: u8) {
         let rets = match decoded_count(count) {
-            Count::Variadic | Count::All => self
+            Count::Variadic => self
                 .take_variadic_from(base)
                 .unwrap_or_else(|| return_values(base, count)),
             Count::Number(_) => return_values(base, count),
@@ -467,7 +467,7 @@ impl<'a> Lifter<'a> {
                     Vec::new()
                 }
             }
-            Count::Variadic | Count::All => self.take_variadic_from(first_arg).unwrap_or_default(),
+            Count::Variadic => self.take_variadic_from(first_arg).unwrap_or_default(),
         };
         let call = HilExpr::Call {
             fun: Box::new(HilExpr::Reg(func)),
@@ -498,7 +498,7 @@ impl<'a> Lifter<'a> {
 
         let first_arg = func + 2; // receiver is at func+1, user args start at func+2
         let variadic_args = match decoded_count(arg_count) {
-            Count::Variadic | Count::All => self.take_variadic_from(first_arg),
+            Count::Variadic => self.take_variadic_from(first_arg),
             Count::Number(_) => None,
         };
 
@@ -520,7 +520,7 @@ impl<'a> Lifter<'a> {
 
         let args = match decoded_count(arg_count) {
             Count::Number(argc) if argc > 1 => local_range(first_arg, argc - 1),
-            Count::Variadic | Count::All => variadic_args.unwrap_or_default(),
+            Count::Variadic => variadic_args.unwrap_or_default(),
             _ => Vec::new(),
         };
 
@@ -535,7 +535,7 @@ impl<'a> Lifter<'a> {
     fn lift_setlist(&mut self, table: u8, base: u8, count: u8, index: u32) {
         let (values, has_variadic_tail) = match decoded_count(count) {
             Count::Number(n) => (local_range(base, n), false),
-            Count::Variadic | Count::All => (
+            Count::Variadic => (
                 self.take_variadic_from(base)
                     .unwrap_or_else(|| vec![HilExpr::Reg(base)]),
                 true,
@@ -559,7 +559,7 @@ impl<'a> Lifter<'a> {
                 left: local_range(dest, n),
                 value: expr,
             }),
-            Count::Variadic | Count::All => {
+            Count::Variadic => {
                 self.pending_multiret = Some(MultiRet {
                     base: dest,
                     expr: expr.to_spanned(self.instr_word_pc(self.ip.saturating_sub(1))),

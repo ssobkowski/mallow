@@ -159,6 +159,17 @@ impl ControlFlowGraph {
                         entries.insert(idx + 1);
                     }
                 }
+                Instr::JumpX { offset } => {
+                    entries.insert(rel_target_plain_from_instr_wide(
+                        idx,
+                        *offset,
+                        instrs,
+                        instr_word_pcs,
+                    ));
+                    if idx + 1 < instrs.len() {
+                        entries.insert(idx + 1);
+                    }
+                }
                 Instr::JumpIfEq { offset, .. }
                 | Instr::JumpIfLe { offset, .. }
                 | Instr::JumpIfLt { offset, .. }
@@ -204,12 +215,15 @@ impl ControlFlowGraph {
                 continue;
             };
 
-            let (body_instrs, exit_instr) = if is_explicit_exit(last_instr) {
+            // TODO: document this
+            let (body_instrs, exit_instr) = if is_branch_exit(last_instr) {
                 let (block_instrs, exit_instr) = block_instrs.split_at(block_instrs.len() - 1);
                 debug_assert!(!exit_instr.is_empty());
 
                 (block_instrs, exit_instr.first())
-            } else if matches!(last_instr, Instr::LoadB { jump, .. } if *jump > 0) {
+            } else if matches!(last_instr, Instr::LoadB { jump, .. } if *jump > 0)
+                || matches!(last_instr, Instr::Return { .. })
+            {
                 (block_instrs, Some(last_instr))
             } else {
                 (block_instrs, None)
@@ -217,7 +231,7 @@ impl ControlFlowGraph {
 
             let exit_instr_idx = end.saturating_sub(1);
 
-            let exit = match exit_instr {
+            let mut exit = match exit_instr {
                 Some(Instr::Return { base, count }) => {
                     BlockExit::Return(return_values(*base, *count))
                 }
@@ -503,7 +517,7 @@ impl ControlFlowGraph {
             };
 
             let body_instr_word_pcs = &instr_word_pcs[start..start + body_instrs.len()];
-            let lifted = lifter::lift(
+            let mut lifted = lifter::lift(
                 body_instrs,
                 body_instr_word_pcs,
                 &proto.consts,
@@ -511,12 +525,34 @@ impl ControlFlowGraph {
                 all_protos,
             );
 
+            if matches!(exit_instr, Some(Instr::Return { .. }))
+                && let Some(Spanned {
+                    inner: HilStmt::Return(_),
+                    ..
+                }) = lifted.last()
+            {
+                let Spanned {
+                    inner: HilStmt::Return(rets),
+                    ..
+                } = lifted.pop().unwrap()
+                else {
+                    unreachable!()
+                };
+                exit = BlockExit::Return(rets);
+            }
+
             blocks.push(Block::new(block_idx, lifted, exit));
         }
 
-        let mut graph = Self::new(blocks, 0);
-        graph.fold_short_circuits();
-        graph
+        let blocks = loop {
+            let (changed, new_blocks) = fold_short_circuits(blocks);
+            if !changed {
+                break new_blocks;
+            }
+            blocks = new_blocks;
+        };
+
+        Self::new(blocks, 0)
     }
 
     /// Returns all successor block ids for `block`.
@@ -577,85 +613,6 @@ impl ControlFlowGraph {
     pub fn immediate_dominator(&self, block: usize) -> Option<usize> {
         self.immediate_dominators.get(block).copied().flatten()
     }
-
-    fn fold_short_circuits(&mut self) {
-        // Folds Lua's `and/or` ternary pattern into a single conditional expression.
-        //
-        // Lua itself lacks a native ternary operator, so `cond and x or y` compiles into
-        // a diamond-shaped CFG: the condition is checked first, and if truthy, the result
-        // register is checked again to guard against falsy `x` values.
-        //
-        //     A: if cond → B, C
-        //     B: if x    → D, C   (x = MOVE of cond result; the "truthy guard")
-        //     C: <fallback>
-        //     D: <continuation>
-        //
-        // When we detect this shape (A and B share the same else-block C), we can
-        // collapse it: emit `result = cond and x` into A, then re-target A's exit
-        // to jump directly to D or C - eliminating the redundant block B in the process.
-
-        for i in 0..self.blocks.len() {
-            let (then_b, else_b, cond) = match &self.blocks[i].exit {
-                BlockExit::CondJump {
-                    then_block,
-                    else_block,
-                    cond,
-                } => (*then_block, *else_block, cond.clone()),
-                _ => continue,
-            };
-
-            let (then_d, else_e) = match &self.blocks[then_b].exit {
-                BlockExit::CondJump {
-                    then_block,
-                    else_block,
-                    ..
-                } => (*then_block, *else_block),
-                _ => continue,
-            };
-
-            if else_b != else_e {
-                continue;
-            }
-
-            // This will match only if the then block has a single assignment
-            // of a register to a register, which is the "truthy check" (Luau
-            // needs to MOVE this register before the jump)
-            if let [
-                Spanned {
-                    inner:
-                        HilStmt::Assign {
-                            left: HilExpr::Reg(result_reg),
-                            value: HilExpr::Reg(cond_expr),
-                        },
-                    ..
-                },
-            ] = &self.blocks[then_b].stmts[..]
-            {
-                // copy out before the borrow dies
-                let result_reg = *result_reg;
-                let cond_expr = *cond_expr;
-                // immutable borrow of self.blocks[then_b] ends here
-
-                self.blocks[i].stmts.push(
-                    HilStmt::Assign {
-                        left: HilExpr::Reg(result_reg),
-                        value: HilExpr::Binary {
-                            lhs: Box::new(cond),
-                            op: BinOp::And,
-                            rhs: Box::new(HilExpr::Reg(cond_expr)),
-                        },
-                    }
-                    .to_spanned(0),
-                );
-
-                self.blocks[i].exit = BlockExit::CondJump {
-                    cond: HilExpr::Reg(result_reg),
-                    then_block: then_d,
-                    else_block: else_b,
-                };
-            }
-        }
-    }
 }
 
 /// Returns successor targets encoded in one block exit.
@@ -690,11 +647,10 @@ fn exit_targets(exit: &BlockExit) -> [Option<usize>; 2] {
 
 /// Returns whether one instruction must terminate its basic block.
 #[must_use]
-fn is_explicit_exit(instr: &Instr) -> bool {
+fn is_branch_exit(instr: &Instr) -> bool {
     matches!(
         instr,
-        Instr::Return { .. }
-            | Instr::Jump { .. }
+        Instr::Jump { .. }
             | Instr::JumpBack { .. }
             | Instr::JumpIf { .. }
             | Instr::JumpIfNot { .. }
@@ -721,7 +677,7 @@ fn is_explicit_exit(instr: &Instr) -> bool {
 ///
 /// Some Luau compare-family jumps encode "no jump" as offset `1` instead of `0`;
 /// `bias` normalizes those opcodes back to a plain PC-relative target.
-fn rel_target_with_bias(next_pc: usize, offset: i16, bias: i16, instr_len: usize) -> usize {
+fn rel_target_with_bias(next_pc: usize, offset: i32, bias: i32, instr_len: usize) -> usize {
     if instr_len == 0 {
         return 0;
     }
@@ -758,8 +714,8 @@ fn normalized_instr_word_pcs<'a>(
 #[must_use]
 fn rel_target_from_instr(
     instr_idx: usize,
-    offset: i16,
-    bias: i16,
+    offset: i32,
+    bias: i32,
     instrs: &[Instr],
     instr_word_pcs: &[usize],
 ) -> usize {
@@ -772,8 +728,9 @@ fn rel_target_from_instr(
     }
 
     let next_word_pc = instr_word_pcs[instr_idx].saturating_add(instrs[instr_idx].word_len());
-    let raw = next_word_pc as isize + offset as isize - bias as isize;
-    let target_word_pc = if raw < 0 { 0usize } else { raw as usize };
+    let target_word_pc = next_word_pc
+        .saturating_add(offset as usize)
+        .saturating_sub(bias as usize);
 
     match instr_word_pcs.binary_search(&target_word_pc) {
         Ok(idx) => idx,
@@ -791,6 +748,17 @@ fn rel_target_plain_from_instr(
     instrs: &[Instr],
     instr_word_pcs: &[usize],
 ) -> usize {
+    rel_target_from_instr(instr_idx, offset as i32, 0, instrs, instr_word_pcs)
+}
+
+/// Resolves the target of a wide jump opcode whose offset uses `0 == next instruction`.
+#[must_use]
+fn rel_target_plain_from_instr_wide(
+    instr_idx: usize,
+    offset: i32,
+    instrs: &[Instr],
+    instr_word_pcs: &[usize],
+) -> usize {
     rel_target_from_instr(instr_idx, offset, 0, instrs, instr_word_pcs)
 }
 
@@ -802,7 +770,7 @@ fn rel_target_compare_from_instr(
     instrs: &[Instr],
     instr_word_pcs: &[usize],
 ) -> usize {
-    rel_target_from_instr(instr_idx, offset, 1, instrs, instr_word_pcs)
+    rel_target_from_instr(instr_idx, offset as i32, 1, instrs, instr_word_pcs)
 }
 
 /// Maps an instruction PC to its containing basic block index.
@@ -986,6 +954,94 @@ fn build_loop_indexes(
     }
 
     (numeric_loops_by_base, generic_loops_by_base)
+}
+
+/// Folds Lua's `and/or` ternary pattern into a cohesive if-else control flow.
+///
+/// # Returns
+///
+/// A tuple of `(changed, blocks)` where `changed` is `true` if any short-circuit
+/// folding was performed, and `blocks` is the modified block list.
+fn fold_short_circuits(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
+    // Lua itself lacks a native ternary operator, so `cond and x or y` compiles into
+    // a diamond-shaped CFG: the condition is checked first, and if truthy, the result
+    // register is checked again to guard against falsy `x` values.
+    //
+    //     A: if cond → B, C
+    //     B: if x    → D, C   (x = MOVE of cond result; the "truthy guard")
+    //     C: <fallback>
+    //     D: <continuation>
+    //
+    // When we detect this shape (A and B share the same else-block C), we can
+    // collapse it: emit `result = cond and x` into A, then re-target A's exit
+    // to jump directly to D or C - eliminating the redundant block B in the process.
+
+    let mut was_changed = false;
+    for i in 0..blocks.len() {
+        let (then_b, else_b, cond) = match &blocks[i].exit {
+            BlockExit::CondJump {
+                then_block,
+                else_block,
+                cond,
+            } => (*then_block, *else_block, cond.clone()),
+            _ => continue,
+        };
+
+        let (then_d, else_e) = match &blocks[then_b].exit {
+            BlockExit::CondJump {
+                then_block,
+                else_block,
+                ..
+            } => (*then_block, *else_block),
+            _ => continue,
+        };
+
+        if else_b != else_e {
+            continue;
+        }
+
+        // This will match only if the then block has a single assignment
+        // of a register to a register, which is the "truthy check" (Luau
+        // needs to MOVE this register before the jump)
+        if let [
+            Spanned {
+                inner:
+                    HilStmt::Assign {
+                        left: HilExpr::Reg(result_reg),
+                        value: HilExpr::Reg(cond_expr),
+                    },
+                ..
+            },
+        ] = &blocks[then_b].stmts[..]
+        {
+            // copy out before the borrow dies
+            let result_reg = *result_reg;
+            let cond_expr = *cond_expr;
+            // immutable borrow of self.blocks[then_b] ends here
+
+            blocks[i].stmts.push(
+                HilStmt::Assign {
+                    left: HilExpr::Reg(result_reg),
+                    value: HilExpr::Binary {
+                        lhs: Box::new(cond),
+                        op: BinOp::And,
+                        rhs: Box::new(HilExpr::Reg(cond_expr)),
+                    },
+                }
+                .to_spanned(0),
+            );
+
+            blocks[i].exit = BlockExit::CondJump {
+                cond: HilExpr::Reg(result_reg),
+                then_block: then_d,
+                else_block: else_b,
+            };
+
+            was_changed = true;
+        }
+    }
+
+    (was_changed, blocks)
 }
 
 #[cfg(test)]
