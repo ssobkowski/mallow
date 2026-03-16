@@ -648,7 +648,6 @@ impl ControlFlowGraph {
                     .to_spanned(0),
                 );
 
-                // TODO: Explore inverting the condition and blocks
                 self.blocks[i].exit = BlockExit::CondJump {
                     cond: HilExpr::Reg(result_reg),
                     then_block: then_d,

@@ -53,10 +53,10 @@ pub fn structure(
 
 impl<'a> Structurer<'a> {
     fn structure_entry(&mut self) -> Block {
-        self.structure_proto(self.entry)
+        self.structure_proto(self.entry, &[])
     }
 
-    fn structure_proto(&mut self, proto_idx: usize) -> Block {
+    fn structure_proto(&mut self, proto_idx: usize, init_vars: &[Var]) -> Block {
         let Some(region) = self.regions.get(proto_idx) else {
             return Block::new();
         };
@@ -64,11 +64,23 @@ impl<'a> Structurer<'a> {
             return Block::new();
         };
 
-        self.lower_region(region, cfg)
+        self.lower_region_with_init(region, cfg, init_vars)
     }
 
     fn lower_region(&mut self, region: &RegionBlock, cfg: &ControlFlowGraph) -> Block {
+        self.lower_region_with_init(region, cfg, &[])
+    }
+
+    fn lower_region_with_init(
+        &mut self,
+        region: &RegionBlock,
+        cfg: &ControlFlowGraph,
+        init_vars: &[Var],
+    ) -> Block {
         self.scopes.push_scope();
+        for var in init_vars {
+            self.declare_var(var.clone());
+        }
         let mut stmts = Vec::new();
         for node in &region.nodes {
             self.lower_node_into(node, cfg, &mut stmts);
@@ -110,15 +122,9 @@ impl<'a> Structurer<'a> {
             RegionNode::Return { values, .. } => out.push(Stmt::Return {
                 values: values.iter().map(|value| self.lower_expr(value)).collect(),
             }),
-            RegionNode::NumericFor {
-                header, base, body, ..
-            } => {
-                let block = &cfg.blocks[*header];
+            RegionNode::NumericFor { base, body, .. } => {
                 let step_reg = *base as u8 + 1;
-                let step = match last_local_assign(block, step_reg) {
-                    Some(HilExpr::Number(1.0)) => None,
-                    _ => Some(Expr::Name(local_ident(step_reg))),
-                };
+                let step = Some(Expr::Name(local_ident(step_reg)));
 
                 let body = self.lower_region(body, cfg);
                 out.push(Stmt::NumericFor {
@@ -399,8 +405,14 @@ impl<'a> Structurer<'a> {
             }
         }
 
-        let params = proto_parameters(proto);
-        let body = self.structure_proto(proto_idx);
+        let (mut params, param_vars): (Vec<_>, Vec<_>) = (0..proto.num_params)
+            .map(|reg| (Parameter::Regular(local_ident(reg)), Var::Reg(reg)))
+            .collect();
+        if proto.is_vararg {
+            params.push(Parameter::Vararg);
+        }
+
+        let body = self.structure_proto(proto_idx, &param_vars);
 
         self.upvalues = old_upvalues;
         self.register_overrides = old_overrides;
@@ -431,8 +443,8 @@ impl<'a> Structurer<'a> {
     }
 
     fn declare_var(&mut self, var: Var) {
-        if !self.is_declared(&var) {
-            self.scopes.declare_var(var, ());
+        if !self.is_declared(&var) && !self.scopes.declare_var(var.clone(), ()) {
+            panic!("failed to declare variable {:?}", var);
         }
     }
 
@@ -459,26 +471,6 @@ fn local_reg(expr: &HilExpr) -> u8 {
         HilExpr::Reg(reg) => *reg,
         _ => unreachable!("expected local register, got {expr:?}"),
     }
-}
-
-fn proto_parameters(proto: &Proto) -> Vec<Parameter> {
-    let mut params: Vec<_> = (0..proto.num_params)
-        .map(|reg| Parameter::Regular(local_ident(reg)))
-        .collect();
-    if proto.is_vararg {
-        params.push(Parameter::Vararg);
-    }
-    params
-}
-
-fn last_local_assign(block: &CfgBlock, reg: u8) -> Option<&HilExpr> {
-    block.stmts.iter().rev().find_map(|stmt| match &stmt.inner {
-        HilStmt::Assign {
-            left: HilExpr::Reg(stmt_reg),
-            value,
-        } if *stmt_reg == reg => Some(value),
-        _ => None,
-    })
 }
 
 #[cfg(test)]

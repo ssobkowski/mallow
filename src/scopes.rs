@@ -166,6 +166,7 @@ impl<K: Hash + Eq, V> ScopeManager<K, V> {
 
     /// Declares a variable in the current scope. Returns false if no scope exists.
     #[inline]
+    #[must_use]
     pub fn declare_var(&mut self, name: K, value: V) -> bool {
         if let Some(scope) = self.top_scope_mut() {
             scope.declare(name, value);
