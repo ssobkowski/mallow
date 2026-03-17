@@ -264,9 +264,6 @@ impl<'a> Structurer<'a> {
                     // We check for the override as if it's an upvalue, it must have an override and
                     // will not appear as the "true" register.
                     force_declaration = self.scopes.get_var(&Var::Reg(*alias)).is_none();
-                    if force_declaration {
-                        println!("Forcing declaration of {}", fun_reg);
-                    }
                 };
 
                 self.lower_expr(value)
