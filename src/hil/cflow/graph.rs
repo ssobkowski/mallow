@@ -3,8 +3,6 @@ use std::{
     collections::{BTreeSet, HashMap},
 };
 
-use bitvec::vec::BitVec;
-
 use crate::disasm::Proto;
 use crate::hil::common::{const_expr, return_values};
 use crate::hil::ir::{HilExpr, HilStmt, Spanned};
@@ -728,9 +726,7 @@ fn rel_target_from_instr(
     }
 
     let next_word_pc = instr_word_pcs[instr_idx].saturating_add(instrs[instr_idx].word_len());
-    let target_word_pc = next_word_pc
-        .saturating_add(offset as usize)
-        .saturating_sub(bias as usize);
+    let target_word_pc = next_word_pc.saturating_add_signed((offset - bias) as isize);
 
     match instr_word_pcs.binary_search(&target_word_pc) {
         Ok(idx) => idx,
@@ -817,117 +813,96 @@ fn build_predecessors(len: usize, successors: &[Vec<usize>]) -> Vec<Vec<usize>> 
     predecessors
 }
 
-/// Marks blocks reachable from entry.
-///
-/// # Returns
-/// - `Vec<bool>`: reachability bitset by block id.
-#[must_use]
-fn reachable_blocks(entry_block: usize, successors: &[Vec<usize>]) -> Vec<bool> {
-    let mut reachable = vec![false; successors.len()];
-    let mut stack = Vec::new();
+fn compute_rpo(entry_block: usize, successors: &[Vec<usize>]) -> Vec<usize> {
+    let len = successors.len();
+    let mut visited = vec![false; len];
+    let mut post_order = Vec::with_capacity(len);
 
-    if entry_block < successors.len() {
-        stack.push(entry_block);
-    }
-
-    while let Some(block) = stack.pop() {
-        if reachable[block] {
-            continue;
-        }
-        reachable[block] = true;
-
-        for &next in &successors[block] {
-            if !reachable[next] {
-                stack.push(next);
+    fn dfs(
+        block: usize,
+        successors: &[Vec<usize>],
+        visited: &mut [bool],
+        post_order: &mut Vec<usize>,
+    ) {
+        visited[block] = true;
+        for &succ in &successors[block] {
+            if !visited[succ] {
+                dfs(succ, successors, visited, post_order);
             }
         }
+        post_order.push(block);
     }
 
-    reachable
+    dfs(entry_block, successors, &mut visited, &mut post_order);
+
+    post_order.reverse();
+    post_order
 }
 
-/// Computes immediate dominators for all reachable blocks.
+/// Computes immediate dominators for all reachable blocks using the
+/// Cooper-Harvey-Kennedy algorithm.
 ///
 /// # Returns
 /// - `Vec<Option<usize>>`: idom by block id; `None` for entry and unreachable blocks.
-#[must_use]
-fn build_dominator_metadata(
+pub fn build_dominator_metadata(
     entry_block: usize,
     successors: &[Vec<usize>],
     predecessors: &[Vec<usize>],
 ) -> Vec<Option<usize>> {
-    let len = successors.len();
-    let reachable = reachable_blocks(entry_block, successors);
+    let rpo_nodes = compute_rpo(entry_block, successors);
 
-    let mut dom: Vec<_> = (0..len)
-        .map(|block| {
-            if !reachable[block] {
-                return BitVec::repeat(false, len);
-            }
-            if block == entry_block {
-                let mut bits = BitVec::repeat(false, len);
-                bits.set(entry_block, true);
-                return bits;
-            }
-            let mut bits = BitVec::repeat(false, len);
-            for (i, is_reachable) in reachable.iter().enumerate().take(len) {
-                if *is_reachable {
-                    bits.set(i, true);
-                }
-            }
-            bits
-        })
-        .collect();
+    let len = successors.len();
+    let mut doms = vec![None; len];
+    doms[entry_block] = Some(entry_block);
+
+    let mut rpo_number = vec![usize::MAX; len];
+    for (index, &block) in rpo_nodes.iter().enumerate() {
+        rpo_number[block] = index;
+    }
 
     let mut changed = true;
     while changed {
         changed = false;
-        for block in 0..len {
-            if !reachable[block] || block == entry_block {
+        for &block in &rpo_nodes {
+            if block == entry_block {
                 continue;
             }
 
-            let mut next = {
-                let mut acc: Option<BitVec> = None;
-                for &pred in &predecessors[block] {
-                    if !reachable[pred] {
-                        continue;
-                    }
-                    acc = Some(match acc {
-                        None => dom[pred].clone(),
-                        Some(mut bits) => {
-                            bits &= &dom[pred];
-                            bits
-                        }
-                    });
-                }
-                acc.unwrap_or_else(|| BitVec::repeat(false, len))
+            let Some(mut new_idom) = predecessors[block]
+                .iter()
+                .copied()
+                .find(|&p| doms[p].is_some())
+            else {
+                continue;
             };
-            next.set(block, true);
 
-            if next != dom[block] {
-                dom[block] = next;
+            for &p in &predecessors[block] {
+                if p != new_idom && doms[p].is_some() {
+                    new_idom = intersect(p, new_idom, &doms, &rpo_number);
+                }
+            }
+
+            if doms[block] != Some(new_idom) {
+                doms[block] = Some(new_idom);
                 changed = true;
             }
         }
     }
+    doms[entry_block] = None;
 
-    let mut immediate_dominators = vec![None; len];
-    for block in 0..len {
-        if !reachable[block] || block == entry_block {
-            continue;
+    doms
+}
+
+fn intersect(mut b1: usize, mut b2: usize, doms: &[Option<usize>], rpo_number: &[usize]) -> usize {
+    while b1 != b2 {
+        while rpo_number[b1] > rpo_number[b2] {
+            b1 = doms[b1].unwrap();
         }
-
-        immediate_dominators[block] = (0..len)
-            .filter(|&candidate| candidate != block && dom[block][candidate])
-            .find(|&candidate| {
-                (0..len)
-                    .filter(|&other| other != candidate && other != block && dom[block][other])
-                    .all(|other| !dom[other][candidate])
-            });
+        while rpo_number[b2] > rpo_number[b1] {
+            b2 = doms[b2].unwrap();
+        }
     }
-
-    immediate_dominators
+    b1
 }
 
 /// Indexes loop-tail blocks by Luau loop base register.
@@ -1085,11 +1060,13 @@ mod tests {
     fn from_proto_builds_numeric_for_edges() {
         let proto = Proto {
             instrs: vec![
-                Instr::FornPrep { base: 0, offset: 2 },
+                Instr::LoadN { reg: 2, value: 1 },
+                Instr::LoadN { reg: 0, value: 2 },
                 Instr::LoadN { reg: 1, value: 1 },
+                Instr::FornPrep { base: 0, offset: 0 },
                 Instr::FornLoop {
                     base: 0,
-                    offset: -2,
+                    offset: -1,
                 },
                 Instr::Return { base: 0, count: 1 },
             ],
@@ -1103,7 +1080,7 @@ mod tests {
             cfg.blocks[0].exit,
             super::BlockExit::ForNPrep {
                 base: 0,
-                loop_block: 2
+                loop_block: 1
             }
         ));
         assert!(matches!(
