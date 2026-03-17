@@ -254,13 +254,19 @@ impl<'a> Structurer<'a> {
             HilExpr::Call { fun, .. } => {
                 // If we call a captured upvalue, we must not override it by accident
                 if let HilExpr::Reg(fun_reg) = fun.as_ref()
-                    && self
+                    && let Some(alias) = self
                         .register_overrides
                         .top_scope()
                         .expect("there must be a scope")
-                        .contains(fun_reg)
+                        .get(fun_reg)
                 {
-                    force_declaration = true;
+                    // Only force the declaration if the upvalue wasn't shadowed by a local already
+                    // We check for the override as if it's an upvalue, it must have an override and
+                    // will not appear as the "true" register.
+                    force_declaration = self.scopes.get_var(&Var::Reg(*alias)).is_none();
+                    if force_declaration {
+                        println!("Forcing declaration of {}", fun_reg);
+                    }
                 };
 
                 self.lower_expr(value)
