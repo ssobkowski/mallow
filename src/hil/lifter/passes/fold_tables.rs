@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::hil::ir::{HilCapture, HilExpr, HilStmt, HilTableItem, Spanned, ToSpanned};
 
@@ -229,9 +229,9 @@ fn interferes_with_build(stmt: &HilStmt, reg: u8) -> bool {
 // For SetList
 fn list_element_name(table: u8, index: u32, is_varying: bool) -> SmolStr {
     if is_varying {
-        SmolStr::from(format!("_t{}_i{}_varying", table, index))
+        format_smolstr!("_t{}_i{}_varying", table, index)
     } else {
-        SmolStr::from(format!("_t{}_i{}", table, index))
+        format_smolstr!("_t{}_i{}", table, index)
     }
 }
 
