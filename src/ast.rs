@@ -55,9 +55,9 @@ pub enum Stmt {
     /// Assignment, e.g. `a, b = 1, 2`.
     Assignment {
         /// Left-hand side expressions.
-        lhs: Expr,
+        lhs: Vec<Expr>,
         /// Right-hand side expressions.
-        rhs: Expr,
+        rhs: Vec<Expr>,
     },
     /// `break`.
     Break,

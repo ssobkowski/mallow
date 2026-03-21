@@ -54,9 +54,19 @@ impl AstPrinter {
         match stmt {
             Stmt::Assignment { lhs, rhs } => {
                 self.write("");
-                self.walk_expr(lhs, 0, Side::None);
+                for (i, lv) in lhs.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.walk_expr(lv, 0, Side::None);
+                }
                 self.write(" = ");
-                self.walk_expr(rhs, 0, Side::None);
+                for (i, rv) in rhs.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.walk_expr(rv, 0, Side::None);
+                }
                 self.newline();
             }
             Stmt::Break => {

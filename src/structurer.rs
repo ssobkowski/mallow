@@ -196,11 +196,11 @@ impl<'a> Structurer<'a> {
                 });
             }
             HilStmt::SetField { table, key, value } => out.push(Stmt::Assignment {
-                lhs: Expr::Index {
+                lhs: vec![Expr::Index {
                     base: Box::new(Expr::Name(local_ident(self.resolve_reg(*table)))),
                     index: Box::new(Expr::Literal(Literal::String(key.clone()))),
-                },
-                rhs: self.lower_expr(value),
+                }],
+                rhs: vec![self.lower_expr(value)],
             }),
             HilStmt::SetList {
                 table,
@@ -210,13 +210,13 @@ impl<'a> Structurer<'a> {
             } => {
                 for (offset, value) in values.iter().enumerate() {
                     out.push(Stmt::Assignment {
-                        lhs: Expr::Index {
+                        lhs: vec![Expr::Index {
                             base: Box::new(Expr::Name(local_ident(self.resolve_reg(*table)))),
                             index: Box::new(Expr::Literal(Literal::Number(
                                 f64::from(*index) + offset as f64,
                             ))),
-                        },
-                        rhs: self.lower_expr(value),
+                        }],
+                        rhs: vec![self.lower_expr(value)],
                     });
                 }
             }
@@ -283,8 +283,8 @@ impl<'a> Structurer<'a> {
                     });
                 } else {
                     out.push(Stmt::Assignment {
-                        lhs: Expr::Name(local_ident(resolved)),
-                        rhs,
+                        lhs: vec![Expr::Name(local_ident(resolved))],
+                        rhs: vec![rhs],
                     });
                 }
             }
@@ -292,8 +292,8 @@ impl<'a> Structurer<'a> {
                 let var = Var::Local(name.clone());
                 if self.is_declared(&var) {
                     out.push(Stmt::Assignment {
-                        lhs: Expr::Name(Identifier::from(name.clone())),
-                        rhs,
+                        lhs: vec![Expr::Name(Identifier::from(name.clone()))],
+                        rhs: vec![rhs],
                     });
                 } else {
                     self.declare_var(var);
@@ -304,8 +304,8 @@ impl<'a> Structurer<'a> {
                 }
             }
             HilExpr::Global(name) => out.push(Stmt::Assignment {
-                lhs: Expr::Name(Identifier::from(name.clone())),
-                rhs,
+                lhs: vec![Expr::Name(Identifier::from(name.clone()))],
+                rhs: vec![rhs],
             }),
             HilExpr::Upval(up) => {
                 // SETUPVAL: write back to the canonical parent variable
@@ -321,23 +321,23 @@ impl<'a> Structurer<'a> {
                 }
 
                 out.push(Stmt::Assignment {
-                    lhs: Expr::Name(lhs_name),
-                    rhs,
+                    lhs: vec![Expr::Name(lhs_name)],
+                    rhs: vec![rhs],
                 });
             }
             HilExpr::GetField { obj, field } => out.push(Stmt::Assignment {
-                lhs: Expr::Field {
+                lhs: vec![Expr::Field {
                     base: Box::new(self.lower_expr(obj)),
                     field: Identifier::from(field.clone()),
-                },
-                rhs,
+                }],
+                rhs: vec![rhs],
             }),
             HilExpr::GetIndex { obj, index } => out.push(Stmt::Assignment {
-                lhs: Expr::Index {
+                lhs: vec![Expr::Index {
                     base: Box::new(self.lower_expr(obj)),
                     index: Box::new(self.lower_expr(index)),
-                },
-                rhs,
+                }],
+                rhs: vec![rhs],
             }),
             _ => unreachable!("unsupported assignment target: {left:?}"),
         }
