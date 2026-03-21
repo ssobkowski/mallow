@@ -186,7 +186,7 @@ fn reads_register_expr(expr: &HilExpr, reg: u8) -> bool {
     match expr {
         HilExpr::Reg(r) => *r == reg,
         HilExpr::Closure { captures, .. } => captures.iter().any(|c| match c {
-            HilCapture::Local(r) => *r == reg,
+            HilCapture::Value(r) | HilCapture::Ref(r) => *r == reg,
             HilCapture::Upval(_) => false,
         }),
         HilExpr::GetField { obj, .. } => reads_register_expr(obj, reg),

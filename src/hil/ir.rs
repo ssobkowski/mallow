@@ -76,8 +76,10 @@ pub enum HilExpr {
 /// One closure capture operand attached to a nested function literal.
 #[derive(Debug, Clone)]
 pub enum HilCapture {
-    /// Capture a local from the current frame.
-    Local(u8),
+    /// Capture a local from the current frame by its value.
+    Value(u8),
+    /// Capture a local from the current frame by its reference.
+    Ref(u8),
     /// Capture an upvalue from the parent closure.
     Upval(u8),
 }

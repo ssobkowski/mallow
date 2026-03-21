@@ -47,10 +47,8 @@ fn concat_expr_range(start: u8, end: u8) -> HilExpr {
 /// Decodes Luau capture metadata into the captured HIL capture operand.
 fn decode_capture(capture_type: u8, reg: u8) -> HilCapture {
     match capture_type {
-        // Luau splits local captures into by-value (0) and by-ref (1), but
-        // both decompile to capturing the same local name.
-        0 | 1 => HilCapture::Local(reg),
-        // Capture an already-existing parent upvalue.
+        0 => HilCapture::Value(reg),
+        1 => HilCapture::Ref(reg),
         2 => HilCapture::Upval(reg),
         _ => unreachable!("unknown capture type: {capture_type}"),
     }

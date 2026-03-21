@@ -407,7 +407,7 @@ impl<'a> Structurer<'a> {
         for (up_index, cap) in captures.iter().enumerate() {
             match cap {
                 // the proto captures a local from the current frame directly.
-                HilCapture::Local(reg) => {
+                HilCapture::Value(reg) | HilCapture::Ref(reg) => {
                     self.upvalues.declare(up_index as u8, *reg);
                 }
                 // the proto re-exports one of our own upvalues. propagate the canonical
