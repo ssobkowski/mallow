@@ -2,7 +2,7 @@ use std::io::{Cursor, Read};
 
 use thiserror::Error;
 
-use crate::il::{Constant, Instr, Table, Value};
+use crate::il::{Constant, Instr, Table, Value, decode_stream_with_word_pcs};
 
 const CONST_NIL: u8 = 0;
 const CONST_BOOL: u8 = 1;
@@ -79,8 +79,7 @@ pub struct Proto {
     pub is_vararg: bool,
     pub flags: u8,
     pub type_info: Vec<u8>,
-    pub instrs: Vec<Instr>,
-    pub instr_word_pcs: Vec<usize>,
+    pub instrs: Vec<(Instr, usize)>,
     pub consts: Vec<Constant>,
     pub protos: Vec<usize>,
     pub locals: Vec<LocalDebug>,
@@ -173,10 +172,7 @@ impl<'a> Disassembler<'a> {
 
         let code_table: Vec<u32> = self.read_vec()?;
         let code_word_count = code_table.len();
-        let (instrs, instr_word_pcs) = Instr::decode_stream_with_word_pcs(&code_table)
-            .map_err(DisasmError::InvalidInstructionStream)?;
-        proto.instrs = instrs;
-        proto.instr_word_pcs = instr_word_pcs;
+        proto.instrs = decode_stream_with_word_pcs(&code_table);
 
         let num_consts = self.read_varint()?;
         proto.consts = Vec::with_capacity(num_consts as usize);

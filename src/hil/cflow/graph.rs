@@ -1,34 +1,77 @@
 use std::{
-    borrow::Cow,
     collections::{BTreeSet, HashMap},
+    ops::Range,
 };
 
-use crate::disasm::Proto;
-use crate::hil::common::{const_expr, return_values};
-use crate::hil::ir::{HilExpr, HilStmt, Spanned};
-use crate::hil::lifter;
-use crate::il::Instr;
-use crate::{ast::BinOp, hil::ir::ToSpanned};
+use id_arena::Arena;
 
-/// One basic block in the per-proto control-flow graph.
+use crate::{
+    ast::BinOp,
+    disasm::Proto,
+    hil::{
+        common::{const_expr, decoded_count},
+        ir::{HilExpr, HilStmt, Spanned, ToSpanned as _},
+        lifter::{
+            LiftContext, Lifter, lift,
+            symbol::{Symbol, SymbolId},
+        },
+    },
+    il::{Constant, Count, Instr},
+};
+
+/// Represents an unlifted block
+#[derive(Debug)]
+pub struct RawBlock {
+    /// The range of instructions indices that belong to this block
+    instr_range: Range<usize>,
+    exit: RawBlockExit,
+}
+
+/// Represents an unlifted terminating edge in the block.
+#[derive(Debug, Clone)]
+pub enum RawBlockExit {
+    Jump(usize),
+    Fallthrough(usize),
+    CondJump {
+        cond: Cond,
+        then_block: usize,
+        else_block: usize,
+    },
+    FornPrep {
+        base: usize,
+        body_block: usize,
+        exit_block: usize,
+    },
+    FornLoop {
+        base: usize,
+        body_block: usize,
+        exit_block: usize,
+    },
+    ForgPrep {
+        base: usize,
+        body_block: usize,
+        exit_block: usize,
+    },
+    ForgLoop {
+        base: usize,
+        body_block: usize,
+        exit_block: usize,
+        result_count: usize,
+    },
+    Return {
+        base: u8,
+        count: u8,
+    },
+}
+
+/// Represents a lifted block
 #[derive(Debug, Clone)]
 pub struct Block {
-    // this is kept for debugging purposes
-    #[allow(dead_code)]
-    pub id: usize,
     pub stmts: Vec<Spanned<HilStmt>>,
     pub exit: BlockExit,
 }
 
-impl Block {
-    /// Creates a new block with a synthetic exit PC.
-    #[must_use]
-    pub fn new(id: usize, stmts: Vec<Spanned<HilStmt>>, exit: BlockExit) -> Self {
-        Self { id, stmts, exit }
-    }
-}
-
-/// One terminating edge description for a block.
+/// Represents a lifted terminating edge in the block.
 #[derive(Debug, Clone)]
 pub enum BlockExit {
     Jump(usize),
@@ -38,20 +81,22 @@ pub enum BlockExit {
         then_block: usize,
         else_block: usize,
     },
-    ForNPrep {
-        base: usize,
-        loop_block: usize,
-    },
-    ForNLoop {
+    FornPrep {
         base: usize,
         body_block: usize,
         exit_block: usize,
     },
-    ForGPrep {
+    FornLoop {
         base: usize,
-        loop_block: usize,
+        body_block: usize,
+        exit_block: usize,
     },
-    ForGLoop {
+    ForgPrep {
+        base: usize,
+        body_block: usize,
+        exit_block: usize,
+    },
+    ForgLoop {
         base: usize,
         body_block: usize,
         exit_block: usize,
@@ -60,58 +105,57 @@ pub enum BlockExit {
     Return(Vec<HilExpr>),
 }
 
-/// Per-proto CFG plus dominance and loop-tail metadata.
 #[derive(Debug, Clone)]
+pub enum CondRhs {
+    /// A physical register
+    Reg(u8),
+    /// An index into the proto's constants
+    Const(usize),
+    /// Nil value
+    Nil,
+    /// A boolean value
+    Bool(bool),
+}
+
+#[derive(Debug, Clone)]
+pub enum Cond {
+    /// A binary condition, i.e. `lhs op rhs`
+    Binary {
+        /// The physical index of the register to compare.
+        lhs: u8,
+        /// The operator
+        op: BinOp,
+        /// The right side of the binary operation.
+        rhs: CondRhs,
+    },
+    /// A unary condition, i.e. just `x`.
+    Unary(u8),
+}
+
+#[derive(Debug)]
 pub struct ControlFlowGraph {
     pub blocks: Vec<Block>,
     pub entry_block: usize,
+
     pub successors: Vec<Vec<usize>>,
     pub predecessors: Vec<Vec<usize>>,
     pub immediate_dominators: Vec<Option<usize>>,
+
     pub numeric_loops_by_base: HashMap<usize, Vec<usize>>,
     pub generic_loops_by_base: HashMap<usize, Vec<usize>>,
 }
 
 impl ControlFlowGraph {
-    /// Builds a CFG from blocks and computes derived graph metadata.
-    #[must_use]
-    pub fn new(blocks: Vec<Block>, entry_block: usize) -> Self {
-        let successors = build_successors(&blocks);
-        let predecessors = build_predecessors(successors.len(), &successors);
-        let immediate_dominators =
-            build_dominator_metadata(entry_block, &successors, &predecessors);
-        let (numeric_loops_by_base, generic_loops_by_base) = build_loop_indexes(&blocks);
-
-        Self {
-            blocks,
-            entry_block,
-            successors,
-            predecessors,
-            immediate_dominators,
-            numeric_loops_by_base,
-            generic_loops_by_base,
-        }
-    }
-
-    /// Builds a CFG for one proto by splitting bytecode into basic blocks and decoding exits.
-    #[must_use]
     pub fn from_proto(proto: &Proto, all_protos: &[Proto]) -> Self {
-        if proto.instrs.is_empty() {
-            const ENTRY: usize = 0;
-            return Self::new(
-                vec![Block::new(ENTRY, Vec::new(), BlockExit::Return(Vec::new()))],
-                ENTRY,
-            );
-        }
-
         let instrs = proto.instrs.as_slice();
-        let instr_word_pcs = normalized_instr_word_pcs(instrs, &proto.instr_word_pcs);
-        let instr_word_pcs = instr_word_pcs.as_ref();
+
+        // First, we build a "raw" cfg - plain blocks that only hold the range
+        // of instructions they contain.
 
         let mut entries = BTreeSet::new();
         entries.insert(0usize);
 
-        for (idx, instr) in instrs.iter().enumerate() {
+        for (idx, (instr, _)) in instrs.iter().enumerate() {
             match instr {
                 Instr::Return { .. } => {
                     if idx + 1 < instrs.len() {
@@ -122,23 +166,13 @@ impl ControlFlowGraph {
                 | Instr::ForgPrep { offset, .. }
                 | Instr::ForgPrepInext { offset, .. }
                 | Instr::ForgPrepNext { offset, .. } => {
-                    entries.insert(rel_target_plain_from_instr(
-                        idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    ));
+                    entries.insert(rel_target_plain_from_instr(idx, *offset, instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
                 }
                 Instr::FornLoop { offset, .. } | Instr::ForgLoop { offset, .. } => {
-                    entries.insert(rel_target_plain_from_instr(
-                        idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    ));
+                    entries.insert(rel_target_plain_from_instr(idx, *offset, instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
@@ -147,23 +181,13 @@ impl ControlFlowGraph {
                 | Instr::JumpBack { offset }
                 | Instr::JumpIf { offset, .. }
                 | Instr::JumpIfNot { offset, .. } => {
-                    entries.insert(rel_target_plain_from_instr(
-                        idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    ));
+                    entries.insert(rel_target_plain_from_instr(idx, *offset, instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
                 }
                 Instr::JumpX { offset } => {
-                    entries.insert(rel_target_plain_from_instr_wide(
-                        idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    ));
+                    entries.insert(rel_target_plain_from_instr_wide(idx, *offset, instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
@@ -178,196 +202,138 @@ impl ControlFlowGraph {
                 | Instr::JumpXEqKB { offset, .. }
                 | Instr::JumpXEqKN { offset, .. }
                 | Instr::JumpXEqKS { offset, .. } => {
-                    entries.insert(rel_target_compare_from_instr(
-                        idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    ));
+                    entries.insert(rel_target_compare_from_instr(idx, *offset, instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
                 }
                 Instr::LoadB { jump, .. } if *jump > 0 => {
-                    entries.insert(rel_target_plain_from_instr(
-                        idx,
-                        i16::from(*jump),
-                        instrs,
-                        instr_word_pcs,
-                    ));
+                    entries.insert(rel_target_plain_from_instr(idx, i16::from(*jump), instrs));
                 }
                 _ => {}
             }
         }
 
-        let entries_vec: Vec<_> = entries.into_iter().collect();
-        let mut blocks = Vec::with_capacity(entries_vec.len());
+        let entries: Vec<_> = entries.into_iter().collect();
+        let mut raw_blocks = Vec::with_capacity(entries.len());
 
-        for (block_idx, &start) in entries_vec.iter().enumerate() {
-            let end = entries_vec
-                .get(block_idx + 1)
-                .copied()
-                .unwrap_or(instrs.len());
-            let block_instrs = &instrs[start..end];
+        for (block_idx, &start) in entries.iter().enumerate() {
+            let end = entries.get(block_idx + 1).copied().unwrap_or(instrs.len());
+
+            let block_instrs: Vec<_> = instrs[start..end].iter().map(|i| i.0).collect();
             let Some(last_instr) = block_instrs.last() else {
                 continue;
             };
 
-            // TODO: document this
-            let (body_instrs, exit_instr) = if is_branch_exit(last_instr) {
-                let (block_instrs, exit_instr) = block_instrs.split_at(block_instrs.len() - 1);
-                debug_assert!(!exit_instr.is_empty());
+            let is_branch_or_return =
+                is_branch_exit(last_instr) || matches!(last_instr, Instr::Return { .. });
 
-                (block_instrs, exit_instr.first())
-            } else if matches!(last_instr, Instr::LoadB { jump, .. } if *jump > 0)
-                || matches!(last_instr, Instr::Return { .. })
-            {
-                (block_instrs, Some(last_instr))
+            let (body_end, exit_instr) = if is_branch_or_return {
+                (end - 1, Some(last_instr))
+            } else if matches!(last_instr, Instr::LoadB { jump, .. } if *jump > 0) {
+                // LoadB still needs to be lifted to assign the boolean
+                (end, Some(last_instr))
             } else {
-                (block_instrs, None)
+                (end, None)
             };
 
             let exit_instr_idx = end.saturating_sub(1);
-
-            let mut exit = match exit_instr {
-                Some(Instr::Return { base, count }) => {
-                    BlockExit::Return(return_values(*base, *count))
-                }
+            let exit = match exit_instr.copied() {
+                Some(Instr::Return { base, count }) => RawBlockExit::Return { base, count },
                 Some(Instr::Jump { offset }) | Some(Instr::JumpBack { offset }) => {
-                    let target = rel_target_plain_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::Jump(pc_to_block_idx(&entries_vec, target))
+                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::Jump(pc_to_block_idx(&entries, target))
+                }
+                Some(Instr::JumpX { offset }) => {
+                    let target = rel_target_plain_from_instr_wide(exit_instr_idx, offset, instrs);
+                    RawBlockExit::Jump(pc_to_block_idx(&entries, target))
                 }
                 Some(Instr::JumpIfNotLt { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Reg(*reg)),
+                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::CondJump {
+                        cond: Cond::Binary {
+                            lhs: reg,
                             op: BinOp::Lt,
-                            rhs: Box::new(HilExpr::Reg(*aux)),
+                            rhs: CondRhs::Reg(aux),
                         },
                         then_block: block_idx + 1,
-                        else_block: pc_to_block_idx(&entries_vec, target),
+                        else_block: pc_to_block_idx(&entries, target),
                     }
                 }
                 Some(Instr::JumpIf { reg, offset }) => {
-                    let target = rel_target_plain_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::CondJump {
-                        cond: HilExpr::Reg(*reg),
-                        then_block: pc_to_block_idx(&entries_vec, target),
+                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::CondJump {
+                        cond: Cond::Unary(reg),
+                        then_block: pc_to_block_idx(&entries, target),
                         else_block: block_idx + 1,
                     }
                 }
                 Some(Instr::JumpIfNot { reg, offset }) => {
-                    let target = rel_target_plain_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::CondJump {
-                        cond: HilExpr::Reg(*reg),
+                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::CondJump {
+                        cond: Cond::Unary(reg),
                         then_block: block_idx + 1,
-                        else_block: pc_to_block_idx(&entries_vec, target),
+                        else_block: pc_to_block_idx(&entries, target),
                     }
                 }
                 Some(Instr::JumpIfEq { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Reg(*reg)),
+                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::CondJump {
+                        cond: Cond::Binary {
+                            lhs: reg,
                             op: BinOp::Eq,
-                            rhs: Box::new(HilExpr::Reg(*aux)),
+                            rhs: CondRhs::Reg(aux),
                         },
-                        then_block: pc_to_block_idx(&entries_vec, target),
-                        else_block: block_idx + 1,
-                    }
-                }
-                Some(Instr::JumpIfLe { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Reg(*reg)),
-                            op: BinOp::Lte,
-                            rhs: Box::new(HilExpr::Reg(*aux)),
-                        },
-                        then_block: pc_to_block_idx(&entries_vec, target),
-                        else_block: block_idx + 1,
-                    }
-                }
-                Some(Instr::JumpIfLt { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Reg(*reg)),
-                            op: BinOp::Lt,
-                            rhs: Box::new(HilExpr::Reg(*aux)),
-                        },
-                        then_block: pc_to_block_idx(&entries_vec, target),
+                        then_block: pc_to_block_idx(&entries, target),
                         else_block: block_idx + 1,
                     }
                 }
                 Some(Instr::JumpIfNotEq { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Reg(*reg)),
-                            op: BinOp::Eq,
-                            rhs: Box::new(HilExpr::Reg(*aux)),
+                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::CondJump {
+                        cond: Cond::Binary {
+                            lhs: reg,
+                            op: BinOp::Ne,
+                            rhs: CondRhs::Reg(aux),
                         },
-                        then_block: block_idx + 1,
-                        else_block: pc_to_block_idx(&entries_vec, target),
+                        then_block: pc_to_block_idx(&entries, target),
+                        else_block: block_idx + 1,
+                    }
+                }
+                Some(Instr::JumpIfLe { reg, aux, offset }) => {
+                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::CondJump {
+                        cond: Cond::Binary {
+                            lhs: reg,
+                            op: BinOp::Lte,
+                            rhs: CondRhs::Reg(aux),
+                        },
+                        then_block: pc_to_block_idx(&entries, target),
+                        else_block: block_idx + 1,
                     }
                 }
                 Some(Instr::JumpIfNotLe { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Reg(*reg)),
-                            op: BinOp::Lte,
-                            rhs: Box::new(HilExpr::Reg(*aux)),
+                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::CondJump {
+                        cond: Cond::Binary {
+                            lhs: reg,
+                            op: BinOp::Gt,
+                            rhs: CondRhs::Reg(aux),
                         },
                         then_block: block_idx + 1,
-                        else_block: pc_to_block_idx(&entries_vec, target),
+                        else_block: pc_to_block_idx(&entries, target),
+                    }
+                }
+                Some(Instr::JumpIfLt { reg, aux, offset }) => {
+                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::CondJump {
+                        cond: Cond::Binary {
+                            lhs: reg,
+                            op: BinOp::Lt,
+                            rhs: CondRhs::Reg(aux),
+                        },
+                        then_block: pc_to_block_idx(&entries, target),
+                        else_block: block_idx + 1,
                     }
                 }
                 Some(Instr::JumpXEqKNil {
@@ -375,21 +341,20 @@ impl ControlFlowGraph {
                     invert,
                     offset,
                 }) => {
-                    let target = rel_target_compare_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    let op = if *invert { BinOp::Ne } else { BinOp::Eq };
-                    BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Reg(*reg)),
-                            op,
-                            rhs: Box::new(HilExpr::Nil),
+                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let (then_block, else_block) = if invert {
+                        (block_idx + 1, pc_to_block_idx(&entries, target))
+                    } else {
+                        (pc_to_block_idx(&entries, target), block_idx + 1)
+                    };
+                    RawBlockExit::CondJump {
+                        cond: Cond::Binary {
+                            lhs: reg,
+                            op: BinOp::Eq,
+                            rhs: CondRhs::Nil,
                         },
-                        then_block: pc_to_block_idx(&entries_vec, target),
-                        else_block: block_idx + 1,
+                        then_block,
+                        else_block,
                     }
                 }
                 Some(Instr::JumpXEqKB {
@@ -398,21 +363,20 @@ impl ControlFlowGraph {
                     invert,
                     offset,
                 }) => {
-                    let target = rel_target_compare_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    let op = if *invert { BinOp::Ne } else { BinOp::Eq };
-                    BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Reg(*reg)),
-                            op,
-                            rhs: Box::new(HilExpr::Bool(*k)),
+                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let (then_block, else_block) = if invert {
+                        (block_idx + 1, pc_to_block_idx(&entries, target))
+                    } else {
+                        (pc_to_block_idx(&entries, target), block_idx + 1)
+                    };
+                    RawBlockExit::CondJump {
+                        cond: Cond::Binary {
+                            lhs: reg,
+                            op: BinOp::Eq,
+                            rhs: CondRhs::Bool(k),
                         },
-                        then_block: pc_to_block_idx(&entries_vec, target),
-                        else_block: block_idx + 1,
+                        then_block,
+                        else_block,
                     }
                 }
                 Some(Instr::JumpXEqKN {
@@ -427,60 +391,46 @@ impl ControlFlowGraph {
                     invert,
                     offset,
                 }) => {
-                    let target = rel_target_compare_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    let op = if *invert { BinOp::Ne } else { BinOp::Eq };
-                    BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Reg(*reg)),
-                            op,
-                            rhs: Box::new(const_expr(&proto.consts, *k as usize)),
+                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let (then_block, else_block) = if invert {
+                        (block_idx + 1, pc_to_block_idx(&entries, target))
+                    } else {
+                        (pc_to_block_idx(&entries, target), block_idx + 1)
+                    };
+                    RawBlockExit::CondJump {
+                        cond: Cond::Binary {
+                            lhs: reg,
+                            op: BinOp::Eq,
+                            rhs: CondRhs::Const(k as usize),
                         },
-                        then_block: pc_to_block_idx(&entries_vec, target),
-                        else_block: block_idx + 1,
+                        then_block,
+                        else_block,
                     }
                 }
                 Some(Instr::FornPrep { base, offset }) => {
-                    let target = rel_target_plain_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::ForNPrep {
-                        base: usize::from(*base),
-                        loop_block: pc_to_block_idx(&entries_vec, target),
+                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::FornPrep {
+                        base: usize::from(base),
+                        body_block: block_idx + 1,
+                        exit_block: pc_to_block_idx(&entries, target),
                     }
                 }
                 Some(Instr::FornLoop { base, offset }) => {
-                    let target = rel_target_plain_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::ForNLoop {
-                        base: usize::from(*base),
-                        body_block: pc_to_block_idx(&entries_vec, target),
+                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::FornLoop {
+                        base: usize::from(base),
+                        body_block: pc_to_block_idx(&entries, target),
                         exit_block: block_idx + 1,
                     }
                 }
                 Some(Instr::ForgPrep { base, offset })
                 | Some(Instr::ForgPrepInext { base, offset })
                 | Some(Instr::ForgPrepNext { base, offset }) => {
-                    let target = rel_target_plain_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::ForGPrep {
-                        base: usize::from(*base),
-                        loop_block: pc_to_block_idx(&entries_vec, target),
+                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::ForgPrep {
+                        base: usize::from(base),
+                        body_block: block_idx + 1,
+                        exit_block: pc_to_block_idx(&entries, target),
                     }
                 }
                 Some(Instr::ForgLoop {
@@ -489,58 +439,157 @@ impl ControlFlowGraph {
                     var_count,
                     ..
                 }) => {
-                    let target = rel_target_plain_from_instr(
-                        exit_instr_idx,
-                        *offset,
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::ForGLoop {
-                        base: usize::from(*base),
-                        body_block: pc_to_block_idx(&entries_vec, target),
+                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    RawBlockExit::ForgLoop {
+                        base: usize::from(base),
+                        body_block: pc_to_block_idx(&entries, target),
                         exit_block: block_idx + 1,
-                        result_count: usize::from(*var_count),
+                        result_count: usize::from(var_count),
                     }
                 }
-                Some(Instr::LoadB { jump, .. }) if *jump > 0 => {
-                    let target = rel_target_plain_from_instr(
-                        exit_instr_idx,
-                        i16::from(*jump),
-                        instrs,
-                        instr_word_pcs,
-                    );
-                    BlockExit::Jump(pc_to_block_idx(&entries_vec, target))
+                Some(Instr::LoadB { jump, .. }) if jump > 0 => {
+                    let target =
+                        rel_target_plain_from_instr(exit_instr_idx, i16::from(jump), instrs);
+                    RawBlockExit::Jump(pc_to_block_idx(&entries, target))
                 }
-                _ => BlockExit::Fallthrough(block_idx + 1),
+                _ => RawBlockExit::Fallthrough(block_idx + 1),
             };
 
-            let body_instr_word_pcs = &instr_word_pcs[start..start + body_instrs.len()];
-            let mut lifted = lifter::lift(
-                body_instrs,
-                body_instr_word_pcs,
-                &proto.consts,
-                proto,
-                all_protos,
-            );
-
-            if matches!(exit_instr, Some(Instr::Return { .. }))
-                && let Some(Spanned {
-                    inner: HilStmt::Return(_),
-                    ..
-                }) = lifted.last()
-            {
-                let Spanned {
-                    inner: HilStmt::Return(rets),
-                    ..
-                } = lifted.pop().unwrap()
-                else {
-                    unreachable!()
-                };
-                exit = BlockExit::Return(rets);
-            }
-
-            blocks.push(Block::new(block_idx, lifted, exit));
+            raw_blocks.push(RawBlock {
+                instr_range: start..body_end,
+                exit,
+            });
         }
+
+        let exits: Vec<_> = raw_blocks.iter().map(|b| b.exit.clone()).collect();
+        let successors = build_successors(&exits);
+        let predecessors = build_predecessors(&successors);
+        let idoms = build_immediate_dominators(0, &successors, &predecessors);
+
+        // Having a raw cfg, we can now compute the phi nodes for each block.
+        let defs: Vec<BTreeSet<_>> = raw_blocks
+            .iter()
+            .map(|b| {
+                let block_instrs = &instrs[b.instr_range.clone()];
+                block_instrs
+                    .iter()
+                    .flat_map(|(i, _)| i.written_registers())
+                    .collect()
+            })
+            .collect();
+
+        // TODO: This whole section is stupid as fuck. It currently uses every register
+        //       ever written for Phi Node insertion, which is redundant and retarded.
+        //       Implement Braun et al.'s.
+        let all_written_regs: BTreeSet<_> = defs
+            .iter()
+            .flat_map(|block_defs| block_defs.iter().copied())
+            .collect();
+
+        let mut phi_sites: Vec<Vec<u8>> = vec![Vec::new(); raw_blocks.len()];
+        for (block_id, preds) in predecessors.iter().enumerate() {
+            if preds.len() >= 2 {
+                // This is a join point, it needs phis
+                phi_sites[block_id].extend(all_written_regs.iter().cloned());
+            }
+        }
+
+        // Iteration order of the blocks matters here as we want every dominator
+        // to come before the blocks it dominates.
+        type BlockState = [Option<SymbolId>; 256];
+
+        let mut exit_states: Vec<Option<BlockState>> = vec![None; raw_blocks.len()];
+        let mut arena = Arena::new();
+        let mut blocks: Vec<Option<Block>> = vec![None; raw_blocks.len()];
+
+        eprintln!(
+            "Proto {} RPO: {:?}",
+            proto.index,
+            compute_rpo(0, &successors)
+        );
+        for (i, succs) in successors.iter().enumerate() {
+            eprintln!("  block {i} successors: {succs:?}");
+        }
+        for (i, b) in raw_blocks.iter().enumerate() {
+            eprintln!("  raw block {i}: {:?}", b.exit);
+            for (instr, _) in &proto.instrs[b.instr_range.clone()] {
+                println!(
+                    "    Instr {:?} written regs {:?}",
+                    instr,
+                    instr.written_registers()
+                );
+            }
+        }
+
+        for block_id in compute_rpo(0, &successors) {
+            let mut symbols = if block_id == 0 {
+                let mut symbols = [None; 256] as BlockState;
+
+                for i in 0..proto.num_params {
+                    symbols[i as usize] = Some(arena.alloc(Symbol::new(i, 0)));
+                }
+
+                symbols
+            } else {
+                exit_states[idoms[block_id].unwrap()].unwrap()
+            };
+
+            let mut stmts = emit_phis(
+                &phi_sites[block_id],
+                &predecessors[block_id],
+                &exit_states,
+                &mut symbols,
+                &mut arena,
+            );
+            stmts.extend(lift(LiftContext {
+                instrs: &instrs[raw_blocks[block_id].instr_range.clone()],
+                consts: &proto.consts,
+                parent_proto: proto,
+                protos: all_protos,
+                arena: &mut arena,
+                state: &mut symbols,
+            }));
+
+            let exit = translate_exit(&raw_blocks[block_id].exit, &symbols, &proto.consts);
+            blocks[block_id] = Some(Block { stmts, exit });
+            exit_states[block_id] = Some(symbols);
+
+            for &succ in &successors[block_id] {
+                let Some(succ_block) = blocks[succ].as_mut() else {
+                    continue;
+                };
+                for stmt in &mut succ_block.stmts {
+                    let HilStmt::Phi { target, operands } = &mut stmt.inner else {
+                        continue;
+                    };
+
+                    // Skip if this predecessor already filled its operand (forward edge, done in emit_phis)
+                    if operands.iter().any(|(p, _)| *p == block_id) {
+                        continue;
+                    }
+
+                    let reg = arena[*target].reg;
+                    if let Some(sym) = exit_states[block_id].unwrap()[reg as usize] {
+                        operands.push((block_id, sym));
+                    }
+                }
+            }
+        }
+
+        let mut blocks: Vec<_> = blocks
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| {
+                b.unwrap_or_else(|| {
+                    panic!(
+                        "block {} of proto {} was never lifted: {:#?}",
+                        i,
+                        proto.index,
+                        &instrs[raw_blocks[i].instr_range.clone()]
+                    )
+                })
+            })
+            .collect();
 
         let blocks = loop {
             let (changed, new_blocks) = fold_short_circuits(blocks);
@@ -549,8 +598,22 @@ impl ControlFlowGraph {
             }
             blocks = new_blocks;
         };
+        let (numeric_loops_by_base, generic_loops_by_base) = build_loop_indexes(&blocks);
 
-        Self::new(blocks, 0)
+        // Rebuild after folding
+        let successors = build_successors(&exits);
+        let predecessors = build_predecessors(&successors);
+        let immediate_dominators = build_immediate_dominators(0, &successors, &predecessors);
+
+        Self {
+            blocks,
+            entry_block: 0,
+            successors,
+            predecessors,
+            immediate_dominators,
+            numeric_loops_by_base,
+            generic_loops_by_base,
+        }
     }
 
     /// Returns all successor block ids for `block`.
@@ -614,179 +677,47 @@ impl ControlFlowGraph {
 }
 
 /// Returns successor targets encoded in one block exit.
-///
-/// # Returns
-/// - `[Option<usize>; 2]`: one or two outgoing targets depending on exit shape.
 #[must_use]
-fn exit_targets(exit: &BlockExit) -> [Option<usize>; 2] {
+fn exit_targets(exit: &RawBlockExit) -> [Option<usize>; 2] {
     match *exit {
-        BlockExit::Jump(target) | BlockExit::Fallthrough(target) => [Some(target), None],
-        BlockExit::CondJump {
+        RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => [Some(target), None],
+        RawBlockExit::CondJump {
             then_block,
             else_block,
             ..
         } => [Some(then_block), Some(else_block)],
-        BlockExit::ForNPrep { loop_block, .. } | BlockExit::ForGPrep { loop_block, .. } => {
-            [Some(loop_block), None]
-        }
-        BlockExit::ForNLoop {
+        RawBlockExit::FornPrep {
             body_block,
             exit_block,
             ..
         }
-        | BlockExit::ForGLoop {
+        | RawBlockExit::ForgPrep {
             body_block,
             exit_block,
             ..
         } => [Some(body_block), Some(exit_block)],
-        BlockExit::Return(_) => [None, None],
+        RawBlockExit::FornLoop {
+            body_block,
+            exit_block,
+            ..
+        }
+        | RawBlockExit::ForgLoop {
+            body_block,
+            exit_block,
+            ..
+        } => [Some(body_block), Some(exit_block)],
+        RawBlockExit::Return { .. } => [None, None],
     }
-}
-
-/// Returns whether one instruction must terminate its basic block.
-#[must_use]
-fn is_branch_exit(instr: &Instr) -> bool {
-    matches!(
-        instr,
-        Instr::Jump { .. }
-            | Instr::JumpBack { .. }
-            | Instr::JumpIf { .. }
-            | Instr::JumpIfNot { .. }
-            | Instr::JumpIfEq { .. }
-            | Instr::JumpIfLe { .. }
-            | Instr::JumpIfLt { .. }
-            | Instr::JumpIfNotEq { .. }
-            | Instr::JumpIfNotLe { .. }
-            | Instr::JumpIfNotLt { .. }
-            | Instr::JumpXEqKNil { .. }
-            | Instr::JumpXEqKB { .. }
-            | Instr::JumpXEqKN { .. }
-            | Instr::JumpXEqKS { .. }
-            | Instr::FornPrep { .. }
-            | Instr::FornLoop { .. }
-            | Instr::ForgPrep { .. }
-            | Instr::ForgPrepInext { .. }
-            | Instr::ForgPrepNext { .. }
-            | Instr::ForgLoop { .. }
-    )
-}
-
-/// Resolves a relative branch target from the next instruction index.
-///
-/// Some Luau compare-family jumps encode "no jump" as offset `1` instead of `0`;
-/// `bias` normalizes those opcodes back to a plain PC-relative target.
-fn rel_target_with_bias(next_pc: usize, offset: i32, bias: i32, instr_len: usize) -> usize {
-    if instr_len == 0 {
-        return 0;
-    }
-
-    let target = next_pc.saturating_add_signed((offset - bias) as isize);
-    if target >= instr_len {
-        instr_len - 1
-    } else {
-        target
-    }
-}
-
-fn normalized_instr_word_pcs<'a>(
-    instrs: &[Instr],
-    instr_word_pcs: &'a [usize],
-) -> Cow<'a, [usize]> {
-    if instr_word_pcs.len() == instrs.len() && !instr_word_pcs.is_empty() {
-        return Cow::Borrowed(instr_word_pcs);
-    }
-
-    let mut word_pcs = Vec::with_capacity(instrs.len());
-    let mut word_pc = 0usize;
-    for instr in instrs {
-        word_pcs.push(word_pc);
-        word_pc = word_pc.saturating_add(instr.word_len());
-    }
-    Cow::Owned(word_pcs)
-}
-
-/// Resolves a relative branch target from an instruction index.
-///
-/// # Returns
-/// - the instruction index targeted by the relative branch.
-#[must_use]
-fn rel_target_from_instr(
-    instr_idx: usize,
-    offset: i32,
-    bias: i32,
-    instrs: &[Instr],
-    instr_word_pcs: &[usize],
-) -> usize {
-    if instrs.is_empty() {
-        return 0;
-    }
-
-    if instr_idx >= instrs.len() || instr_word_pcs.len() != instrs.len() {
-        return rel_target_with_bias(instr_idx + 1, offset, bias, instrs.len());
-    }
-
-    let next_word_pc = instr_word_pcs[instr_idx].saturating_add(instrs[instr_idx].word_len());
-    let target_word_pc = next_word_pc.saturating_add_signed((offset - bias) as isize);
-
-    match instr_word_pcs.binary_search(&target_word_pc) {
-        Ok(idx) => idx,
-        Err(0) => 0,
-        Err(pos) if pos >= instrs.len() => instrs.len() - 1,
-        Err(pos) => pos - 1,
-    }
-}
-
-/// Resolves the target of a jump opcode whose offset uses `0 == next instruction`.
-#[must_use]
-fn rel_target_plain_from_instr(
-    instr_idx: usize,
-    offset: i16,
-    instrs: &[Instr],
-    instr_word_pcs: &[usize],
-) -> usize {
-    rel_target_from_instr(instr_idx, offset as i32, 0, instrs, instr_word_pcs)
-}
-
-/// Resolves the target of a wide jump opcode whose offset uses `0 == next instruction`.
-#[must_use]
-fn rel_target_plain_from_instr_wide(
-    instr_idx: usize,
-    offset: i32,
-    instrs: &[Instr],
-    instr_word_pcs: &[usize],
-) -> usize {
-    rel_target_from_instr(instr_idx, offset, 0, instrs, instr_word_pcs)
-}
-
-/// Resolves the target of a compare-family jump whose offset uses `1 == next instruction`.
-#[must_use]
-fn rel_target_compare_from_instr(
-    instr_idx: usize,
-    offset: i16,
-    instrs: &[Instr],
-    instr_word_pcs: &[usize],
-) -> usize {
-    rel_target_from_instr(instr_idx, offset as i32, 1, instrs, instr_word_pcs)
-}
-
-/// Maps an instruction PC to its containing basic block index.
-fn pc_to_block_idx(entries: &[usize], pc: usize) -> usize {
-    assert!(!entries.is_empty());
-    assert!(entries[0] <= pc);
-    entries.partition_point(|&e| e <= pc) - 1
 }
 
 /// Builds forward adjacency lists from block exits.
-///
-/// # Returns
-/// - `Vec<Vec<usize>>`: `successors[src]` for each block id.
 #[must_use]
-fn build_successors(blocks: &[Block]) -> Vec<Vec<usize>> {
-    let len = blocks.len();
+fn build_successors(exits: &[RawBlockExit]) -> Vec<Vec<usize>> {
+    let len = exits.len();
     let mut successors = vec![Vec::new(); len];
 
-    for (src, block) in blocks.iter().enumerate() {
-        for target in exit_targets(&block.exit).into_iter().flatten() {
+    for (src, exit) in exits.iter().enumerate() {
+        for target in exit_targets(exit).into_iter().flatten() {
             if target < len {
                 successors[src].push(target);
             }
@@ -797,12 +728,9 @@ fn build_successors(blocks: &[Block]) -> Vec<Vec<usize>> {
 }
 
 /// Builds reverse adjacency lists from forward adjacency.
-///
-/// # Returns
-/// - `Vec<Vec<usize>>`: `predecessors[target]` for each block id.
 #[must_use]
-fn build_predecessors(len: usize, successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
-    let mut predecessors = vec![Vec::new(); len];
+fn build_predecessors(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut predecessors = vec![Vec::new(); successors.len()];
 
     for (src, targets) in successors.iter().enumerate() {
         for &target in targets {
@@ -818,6 +746,7 @@ fn compute_rpo(entry_block: usize, successors: &[Vec<usize>]) -> Vec<usize> {
     let mut visited = vec![false; len];
     let mut post_order = Vec::with_capacity(len);
 
+    // TODO: Use iterated stack here? This might overflow, though I have not hit that yet.
     fn dfs(
         block: usize,
         successors: &[Vec<usize>],
@@ -841,10 +770,7 @@ fn compute_rpo(entry_block: usize, successors: &[Vec<usize>]) -> Vec<usize> {
 
 /// Computes immediate dominators for all reachable blocks using the
 /// Cooper-Harvey-Kennedy algorithm.
-///
-/// # Returns
-/// - `Vec<Option<usize>>`: idom by block id; `None` for entry and unreachable blocks.
-pub fn build_dominator_metadata(
+pub fn build_immediate_dominators(
     entry_block: usize,
     successors: &[Vec<usize>],
     predecessors: &[Vec<usize>],
@@ -905,6 +831,257 @@ fn intersect(mut b1: usize, mut b2: usize, doms: &[Option<usize>], rpo_number: &
     b1
 }
 
+/// Resolves a relative branch target from the next instruction index.
+///
+/// Some Luau compare-family jumps encode "no jump" as offset `1` instead of `0`;
+/// `bias` normalizes those opcodes back to a plain PC-relative target.
+const fn rel_target_with_bias(next_pc: usize, offset: i32, bias: i32, instr_len: usize) -> usize {
+    if instr_len == 0 {
+        return 0;
+    }
+
+    let target = next_pc.saturating_add_signed((offset - bias) as isize);
+    if target >= instr_len {
+        instr_len - 1
+    } else {
+        target
+    }
+}
+
+/// Resolves a relative branch target from an instruction index.
+#[must_use]
+fn rel_target_from_instr(
+    instr_idx: usize,
+    offset: i32,
+    bias: i32,
+    instrs: &[(Instr, usize)],
+) -> usize {
+    if instrs.is_empty() {
+        return 0;
+    }
+
+    if instr_idx >= instrs.len() {
+        return rel_target_with_bias(instr_idx + 1, offset, bias, instrs.len());
+    }
+
+    let (instr, pc) = instrs[instr_idx];
+    let next_word_pc = pc.saturating_add(instr.word_len());
+    let target_word_pc = next_word_pc.saturating_add_signed((offset - bias) as isize);
+
+    match instrs.binary_search_by(|(_, pc)| pc.cmp(&target_word_pc)) {
+        Ok(idx) => idx,
+        Err(0) => 0,
+        Err(pos) if pos >= instrs.len() => instrs.len() - 1,
+        Err(pos) => pos - 1,
+    }
+}
+
+/// Resolves the target of a jump opcode whose offset uses `0 == next instruction`.
+#[must_use]
+fn rel_target_plain_from_instr(instr_idx: usize, offset: i16, instrs: &[(Instr, usize)]) -> usize {
+    rel_target_from_instr(instr_idx, offset as i32, 0, instrs)
+}
+
+/// Resolves the target of a wide jump opcode whose offset uses `0 == next instruction`.
+#[must_use]
+fn rel_target_plain_from_instr_wide(
+    instr_idx: usize,
+    offset: i32,
+    instrs: &[(Instr, usize)],
+) -> usize {
+    rel_target_from_instr(instr_idx, offset, 0, instrs)
+}
+
+/// Resolves the target of a compare-family jump whose offset uses `1 == next instruction`.
+#[must_use]
+fn rel_target_compare_from_instr(
+    instr_idx: usize,
+    offset: i16,
+    instrs: &[(Instr, usize)],
+) -> usize {
+    rel_target_from_instr(instr_idx, offset as i32, 1, instrs)
+}
+
+/// Returns whether one instruction must terminate its basic block.
+#[must_use]
+const fn is_branch_exit(instr: &Instr) -> bool {
+    matches!(
+        instr,
+        Instr::Jump { .. }
+            | Instr::JumpX { .. }
+            | Instr::JumpBack { .. }
+            | Instr::JumpIf { .. }
+            | Instr::JumpIfNot { .. }
+            | Instr::JumpIfEq { .. }
+            | Instr::JumpIfLe { .. }
+            | Instr::JumpIfLt { .. }
+            | Instr::JumpIfNotEq { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpXEqKNil { .. }
+            | Instr::JumpXEqKB { .. }
+            | Instr::JumpXEqKN { .. }
+            | Instr::JumpXEqKS { .. }
+            | Instr::FornPrep { .. }
+            | Instr::FornLoop { .. }
+            | Instr::ForgPrep { .. }
+            | Instr::ForgPrepInext { .. }
+            | Instr::ForgPrepNext { .. }
+            | Instr::ForgLoop { .. }
+    )
+}
+
+/// Maps an instruction PC to its containing basic block index.
+fn pc_to_block_idx(entries: &[usize], pc: usize) -> usize {
+    assert!(!entries.is_empty());
+    assert!(entries[0] <= pc);
+    entries.partition_point(|&e| e <= pc) - 1
+}
+
+fn emit_phis(
+    phi_regs: &[u8],
+    predecessors: &[usize],
+    exit_states: &[Option<[Option<SymbolId>; 256]>],
+    current_symbols: &mut [Option<SymbolId>; 256],
+    arena: &mut Arena<Symbol>,
+) -> Vec<Spanned<HilStmt>> {
+    let mut stmts = Vec::new();
+
+    for &reg in phi_regs {
+        // TODO: flat_map first + zip with predecessors (?)
+        let operands: Vec<_> = predecessors
+            .iter()
+            .map(|&p| (p, exit_states[p].as_ref().and_then(|s| s[reg as usize])))
+            .collect();
+
+        // If every predecessor that has been processed agrees on the same symbol,
+        // and no predecessor has a different one, no phi is needed.
+        let known: Vec<_> = operands.iter().filter_map(|(_, s)| *s).collect();
+        if !known.is_empty() && known.windows(2).all(|w| w[0] == w[1]) {
+            current_symbols[reg as usize] = Some(known[0]);
+            continue;
+        }
+
+        // TODO: Does pc matter here? If yes, what pc should be used?
+        let target = arena.alloc(Symbol::new(reg, 0));
+        current_symbols[reg as usize] = Some(target);
+
+        stmts.push(
+            HilStmt::Phi {
+                target,
+                operands: operands
+                    .into_iter()
+                    .filter_map(|(pred, sym)| sym.map(|s| (pred, s)))
+                    .collect(),
+            }
+            .to_spanned(0),
+        );
+    }
+
+    stmts
+}
+
+// TODO: Make RawBlockExit Copy as the constant dereferencing here is retarded,
+//       and it's a one time 40 bytes copy anyways.
+fn translate_exit(
+    exit: &RawBlockExit,
+    state: &[Option<SymbolId>; 256],
+    consts: &[Constant],
+) -> BlockExit {
+    match exit {
+        RawBlockExit::Jump(t) => BlockExit::Jump(*t),
+        RawBlockExit::Fallthrough(t) => BlockExit::Fallthrough(*t),
+        RawBlockExit::CondJump {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            let hil_cond = match cond {
+                Cond::Unary(reg) => HilExpr::Symbol(
+                    state[*reg as usize].unwrap_or_else(|| panic!("unbound register: {}", reg)),
+                ),
+                Cond::Binary { lhs, op, rhs } => {
+                    let lhs_expr = HilExpr::Symbol(
+                        state[*lhs as usize].unwrap_or_else(|| panic!("unbound register: {}", lhs)),
+                    );
+                    let rhs_expr = match rhs {
+                        CondRhs::Reg(r) => HilExpr::Symbol(
+                            state[*r as usize].unwrap_or_else(|| panic!("unbound register: {}", r)),
+                        ),
+                        CondRhs::Const(idx) => const_expr(consts, *idx),
+                        CondRhs::Nil => HilExpr::Nil,
+                        CondRhs::Bool(b) => HilExpr::Bool(*b),
+                    };
+
+                    HilExpr::Binary {
+                        lhs: Box::new(lhs_expr),
+                        op: *op,
+                        rhs: Box::new(rhs_expr),
+                    }
+                }
+            };
+
+            BlockExit::CondJump {
+                cond: hil_cond,
+                then_block: *then_block,
+                else_block: *else_block,
+            }
+        }
+        RawBlockExit::FornPrep {
+            base,
+            body_block,
+            exit_block,
+        } => BlockExit::FornPrep {
+            base: *base,
+            body_block: *body_block,
+            exit_block: *exit_block,
+        },
+        RawBlockExit::FornLoop {
+            base,
+            body_block,
+            exit_block,
+        } => BlockExit::FornLoop {
+            base: *base,
+            body_block: *body_block,
+            exit_block: *exit_block,
+        },
+        RawBlockExit::ForgPrep {
+            base,
+            body_block,
+            exit_block,
+        } => BlockExit::ForgPrep {
+            base: *base,
+            body_block: *body_block,
+            exit_block: *exit_block,
+        },
+        RawBlockExit::ForgLoop {
+            base,
+            body_block,
+            exit_block,
+            result_count,
+        } => BlockExit::ForgLoop {
+            base: *base,
+            body_block: *body_block,
+            exit_block: *exit_block,
+            result_count: *result_count,
+        },
+        RawBlockExit::Return { base, count } => match decoded_count(*count) {
+            Count::Variadic => todo!(),
+            Count::Number(n) => {
+                let rets = (*base..*base + n)
+                    .map(|i| {
+                        let symbol = state[i as usize].unwrap_or_else(|| {
+                            panic!("unbound register: {} while translating raw block exit", i)
+                        });
+                        HilExpr::Symbol(symbol)
+                    })
+                    .collect();
+                BlockExit::Return(rets)
+            }
+        },
+    }
+}
+
 /// Indexes loop-tail blocks by Luau loop base register.
 ///
 /// # Returns
@@ -918,10 +1095,10 @@ fn build_loop_indexes(
 
     for (idx, block) in blocks.iter().enumerate() {
         match block.exit {
-            BlockExit::ForNLoop { base, .. } => {
+            BlockExit::FornLoop { base, .. } => {
                 numeric_loops_by_base.entry(base).or_default().push(idx)
             }
-            BlockExit::ForGLoop { base, .. } => {
+            BlockExit::ForgLoop { base, .. } => {
                 generic_loops_by_base.entry(base).or_default().push(idx)
             }
             _ => {}
@@ -962,12 +1139,12 @@ fn fold_short_circuits(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
             _ => continue,
         };
 
-        let (then_d, else_e) = match &blocks[then_b].exit {
-            BlockExit::CondJump {
+        let (then_d, else_e) = match blocks.get(then_b).map(|b| &b.exit) {
+            Some(BlockExit::CondJump {
                 then_block,
                 else_block,
                 ..
-            } => (*then_block, *else_block),
+            }) => (*then_block, *else_block),
             _ => continue,
         };
 
@@ -982,8 +1159,8 @@ fn fold_short_circuits(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
             Spanned {
                 inner:
                     HilStmt::Assign {
-                        left: HilExpr::Reg(result_reg),
-                        value: HilExpr::Reg(cond_expr),
+                        left: HilExpr::Symbol(result_reg),
+                        value: HilExpr::Symbol(cond_expr),
                     },
                 ..
             },
@@ -996,18 +1173,18 @@ fn fold_short_circuits(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
 
             blocks[i].stmts.push(
                 HilStmt::Assign {
-                    left: HilExpr::Reg(result_reg),
+                    left: HilExpr::Symbol(result_reg),
                     value: HilExpr::Binary {
                         lhs: Box::new(cond),
                         op: BinOp::And,
-                        rhs: Box::new(HilExpr::Reg(cond_expr)),
+                        rhs: Box::new(HilExpr::Symbol(cond_expr)),
                     },
                 }
                 .to_spanned(0),
             );
 
             blocks[i].exit = BlockExit::CondJump {
-                cond: HilExpr::Reg(result_reg),
+                cond: HilExpr::Symbol(result_reg),
                 then_block: then_d,
                 else_block: else_b,
             };
@@ -1017,122 +1194,4 @@ fn fold_short_circuits(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
     }
 
     (was_changed, blocks)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::disasm::Proto;
-    use crate::il::Instr;
-
-    use super::ControlFlowGraph;
-
-    #[test]
-    fn from_proto_builds_conditional_edges() {
-        let proto = Proto {
-            instrs: vec![
-                Instr::LoadB {
-                    reg: 0,
-                    value: true,
-                    jump: 0,
-                },
-                Instr::JumpIfNot { reg: 0, offset: 1 },
-                Instr::LoadN { reg: 1, value: 1 },
-                Instr::Return { base: 1, count: 2 },
-                Instr::Return { base: 0, count: 1 },
-            ],
-            ..Proto::default()
-        };
-        let all_protos = vec![proto];
-
-        let cfg = ControlFlowGraph::from_proto(&all_protos[0], &all_protos);
-        assert_eq!(cfg.blocks.len(), 4);
-        assert!(matches!(
-            cfg.blocks[0].exit,
-            super::BlockExit::CondJump {
-                then_block: 1,
-                else_block: 2,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn from_proto_builds_numeric_for_edges() {
-        let proto = Proto {
-            instrs: vec![
-                Instr::LoadN { reg: 2, value: 1 },
-                Instr::LoadN { reg: 0, value: 2 },
-                Instr::LoadN { reg: 1, value: 1 },
-                Instr::FornPrep { base: 0, offset: 0 },
-                Instr::FornLoop {
-                    base: 0,
-                    offset: -1,
-                },
-                Instr::Return { base: 0, count: 1 },
-            ],
-            ..Proto::default()
-        };
-        let all_protos = vec![proto];
-
-        let cfg = ControlFlowGraph::from_proto(&all_protos[0], &all_protos);
-        assert_eq!(cfg.blocks.len(), 3);
-        assert!(matches!(
-            cfg.blocks[0].exit,
-            super::BlockExit::ForNPrep {
-                base: 0,
-                loop_block: 1
-            }
-        ));
-        assert!(matches!(
-            cfg.blocks[1].exit,
-            super::BlockExit::ForNLoop {
-                base: 0,
-                body_block: 1,
-                exit_block: 2
-            }
-        ));
-    }
-
-    #[test]
-    fn from_proto_uses_block_local_word_pcs_for_lifted_statements() {
-        let proto = Proto {
-            instrs: vec![
-                Instr::LoadN { reg: 0, value: 1 },
-                Instr::Return { base: 0, count: 1 },
-                Instr::LoadN { reg: 1, value: 2 },
-                Instr::Return { base: 1, count: 2 },
-            ],
-            instr_word_pcs: vec![0, 1, 2, 3],
-            ..Proto::default()
-        };
-        let all_protos = vec![proto];
-
-        let cfg = ControlFlowGraph::from_proto(&all_protos[0], &all_protos);
-        assert_eq!(cfg.blocks.len(), 2);
-        assert_eq!(cfg.blocks[0].stmts[0].pc, 0);
-        assert_eq!(cfg.blocks[1].stmts[0].pc, 2);
-    }
-
-    #[test]
-    fn from_proto_synthesizes_word_pcs_from_instruction_lengths() {
-        let proto = Proto {
-            instrs: vec![
-                Instr::GetImport {
-                    dest: 0,
-                    index: 0,
-                    path: 1,
-                },
-                Instr::LoadN { reg: 1, value: 2 },
-                Instr::Return { base: 0, count: 1 },
-            ],
-            ..Proto::default()
-        };
-        let all_protos = vec![proto];
-
-        let cfg = ControlFlowGraph::from_proto(&all_protos[0], &all_protos);
-        assert_eq!(cfg.blocks.len(), 1);
-        assert_eq!(cfg.blocks[0].stmts.len(), 2);
-        assert_eq!(cfg.blocks[0].stmts[0].pc, 0);
-        assert_eq!(cfg.blocks[0].stmts[1].pc, 2);
-    }
 }

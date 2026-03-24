@@ -202,53 +202,51 @@ impl<'a> RegionBuilder<'a> {
                         break;
                     }
                 }
-                BlockExit::ForNPrep { base, loop_block } => {
-                    if let Some((_tail_block, body_block, exit_block)) =
-                        resolve_numeric_for_tail(curr_id, *base, *loop_block, self.cfg)
-                    {
-                        let body = self.build_region_with_loop(
-                            body_block,
-                            Some(exit_block),
-                            Some(exit_block),
-                        );
-                        nodes.push(RegionNode::NumericFor {
-                            header: curr_id,
-                            base: *base,
-                            body,
-                            exit_block,
-                        });
-                        curr_id = exit_block;
-                    } else {
-                        nodes.push(RegionNode::Jump {
-                            from_block: curr_id,
-                            target: *loop_block,
-                        });
-                        curr_id = *loop_block;
-                    }
+                BlockExit::FornPrep {
+                    base,
+                    body_block,
+                    exit_block,
+                } => {
+                    let body = self.build_region_with_loop(
+                        *body_block,
+                        Some(*exit_block),
+                        Some(*exit_block),
+                    );
+                    nodes.push(RegionNode::NumericFor {
+                        header: curr_id,
+                        base: *base,
+                        body,
+                        exit_block: *exit_block,
+                    });
+                    curr_id = *exit_block;
                 }
-                BlockExit::ForGPrep { base, loop_block } => {
-                    if let Some((_tail_block, body_block, exit_block, result_count)) =
-                        resolve_generic_for_tail(curr_id, *base, *loop_block, self.cfg)
+                BlockExit::ForgPrep {
+                    base,
+                    body_block,
+                    exit_block,
+                } => {
+                    if let Some((_tail_block, _body_block, _exit_block, result_count)) =
+                        resolve_generic_for_tail(curr_id, *base, *body_block, self.cfg)
                     {
                         let body = self.build_region_with_loop(
-                            body_block,
-                            Some(exit_block),
-                            Some(exit_block),
+                            *body_block,
+                            Some(*exit_block),
+                            Some(*exit_block),
                         );
                         nodes.push(RegionNode::GenericFor {
                             header: curr_id,
                             base: *base,
                             result_count,
                             body,
-                            exit_block,
+                            exit_block: *exit_block,
                         });
-                        curr_id = exit_block;
+                        curr_id = *exit_block;
                     } else {
                         nodes.push(RegionNode::Jump {
                             from_block: curr_id,
-                            target: *loop_block,
+                            target: *body_block,
                         });
-                        curr_id = *loop_block;
+                        curr_id = *body_block;
                     }
                 }
                 BlockExit::Return(values) => {
@@ -258,10 +256,10 @@ impl<'a> RegionBuilder<'a> {
                     });
                     break;
                 }
-                BlockExit::ForNLoop { .. } => {
+                BlockExit::FornLoop { .. } => {
                     break;
                 }
-                BlockExit::ForGLoop { .. } => break,
+                BlockExit::ForgLoop { .. } => break,
             }
         }
 
@@ -295,130 +293,5 @@ fn invert_condition(expr: HilExpr) -> HilExpr {
     HilExpr::Unary {
         op: UnOp::Not,
         expr: Box::new(expr),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::hil::{
-        cflow::graph::{Block, BlockExit, ControlFlowGraph},
-        ir::{HilExpr, HilStmt, Spanned},
-    };
-
-    use super::{RegionBuilder, RegionNode};
-
-    #[test]
-    fn build_region_omits_synthetic_generic_for_tail_nodes() {
-        let cfg = ControlFlowGraph::new(
-            vec![
-                Block::new(
-                    0,
-                    Vec::new(),
-                    BlockExit::ForGPrep {
-                        base: 1,
-                        loop_block: 2,
-                    },
-                ),
-                Block::new(
-                    1,
-                    vec![Spanned::new(
-                        HilStmt::Assign {
-                            left: HilExpr::Reg(4),
-                            value: HilExpr::Reg(2),
-                        },
-                        0,
-                    )],
-                    BlockExit::Fallthrough(2),
-                ),
-                Block::new(
-                    2,
-                    Vec::new(),
-                    BlockExit::ForGLoop {
-                        base: 1,
-                        body_block: 1,
-                        exit_block: 3,
-                        result_count: 2,
-                    },
-                ),
-                Block::new(3, Vec::new(), BlockExit::Return(Vec::new())),
-            ],
-            0,
-        );
-
-        let mut builder = RegionBuilder::new(&cfg);
-        let region = builder.build_region(0, None);
-
-        let RegionNode::GenericFor { body, .. } = &region.nodes[0] else {
-            panic!("expected generic for");
-        };
-
-        assert!(matches!(
-            body.nodes.as_slice(),
-            [RegionNode::BasicBlock { block: 1 }]
-        ));
-    }
-
-    #[test]
-    fn build_region_emits_break_for_direct_loop_exit_branch() {
-        let cfg = ControlFlowGraph::new(
-            vec![
-                Block::new(
-                    0,
-                    Vec::new(),
-                    BlockExit::CondJump {
-                        cond: HilExpr::Reg(0),
-                        then_block: 1,
-                        else_block: 3,
-                    },
-                ),
-                Block::new(
-                    1,
-                    Vec::new(),
-                    BlockExit::CondJump {
-                        cond: HilExpr::Reg(1),
-                        then_block: 3,
-                        else_block: 2,
-                    },
-                ),
-                Block::new(2, Vec::new(), BlockExit::Jump(0)),
-                Block::new(3, Vec::new(), BlockExit::Return(Vec::new())),
-            ],
-            0,
-        );
-
-        let mut builder = RegionBuilder::new(&cfg);
-        let region = builder.build_region(0, None);
-
-        let RegionNode::While {
-            body, exit_block, ..
-        } = &region.nodes[0]
-        else {
-            panic!("expected while");
-        };
-        assert_eq!(*exit_block, 3);
-
-        let RegionNode::If {
-            then_branch,
-            else_branch,
-            ..
-        } = &body.nodes[0]
-        else {
-            panic!("expected break-if inside while");
-        };
-
-        assert!(matches!(
-            then_branch.nodes.as_slice(),
-            [RegionNode::Break {
-                from_block: 1,
-                target_exit: 3
-            }]
-        ));
-        assert!(matches!(
-            else_branch.nodes.as_slice(),
-            [RegionNode::Continue {
-                from_block: 2,
-                target_loop_header: 0
-            }]
-        ));
     }
 }

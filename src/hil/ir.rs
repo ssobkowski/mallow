@@ -1,6 +1,7 @@
 use smol_str::SmolStr;
 
 use crate::ast::{BinOp, UnOp};
+use crate::hil::lifter::symbol::SymbolId;
 
 /// A wrapper that attaches a bytecode PC to any IR node.
 #[derive(Debug, Clone)]
@@ -26,16 +27,12 @@ pub enum HilExpr {
     String(String),
     /// A boolean literal.
     Bool(bool),
-    /// A register, identified by its index.
-    Reg(u8),
-    /// An upvalue, identified by its index in the function's upvalue list.
-    Upval(u8),
-    /// A local variable, identified by its name. Used internally for non-register locals.
-    Local(SmolStr),
+    /// A symbol, an universal variable reference.
+    Symbol(SymbolId),
     /// A closure literal and the proto/captures needed to rebuild nested functions.
     Closure {
         proto: usize,
-        captures: Vec<HilCapture>,
+        captures: Vec<SymbolId>,
     },
     /// A global variable, identified by its name.
     Global(SmolStr),
@@ -77,11 +74,9 @@ pub enum HilExpr {
 #[derive(Debug, Clone)]
 pub enum HilCapture {
     /// Capture a local from the current frame by its value.
-    Value(u8),
+    Value(SymbolId),
     /// Capture a local from the current frame by its reference.
-    Ref(u8),
-    /// Capture an upvalue from the parent closure.
-    Upval(u8),
+    Ref(SymbolId),
 }
 
 /// An entry in the table constructor.
@@ -105,13 +100,13 @@ pub enum HilStmt {
     AssignMany { left: Vec<HilExpr>, value: HilExpr },
     /// A table-field assignment lowered from opcodes such as `SETTABLEKS`.
     SetField {
-        table: u8,
+        table: SymbolId,
         key: SmolStr,
         value: HilExpr,
     },
     /// A bulk array write lowered from `SETLIST`.
     SetList {
-        table: u8,
+        table: SymbolId,
         index: u32,
         values: Vec<HilExpr>,
         has_variadic_tail: bool,
@@ -120,6 +115,11 @@ pub enum HilStmt {
     Call(HilExpr),
     /// A return statement.
     Return(Vec<HilExpr>),
+    /// A "Phi-Node", used for merging symbols between region blocks.
+    Phi {
+        target: SymbolId,
+        operands: Vec<(usize, SymbolId)>,
+    },
 }
 
 pub trait ToSpanned {

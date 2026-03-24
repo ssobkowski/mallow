@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 
+use smallvec::{SmallVec, smallvec};
+
+use crate::hil::common::decoded_count;
+
 /// Represents the two states of a table, array (index-value pairs) and hashmap
 /// (key-value pairs).
 #[derive(Debug, Clone)]
@@ -291,7 +295,7 @@ pub enum Instr {
 impl Instr {
     const LOP_COUNT: u8 = 83; // LOP__COUNT (not a valid opcode)
 
-    fn opcode_requires_aux(opcode: u8) -> bool {
+    const fn opcode_requires_aux(opcode: u8) -> bool {
         matches!(
             opcode,
             7 | 8
@@ -319,7 +323,7 @@ impl Instr {
         )
     }
 
-    pub fn word_len(&self) -> usize {
+    pub const fn word_len(&self) -> usize {
         match self {
             Instr::GetGlobal { .. }
             | Instr::SetGlobal { .. }
@@ -335,7 +339,11 @@ impl Instr {
             | Instr::JumpIfNotLt { .. }
             | Instr::NewTable { .. }
             | Instr::SetList { .. }
+            | Instr::ForgPrep { .. }
             | Instr::ForgLoop { .. }
+            | Instr::FornPrep { .. }
+            | Instr::ForgPrepInext { .. }
+            | Instr::ForgPrepNext { .. }
             | Instr::FastCall3 { .. }
             | Instr::LoadKX { .. }
             | Instr::FastCall2 { .. }
@@ -348,7 +356,93 @@ impl Instr {
         }
     }
 
-    fn decode_header(value: u32, aux: Option<u32>) -> Result<Self, String> {
+    /// Returns the indices of a physical register this instruction
+    /// writes to, if any.
+    pub fn written_registers(&self) -> SmallVec<[u8; 4]> {
+        match &self {
+            Instr::LoadNil { reg }
+            | Instr::LoadB { reg, .. }
+            | Instr::LoadN { reg, .. }
+            | Instr::LoadK { reg, .. }
+            | Instr::Move { dest: reg, .. }
+            | Instr::GetGlobal { dest: reg, .. }
+            | Instr::GetUpval { dest: reg, .. }
+            | Instr::GetImport { dest: reg, .. }
+            | Instr::GetTable { dest: reg, .. }
+            | Instr::GetTableKS { dest: reg, .. }
+            | Instr::NewClosure { dest: reg, .. }
+            | Instr::Add { dest: reg, .. }
+            | Instr::Sub { dest: reg, .. }
+            | Instr::Mul { dest: reg, .. }
+            | Instr::Div { dest: reg, .. }
+            | Instr::Mod { dest: reg, .. }
+            | Instr::Pow { dest: reg, .. }
+            | Instr::AddK { dest: reg, .. }
+            | Instr::SubK { dest: reg, .. }
+            | Instr::MulK { dest: reg, .. }
+            | Instr::DivK { dest: reg, .. }
+            | Instr::ModK { dest: reg, .. }
+            | Instr::PowK { dest: reg, .. }
+            | Instr::And { dest: reg, .. }
+            | Instr::Or { dest: reg, .. }
+            | Instr::AndK { dest: reg, .. }
+            | Instr::OrK { dest: reg, .. }
+            | Instr::Concat { dest: reg, .. }
+            | Instr::Not { dest: reg, .. }
+            | Instr::Minus { dest: reg, .. }
+            | Instr::Length { dest: reg, .. }
+            | Instr::NewTable { dest: reg, .. }
+            | Instr::DupTable { dest: reg, .. }
+            | Instr::SetList { table: reg, .. }
+            | Instr::DupClosure { dest: reg, .. }
+            | Instr::SubRK { dest: reg, .. }
+            | Instr::DivRK { dest: reg, .. }
+            | Instr::IDiv { dest: reg, .. }
+            | Instr::IDivK { dest: reg, .. } => smallvec![*reg],
+
+            Instr::ForgLoop {
+                base, var_count, ..
+            } => {
+                let base = *base + 3;
+                debug_assert!(
+                    base.checked_add(*var_count).is_some(),
+                    "CALL return register overflow"
+                );
+                (base..base + *var_count).collect()
+            }
+
+            Instr::Call {
+                func, ret_count, ..
+            } => match decoded_count(*ret_count) {
+                Count::Number(n) => {
+                    let base = *func;
+                    debug_assert!(
+                        base.checked_add(n).is_some(),
+                        "CALL return register overflow"
+                    );
+                    (base..base + n).collect()
+                }
+                // TODO: how do you even determine this?
+                Count::Variadic => todo!(),
+            },
+
+            Instr::GetVarArgs { dest, count } => match decoded_count(*count) {
+                Count::Number(n) => {
+                    let base = *dest;
+                    debug_assert!(
+                        base.checked_add(n).is_some(),
+                        "GETVARARGS register overflow"
+                    );
+                    (base..base + n).collect()
+                }
+                Count::Variadic => unreachable!(),
+            },
+
+            _ => smallvec![],
+        }
+    }
+
+    fn new(value: u32, aux: Option<u32>) -> Result<Self, String> {
         let opcode = (value & 0xff) as u8;
         if opcode >= Self::LOP_COUNT {
             return Err(format!(
@@ -698,50 +792,52 @@ impl Instr {
 
         Ok(instr)
     }
-
-    pub fn decode_stream_with_word_pcs(words: &[u32]) -> Result<(Vec<Self>, Vec<usize>), String> {
-        let mut out = Vec::new();
-        let mut word_pcs = Vec::new();
-        let mut pc = 0usize;
-
-        while pc < words.len() {
-            let header_pc = pc;
-            let header = words[header_pc];
-            let opcode = (header & 0xff) as u8;
-
-            if opcode >= Self::LOP_COUNT {
-                return Err(format!(
-                    "invalid Luau opcode {} at word pc {} (0x{header:08x})",
-                    opcode, header_pc
-                ));
-            }
-
-            let aux = if Self::opcode_requires_aux(opcode) {
-                pc += 1;
-                if pc >= words.len() {
-                    return Err(format!(
-                        "truncated bytecode: opcode {} at word pc {} requires AUX word",
-                        opcode, header_pc
-                    ));
-                }
-                Some(words[pc])
-            } else {
-                None
-            };
-
-            out.push(Self::decode_header(header, aux)?);
-            word_pcs.push(header_pc);
-            pc += 1;
-        }
-
-        Ok((out, word_pcs))
-    }
 }
 
 impl From<u32> for Instr {
     fn from(value: u32) -> Self {
-        Self::decode_header(value, None).unwrap_or_else(|err| panic!("{err}"))
+        Self::new(value, None).unwrap_or_else(|err| panic!("{err}"))
     }
+}
+
+pub fn decode_stream_with_word_pcs(words: &[u32]) -> Vec<(Instr, usize)> {
+    let mut out = Vec::new();
+    let mut pc = 0usize;
+
+    while pc < words.len() {
+        let header_pc = pc;
+        let header = words[header_pc];
+        let opcode = (header & 0xff) as u8;
+
+        if opcode >= Instr::LOP_COUNT {
+            panic!(
+                "invalid Luau opcode {} at word pc {} (0x{header:08x})",
+                opcode, header_pc
+            );
+        }
+
+        let aux = if Instr::opcode_requires_aux(opcode) {
+            pc += 1;
+            if pc >= words.len() {
+                panic!(
+                    "truncated bytecode: opcode {} at word pc {} requires AUX word",
+                    opcode, header_pc
+                );
+            }
+            Some(words[pc])
+        } else {
+            None
+        };
+
+        out.push((
+            Instr::new(header, aux)
+                .unwrap_or_else(|_| panic!("failed to decode instruction at word pc {header_pc}")),
+            header_pc,
+        ));
+        pc += 1;
+    }
+
+    out
 }
 
 #[cfg(test)]
