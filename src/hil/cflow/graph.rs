@@ -981,10 +981,14 @@ fn emit_phis(
             .map(|&p| (p, exit_states[p].as_ref().and_then(|s| s[reg as usize])))
             .collect();
 
-        // If every predecessor that has been processed agrees on the same symbol,
-        // and no predecessor has a different one, no phi is needed.
+        // Check if we are waiting on a back-edge that hasn't been visited yet
+        let has_unknown_preds = operands.iter().any(|(_, s)| s.is_none());
+
+        // If we have no unknown predecessors, and every predecessor that
+        // has been processed agrees on the same symbol, and no predecessor
+        // has a different one, no phi is needed.
         let known: Vec<_> = operands.iter().filter_map(|(_, s)| *s).collect();
-        if !known.is_empty() && known.windows(2).all(|w| w[0] == w[1]) {
+        if !has_unknown_preds && !known.is_empty() && known.windows(2).all(|w| w[0] == w[1]) {
             current_symbols[reg as usize] = Some(known[0]);
             continue;
         }
