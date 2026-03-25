@@ -66,6 +66,38 @@ pub enum RawBlockExit {
     },
 }
 
+impl RawBlockExit {
+    /// Returns successor targets encoded in one block exit.
+    #[must_use]
+    fn exit_targets(&self) -> [Option<usize>; 2] {
+        match self {
+            RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => [Some(*target), None],
+            RawBlockExit::CondJump {
+                then_block,
+                else_block,
+                ..
+            } => [Some(*then_block), Some(*else_block)],
+            RawBlockExit::FornPrep {
+                body_block,
+                exit_block,
+                ..
+            } => [Some(*body_block), Some(*exit_block)],
+            RawBlockExit::ForgPrep { body_block, .. } => [Some(*body_block), None],
+            RawBlockExit::FornLoop {
+                body_block,
+                exit_block,
+                ..
+            }
+            | RawBlockExit::ForgLoop {
+                body_block,
+                exit_block,
+                ..
+            } => [Some(*body_block), Some(*exit_block)],
+            RawBlockExit::Return { .. } => [None, None],
+        }
+    }
+}
+
 /// Represents a lifted block
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -105,6 +137,38 @@ pub enum BlockExit {
         result_count: usize,
     },
     Return(Vec<HilExpr>),
+}
+
+impl BlockExit {
+    /// Returns successor targets encoded in one block exit.
+    #[must_use]
+    fn exit_targets(&self) -> [Option<usize>; 2] {
+        match self {
+            BlockExit::Jump(target) | BlockExit::Fallthrough(target) => [Some(*target), None],
+            BlockExit::CondJump {
+                then_block,
+                else_block,
+                ..
+            } => [Some(*then_block), Some(*else_block)],
+            BlockExit::FornPrep {
+                body_block,
+                exit_block,
+                ..
+            } => [Some(*body_block), Some(*exit_block)],
+            BlockExit::ForgPrep { body_block, .. } => [Some(*body_block), None],
+            BlockExit::FornLoop {
+                body_block,
+                exit_block,
+                ..
+            }
+            | BlockExit::ForgLoop {
+                body_block,
+                exit_block,
+                ..
+            } => [Some(*body_block), Some(*exit_block)],
+            BlockExit::Return { .. } => [None, None],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -464,8 +528,7 @@ impl ControlFlowGraph {
             });
         }
 
-        let exits: Vec<_> = raw_blocks.iter().map(|b| b.exit.clone()).collect();
-        let successors = build_successors(&exits);
+        let successors = build_successors(raw_blocks.iter().map(|b| b.exit.exit_targets()));
         let predecessors = build_predecessors(&successors);
         let idoms = build_immediate_dominators(0, &successors, &predecessors);
 
@@ -603,7 +666,7 @@ impl ControlFlowGraph {
         let (numeric_loops_by_base, generic_loops_by_base) = build_loop_indexes(&blocks);
 
         // Rebuild after folding
-        let successors = build_successors(&exits);
+        let successors = build_successors(blocks.iter().map(|b| b.exit.exit_targets()));
         let predecessors = build_predecessors(&successors);
         let immediate_dominators = build_immediate_dominators(0, &successors, &predecessors);
 
@@ -678,51 +741,18 @@ impl ControlFlowGraph {
     }
 }
 
-/// Returns successor targets encoded in one block exit.
-#[must_use]
-fn exit_targets(exit: &RawBlockExit) -> [Option<usize>; 2] {
-    match *exit {
-        RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => [Some(target), None],
-        RawBlockExit::CondJump {
-            then_block,
-            else_block,
-            ..
-        } => [Some(then_block), Some(else_block)],
-        RawBlockExit::FornPrep {
-            body_block,
-            exit_block,
-            ..
-        } => [Some(body_block), Some(exit_block)],
-        RawBlockExit::ForgPrep { body_block, .. } => [Some(body_block), None],
-        RawBlockExit::FornLoop {
-            body_block,
-            exit_block,
-            ..
-        }
-        | RawBlockExit::ForgLoop {
-            body_block,
-            exit_block,
-            ..
-        } => [Some(body_block), Some(exit_block)],
-        RawBlockExit::Return { .. } => [None, None],
-    }
-}
-
 /// Builds forward adjacency lists from block exits.
 #[must_use]
-fn build_successors(exits: &[RawBlockExit]) -> Vec<Vec<usize>> {
-    let len = exits.len();
-    let mut successors = vec![Vec::new(); len];
+fn build_successors<I>(targets_iter: I) -> Vec<Vec<usize>>
+where
+    I: IntoIterator<Item = [Option<usize>; 2]>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let iter = targets_iter.into_iter();
+    let len = iter.len();
 
-    for (src, exit) in exits.iter().enumerate() {
-        for target in exit_targets(exit).into_iter().flatten() {
-            if target < len {
-                successors[src].push(target);
-            }
-        }
-    }
-
-    successors
+    iter.map(|targets| targets.into_iter().flatten().filter(|&t| t < len).collect())
+        .collect()
 }
 
 /// Builds reverse adjacency lists from forward adjacency.
