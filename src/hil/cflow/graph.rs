@@ -22,8 +22,10 @@ use crate::{
 /// Represents an unlifted block
 #[derive(Debug)]
 pub struct RawBlock {
-    /// The range of instructions indices that belong to this block
+    /// The range of instructions indices that belong to this block, excluding the potential exit instruction.
     instr_range: Range<usize>,
+    /// The full range of instruction indices that belong to this block, including the potential exit instruction.
+    full_instr_range: Range<usize>,
     exit: RawBlockExit,
 }
 
@@ -457,6 +459,7 @@ impl ControlFlowGraph {
 
             raw_blocks.push(RawBlock {
                 instr_range: start..body_end,
+                full_instr_range: start..end,
                 exit,
             });
         }
@@ -470,7 +473,7 @@ impl ControlFlowGraph {
         let defs: Vec<BTreeSet<_>> = raw_blocks
             .iter()
             .map(|b| {
-                let block_instrs = &instrs[b.instr_range.clone()];
+                let block_instrs = &instrs[b.full_instr_range.clone()];
                 block_instrs
                     .iter()
                     .flat_map(|(i, _)| i.written_registers())
@@ -512,7 +515,7 @@ impl ControlFlowGraph {
         }
         for (i, b) in raw_blocks.iter().enumerate() {
             eprintln!("  raw block {i}: {:?}", b.exit);
-            for (instr, _) in &proto.instrs[b.instr_range.clone()] {
+            for (instr, _) in &proto.instrs[b.full_instr_range.clone()] {
                 println!(
                     "    Instr {:?} written regs {:?}",
                     instr,
@@ -578,15 +581,14 @@ impl ControlFlowGraph {
 
         let mut blocks: Vec<_> = blocks
             .into_iter()
-            .enumerate()
-            .map(|(i, b)| {
+            .map(|b| {
                 b.unwrap_or_else(|| {
-                    panic!(
-                        "block {} of proto {} was never lifted: {:#?}",
-                        i,
-                        proto.index,
-                        &instrs[raw_blocks[i].instr_range.clone()]
-                    )
+                    // Luau compiler might leave some "dead" blocks (for instance leftovers of jump threading optimization)
+                    // we don't panic here as it's probably fine (if rpo couldn't reach it), just emit a dummy
+                    Block {
+                        stmts: Vec::new(),
+                        exit: BlockExit::Return(Vec::new()),
+                    }
                 })
             })
             .collect();
@@ -690,12 +692,8 @@ fn exit_targets(exit: &RawBlockExit) -> [Option<usize>; 2] {
             body_block,
             exit_block,
             ..
-        }
-        | RawBlockExit::ForgPrep {
-            body_block,
-            exit_block,
-            ..
         } => [Some(body_block), Some(exit_block)],
+        RawBlockExit::ForgPrep { body_block, .. } => [Some(body_block), None],
         RawBlockExit::FornLoop {
             body_block,
             exit_block,
@@ -850,23 +848,22 @@ const fn rel_target_with_bias(next_pc: usize, offset: i32, bias: i32, instr_len:
 
 /// Resolves a relative branch target from an instruction index.
 #[must_use]
-fn rel_target_from_instr(
-    instr_idx: usize,
-    offset: i32,
-    bias: i32,
-    instrs: &[(Instr, usize)],
-) -> usize {
+fn rel_target_from_instr(instr_idx: usize, offset: i32, instrs: &[(Instr, usize)]) -> usize {
     if instrs.is_empty() {
         return 0;
     }
 
     if instr_idx >= instrs.len() {
-        return rel_target_with_bias(instr_idx + 1, offset, bias, instrs.len());
+        let target = (instr_idx + 1).saturating_add_signed(offset as isize);
+        return if target >= instrs.len() {
+            instrs.len() - 1
+        } else {
+            target
+        };
     }
 
-    let (instr, pc) = instrs[instr_idx];
-    let next_word_pc = pc.saturating_add(instr.word_len());
-    let target_word_pc = next_word_pc.saturating_add_signed((offset - bias) as isize);
+    let (_, pc) = instrs[instr_idx];
+    let target_word_pc = pc.saturating_add(1).saturating_add_signed(offset as isize);
 
     match instrs.binary_search_by(|(_, pc)| pc.cmp(&target_word_pc)) {
         Ok(idx) => idx,
@@ -879,7 +876,7 @@ fn rel_target_from_instr(
 /// Resolves the target of a jump opcode whose offset uses `0 == next instruction`.
 #[must_use]
 fn rel_target_plain_from_instr(instr_idx: usize, offset: i16, instrs: &[(Instr, usize)]) -> usize {
-    rel_target_from_instr(instr_idx, offset as i32, 0, instrs)
+    rel_target_from_instr(instr_idx, offset as i32, instrs)
 }
 
 /// Resolves the target of a wide jump opcode whose offset uses `0 == next instruction`.
@@ -889,7 +886,7 @@ fn rel_target_plain_from_instr_wide(
     offset: i32,
     instrs: &[(Instr, usize)],
 ) -> usize {
-    rel_target_from_instr(instr_idx, offset, 0, instrs)
+    rel_target_from_instr(instr_idx, offset, instrs)
 }
 
 /// Resolves the target of a compare-family jump whose offset uses `1 == next instruction`.
@@ -899,7 +896,7 @@ fn rel_target_compare_from_instr(
     offset: i16,
     instrs: &[(Instr, usize)],
 ) -> usize {
-    rel_target_from_instr(instr_idx, offset as i32, 1, instrs)
+    rel_target_from_instr(instr_idx, offset as i32, instrs)
 }
 
 /// Returns whether one instruction must terminate its basic block.
