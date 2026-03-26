@@ -203,44 +203,51 @@ impl<'a> RegionBuilder<'a> {
                     }
                 }
                 BlockExit::FornPrep {
-                    base,
-                    body_block,
-                    exit_block,
+                    base, body_block, ..
                 } => {
-                    let body = self.build_region_with_loop(
-                        *body_block,
-                        Some(*exit_block),
-                        Some(*exit_block),
-                    );
-                    nodes.push(RegionNode::NumericFor {
-                        header: curr_id,
-                        base: *base,
-                        body,
-                        exit_block: *exit_block,
-                    });
-                    curr_id = *exit_block;
+                    if let Some((_, resolved_body, resolved_exit)) =
+                        resolve_numeric_for_tail(curr_id, *base, *body_block, self.cfg)
+                    {
+                        let body = self.build_region_with_loop(
+                            resolved_body,
+                            Some(resolved_exit),
+                            Some(resolved_exit),
+                        );
+                        nodes.push(RegionNode::NumericFor {
+                            header: curr_id,
+                            base: *base,
+                            body,
+                            exit_block: resolved_exit,
+                        });
+                        curr_id = resolved_exit;
+                    } else {
+                        // Fallback if the loop shape is corrupted
+                        nodes.push(RegionNode::Jump {
+                            from_block: curr_id,
+                            target: *body_block,
+                        });
+                        curr_id = *body_block;
+                    }
                 }
                 BlockExit::ForgPrep {
-                    base,
-                    body_block,
-                    exit_block,
+                    base, body_block, ..
                 } => {
-                    if let Some((_tail_block, _body_block, _exit_block, result_count)) =
+                    if let Some((_, resolved_body, resolved_exit, result_count)) =
                         resolve_generic_for_tail(curr_id, *base, *body_block, self.cfg)
                     {
                         let body = self.build_region_with_loop(
-                            *body_block,
-                            Some(*exit_block),
-                            Some(*exit_block),
+                            resolved_body,
+                            Some(resolved_exit),
+                            Some(resolved_exit),
                         );
                         nodes.push(RegionNode::GenericFor {
                             header: curr_id,
                             base: *base,
                             result_count,
                             body,
-                            exit_block: *exit_block,
+                            exit_block: resolved_exit,
                         });
-                        curr_id = *exit_block;
+                        curr_id = resolved_exit;
                     } else {
                         nodes.push(RegionNode::Jump {
                             from_block: curr_id,
@@ -256,10 +263,9 @@ impl<'a> RegionBuilder<'a> {
                     });
                     break;
                 }
-                BlockExit::FornLoop { .. } => {
+                BlockExit::FornLoop { .. } | BlockExit::ForgLoop { .. } => {
                     break;
                 }
-                BlockExit::ForgLoop { .. } => break,
             }
         }
 
