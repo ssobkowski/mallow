@@ -568,25 +568,6 @@ impl ControlFlowGraph {
         let mut arena = Arena::new();
         let mut blocks: Vec<Option<Block>> = vec![None; raw_blocks.len()];
 
-        eprintln!(
-            "Proto {} RPO: {:?}",
-            proto.index,
-            compute_rpo(0, &successors)
-        );
-        for (i, succs) in successors.iter().enumerate() {
-            eprintln!("  block {i} successors: {succs:?}");
-        }
-        for (i, b) in raw_blocks.iter().enumerate() {
-            eprintln!("  raw block {i}: {:?}", b.exit);
-            for (instr, _) in &proto.instrs[b.full_instr_range.clone()] {
-                println!(
-                    "    Instr {:?} written regs {:?}",
-                    instr,
-                    instr.written_registers()
-                );
-            }
-        }
-
         for block_id in compute_rpo(0, &successors) {
             let mut symbols = if block_id == 0 {
                 let mut symbols = [None; 256] as BlockState;
