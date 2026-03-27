@@ -241,7 +241,7 @@ impl AstPrinter {
 
     fn walk_expr(&mut self, expr: &Expr, parent_prec: u8, side: Side) {
         match expr {
-            Expr::Name(name) => self.write(name.as_str()),
+            Expr::Named(name) => self.write(name.as_str()),
             Expr::Binary { lhs, op, rhs } => {
                 let prec = op.precedence();
                 let assoc = binary_assoc(op);

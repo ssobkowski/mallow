@@ -3,14 +3,15 @@ mod common;
 mod disasm;
 mod hil;
 mod il;
-// mod passes;
 mod printer;
 mod scopes;
-// mod structurer;
+mod structurer;
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+
+use crate::hil::StructuredFunction;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -77,32 +78,18 @@ fn main() {
                 }
             };
 
-            let (regions, cfgs): (Vec<_>, Vec<_>) = disassembled
+            let fns: Vec<_> = disassembled
                 .protos
                 .iter()
-                .map(|proto| {
-                    let cfg = hil::cflow::graph::ControlFlowGraph::from_proto(
-                        proto,
-                        &disassembled.protos,
-                    );
-                    let mut region = hil::cflow::region::RegionBuilder::new(&cfg);
-                    (region.build_region(cfg.entry_block, None), cfg)
-                })
+                .map(|proto| StructuredFunction::from_proto(proto, &disassembled.protos))
                 .collect();
 
-            println!("{:#?}", regions);
+            let ast = structurer::structure(fns, disassembled.entry_proto as usize);
+            let code = printer::print(&ast);
 
-            // let ast = structurer::structure(
-            //     &regions,
-            //     &cfgs,
-            //     disassembled.entry_proto as usize,
-            //     &disassembled.protos,
-            // );
-            // let code = printer::print(&ast);
-
-            // if let Err(e) = write_output(output, &code) {
-            //     eprintln!("Error writing decompilation output: {e}");
-            // }
+            if let Err(e) = write_output(output, &code) {
+                eprintln!("Error writing decompilation output: {e}");
+            }
         }
     }
 }

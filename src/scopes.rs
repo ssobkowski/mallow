@@ -45,17 +45,17 @@ impl<K: Hash + Eq, V> Scope<K, V> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ScopeManager<K: Hash + Eq, V> {
+pub struct Scopes<K: Hash + Eq, V> {
     scopes: Vec<Scope<K, V>>,
 }
 
-impl<K: Hash + Eq, V> Default for ScopeManager<K, V> {
+impl<K: Hash + Eq, V> Default for Scopes<K, V> {
     fn default() -> Self {
         Self { scopes: Vec::new() }
     }
 }
 
-impl<K: Hash + Eq, V> ScopeManager<K, V> {
+impl<K: Hash + Eq, V> Scopes<K, V> {
     /// Creates a new scope manager with no scopes.
     #[inline]
     pub fn new() -> Self {
@@ -95,8 +95,7 @@ impl<K: Hash + Eq, V> ScopeManager<K, V> {
 
     /// Declares a variable in the current scope. Returns false if no scope exists.
     #[inline]
-    #[must_use]
-    pub fn declare_var(&mut self, name: K, value: V) -> bool {
+    pub fn declare(&mut self, name: K, value: V) -> bool {
         if let Some(scope) = self.top_scope_mut() {
             scope.declare(name, value);
             true
@@ -108,8 +107,9 @@ impl<K: Hash + Eq, V> ScopeManager<K, V> {
     /// Returns a variable from the current scope, if it exists.
     /// If one cannot be found in the current scope, it will search
     /// parent scopes until it finds one or exhausts all scopes.
+    #[inline]
     #[must_use]
-    pub fn get_var(&self, name: &K) -> Option<&V> {
+    pub fn get(&self, name: &K) -> Option<&V> {
         self.iter().find_map(|s| s.get(name))
     }
 }

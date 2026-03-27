@@ -1,5 +1,9 @@
 use std::collections::HashSet;
 
+use smallvec::SmallVec;
+
+use crate::hil::lifter::symbol::SymbolId;
+
 use super::graph::{BlockExit, ControlFlowGraph};
 
 /// Walks a branch to locate its most likely merge successor.
@@ -80,6 +84,99 @@ pub fn find_if_else_join(
     Some(candidate)
 }
 
+/// Scored candidate from the loop-tail search.
+#[derive(PartialEq, Eq, Hash)]
+struct ForTailCandidate {
+    tail: usize,
+    body: usize,
+    exit: usize,
+}
+
+impl ForTailCandidate {
+    pub fn new(tail: usize, body: usize, exit: usize) -> Self {
+        Self { tail, body, exit }
+    }
+}
+
+/// Shared candidate-gathering and scoring logic for all `for` loop variants.
+///
+/// `try_extract` should match the relevant `BlockExit` variant, verify the base register,
+/// and return `(body_block, exit_block)` on success.
+///
+/// `fallback_pool` is consumed only when no candidates are found through normal traversal.
+fn select_best_for_tail(
+    prep_block: usize,
+    prep_target_block: usize,
+    cfg: &ControlFlowGraph,
+    try_extract: impl Fn(&BlockExit) -> Option<(usize, usize)>,
+    fallback_pool: impl Iterator<Item = usize>,
+) -> Option<ForTailCandidate> {
+    if prep_block >= cfg.blocks.len() {
+        return None;
+    }
+
+    let preferred_body = prep_block + 1;
+    let mut candidates = HashSet::new();
+
+    if let Some(block) = cfg.blocks.get(prep_target_block)
+        && let Some((body, exit)) = try_extract(&block.exit)
+    {
+        candidates.insert(ForTailCandidate::new(prep_target_block, body, exit));
+    }
+
+    for &pred in cfg.predecessors(prep_target_block) {
+        if let Some(block) = cfg.blocks.get(pred)
+            && let Some((body, exit)) = try_extract(&block.exit)
+            && exit == prep_target_block
+        {
+            candidates.insert(ForTailCandidate::new(pred, body, exit));
+        }
+    }
+
+    if preferred_body < cfg.blocks.len() {
+        for &pred in cfg.predecessors(preferred_body) {
+            if let Some(block) = cfg.blocks.get(pred)
+                && let Some((body, exit)) = try_extract(&block.exit)
+                && body == preferred_body
+            {
+                candidates.insert(ForTailCandidate::new(pred, body, exit));
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        for tail in fallback_pool {
+            if let Some(block) = cfg.blocks.get(tail)
+                && let Some((body, exit)) = try_extract(&block.exit)
+            {
+                candidates.insert(ForTailCandidate::new(tail, body, exit));
+            }
+        }
+    }
+
+    candidates.into_iter().max_by_key(|c| {
+        let mut score = 0usize;
+        if c.tail == prep_target_block {
+            score += 8;
+        }
+        if c.exit == prep_target_block {
+            score += 4;
+        }
+        if c.body == preferred_body {
+            score += 2;
+        }
+        if cfg.dominates(prep_block, c.body) {
+            score += 1;
+        }
+        score
+    })
+}
+
+pub struct NumericForTail {
+    pub body: usize,
+    pub exit: usize,
+}
+
 /// Resolves the tail/body/exit for a numeric `for` loop preheader.
 ///
 /// # Returns
@@ -91,87 +188,38 @@ pub fn resolve_numeric_for_tail(
     base: usize,
     prep_target_block: usize,
     cfg: &ControlFlowGraph,
-) -> Option<(usize, usize, usize)> {
-    if prep_block >= cfg.blocks.len() {
-        return None;
-    }
+) -> Option<NumericForTail> {
+    let fallback = cfg
+        .numeric_loops_by_base
+        .get(&base)
+        .into_iter()
+        .flatten()
+        .copied();
 
-    let preferred_body = prep_block + 1;
-    let mut candidates: HashSet<(usize, usize, usize)> = HashSet::new();
-
-    if let Some(block) = cfg.blocks.get(prep_target_block)
-        && let BlockExit::FornLoop {
-            base: loop_base,
-            body_block,
-            exit_block,
-        } = block.exit
-        && loop_base == base
-    {
-        candidates.insert((prep_target_block, body_block, exit_block));
-    }
-
-    for &pred in cfg.predecessors(prep_target_block) {
-        if let Some(block) = cfg.blocks.get(pred)
-            && let BlockExit::FornLoop {
+    let candidate = select_best_for_tail(
+        prep_block,
+        prep_target_block,
+        cfg,
+        |exit| match exit {
+            BlockExit::FornLoop {
                 base: loop_base,
                 body_block,
                 exit_block,
-            } = block.exit
-            && loop_base == base
-            && exit_block == prep_target_block
-        {
-            candidates.insert((pred, body_block, exit_block));
-        }
-    }
-
-    if preferred_body < cfg.blocks.len() {
-        for &pred in cfg.predecessors(preferred_body) {
-            if let Some(block) = cfg.blocks.get(pred)
-                && let BlockExit::FornLoop {
-                    base: loop_base,
-                    body_block,
-                    exit_block,
-                } = block.exit
-                && loop_base == base
-                && body_block == preferred_body
-            {
-                candidates.insert((pred, body_block, exit_block));
-            }
-        }
-    }
-
-    if candidates.is_empty()
-        && let Some(loop_tails) = cfg.numeric_loops_by_base.get(&base)
-    {
-        for &tail in loop_tails {
-            if let Some(block) = cfg.blocks.get(tail)
-                && let BlockExit::FornLoop {
-                    body_block,
-                    exit_block,
-                    ..
-                } = block.exit
-            {
-                candidates.insert((tail, body_block, exit_block));
-            }
-        }
-    }
-
-    candidates.into_iter().max_by_key(|(tail, body, exit)| {
-        let mut score = 0usize;
-        if *tail == prep_target_block {
-            score += 8;
-        }
-        if *exit == prep_target_block {
-            score += 4;
-        }
-        if *body == preferred_body {
-            score += 2;
-        }
-        if cfg.dominates(prep_block, *body) {
-            score += 1;
-        }
-        score
+            } if *loop_base == base => Some((*body_block, *exit_block)),
+            _ => None,
+        },
+        fallback,
+    )?;
+    Some(NumericForTail {
+        body: candidate.body,
+        exit: candidate.exit,
     })
+}
+
+pub struct GenericForTail<'cfg> {
+    pub body: usize,
+    pub exit: usize,
+    pub vars: &'cfg SmallVec<[SymbolId; 3]>,
 }
 
 /// Resolves the tail/body/exit/result-count for a generic `for` loop preheader.
@@ -180,105 +228,53 @@ pub fn resolve_numeric_for_tail(
 /// - `Some((tail_block, body_block, exit_block, result_count))` for a recoverable generic loop.
 /// - `None` when no matching `FORGLOOP` shape is found.
 #[must_use]
-pub fn resolve_generic_for_tail(
+pub fn resolve_generic_for_tail<'a>(
     prep_block: usize,
     base: usize,
     prep_target_block: usize,
-    cfg: &ControlFlowGraph,
-) -> Option<(usize, usize, usize, usize)> {
-    if prep_block >= cfg.blocks.len() {
-        return None;
-    }
+    cfg: &'a ControlFlowGraph,
+) -> Option<GenericForTail<'a>> {
+    let fallback = cfg
+        .generic_loops_by_base
+        .get(&base)
+        .into_iter()
+        .flatten()
+        .copied();
 
     let preferred_body = prep_block + 1;
-    let mut candidates: HashSet<(usize, usize, usize, usize)> = HashSet::new();
 
-    if let Some(block) = cfg.blocks.get(prep_target_block)
-        && let BlockExit::ForgLoop {
-            base: loop_base,
-            body_block,
-            exit_block,
-            result_count,
-        } = block.exit
-        && loop_base == base
-    {
-        candidates.insert((prep_target_block, body_block, exit_block, result_count));
-    }
-
-    for &pred in cfg.predecessors(prep_target_block) {
-        if let Some(block) = cfg.blocks.get(pred)
-            && let BlockExit::ForgLoop {
+    let candidate = select_best_for_tail(
+        prep_block,
+        prep_target_block,
+        cfg,
+        |exit| match exit {
+            BlockExit::ForgLoop {
                 base: loop_base,
                 body_block,
                 exit_block,
-                result_count,
-            } = block.exit
-            && loop_base == base
-            && exit_block == prep_target_block
-        {
-            candidates.insert((pred, body_block, exit_block, result_count));
-        }
-    }
+                ..
+            } if *loop_base == base => Some((*body_block, *exit_block)),
+            _ => None,
+        },
+        fallback,
+    )?;
 
-    if preferred_body < cfg.blocks.len() {
-        for &pred in cfg.predecessors(preferred_body) {
-            if let Some(block) = cfg.blocks.get(pred)
-                && let BlockExit::ForgLoop {
-                    base: loop_base,
-                    body_block,
-                    exit_block,
-                    result_count,
-                } = block.exit
-                && loop_base == base
-                && body_block == preferred_body
-            {
-                candidates.insert((pred, body_block, exit_block, result_count));
-            }
-        }
-    }
-
-    if candidates.is_empty()
-        && let Some(loop_tails) = cfg.generic_loops_by_base.get(&base)
-    {
-        for &tail in loop_tails {
-            if let Some(block) = cfg.blocks.get(tail)
-                && let BlockExit::ForgLoop {
-                    body_block,
-                    exit_block,
-                    result_count,
-                    ..
-                } = block.exit
-            {
-                candidates.insert((tail, body_block, exit_block, result_count));
-            }
-        }
-    }
-
-    let best = candidates.into_iter().max_by_key(|(tail, body, exit, _)| {
-        let mut score = 0usize;
-        if *tail == prep_target_block {
-            score += 8;
-        }
-        if *exit == prep_target_block {
-            score += 4;
-        }
-        if *body == preferred_body {
-            score += 2;
-        }
-        if cfg.dominates(prep_block, *body) {
-            score += 1;
-        }
-        score
-    })?;
-
-    let (tail, body, exit, result_count) = best;
-    let body = if linear_fallthrough_reaches(preferred_body, body, exit, cfg) {
-        preferred_body
-    } else {
-        body
+    let BlockExit::ForgLoop { ref vars, .. } = cfg.blocks[candidate.tail].exit else {
+        unreachable!("tail_block was selected from a ForgLoop exit");
     };
 
-    Some((tail, body, exit, result_count))
+    let body_block =
+        if linear_fallthrough_reaches(preferred_body, candidate.body, candidate.exit, cfg) {
+            preferred_body
+        } else {
+            candidate.body
+        };
+
+    Some(GenericForTail {
+        body: body_block,
+        exit: candidate.exit,
+        vars,
+    })
 }
 
 /// Returns whether `start` reaches `target` through strict linear fallthrough blocks.

@@ -9,7 +9,7 @@ use crate::{
     disasm::Proto,
     hil::{
         common::{const_expr, decoded_count},
-        ir::{HilCapture, HilExpr, HilStmt, Spanned, ToSpanned},
+        ir::{HilExpr, HilStmt, Spanned, ToSpanned},
         lifter::symbol::{Mutability, Symbol, SymbolId},
     },
     il::{Constant, Count, Instr},
@@ -164,15 +164,6 @@ impl<'a> Lifter<'a> {
         expr
     }
 
-    fn decode_capture(&self, capture_type: u8, reg: u8) -> HilCapture {
-        match capture_type {
-            0 => HilCapture::Value(self.get_reg_symbol(reg)),
-            1 => HilCapture::Ref(self.get_reg_symbol(reg)),
-            2 => HilCapture::Value(self.upvalues[reg as usize]),
-            _ => unreachable!("unknown capture type: {capture_type}"),
-        }
-    }
-
     /// Emits a plain assignment statement at the current PC span.
     fn assign(&mut self, left: HilExpr, value: HilExpr) {
         let ip = self.ip.saturating_sub(1);
@@ -211,26 +202,6 @@ impl<'a> Lifter<'a> {
                 reg, faulty_idx, instr
             );
         })
-    }
-
-    /// Extracts the returned variables as Symbols, handling fixed and variadic counts.
-    /// Needs `&mut self` because it consumes any pending multiret expressions.
-    pub fn take_return_symbols(&mut self, base: u8, count: u8) -> Vec<HilExpr> {
-        match decoded_count(count) {
-            Count::Number(n) => {
-                // Fixed number of returns
-                let mut rets = Vec::with_capacity(n as usize);
-                for i in 0..n {
-                    let reg = base + i;
-                    rets.push(HilExpr::Symbol(self.get_reg_symbol(reg)));
-                }
-                rets
-            }
-            Count::Variadic => {
-                // Variadic return (e.g., `return a, f()`)
-                self.take_variadic_from(base).unwrap_or_default()
-            }
-        }
     }
 
     /// Lifts all instructions into pc-spanned HIL statements in bytecode order.
@@ -291,7 +262,9 @@ impl<'a> Lifter<'a> {
                     arg_count,
                     ret_count,
                 } => self.lift_call(*func, *arg_count, *ret_count),
-                Instr::Return { base, count } => self.lift_return(*base, *count),
+                Instr::Return { .. } => {
+                    unreachable!("RETURN should have been handled by the CFG generator")
+                }
 
                 Instr::GetTableKS {
                     dest, table, key, ..
@@ -528,16 +501,6 @@ impl<'a> Lifter<'a> {
         // effects (e.g. a variadic call), so materialize it before returning.
         self.flush_multiret();
         self.stmts
-    }
-
-    fn lift_return(&mut self, base: u8, count: u8) {
-        let rets = match decoded_count(count) {
-            Count::Variadic => self
-                .take_variadic_from(base)
-                .unwrap_or_else(|| vec![HilExpr::Symbol(self.get_reg_symbol(base))]),
-            Count::Number(n) => self.read_regs(base, n),
-        };
-        self.push(HilStmt::Return(rets));
     }
 
     fn lift_call(&mut self, func: u8, arg_count: u8, ret_count: u8) {

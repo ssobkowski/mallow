@@ -4,6 +4,7 @@ use std::{
 };
 
 use id_arena::Arena;
+use smallvec::SmallVec;
 
 use crate::{
     ast::BinOp,
@@ -16,7 +17,7 @@ use crate::{
             symbol::{Symbol, SymbolId},
         },
     },
-    il::{Constant, Count, Instr},
+    il::{Count, Instr},
 };
 
 /// Represents an unlifted block
@@ -119,6 +120,9 @@ pub enum BlockExit {
         base: usize,
         body_block: usize,
         exit_block: usize,
+        start: SymbolId,
+        end: SymbolId,
+        step: SymbolId,
     },
     FornLoop {
         base: usize,
@@ -129,12 +133,14 @@ pub enum BlockExit {
         base: usize,
         body_block: usize,
         exit_block: usize,
+        exprs: [SymbolId; 3],
     },
     ForgLoop {
         base: usize,
         body_block: usize,
         exit_block: usize,
         result_count: usize,
+        vars: SmallVec<[SymbolId; 3]>,
     },
     Return(Vec<HilExpr>),
 }
@@ -198,7 +204,7 @@ pub enum Cond {
     Unary(u8),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ControlFlowGraph {
     pub blocks: Vec<Block>,
     pub entry_block: usize,
@@ -253,7 +259,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Instr::JumpX { offset } => {
-                    entries.insert(rel_target_from_instr(idx, (*offset).into(), instrs));
+                    entries.insert(rel_target_from_instr(idx, *offset, instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
@@ -596,7 +602,123 @@ impl ControlFlowGraph {
                 state: &mut symbols,
             }));
 
-            let exit = translate_exit(&raw_blocks[block_id].exit, &symbols, &proto.consts);
+            let exit =
+                match &raw_blocks[block_id].exit {
+                    RawBlockExit::Jump(t) => BlockExit::Jump(*t),
+                    RawBlockExit::Fallthrough(t) => BlockExit::Fallthrough(*t),
+                    RawBlockExit::CondJump {
+                        cond,
+                        then_block,
+                        else_block,
+                    } => {
+                        let hil_cond = match cond {
+                            Cond::Unary(reg) => HilExpr::Symbol(
+                                symbols[*reg as usize]
+                                    .unwrap_or_else(|| panic!("unbound register: {}", reg)),
+                            ),
+                            Cond::Binary { lhs, op, rhs } => {
+                                let lhs_expr = HilExpr::Symbol(
+                                    symbols[*lhs as usize]
+                                        .unwrap_or_else(|| panic!("unbound register: {}", lhs)),
+                                );
+                                let rhs_expr = match rhs {
+                                    CondRhs::Reg(r) => HilExpr::Symbol(
+                                        symbols[*r as usize]
+                                            .unwrap_or_else(|| panic!("unbound register: {}", r)),
+                                    ),
+                                    CondRhs::Const(idx) => const_expr(&proto.consts, *idx),
+                                    CondRhs::Nil => HilExpr::Nil,
+                                    CondRhs::Bool(b) => HilExpr::Bool(*b),
+                                };
+
+                                HilExpr::Binary {
+                                    lhs: Box::new(lhs_expr),
+                                    op: *op,
+                                    rhs: Box::new(rhs_expr),
+                                }
+                            }
+                        };
+
+                        BlockExit::CondJump {
+                            cond: hil_cond,
+                            then_block: *then_block,
+                            else_block: *else_block,
+                        }
+                    }
+                    RawBlockExit::FornPrep {
+                        base,
+                        body_block,
+                        exit_block,
+                    } => {
+                        let base = *base;
+                        let start = symbols[base + 2].unwrap();
+                        let end = symbols[base].unwrap();
+                        let step = symbols[base + 1].unwrap();
+                        BlockExit::FornPrep {
+                            base,
+                            body_block: *body_block,
+                            exit_block: *exit_block,
+                            start,
+                            end,
+                            step,
+                        }
+                    }
+                    RawBlockExit::FornLoop {
+                        base,
+                        body_block,
+                        exit_block,
+                    } => BlockExit::FornLoop {
+                        base: *base,
+                        body_block: *body_block,
+                        exit_block: *exit_block,
+                    },
+                    RawBlockExit::ForgPrep {
+                        base,
+                        body_block,
+                        exit_block,
+                    } => {
+                        let exprs = [
+                            symbols[*base].unwrap(),
+                            symbols[*base + 1].unwrap(),
+                            symbols[*base + 2].unwrap(),
+                        ];
+                        BlockExit::ForgPrep {
+                            base: *base,
+                            body_block: *body_block,
+                            exit_block: *exit_block,
+                            exprs,
+                        }
+                    }
+                    RawBlockExit::ForgLoop {
+                        base,
+                        body_block,
+                        exit_block,
+                        result_count,
+                    } => BlockExit::ForgLoop {
+                        base: *base,
+                        body_block: *body_block,
+                        exit_block: *exit_block,
+                        result_count: *result_count,
+                        vars: (0..*result_count)
+                            .map(|i| symbols[*base + 3 + i].unwrap())
+                            .collect(),
+                    },
+                    RawBlockExit::Return { base, count } => match decoded_count(*count) {
+                        Count::Variadic => todo!(),
+                        Count::Number(n) => {
+                            let rets =
+                                (*base..*base + n)
+                                    .map(|i| {
+                                        let symbol = symbols[i as usize].unwrap_or_else(|| {
+                            panic!("unbound register: {} while translating raw block exit", i)
+                        });
+                                        HilExpr::Symbol(symbol)
+                                    })
+                                    .collect();
+                            BlockExit::Return(rets)
+                        }
+                    },
+                };
             blocks[block_id] = Some(Block { stmts, exit });
             exit_states[block_id] = Some(symbols);
 
@@ -650,7 +772,7 @@ impl ControlFlowGraph {
         let predecessors = build_predecessors(&successors);
         let immediate_dominators = build_immediate_dominators(0, &successors, &predecessors);
 
-        Self {
+        let mut graph = Self {
             blocks,
             entry_block: 0,
             successors,
@@ -658,7 +780,11 @@ impl ControlFlowGraph {
             immediate_dominators,
             numeric_loops_by_base,
             generic_loops_by_base,
+        };
+        for i in 0..graph.blocks.len() {
+            graph.unfold_phis(i);
         }
+        graph
     }
 
     /// Returns all successor block ids for `block`.
@@ -718,6 +844,52 @@ impl ControlFlowGraph {
     #[must_use]
     pub fn immediate_dominator(&self, block: usize) -> Option<usize> {
         self.immediate_dominators.get(block).copied().flatten()
+    }
+
+    /// Unfolds Phi Nodes into assign statements inserted at appropriate locations.
+    ///
+    /// This should be ran after the graph metadata has been computed.
+    fn unfold_phis(&mut self, block_idx: usize) {
+        let Some(idom) = self.immediate_dominator(block_idx) else {
+            // This block has no immediate dominator, we can't emit the phi node
+            // target declaration anywhere.
+            return;
+        };
+
+        let phis: Vec<_> = self.blocks[block_idx]
+            .stmts
+            .extract_if(.., |stmt| matches!(stmt.inner, HilStmt::Phi { .. }))
+            .map(|stmt| {
+                let HilStmt::Phi { target, operands } = stmt.inner else {
+                    unreachable!();
+                };
+
+                (target, operands)
+            })
+            .collect();
+
+        for (target, operands) in phis {
+            // Emit the target declaration in the idom block. The structurer
+            // will determine whether to make it a declaration or not.
+            self.blocks[idom].stmts.push(
+                HilStmt::Assign {
+                    left: HilExpr::Symbol(target),
+                    value: HilExpr::Nil,
+                }
+                .to_spanned(0),
+            );
+
+            // In each operand block insert the `target = operand` statement.
+            for (op_block_idx, version) in operands {
+                self.blocks[op_block_idx].stmts.push(
+                    HilStmt::Assign {
+                        left: HilExpr::Symbol(target),
+                        value: HilExpr::Symbol(version),
+                    }
+                    .to_spanned(0),
+                );
+            }
+        }
     }
 }
 
@@ -947,107 +1119,6 @@ fn emit_phis(
     }
 
     stmts
-}
-
-// TODO: Make RawBlockExit Copy as the constant dereferencing here is retarded,
-//       and it's a one time 40 bytes copy anyways.
-fn translate_exit(
-    exit: &RawBlockExit,
-    state: &[Option<SymbolId>; 256],
-    consts: &[Constant],
-) -> BlockExit {
-    match exit {
-        RawBlockExit::Jump(t) => BlockExit::Jump(*t),
-        RawBlockExit::Fallthrough(t) => BlockExit::Fallthrough(*t),
-        RawBlockExit::CondJump {
-            cond,
-            then_block,
-            else_block,
-        } => {
-            let hil_cond = match cond {
-                Cond::Unary(reg) => HilExpr::Symbol(
-                    state[*reg as usize].unwrap_or_else(|| panic!("unbound register: {}", reg)),
-                ),
-                Cond::Binary { lhs, op, rhs } => {
-                    let lhs_expr = HilExpr::Symbol(
-                        state[*lhs as usize].unwrap_or_else(|| panic!("unbound register: {}", lhs)),
-                    );
-                    let rhs_expr = match rhs {
-                        CondRhs::Reg(r) => HilExpr::Symbol(
-                            state[*r as usize].unwrap_or_else(|| panic!("unbound register: {}", r)),
-                        ),
-                        CondRhs::Const(idx) => const_expr(consts, *idx),
-                        CondRhs::Nil => HilExpr::Nil,
-                        CondRhs::Bool(b) => HilExpr::Bool(*b),
-                    };
-
-                    HilExpr::Binary {
-                        lhs: Box::new(lhs_expr),
-                        op: *op,
-                        rhs: Box::new(rhs_expr),
-                    }
-                }
-            };
-
-            BlockExit::CondJump {
-                cond: hil_cond,
-                then_block: *then_block,
-                else_block: *else_block,
-            }
-        }
-        RawBlockExit::FornPrep {
-            base,
-            body_block,
-            exit_block,
-        } => BlockExit::FornPrep {
-            base: *base,
-            body_block: *body_block,
-            exit_block: *exit_block,
-        },
-        RawBlockExit::FornLoop {
-            base,
-            body_block,
-            exit_block,
-        } => BlockExit::FornLoop {
-            base: *base,
-            body_block: *body_block,
-            exit_block: *exit_block,
-        },
-        RawBlockExit::ForgPrep {
-            base,
-            body_block,
-            exit_block,
-        } => BlockExit::ForgPrep {
-            base: *base,
-            body_block: *body_block,
-            exit_block: *exit_block,
-        },
-        RawBlockExit::ForgLoop {
-            base,
-            body_block,
-            exit_block,
-            result_count,
-        } => BlockExit::ForgLoop {
-            base: *base,
-            body_block: *body_block,
-            exit_block: *exit_block,
-            result_count: *result_count,
-        },
-        RawBlockExit::Return { base, count } => match decoded_count(*count) {
-            Count::Variadic => todo!(),
-            Count::Number(n) => {
-                let rets = (*base..*base + n)
-                    .map(|i| {
-                        let symbol = state[i as usize].unwrap_or_else(|| {
-                            panic!("unbound register: {} while translating raw block exit", i)
-                        });
-                        HilExpr::Symbol(symbol)
-                    })
-                    .collect();
-                BlockExit::Return(rets)
-            }
-        },
-    }
 }
 
 /// Indexes loop-tail blocks by Luau loop base register.

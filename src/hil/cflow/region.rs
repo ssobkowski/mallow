@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
+use smallvec::SmallVec;
+
 use crate::ast::UnOp;
 use crate::hil::ir::HilExpr;
+use crate::hil::lifter::symbol::SymbolId;
 
 use super::analysis::{
     branch_has_plain_backedge, find_if_else_join, find_loop_exit_block, resolve_generic_for_tail,
@@ -26,58 +29,34 @@ pub enum RegionNode {
         condition: HilExpr,
         then_branch: RegionBlock,
         else_branch: RegionBlock,
-        merge_block: Option<usize>,
     },
     /// A structured while loop recovered from backedges.
     While {
         header: usize,
         condition: HilExpr,
         body: RegionBlock,
-        exit_block: usize,
     },
     /// A structured numeric `for` loop recovered from `FORNPREP/FORNLOOP`.
     NumericFor {
-        /// Preheader block containing `ForNPrep` and any synthetic bound/step/current setup.
         header: usize,
-        /// Base register of Luau's numeric-for tuple:
-        /// `base` = limit, `base + 1` = step, `base + 2` = visible loop variable/current value.
-        base: usize,
-        /// Structured loop body, already sliced to stop before `exit_block`.
         body: RegionBlock,
-        /// First block reached when the loop terminates normally.
-        exit_block: usize,
+        start: SymbolId,
+        end: SymbolId,
+        step: SymbolId,
     },
     /// A structured generic `for` loop recovered from `FORGPREP/FORGLOOP`.
     GenericFor {
-        /// Preheader block containing `ForGPrep` and any synthetic iterator-state setup.
         header: usize,
-        /// Base register of Luau's generic-for tuple:
-        /// `base..=base+2` are iterator/state/control, yielded variables start at `base + 3`.
-        base: usize,
-        /// Number of visible loop variables yielded by each iteration.
-        result_count: usize,
-        /// Structured loop body, already sliced to stop before `exit_block`.
         body: RegionBlock,
-        /// First block reached when the loop terminates normally.
-        exit_block: usize,
+        vars: SmallVec<[SymbolId; 3]>,
+        exprs: [SymbolId; 3],
     },
     /// Explicit `continue` edge for a recovered loop.
-    Continue {
-        from_block: usize,
-        target_loop_header: usize,
-    },
+    Continue,
     /// Explicit `break` edge from a loop body.
-    Break {
-        from_block: usize,
-        target_exit: usize,
-    },
+    Break,
     /// Explicit return.
-    Return {
-        from_block: usize,
-        values: Vec<HilExpr>,
-    },
-    /// Fallback edge for shapes not yet fully structured.
-    Jump { from_block: usize, target: usize },
+    Return { values: Vec<HilExpr> },
 }
 
 /// Stateful region builder used to avoid recursive region expansion loops.
@@ -128,17 +107,11 @@ impl<'a> RegionBuilder<'a> {
             match &block.exit {
                 BlockExit::Fallthrough(next) | BlockExit::Jump(next) => {
                     if *next < curr_id && self.cfg.dominates(*next, curr_id) {
-                        nodes.push(RegionNode::Continue {
-                            from_block: curr_id,
-                            target_loop_header: *next,
-                        });
+                        nodes.push(RegionNode::Continue);
                         break;
                     }
                     if Some(*next) == loop_exit {
-                        nodes.push(RegionNode::Break {
-                            from_block: curr_id,
-                            target_exit: *next,
-                        });
+                        nodes.push(RegionNode::Break);
                         break;
                     }
                     curr_id = *next;
@@ -175,7 +148,6 @@ impl<'a> RegionBuilder<'a> {
                             header: curr_id,
                             condition,
                             body,
-                            exit_block,
                         });
 
                         curr_id = exit_block;
@@ -183,17 +155,24 @@ impl<'a> RegionBuilder<'a> {
                     }
 
                     let merge_block = find_if_else_join(*then_block, *else_block, self.cfg);
-                    let then_branch =
-                        self.build_branch_region(curr_id, *then_block, merge_block, loop_exit);
-                    let else_branch =
-                        self.build_branch_region(curr_id, *else_block, merge_block, loop_exit);
+                    let mut then_branch =
+                        self.build_branch_region(*then_block, merge_block, loop_exit);
+                    let mut else_branch =
+                        self.build_branch_region(*else_block, merge_block, loop_exit);
+
+                    // Invert then-branch and else-branch if then-branch is empty, and else-branch isn't
+                    // (CFG's short circuit folding leaves if's like that.) It also simply looks better.
+                    let mut condition = cond.clone();
+                    if !else_branch.nodes.is_empty() && then_branch.nodes.is_empty() {
+                        std::mem::swap(&mut then_branch, &mut else_branch);
+                        condition = invert_condition(condition);
+                    }
 
                     nodes.push(RegionNode::If {
                         header: curr_id,
-                        condition: cond.clone(),
+                        condition,
                         then_branch,
                         else_branch,
-                        merge_block,
                     });
 
                     if let Some(merge_block) = merge_block {
@@ -203,62 +182,66 @@ impl<'a> RegionBuilder<'a> {
                     }
                 }
                 BlockExit::FornPrep {
-                    base, body_block, ..
+                    base,
+                    body_block,
+                    start,
+                    end,
+                    step,
+                    ..
                 } => {
-                    if let Some((_, resolved_body, resolved_exit)) =
+                    if let Some(tail) =
                         resolve_numeric_for_tail(curr_id, *base, *body_block, self.cfg)
                     {
                         let body = self.build_region_with_loop(
-                            resolved_body,
-                            Some(resolved_exit),
-                            Some(resolved_exit),
+                            tail.body,
+                            Some(tail.exit),
+                            Some(tail.exit),
                         );
                         nodes.push(RegionNode::NumericFor {
                             header: curr_id,
-                            base: *base,
                             body,
-                            exit_block: resolved_exit,
+                            start: *start,
+                            end: *end,
+                            step: *step,
                         });
-                        curr_id = resolved_exit;
+                        curr_id = tail.exit;
                     } else {
-                        // Fallback if the loop shape is corrupted
-                        nodes.push(RegionNode::Jump {
-                            from_block: curr_id,
-                            target: *body_block,
-                        });
-                        curr_id = *body_block;
+                        panic!(
+                            "failed to resolve numeric for tail: curr_id = {}, body_block = {}",
+                            curr_id, body_block
+                        )
                     }
                 }
                 BlockExit::ForgPrep {
-                    base, body_block, ..
+                    base,
+                    body_block,
+                    exprs,
+                    ..
                 } => {
-                    if let Some((_, resolved_body, resolved_exit, result_count)) =
+                    if let Some(tail) =
                         resolve_generic_for_tail(curr_id, *base, *body_block, self.cfg)
                     {
                         let body = self.build_region_with_loop(
-                            resolved_body,
-                            Some(resolved_exit),
-                            Some(resolved_exit),
+                            tail.body,
+                            Some(tail.exit),
+                            Some(tail.exit),
                         );
                         nodes.push(RegionNode::GenericFor {
                             header: curr_id,
-                            base: *base,
-                            result_count,
+                            vars: tail.vars.clone(),
+                            exprs: *exprs,
                             body,
-                            exit_block: resolved_exit,
                         });
-                        curr_id = resolved_exit;
+                        curr_id = tail.exit;
                     } else {
-                        nodes.push(RegionNode::Jump {
-                            from_block: curr_id,
-                            target: *body_block,
-                        });
-                        curr_id = *body_block;
+                        panic!(
+                            "failed to resolve numeric for tail: curr_id = {}, body_block = {}",
+                            curr_id, body_block
+                        )
                     }
                 }
                 BlockExit::Return(values) => {
                     nodes.push(RegionNode::Return {
-                        from_block: curr_id,
                         values: values.clone(),
                     });
                     break;
@@ -275,17 +258,13 @@ impl<'a> RegionBuilder<'a> {
 
     fn build_branch_region(
         &mut self,
-        from_block: usize,
         branch_start: usize,
         stop_at: Option<usize>,
         loop_exit: Option<usize>,
     ) -> RegionBlock {
         if Some(branch_start) == loop_exit {
             return RegionBlock {
-                nodes: vec![RegionNode::Break {
-                    from_block,
-                    target_exit: branch_start,
-                }],
+                nodes: vec![RegionNode::Break],
             };
         }
 

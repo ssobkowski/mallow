@@ -146,8 +146,8 @@ pub enum Stmt {
 /// An expression node.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    /// Name/identifier reference.
-    Name(Identifier),
+    /// Identifier reference.
+    Named(Identifier),
     /// Binary expression.
     Binary {
         /// Left operand.
@@ -293,7 +293,7 @@ pub enum CompoundBinOp {
 }
 
 /// Unary operator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UnOp {
     Minus,
     Length,
