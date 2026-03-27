@@ -12,7 +12,7 @@ use crate::{
         common::{const_expr, decoded_count},
         ir::{HilExpr, HilStmt, Spanned, ToSpanned as _},
         lifter::{
-            LiftContext, Lifter, lift,
+            LiftContext, lift,
             symbol::{Symbol, SymbolId},
         },
     },
@@ -232,13 +232,13 @@ impl ControlFlowGraph {
                 | Instr::ForgPrep { offset, .. }
                 | Instr::ForgPrepInext { offset, .. }
                 | Instr::ForgPrepNext { offset, .. } => {
-                    entries.insert(rel_target_plain_from_instr(idx, *offset, instrs));
+                    entries.insert(rel_target_from_instr(idx, (*offset).into(), instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
                 }
                 Instr::FornLoop { offset, .. } | Instr::ForgLoop { offset, .. } => {
-                    entries.insert(rel_target_plain_from_instr(idx, *offset, instrs));
+                    entries.insert(rel_target_from_instr(idx, (*offset).into(), instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
@@ -247,13 +247,13 @@ impl ControlFlowGraph {
                 | Instr::JumpBack { offset }
                 | Instr::JumpIf { offset, .. }
                 | Instr::JumpIfNot { offset, .. } => {
-                    entries.insert(rel_target_plain_from_instr(idx, *offset, instrs));
+                    entries.insert(rel_target_from_instr(idx, (*offset).into(), instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
                 }
                 Instr::JumpX { offset } => {
-                    entries.insert(rel_target_plain_from_instr_wide(idx, *offset, instrs));
+                    entries.insert(rel_target_from_instr(idx, (*offset).into(), instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
@@ -268,13 +268,13 @@ impl ControlFlowGraph {
                 | Instr::JumpXEqKB { offset, .. }
                 | Instr::JumpXEqKN { offset, .. }
                 | Instr::JumpXEqKS { offset, .. } => {
-                    entries.insert(rel_target_compare_from_instr(idx, *offset, instrs));
+                    entries.insert(rel_target_from_instr(idx, (*offset).into(), instrs));
                     if idx + 1 < instrs.len() {
                         entries.insert(idx + 1);
                     }
                 }
                 Instr::LoadB { jump, .. } if *jump > 0 => {
-                    entries.insert(rel_target_plain_from_instr(idx, i16::from(*jump), instrs));
+                    entries.insert(rel_target_from_instr(idx, (*jump).into(), instrs));
                 }
                 _ => {}
             }
@@ -307,15 +307,15 @@ impl ControlFlowGraph {
             let exit = match exit_instr.copied() {
                 Some(Instr::Return { base, count }) => RawBlockExit::Return { base, count },
                 Some(Instr::Jump { offset }) | Some(Instr::JumpBack { offset }) => {
-                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::Jump(pc_to_block_idx(&entries, target))
                 }
                 Some(Instr::JumpX { offset }) => {
-                    let target = rel_target_plain_from_instr_wide(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset, instrs);
                     RawBlockExit::Jump(pc_to_block_idx(&entries, target))
                 }
                 Some(Instr::JumpIfNotLt { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::CondJump {
                         cond: Cond::Binary {
                             lhs: reg,
@@ -327,7 +327,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::JumpIf { reg, offset }) => {
-                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::CondJump {
                         cond: Cond::Unary(reg),
                         then_block: pc_to_block_idx(&entries, target),
@@ -335,7 +335,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::JumpIfNot { reg, offset }) => {
-                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::CondJump {
                         cond: Cond::Unary(reg),
                         then_block: block_idx + 1,
@@ -343,7 +343,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::JumpIfEq { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::CondJump {
                         cond: Cond::Binary {
                             lhs: reg,
@@ -355,7 +355,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::JumpIfNotEq { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::CondJump {
                         cond: Cond::Binary {
                             lhs: reg,
@@ -367,7 +367,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::JumpIfLe { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::CondJump {
                         cond: Cond::Binary {
                             lhs: reg,
@@ -379,7 +379,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::JumpIfNotLe { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::CondJump {
                         cond: Cond::Binary {
                             lhs: reg,
@@ -391,7 +391,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::JumpIfLt { reg, aux, offset }) => {
-                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::CondJump {
                         cond: Cond::Binary {
                             lhs: reg,
@@ -407,7 +407,7 @@ impl ControlFlowGraph {
                     invert,
                     offset,
                 }) => {
-                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     let (then_block, else_block) = if invert {
                         (block_idx + 1, pc_to_block_idx(&entries, target))
                     } else {
@@ -429,7 +429,7 @@ impl ControlFlowGraph {
                     invert,
                     offset,
                 }) => {
-                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     let (then_block, else_block) = if invert {
                         (block_idx + 1, pc_to_block_idx(&entries, target))
                     } else {
@@ -457,7 +457,7 @@ impl ControlFlowGraph {
                     invert,
                     offset,
                 }) => {
-                    let target = rel_target_compare_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     let (then_block, else_block) = if invert {
                         (block_idx + 1, pc_to_block_idx(&entries, target))
                     } else {
@@ -474,7 +474,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::FornPrep { base, offset }) => {
-                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::FornPrep {
                         base: usize::from(base),
                         body_block: block_idx + 1,
@@ -482,7 +482,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::FornLoop { base, offset }) => {
-                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::FornLoop {
                         base: usize::from(base),
                         body_block: pc_to_block_idx(&entries, target),
@@ -492,7 +492,7 @@ impl ControlFlowGraph {
                 Some(Instr::ForgPrep { base, offset })
                 | Some(Instr::ForgPrepInext { base, offset })
                 | Some(Instr::ForgPrepNext { base, offset }) => {
-                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::ForgPrep {
                         base: usize::from(base),
                         body_block: block_idx + 1,
@@ -505,7 +505,7 @@ impl ControlFlowGraph {
                     var_count,
                     ..
                 }) => {
-                    let target = rel_target_plain_from_instr(exit_instr_idx, offset, instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
                     RawBlockExit::ForgLoop {
                         base: usize::from(base),
                         body_block: pc_to_block_idx(&entries, target),
@@ -514,8 +514,7 @@ impl ControlFlowGraph {
                     }
                 }
                 Some(Instr::LoadB { jump, .. }) if jump > 0 => {
-                    let target =
-                        rel_target_plain_from_instr(exit_instr_idx, i16::from(jump), instrs);
+                    let target = rel_target_from_instr(exit_instr_idx, jump.into(), instrs);
                     RawBlockExit::Jump(pc_to_block_idx(&entries, target))
                 }
                 _ => RawBlockExit::Fallthrough(block_idx + 1),
@@ -840,23 +839,6 @@ fn intersect(mut b1: usize, mut b2: usize, doms: &[Option<usize>], rpo_number: &
     b1
 }
 
-/// Resolves a relative branch target from the next instruction index.
-///
-/// Some Luau compare-family jumps encode "no jump" as offset `1` instead of `0`;
-/// `bias` normalizes those opcodes back to a plain PC-relative target.
-const fn rel_target_with_bias(next_pc: usize, offset: i32, bias: i32, instr_len: usize) -> usize {
-    if instr_len == 0 {
-        return 0;
-    }
-
-    let target = next_pc.saturating_add_signed((offset - bias) as isize);
-    if target >= instr_len {
-        instr_len - 1
-    } else {
-        target
-    }
-}
-
 /// Resolves a relative branch target from an instruction index.
 #[must_use]
 fn rel_target_from_instr(instr_idx: usize, offset: i32, instrs: &[(Instr, usize)]) -> usize {
@@ -882,32 +864,6 @@ fn rel_target_from_instr(instr_idx: usize, offset: i32, instrs: &[(Instr, usize)
         Err(pos) if pos >= instrs.len() => instrs.len() - 1,
         Err(pos) => pos - 1,
     }
-}
-
-/// Resolves the target of a jump opcode whose offset uses `0 == next instruction`.
-#[must_use]
-fn rel_target_plain_from_instr(instr_idx: usize, offset: i16, instrs: &[(Instr, usize)]) -> usize {
-    rel_target_from_instr(instr_idx, offset as i32, instrs)
-}
-
-/// Resolves the target of a wide jump opcode whose offset uses `0 == next instruction`.
-#[must_use]
-fn rel_target_plain_from_instr_wide(
-    instr_idx: usize,
-    offset: i32,
-    instrs: &[(Instr, usize)],
-) -> usize {
-    rel_target_from_instr(instr_idx, offset, instrs)
-}
-
-/// Resolves the target of a compare-family jump whose offset uses `1 == next instruction`.
-#[must_use]
-fn rel_target_compare_from_instr(
-    instr_idx: usize,
-    offset: i16,
-    instrs: &[(Instr, usize)],
-) -> usize {
-    rel_target_from_instr(instr_idx, offset as i32, instrs)
 }
 
 /// Returns whether one instruction must terminate its basic block.

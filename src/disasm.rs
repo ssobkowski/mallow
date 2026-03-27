@@ -2,7 +2,7 @@ use std::io::{Cursor, Read};
 
 use thiserror::Error;
 
-use crate::il::{Constant, Instr, Table, Value, decode_stream_with_word_pcs};
+use crate::il::{Constant, Instr, decode_stream_with_word_pcs};
 
 const CONST_NIL: u8 = 0;
 const CONST_BOOL: u8 = 1;
@@ -97,8 +97,6 @@ pub enum DisasmError {
     InvalidTypesVersion(u8),
     #[error("Invalid string index: {0}. String table has {1} entries.")]
     InvalidStringIndex(u64, usize),
-    #[error("Invalid instruction stream: {0}")]
-    InvalidInstructionStream(String),
 }
 
 #[derive(Debug)]
@@ -161,30 +159,29 @@ impl<'a> Disassembler<'a> {
     }
 
     fn read_proto(&mut self, strings: &[String]) -> Result<Proto, DisasmError> {
-        let mut proto = Proto::default();
-        proto.max_stack_size = self.read()?;
-        proto.num_params = self.read()?;
-        proto.num_upvals = self.read()?;
-        proto.is_vararg = self.read::<u8>()? != 0;
-        proto.flags = self.read()?;
+        let max_stack_size = self.read()?;
+        let num_params = self.read()?;
+        let num_upvals = self.read()?;
+        let is_vararg = self.read::<u8>()? != 0;
+        let flags = self.read()?;
 
-        proto.type_info = self.read_vec()?;
+        let type_info = self.read_vec()?;
 
         let code_table: Vec<u32> = self.read_vec()?;
         let code_word_count = code_table.len();
-        proto.instrs = decode_stream_with_word_pcs(&code_table);
+        let instrs = decode_stream_with_word_pcs(&code_table);
 
         let num_consts = self.read_varint()?;
-        proto.consts = Vec::with_capacity(num_consts as usize);
+        let mut consts = Vec::with_capacity(num_consts as usize);
         for _ in 0..num_consts {
-            proto.consts.push(self.read_const(strings)?);
+            consts.push(self.read_const(strings)?);
         }
 
         let num_protos = self.read_varint()?;
-        proto.protos = Vec::with_capacity(num_protos as usize);
+        let mut protos = Vec::with_capacity(num_protos as usize);
         for _ in 0..num_protos {
             let index = self.read_varint()? as usize;
-            proto.protos.push(index);
+            protos.push(index);
         }
 
         self.read_varint()?; // line defined
@@ -210,9 +207,9 @@ impl<'a> Disassembler<'a> {
         }
 
         // local variables and upvalues
-        if self.read::<u8>()? == 1 {
+        let locals = if self.read::<u8>()? == 1 {
             let num_locals = self.read_varint()?;
-            proto.locals = Vec::with_capacity(num_locals as usize);
+            let mut locals = Vec::with_capacity(num_locals as usize);
 
             for _ in 0..num_locals {
                 let name_idx = self.read_varint()?;
@@ -223,7 +220,7 @@ impl<'a> Disassembler<'a> {
                     .get(name_idx.saturating_sub(1) as usize)
                     .cloned()
                     .unwrap_or_default();
-                proto.locals.push(LocalDebug {
+                locals.push(LocalDebug {
                     name,
                     start_pc,
                     end_pc,
@@ -235,9 +232,25 @@ impl<'a> Disassembler<'a> {
             for _ in 0..num_upvals {
                 self.read_varint()?; // upval name index
             }
-        }
 
-        Ok(proto)
+            locals
+        } else {
+            Vec::new()
+        };
+
+        Ok(Proto {
+            index: 0,
+            max_stack_size,
+            num_params,
+            num_upvals,
+            is_vararg,
+            flags,
+            type_info,
+            instrs,
+            consts,
+            protos,
+            locals,
+        })
     }
 
     fn read_const(&mut self, strings: &[String]) -> Result<Constant, DisasmError> {
@@ -268,9 +281,9 @@ impl<'a> Disassembler<'a> {
                 let mut list = Vec::with_capacity(size_hint as usize);
                 for _ in 0..size_hint {
                     let value = self.read_varint()?;
-                    list.push(Value::ConstantIndex(value as usize));
+                    list.push(value as usize);
                 }
-                Ok(Constant::Table(Table::Array(list)))
+                Ok(Constant::Table(list))
             }
             CONST_CLOSURE => {
                 let proto_index = self.read_varint()?;

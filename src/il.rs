@@ -1,16 +1,6 @@
-use std::collections::HashMap;
-
 use smallvec::{SmallVec, smallvec};
 
 use crate::hil::common::decoded_count;
-
-/// Represents the two states of a table, array (index-value pairs) and hashmap
-/// (key-value pairs).
-#[derive(Debug, Clone)]
-pub enum Table {
-    Map(HashMap<Value, Value>),
-    Array(Vec<Value>),
-}
 
 /// Represents the types of values that can be present in the constant table.
 #[derive(Debug, Clone)]
@@ -22,18 +12,14 @@ pub enum Constant {
     String(String),
     Import(u32),
     Closure(u64),
-    Table(Table),
-    Vector { x: f32, y: f32, z: f32, w: f32 },
-}
-
-/// Represents the types of operands that can be used within an IL instruction.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Value {
-    Nil,
-    Boolean(bool),
-    ConstantIndex(usize),
-    Immediate(i32),
-    StackIndex(usize),
+    /// A table constant, stored as a vector of indices into the constant table.
+    Table(Vec<usize>),
+    Vector {
+        x: f32,
+        y: f32,
+        z: f32,
+        w: f32,
+    },
 }
 
 #[derive(Debug)]
@@ -321,39 +307,6 @@ impl Instr {
                 | 79
                 | 80
         )
-    }
-
-    pub const fn word_len(&self) -> usize {
-        match self {
-            Instr::GetGlobal { .. }
-            | Instr::SetGlobal { .. }
-            | Instr::GetImport { .. }
-            | Instr::GetTableKS { .. }
-            | Instr::SetTableKS { .. }
-            | Instr::NameCall { .. }
-            | Instr::JumpIfEq { .. }
-            | Instr::JumpIfLe { .. }
-            | Instr::JumpIfLt { .. }
-            | Instr::JumpIfNotEq { .. }
-            | Instr::JumpIfNotLe { .. }
-            | Instr::JumpIfNotLt { .. }
-            | Instr::NewTable { .. }
-            | Instr::SetList { .. }
-            | Instr::ForgPrep { .. }
-            | Instr::ForgLoop { .. }
-            | Instr::FornPrep { .. }
-            | Instr::ForgPrepInext { .. }
-            | Instr::ForgPrepNext { .. }
-            | Instr::FastCall3 { .. }
-            | Instr::LoadKX { .. }
-            | Instr::FastCall2 { .. }
-            | Instr::FastCall2K { .. }
-            | Instr::JumpXEqKNil { .. }
-            | Instr::JumpXEqKB { .. }
-            | Instr::JumpXEqKN { .. }
-            | Instr::JumpXEqKS { .. } => 2,
-            _ => 1,
-        }
     }
 
     /// Returns the indices of a physical register this instruction

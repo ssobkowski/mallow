@@ -3,7 +3,6 @@ mod common;
 mod disasm;
 mod hil;
 mod il;
-mod logging;
 // mod passes;
 mod printer;
 mod scopes;
@@ -52,7 +51,6 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    logging::set_verbose(cli.verbose);
 
     match cli.command {
         Commands::Disasm { input, output } => {
@@ -79,7 +77,7 @@ fn main() {
                 }
             };
 
-            let cfgs: Vec<_> = disassembled
+            let (regions, cfgs): (Vec<_>, Vec<_>) = disassembled
                 .protos
                 .iter()
                 .map(|proto| {
@@ -87,15 +85,12 @@ fn main() {
                         proto,
                         &disassembled.protos,
                     );
-                    // let mut region = hil::cflow::region::RegionBuilder::new(&cfg);
-                    // (region.build_region(cfg.entry_block, None), cfg)
-                    cfg
+                    let mut region = hil::cflow::region::RegionBuilder::new(&cfg);
+                    (region.build_region(cfg.entry_block, None), cfg)
                 })
                 .collect();
 
-            for (i, cfg) in cfgs.iter().enumerate() {
-                println!("[{}]: {:#?}", i, cfg);
-            }
+            println!("{:#?}", regions);
 
             // let ast = structurer::structure(
             //     &regions,
