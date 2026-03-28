@@ -139,7 +139,6 @@ pub enum BlockExit {
         base: usize,
         body_block: usize,
         exit_block: usize,
-        result_count: usize,
         vars: SmallVec<[SymbolId; 3]>,
     },
     Return(Vec<HilExpr>),
@@ -698,7 +697,6 @@ impl ControlFlowGraph {
                         base: *base,
                         body_block: *body_block,
                         exit_block: *exit_block,
-                        result_count: *result_count,
                         vars: (0..*result_count)
                             .map(|i| symbols[*base + 3 + i].unwrap())
                             .collect(),

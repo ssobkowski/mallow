@@ -81,6 +81,15 @@ impl Structurer {
                     body,
                 });
             }
+            RegionNode::RepeatUntil {
+                condition, body, ..
+            } => {
+                let body = self.visit_region(body, cfg);
+                buf.push(Stmt::Repeat {
+                    body,
+                    condition: self.visit_expr(condition),
+                })
+            }
             RegionNode::NumericFor {
                 body,
                 start,
@@ -165,22 +174,19 @@ impl Structurer {
                 }],
                 rhs: vec![self.visit_expr(value)],
             },
-            sl @ HilStmt::SetList {
-                table,
-                index,
-                values,
-                has_variadic_tail,
-            } => {
-                panic!("Unimplemented SetList {:#?}", sl);
+            HilStmt::SetList { .. } => {
+                panic!("Unimplemented SetList {:#?}", stmt);
             }
             HilStmt::Call(expr) => Stmt::Expression {
                 expr: self.visit_expr(expr),
             },
-            HilStmt::Phi { target, operands } => panic!(
-                "encountered unfolded phi node during structuring: target={}, operands={:?}",
-                target.index(),
-                operands
-            ),
+            HilStmt::Phi { target, operands } => {
+                panic!(
+                    "encountered unfolded phi node during structuring: target={}, operands={:?}",
+                    target.index(),
+                    operands
+                )
+            }
             HilStmt::Return(_) => panic!("wild return spotted in the wild"),
         }
     }

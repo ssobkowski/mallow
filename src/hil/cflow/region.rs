@@ -25,20 +25,22 @@ pub enum RegionNode {
     BasicBlock { block: usize },
     /// A structured if/else split with optional merge block.
     If {
-        header: usize,
         condition: HilExpr,
         then_branch: RegionBlock,
         else_branch: RegionBlock,
     },
     /// A structured while loop recovered from backedges.
     While {
-        header: usize,
+        condition: HilExpr,
+        body: RegionBlock,
+    },
+    /// A structured repeat/until loop recovered from backedges.
+    RepeatUntil {
         condition: HilExpr,
         body: RegionBlock,
     },
     /// A structured numeric `for` loop recovered from `FORNPREP/FORNLOOP`.
     NumericFor {
-        header: usize,
         body: RegionBlock,
         start: SymbolId,
         end: SymbolId,
@@ -46,7 +48,6 @@ pub enum RegionNode {
     },
     /// A structured generic `for` loop recovered from `FORGPREP/FORGLOOP`.
     GenericFor {
-        header: usize,
         body: RegionBlock,
         vars: SmallVec<[SymbolId; 3]>,
         exprs: [SymbolId; 3],
@@ -133,22 +134,32 @@ impl<'a> RegionBuilder<'a> {
                         let exit_block =
                             find_loop_exit_block(curr_id, exit_branch, loop_block, self.cfg);
 
-                        let body = self.build_region_with_loop(
+                        let mut body = self.build_region_with_loop(
                             loop_block,
                             Some(curr_id),
                             Some(exit_block),
                         );
-                        let condition = if loop_branch_is_then {
-                            cond.clone()
-                        } else {
-                            invert_condition(cond.clone())
-                        };
 
-                        nodes.push(RegionNode::While {
-                            header: curr_id,
-                            condition,
-                            body,
-                        });
+                        if loop_branch_is_then {
+                            // while
+                            nodes.push(RegionNode::While {
+                                condition: cond.clone(),
+                                body,
+                            });
+                        } else {
+                            // repeat..until
+                            if matches!(nodes.last(), Some(RegionNode::BasicBlock { block: b }) if *b == curr_id)
+                            {
+                                nodes.pop();
+                                body.nodes
+                                    .insert(0, RegionNode::BasicBlock { block: curr_id });
+                            }
+
+                            nodes.push(RegionNode::RepeatUntil {
+                                condition: cond.clone(),
+                                body,
+                            });
+                        }
 
                         curr_id = exit_block;
                         continue;
@@ -169,7 +180,6 @@ impl<'a> RegionBuilder<'a> {
                     }
 
                     nodes.push(RegionNode::If {
-                        header: curr_id,
                         condition,
                         then_branch,
                         else_branch,
@@ -198,7 +208,6 @@ impl<'a> RegionBuilder<'a> {
                             Some(tail.exit),
                         );
                         nodes.push(RegionNode::NumericFor {
-                            header: curr_id,
                             body,
                             start: *start,
                             end: *end,
@@ -227,7 +236,6 @@ impl<'a> RegionBuilder<'a> {
                             Some(tail.exit),
                         );
                         nodes.push(RegionNode::GenericFor {
-                            header: curr_id,
                             vars: tail.vars.clone(),
                             exprs: *exprs,
                             body,
