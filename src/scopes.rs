@@ -112,4 +112,11 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
     pub fn get(&self, name: &K) -> Option<&V> {
         self.iter().find_map(|s| s.get(name))
     }
+
+    /// Returns whether the given name is declared in the current
+    /// scope or any parent scopes.
+    #[inline]
+    pub fn contains(&self, name: &K) -> bool {
+        self.iter().any(|s| s.get(name).is_some())
+    }
 }

@@ -143,28 +143,47 @@ impl Structurer {
     fn visit_stmt(&mut self, stmt: &HilStmt) -> Stmt {
         match stmt {
             HilStmt::Assign { left, value } => {
+                let mut needs_declaration = false;
                 let left = match left {
                     HilExpr::Symbol(sym) => {
-                        self.scopes.declare(*sym, ());
-                        Expr::Named(symbol_ident(sym))
+                        if !self.scopes.contains(sym) {
+                            self.scopes.declare(*sym, ());
+                            needs_declaration = true;
+                        }
+                        symbol_ident(sym)
                     }
                     _ => todo!("assignment lhs"),
                 };
-
                 let right = self.visit_expr(value);
 
-                Stmt::Assignment {
-                    lhs: vec![left],
-                    rhs: vec![right],
+                if needs_declaration {
+                    Stmt::LocalDeclaration {
+                        names: vec![left],
+                        values: vec![right],
+                    }
+                } else {
+                    Stmt::Assignment {
+                        lhs: vec![Expr::Named(left)],
+                        rhs: vec![right],
+                    }
                 }
             }
             HilStmt::AssignMany { left, value } => {
-                let left = left.iter().map(|expr| self.visit_expr(expr)).collect();
+                let all_declared = left.iter().all(|sym| self.scopes.contains(sym));
+
+                let left: Vec<_> = left.iter().map(symbol_ident).collect();
                 let right = self.visit_expr(value);
 
-                Stmt::Assignment {
-                    lhs: left,
-                    rhs: vec![right],
+                if all_declared {
+                    Stmt::Assignment {
+                        lhs: left.into_iter().map(Expr::Named).collect(),
+                        rhs: vec![right],
+                    }
+                } else {
+                    Stmt::LocalDeclaration {
+                        names: left,
+                        values: vec![right],
+                    }
                 }
             }
             HilStmt::SetField { table, key, value } => Stmt::Assignment {
@@ -187,7 +206,6 @@ impl Structurer {
                     operands
                 )
             }
-            HilStmt::Return(_) => panic!("wild return spotted in the wild"),
         }
     }
 

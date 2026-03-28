@@ -97,7 +97,10 @@ pub enum HilStmt {
     /// An assignment statement, like `foo = 123`.
     Assign { left: HilExpr, value: HilExpr },
     /// A multi-variable assignment statement, like `a, b = returns_tuple()`.
-    AssignMany { left: Vec<HilExpr>, value: HilExpr },
+    ///
+    /// Unlike the [regular Assign](HilStmt::Assign), the left hand side of this assignment
+    /// holds [SymbolId]s for the sake of simplicity, as no other lvalue gets emitted by the luau compiler.
+    AssignMany { left: Vec<SymbolId>, value: HilExpr },
     /// A table-field assignment lowered from opcodes such as `SETTABLEKS`.
     SetField {
         table: SymbolId,
@@ -113,8 +116,6 @@ pub enum HilStmt {
     },
     /// A call statement.
     Call(HilExpr),
-    /// A return statement.
-    Return(Vec<HilExpr>),
     /// A "Phi-Node", used for merging symbols between region blocks.
     Phi {
         target: SymbolId,

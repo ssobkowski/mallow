@@ -135,14 +135,14 @@ impl<'a> Lifter<'a> {
             .collect()
     }
 
-    fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<HilExpr> {
+    fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<SymbolId> {
         let pc = self.current_pc();
         (0..count)
             .map(|i| {
                 let reg = start + i;
                 let sym = self.arena.alloc(Symbol::new(reg, pc));
                 self.state[reg as usize] = Some(sym);
-                HilExpr::Symbol(sym)
+                sym
             })
             .collect()
     }
