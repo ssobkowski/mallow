@@ -108,7 +108,11 @@ impl<'a> RegionBuilder<'a> {
             match &block.exit {
                 BlockExit::Fallthrough(next) | BlockExit::Jump(next) => {
                     if *next < curr_id && self.cfg.dominates(*next, curr_id) {
-                        nodes.push(RegionNode::Continue);
+                        if let Some(loop_header) = stop_at
+                            && *next != loop_header
+                        {
+                            nodes.push(RegionNode::Continue);
+                        }
                         break;
                     }
                     if Some(*next) == loop_exit {
