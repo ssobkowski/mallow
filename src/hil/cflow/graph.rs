@@ -15,7 +15,7 @@ use crate::{
         ir::{HilExpr, HilStmt, HilTableItem, PhiNode, Spanned, ToSpanned as _},
         lifter::{
             LiftContext, lift,
-            ssa::{Ssa, Symbol, SymbolId},
+            ssa::{Ssa, Symbol, SymbolId, SymbolKind},
         },
     },
     il::{Count, Instr},
@@ -223,6 +223,9 @@ pub struct ControlFlowGraph {
 
     pub numeric_loops_by_base: HashMap<u8, Vec<usize>>,
     pub generic_loops_by_base: HashMap<u8, Vec<usize>>,
+
+    pub arena: Arena<Symbol>,
+    pub upvalues: Vec<SymbolId>,
 }
 
 impl ControlFlowGraph {
@@ -548,8 +551,13 @@ impl ControlFlowGraph {
         let mut ssa = Ssa::new(&predecessors, &mut arena);
 
         for i in 0..proto.num_params {
-            let sym = ssa.alloc_symbol(Symbol::new(i as u8));
+            let sym = ssa.alloc_symbol(Symbol::reg(i as u8));
             ssa.write_reg(0, i as u8, sym);
+        }
+
+        for i in 0..proto.num_upvals {
+            let sym = ssa.alloc_symbol(Symbol::upval(i as u8));
+            ssa.write_upval(0, i as u8, sym);
         }
 
         for block_id in compute_rpo(0, &successors) {
@@ -683,7 +691,39 @@ impl ControlFlowGraph {
             }
         }
 
+        // Unify all versions of the same upvalue. Since upvalues are shared
+        // external state, all assignments and reads must refer to the same
+        // logical variable in the decompiled output.
+        let mut upval_versions: HashMap<u8, Vec<SymbolId>> = HashMap::new();
+        for (id, symbol) in ssa.arena_iter() {
+            if let SymbolKind::Upvalue(idx) = symbol.kind {
+                upval_versions.entry(idx).or_default().push(id);
+            }
+        }
+        for versions in upval_versions.values() {
+            for i in 1..versions.len() {
+                disjoint_set.union(versions[0], versions[i]);
+            }
+        }
+
         resolve_ssa_symbols(&mut blocks, &ssa, &mut disjoint_set);
+
+        let mut upvalues = Vec::with_capacity(proto.num_upvals as usize);
+        for i in 0..proto.num_upvals {
+            // Find any symbol for upvalue i and resolve its canonical id
+            let id = ssa
+                .arena_iter()
+                .find_map(|(id, sym)| {
+                    if let SymbolKind::Upvalue(idx) = sym.kind {
+                        if idx == i {
+                            return Some(id);
+                        }
+                    }
+                    None
+                })
+                .unwrap();
+            upvalues.push(disjoint_set.find(id));
+        }
 
         let blocks = loop {
             let (changed, new_blocks) = fold_short_circuits(blocks);
@@ -707,6 +747,8 @@ impl ControlFlowGraph {
             immediate_dominators,
             numeric_loops_by_base,
             generic_loops_by_base,
+            arena,
+            upvalues,
         };
         for i in 0..graph.blocks.len() {
             graph.unfold_phis(i);

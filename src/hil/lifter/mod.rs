@@ -93,8 +93,6 @@ pub struct Lifter<'a, 'cfg> {
     ssa: &'a mut Ssa<'cfg>,
     block_idx: usize,
 
-    upvalues: Vec<SymbolId>,
-
     stmts: Vec<Spanned<HilStmt>>,
     pending_multiret: Option<MultiRet>,
 }
@@ -109,7 +107,6 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
             protos: ctx.protos,
             ssa: ctx.ssa,
             block_idx: ctx.block_idx,
-            upvalues: Vec::new(),
             stmts: Vec::new(),
             pending_multiret: None,
         }
@@ -149,7 +146,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         (0..count)
             .map(|i| {
                 let reg = start + i;
-                let sym = self.ssa.alloc_symbol(Symbol::new(reg));
+                let sym = self.ssa.alloc_symbol(Symbol::reg(reg));
                 self.ssa.write_reg(self.block_idx, reg, sym);
                 sym
             })
@@ -190,7 +187,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         debug_assert!(ip < self.instrs.len());
         let pc = self.instrs[ip].1;
 
-        let sym = self.ssa.alloc_symbol(Symbol::new(reg));
+        let sym = self.ssa.alloc_symbol(Symbol::reg(reg));
         self.ssa.write_reg(self.block_idx, reg, sym);
 
         self.stmts.push(
@@ -237,15 +234,14 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                     );
                 }
                 Instr::GetUpval { dest, upval } => {
-                    let upval_sym = self.upvalues[*upval as usize];
+                    let upval_sym = self.ssa.read_upval(self.block_idx, *upval);
                     self.assign_reg(*dest, HilExpr::Symbol(upval_sym));
                 }
                 Instr::SetUpval { src, upval } => {
-                    let upval_sym = self.upvalues[*upval as usize];
-                    let src_sym = self.get_reg_symbol(*src);
+                    let upval_sym = self.ssa.alloc_symbol(Symbol::upval(*upval));
+                    self.ssa.write_upval(self.block_idx, *upval, upval_sym);
 
-                    // TODO
-                    // self.arena[upval_sym].mutability = Mutability::Mutable;
+                    let src_sym = self.get_reg_symbol(*src);
 
                     self.assign(HilExpr::Symbol(upval_sym), HilExpr::Symbol(src_sym))
                 }
@@ -660,7 +656,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                 Some(Instr::Capture { capture_type, reg }) => {
                     let symbol = match capture_type {
                         0 | 1 => self.get_reg_symbol(reg),
-                        2 => self.upvalues[reg as usize],
+                        2 => self.ssa.read_upval(self.block_idx, reg),
                         _ => unreachable!("unknown capture type: {capture_type}"),
                     };
                     captures.push(symbol);
@@ -683,7 +679,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                 .stmts
                 .push(HilStmt::Call(expr.inner).to_spanned(expr.pc)),
             HilExpr::VarArgs => {
-                let sym = self.ssa.alloc_symbol(Symbol::new(base));
+                let sym = self.ssa.alloc_symbol(Symbol::reg(base));
                 self.ssa.write_reg(self.block_idx, base, sym);
 
                 self.stmts.push(

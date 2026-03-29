@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use smol_str::format_smolstr;
 
 use crate::{
@@ -19,6 +21,8 @@ struct Structurer {
     entry: usize,
 
     scopes: Scopes<SymbolId, ()>,
+    names: HashMap<(usize, SymbolId), Identifier>,
+    current_func: usize,
 }
 
 pub fn structure(functions: Vec<StructuredFunction>, entry: usize) -> Block {
@@ -26,6 +30,8 @@ pub fn structure(functions: Vec<StructuredFunction>, entry: usize) -> Block {
         functions,
         entry,
         scopes: Scopes::new(),
+        names: HashMap::new(),
+        current_func: entry,
     };
 
     st.visit_entry()
@@ -37,12 +43,31 @@ impl Structurer {
     }
 
     fn visit_function(&mut self, index: usize) -> Block {
+        let old_func = self.current_func;
+        self.current_func = index;
+
         let fun = &self.functions[index].clone();
 
         self.scopes.push_scope();
+        for &sym in &fun.cfg.upvalues {
+            self.scopes.declare(sym, ());
+        }
+
         let block = self.visit_region(&fun.root, &fun.cfg);
         self.scopes.pop_scope();
+
+        self.current_func = old_func;
         block
+    }
+
+    fn get_symbol_name(&mut self, sym: &SymbolId) -> Identifier {
+        if let Some(name) = self.names.get(&(self.current_func, *sym)) {
+            return name.clone();
+        }
+
+        let name = Identifier::new(format_smolstr!("v{}", sym.index()));
+        self.names.insert((self.current_func, *sym), name.clone());
+        name
     }
 
     fn visit_region(&mut self, region: &RegionBlock, cfg: &ControlFlowGraph) -> Block {
@@ -97,10 +122,10 @@ impl Structurer {
                 step,
                 ..
             } => {
-                let var = symbol_ident(start);
-                let start = Expr::Named(symbol_ident(start));
-                let end = Expr::Named(symbol_ident(end));
-                let step = Some(Expr::Named(symbol_ident(step)));
+                let var = self.get_symbol_name(start);
+                let start = Expr::Named(self.get_symbol_name(start));
+                let end = Expr::Named(self.get_symbol_name(end));
+                let step = Some(Expr::Named(self.get_symbol_name(step)));
 
                 let body = self.visit_region(body, cfg);
                 buf.push(Stmt::NumericFor {
@@ -114,10 +139,10 @@ impl Structurer {
             RegionNode::GenericFor {
                 vars, exprs, body, ..
             } => {
-                let vars = vars.iter().map(symbol_ident).collect();
+                let vars = vars.iter().map(|s| self.get_symbol_name(s)).collect();
                 let exprs = exprs
                     .iter()
-                    .map(|sym| Expr::Named(symbol_ident(sym)))
+                    .map(|sym| Expr::Named(self.get_symbol_name(sym)))
                     .collect();
                 let body = self.visit_region(body, cfg);
                 buf.push(Stmt::GenericFor { vars, exprs, body });
@@ -150,7 +175,7 @@ impl Structurer {
                             self.scopes.declare(*sym, ());
                             needs_declaration = true;
                         }
-                        symbol_ident(sym)
+                        self.get_symbol_name(sym)
                     }
                     _ => todo!("assignment lhs"),
                 };
@@ -171,7 +196,7 @@ impl Structurer {
             HilStmt::AssignMany { left, value } => {
                 let all_declared = left.iter().all(|sym| self.scopes.contains(sym));
 
-                let left: Vec<_> = left.iter().map(symbol_ident).collect();
+                let left: Vec<_> = left.iter().map(|s| self.get_symbol_name(s)).collect();
                 let right = self.visit_expr(value);
 
                 if all_declared {
@@ -231,7 +256,7 @@ impl Structurer {
             HilExpr::Number(num) => Expr::Literal(Literal::Number(*num)),
             HilExpr::String(s) => Expr::Literal(Literal::String(s.into())),
             HilExpr::Bool(b) => Expr::Literal(Literal::Bool(*b)),
-            HilExpr::Symbol(sym) => Expr::Named(symbol_ident(sym)),
+            HilExpr::Symbol(sym) => Expr::Named(self.get_symbol_name(sym)),
             HilExpr::Closure { proto, captures } => self.visit_closure(*proto, captures),
             HilExpr::Binary { lhs, op, rhs } => Expr::Binary {
                 lhs: Box::new(self.visit_expr(lhs)),
@@ -273,6 +298,18 @@ impl Structurer {
     }
 
     fn visit_closure(&mut self, proto_idx: usize, captures: &[SymbolId]) -> Expr {
+        let parent_names: Vec<_> = captures
+            .iter()
+            .map(|sym| self.get_symbol_name(sym))
+            .collect();
+
+        let child_fun = &self.functions[proto_idx];
+        for (i, name) in parent_names.into_iter().enumerate() {
+            if let Some(&child_upval_sym) = child_fun.cfg.upvalues.get(i) {
+                self.names.insert((proto_idx, child_upval_sym), name);
+            }
+        }
+
         let old_scopes = std::mem::take(&mut self.scopes);
 
         let fun = &self.functions[proto_idx];
@@ -289,8 +326,4 @@ impl Structurer {
 
         Expr::AnonymousFunction { params, body }
     }
-}
-
-fn symbol_ident(sym: &SymbolId) -> Identifier {
-    Identifier::new(format_smolstr!("v{}", sym.index()))
 }
