@@ -24,9 +24,9 @@ use crate::{
 #[derive(Debug)]
 pub struct MultiRet {
     /// First result register of the variadic sequence.
-    base: u8,
+    pub base: u8,
     /// The expression that produced the sequence.
-    expr: Spanned<HilExpr>,
+    pub expr: Spanned<HilExpr>,
 }
 
 /// Returns true when an instruction can appear between a pending multiret and
@@ -204,7 +204,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
     }
 
     /// Lifts all instructions into pc-spanned HIL statements in bytecode order.
-    pub fn run(mut self) -> Vec<Spanned<HilStmt>> {
+    pub fn run(mut self) -> (Vec<Spanned<HilStmt>>, Option<MultiRet>) {
         while let Some(instr) = self.next() {
             match &instr {
                 Instr::Nop => {}
@@ -505,10 +505,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
             }
         }
 
-        // Any deferred variadic source that survives to the end still has runtime
-        // effects (e.g. a variadic call), so materialize it before returning.
-        self.flush_multiret();
-        self.stmts
+        (self.stmts, self.pending_multiret)
     }
 
     fn lift_call(&mut self, func: u8, arg_count: u8, ret_count: u8) {
@@ -670,7 +667,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 
     /// Flush the pending multiret to `self.stmts` as a standalone call-stmt or
     /// a plain `local = ...` assignment.
-    fn flush_multiret(&mut self) {
+    pub fn flush_multiret(&mut self) {
         let Some(MultiRet { base, expr }) = self.pending_multiret.take() else {
             return;
         };
@@ -752,11 +749,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 
 /// Lifts one instruction slice into raw HIL statements.
 #[must_use]
-pub fn lift<'a, 'cfg>(ctx: LiftContext<'a, 'cfg>) -> Vec<Spanned<HilStmt>> {
+pub fn lift<'a, 'cfg>(ctx: LiftContext<'a, 'cfg>) -> (Vec<Spanned<HilStmt>>, Option<MultiRet>) {
     let lifter = Lifter::new(ctx);
-    let stmts = lifter.run();
-
-    // let stmts = run_passes(stmts);
-
-    stmts
+    lifter.run()
 }

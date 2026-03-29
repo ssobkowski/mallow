@@ -3,6 +3,11 @@ local function returns_many()
 end
 print(returns_many())
 
+local function returns_copy()
+    return returns_many()
+end
+print(returns_copy())
+
 local a, b, c = returns_many()
 print(a, b, c)
 local d, e, f, g, h, i = returns_many()

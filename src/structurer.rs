@@ -169,26 +169,29 @@ impl Structurer {
         match stmt {
             HilStmt::Assign { left, value } => {
                 let mut needs_declaration = false;
-                let left = match left {
+                let left_expr = match left {
                     HilExpr::Symbol(sym) => {
                         if !self.scopes.contains(sym) {
                             self.scopes.declare(*sym, ());
                             needs_declaration = true;
                         }
-                        self.get_symbol_name(sym)
+                        Expr::Named(self.get_symbol_name(sym))
                     }
-                    _ => todo!("assignment lhs"),
+                    _ => self.visit_expr(left),
                 };
                 let right = self.visit_expr(value);
 
                 if needs_declaration {
+                    let Expr::Named(name) = left_expr else {
+                        unreachable!("Symbol was not visited as Named");
+                    };
                     Stmt::LocalDeclaration {
-                        names: vec![left],
+                        names: vec![name],
                         values: vec![right],
                     }
                 } else {
                     Stmt::Assignment {
-                        lhs: vec![Expr::Named(left)],
+                        lhs: vec![left_expr],
                         rhs: vec![right],
                     }
                 }
@@ -267,15 +270,33 @@ impl Structurer {
                 op: *op,
                 expr: Box::new(self.visit_expr(expr)),
             },
+            HilExpr::Global(name) => Expr::Named(Identifier::new(name.clone())),
             HilExpr::Import(import) => Expr::Named(Identifier::new(import.clone())),
+            HilExpr::GetField { obj, field } => Expr::Field {
+                base: Box::new(self.visit_expr(obj)),
+                field: Identifier::new(field.clone()),
+            },
+            HilExpr::GetIndex { obj, index } => Expr::Index {
+                base: Box::new(self.visit_expr(obj)),
+                index: Box::new(self.visit_expr(index)),
+            },
             HilExpr::Call { fun, args } => Expr::FunctionCall {
                 func: Box::new(self.visit_expr(fun)),
+                args: args.iter().map(|expr| self.visit_expr(expr)).collect(),
+            },
+            HilExpr::MethodCall {
+                object,
+                method,
+                args,
+            } => Expr::MethodCall {
+                object: Box::new(self.visit_expr(object)),
+                method: Identifier::new(method.clone()),
                 args: args.iter().map(|expr| self.visit_expr(expr)).collect(),
             },
             HilExpr::Table { items } => Expr::Table {
                 items: self.visit_table_items(items),
             },
-            _ => todo!("Visiting Expr: {:#?}", expr),
+            HilExpr::VarArgs => Expr::Vararg,
         }
     }
 

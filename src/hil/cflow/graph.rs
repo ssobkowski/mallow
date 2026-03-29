@@ -224,7 +224,6 @@ pub struct ControlFlowGraph {
     pub numeric_loops_by_base: HashMap<u8, Vec<usize>>,
     pub generic_loops_by_base: HashMap<u8, Vec<usize>>,
 
-    pub arena: Arena<Symbol>,
     pub upvalues: Vec<SymbolId>,
 }
 
@@ -561,7 +560,7 @@ impl ControlFlowGraph {
         }
 
         for block_id in compute_rpo(0, &successors) {
-            let stmts = lift(LiftContext {
+            let (mut stmts, mut pending_multiret) = lift(LiftContext {
                 instrs: &instrs[raw_blocks[block_id].instr_range.clone()],
                 consts: &proto.consts,
                 parent_proto: proto,
@@ -660,7 +659,21 @@ impl ControlFlowGraph {
                         .collect(),
                 },
                 RawBlockExit::Return { base, count } => match decoded_count(*count) {
-                    Count::Variadic => todo!(),
+                    Count::Variadic => {
+                        let mut rets = Vec::new();
+                        if let Some(multiret) = pending_multiret.take() {
+                            if multiret.base >= *base {
+                                for i in *base..multiret.base {
+                                    rets.push(HilExpr::Symbol(ssa.read_reg(block_id, i)));
+                                }
+                            }
+                            rets.push(multiret.expr.inner);
+                        } else {
+                            // No multiret, just return the base register
+                            rets.push(HilExpr::Symbol(ssa.read_reg(block_id, *base)));
+                        }
+                        BlockExit::Return(rets)
+                    }
                     Count::Number(n) => {
                         let rets = (*base..*base + n)
                             .map(|i| {
@@ -672,6 +685,27 @@ impl ControlFlowGraph {
                     }
                 },
             };
+
+            if let Some(multiret) = pending_multiret {
+                match multiret.expr.inner {
+                    HilExpr::Call { .. } | HilExpr::MethodCall { .. } => {
+                        stmts.push(HilStmt::Call(multiret.expr.inner).to_spanned(multiret.expr.pc));
+                    }
+                    HilExpr::VarArgs => {
+                        let sym = ssa.alloc_symbol(Symbol::reg(multiret.base));
+                        ssa.write_reg(block_id, multiret.base, sym);
+
+                        stmts.push(
+                            HilStmt::Assign {
+                                left: HilExpr::Symbol(sym),
+                                value: HilExpr::VarArgs,
+                            }
+                            .to_spanned(multiret.expr.pc),
+                        );
+                    }
+                    _ => unreachable!("unexpected deferred variadic source"),
+                }
+            }
 
             blocks[block_id] = Block { stmts, exit };
             ssa.mark_filled(block_id);
@@ -747,7 +781,6 @@ impl ControlFlowGraph {
             immediate_dominators,
             numeric_loops_by_base,
             generic_loops_by_base,
-            arena,
             upvalues,
         };
         for i in 0..graph.blocks.len() {
