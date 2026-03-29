@@ -1,14 +1,14 @@
 use smol_str::format_smolstr;
 
 use crate::{
-    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt},
+    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem},
     hil::{
         StructuredFunction,
         cflow::{
             graph::ControlFlowGraph,
             region::{RegionBlock, RegionNode},
         },
-        ir::{HilExpr, HilStmt},
+        ir::{HilExpr, HilStmt, HilTableItem},
         lifter::ssa::SymbolId,
     },
     scopes::Scopes,
@@ -193,8 +193,24 @@ impl Structurer {
                 }],
                 rhs: vec![self.visit_expr(value)],
             },
-            HilStmt::SetList { .. } => {
-                panic!("Unimplemented SetList {:#?}", stmt);
+            HilStmt::SetList {
+                table,
+                index,
+                values,
+                ..
+            } => {
+                let table_expr = self.visit_expr(&HilExpr::Symbol(*table));
+                let base = *index as usize;
+
+                let lhs = (base..base + values.len())
+                    .map(|i| Expr::Index {
+                        base: Box::new(table_expr.clone()),
+                        index: Box::new(Expr::Literal(Literal::Number(i as f64))),
+                    })
+                    .collect();
+                let rhs = values.iter().map(|v| self.visit_expr(v)).collect();
+
+                Stmt::Assignment { lhs, rhs }
             }
             HilStmt::Call(expr) => Stmt::Expression {
                 expr: self.visit_expr(expr),
@@ -231,8 +247,29 @@ impl Structurer {
                 func: Box::new(self.visit_expr(fun)),
                 args: args.iter().map(|expr| self.visit_expr(expr)).collect(),
             },
+            HilExpr::Table { items } => Expr::Table {
+                items: self.visit_table_items(items),
+            },
             _ => todo!("Visiting Expr: {:#?}", expr),
         }
+    }
+
+    fn visit_table_items(&mut self, items: &[HilTableItem]) -> Vec<TableItem> {
+        items
+            .iter()
+            .map(|item| match item {
+                HilTableItem::List(expr) => TableItem::Implicit {
+                    value: self.visit_expr(expr),
+                },
+                HilTableItem::Index(key, value) => TableItem::Indexed {
+                    index: self.visit_expr(key),
+                    value: self.visit_expr(value),
+                },
+                HilTableItem::Packed(expr) => TableItem::Implicit {
+                    value: self.visit_expr(expr),
+                },
+            })
+            .collect()
     }
 
     fn visit_closure(&mut self, proto_idx: usize, captures: &[SymbolId]) -> Expr {
