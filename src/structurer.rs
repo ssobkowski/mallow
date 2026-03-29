@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use smol_str::format_smolstr;
 
 use crate::{
-    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem},
+    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem, UnOp},
     hil::{
         StructuredFunction,
         cflow::{
@@ -199,17 +199,20 @@ impl Structurer {
             HilStmt::AssignMany { left, value } => {
                 let all_declared = left.iter().all(|sym| self.scopes.contains(sym));
 
-                let left: Vec<_> = left.iter().map(|s| self.get_symbol_name(s)).collect();
+                let names: Vec<_> = left.iter().map(|s| self.get_symbol_name(s)).collect();
                 let right = self.visit_expr(value);
 
                 if all_declared {
                     Stmt::Assignment {
-                        lhs: left.into_iter().map(Expr::Named).collect(),
+                        lhs: names.into_iter().map(Expr::Named).collect(),
                         rhs: vec![right],
                     }
                 } else {
+                    for sym in left {
+                        self.scopes.declare(*sym, ());
+                    }
                     Stmt::LocalDeclaration {
-                        names: left,
+                        names,
                         values: vec![right],
                     }
                 }
@@ -225,20 +228,66 @@ impl Structurer {
                 table,
                 index,
                 values,
-                ..
+                has_variadic_tail,
             } => {
                 let table_expr = self.visit_expr(&HilExpr::Symbol(*table));
-                let base = *index as usize;
+                if *has_variadic_tail {
+                    // The idea is that if we have a variadic tail, we can't simply assign
+                    // a tuple to a single index (t[k] = a, b)
+                    //
+                    // We create a temporary table and then copy the contents of it into the
+                    // true table with `table.move`
+                    //
+                    // TODO: This is technically subject to some kind of global poisoning attack, so
+                    // perhaps a better way to handle this would be to have a pass before structuring
+                    // and after inlining that unfolds such SetLists into normal table constructors.
 
-                let lhs = (base..base + values.len())
-                    .map(|i| Expr::Index {
-                        base: Box::new(table_expr.clone()),
-                        index: Box::new(Expr::Literal(Literal::Number(i as f64))),
-                    })
-                    .collect();
-                let rhs = values.iter().map(|v| self.visit_expr(v)).collect();
+                    let temp_table_ident = Identifier::new("__t");
+                    Stmt::Do {
+                        body: Block::with_stmts(vec![
+                            Stmt::LocalDeclaration {
+                                names: vec![temp_table_ident.clone()],
+                                values: vec![Expr::Table {
+                                    items: values
+                                        .iter()
+                                        .map(|v| TableItem::Implicit {
+                                            value: self.visit_expr(v),
+                                        })
+                                        .collect(),
+                                }],
+                            },
+                            Stmt::Expression {
+                                expr: Expr::FunctionCall {
+                                    func: Box::new(Expr::Field {
+                                        base: Box::new(Expr::Named(Identifier::new("table"))),
+                                        field: Identifier::new("move"),
+                                    }),
+                                    args: vec![
+                                        Expr::Named(temp_table_ident.clone()),
+                                        Expr::Literal(Literal::Number(1.0)),
+                                        Expr::Unary {
+                                            op: UnOp::Length,
+                                            expr: Box::new(Expr::Named(temp_table_ident)),
+                                        },
+                                        Expr::Literal(Literal::Number(*index as f64)),
+                                        table_expr,
+                                    ],
+                                },
+                            },
+                        ]),
+                    }
+                } else {
+                    let base = *index as usize;
+                    let lhs = (base..base + values.len())
+                        .map(|i| Expr::Index {
+                            base: Box::new(table_expr.clone()),
+                            index: Box::new(Expr::Literal(Literal::Number(i as f64))),
+                        })
+                        .collect();
+                    let rhs = values.iter().map(|v| self.visit_expr(v)).collect();
 
-                Stmt::Assignment { lhs, rhs }
+                    Stmt::Assignment { lhs, rhs }
+                }
             }
             HilStmt::Call(expr) => Stmt::Expression {
                 expr: self.visit_expr(expr),
