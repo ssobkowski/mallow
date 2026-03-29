@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 
 use crate::ast::UnOp;
 use crate::hil::ir::HilExpr;
-use crate::hil::lifter::symbol::SymbolId;
+use crate::hil::lifter::ssa::SymbolId;
 
 use super::analysis::{
     branch_has_plain_backedge, find_if_else_join, find_loop_exit_block, resolve_generic_for_tail,

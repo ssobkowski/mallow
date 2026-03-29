@@ -1,7 +1,7 @@
 use smol_str::SmolStr;
 
 use crate::ast::{BinOp, UnOp};
-use crate::hil::lifter::symbol::SymbolId;
+use crate::hil::lifter::ssa::SymbolId;
 
 /// A wrapper that attaches a bytecode PC to any IR node.
 #[derive(Debug, Clone)]
@@ -91,6 +91,12 @@ pub enum HilTableItem {
     Packed(HilExpr),
 }
 
+#[derive(Debug, Clone)]
+pub struct PhiNode {
+    pub target: SymbolId,
+    pub operands: Vec<(usize, SymbolId)>,
+}
+
 /// A statement in the high-level intermediate representation.
 #[derive(Debug, Clone)]
 pub enum HilStmt {
@@ -117,10 +123,7 @@ pub enum HilStmt {
     /// A call statement.
     Call(HilExpr),
     /// A "Phi-Node", used for merging symbols between region blocks.
-    Phi {
-        target: SymbolId,
-        operands: Vec<(usize, SymbolId)>,
-    },
+    Phi(PhiNode),
 }
 
 pub trait ToSpanned {

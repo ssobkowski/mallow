@@ -1,7 +1,7 @@
 // mod passes;
-pub mod symbol;
+pub mod ssa;
 
-use id_arena::Arena;
+use ssa::Ssa;
 
 use crate::{
     ast::{BinOp, UnOp},
@@ -10,7 +10,7 @@ use crate::{
     hil::{
         common::{const_expr, decoded_count},
         ir::{HilExpr, HilStmt, Spanned, ToSpanned},
-        lifter::symbol::{Mutability, Symbol, SymbolId},
+        lifter::ssa::{Symbol, SymbolId},
     },
     il::{Constant, Count, Instr},
 };
@@ -64,16 +64,25 @@ fn binop_for_instr(instr: &Instr) -> BinOp {
     }
 }
 
-pub struct LiftContext<'a> {
+fn unop_for_instr(instr: &Instr) -> UnOp {
+    match instr {
+        Instr::Minus { .. } => UnOp::Minus,
+        Instr::Length { .. } => UnOp::Length,
+        Instr::Not { .. } => UnOp::Not,
+        _ => unreachable!("not a unary operator instruction: {:?}", instr),
+    }
+}
+
+pub struct LiftContext<'a, 'cfg> {
     pub instrs: &'a [(Instr, usize)],
     pub consts: &'a [Constant],
     pub parent_proto: &'a Proto,
     pub protos: &'a [Proto],
-    pub arena: &'a mut Arena<Symbol>,
-    pub state: &'a mut [Option<SymbolId>; 256],
+    pub ssa: &'a mut Ssa<'cfg>,
+    pub block_idx: usize,
 }
 
-pub struct Lifter<'a> {
+pub struct Lifter<'a, 'cfg> {
     ip: usize,
 
     instrs: &'a [(Instr, usize)],
@@ -81,24 +90,25 @@ pub struct Lifter<'a> {
     parent_proto: &'a Proto,
     protos: &'a [Proto],
 
-    arena: &'a mut Arena<Symbol>,
-    state: &'a mut [Option<SymbolId>; 256],
+    ssa: &'a mut Ssa<'cfg>,
+    block_idx: usize,
+
     upvalues: Vec<SymbolId>,
 
     stmts: Vec<Spanned<HilStmt>>,
     pending_multiret: Option<MultiRet>,
 }
 
-impl<'a> Lifter<'a> {
-    pub fn new(ctx: LiftContext<'a>) -> Self {
+impl<'a, 'cfg> Lifter<'a, 'cfg> {
+    pub fn new(ctx: LiftContext<'a, 'cfg>) -> Self {
         Self {
             ip: 0,
             instrs: ctx.instrs,
             consts: ctx.consts,
             parent_proto: ctx.parent_proto,
             protos: ctx.protos,
-            arena: ctx.arena,
-            state: ctx.state,
+            ssa: ctx.ssa,
+            block_idx: ctx.block_idx,
             upvalues: Vec::new(),
             stmts: Vec::new(),
             pending_multiret: None,
@@ -129,25 +139,24 @@ impl<'a> Lifter<'a> {
         self.stmts.push(Spanned::new(stmt, self.current_pc()));
     }
 
-    fn read_regs(&self, start: u8, count: u8) -> Vec<HilExpr> {
+    fn read_regs(&mut self, start: u8, count: u8) -> Vec<HilExpr> {
         (0..count)
             .map(|i| HilExpr::Symbol(self.get_reg_symbol(start + i)))
             .collect()
     }
 
     fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<SymbolId> {
-        let pc = self.current_pc();
         (0..count)
             .map(|i| {
                 let reg = start + i;
-                let sym = self.arena.alloc(Symbol::new(reg, pc));
-                self.state[reg as usize] = Some(sym);
+                let sym = self.ssa.alloc_symbol(Symbol::new(reg));
+                self.ssa.write_reg(self.block_idx, reg, sym);
                 sym
             })
             .collect()
     }
 
-    fn concat_expr_range(&self, start: u8, end: u8) -> HilExpr {
+    fn concat_expr_range(&mut self, start: u8, end: u8) -> HilExpr {
         debug_assert!(
             start <= end,
             "invalid CONCAT register range: {start}..{end}"
@@ -180,28 +189,21 @@ impl<'a> Lifter<'a> {
         let ip = self.ip.saturating_sub(1);
         debug_assert!(ip < self.instrs.len());
         let pc = self.instrs[ip].1;
-        let symbol_id = self.arena.alloc(Symbol::new(reg, pc));
 
-        self.state[reg as usize] = Some(symbol_id);
+        let sym = self.ssa.alloc_symbol(Symbol::new(reg));
+        self.ssa.write_reg(self.block_idx, reg, sym);
+
         self.stmts.push(
             HilStmt::Assign {
-                left: HilExpr::Symbol(symbol_id),
+                left: HilExpr::Symbol(sym),
                 value,
             }
             .to_spanned(pc),
         );
     }
 
-    fn get_reg_symbol(&self, reg: u8) -> SymbolId {
-        self.state[reg as usize].unwrap_or_else(|| {
-            // Grab the instruction that caused the crash
-            let faulty_idx = self.ip.saturating_sub(1);
-            let instr = self.instrs.get(faulty_idx);
-            panic!(
-                "FATAL: Register R{} was uninitialized!\nRead by instruction at IP {}: {:#?}",
-                reg, faulty_idx, instr
-            );
-        })
+    fn get_reg_symbol(&mut self, reg: u8) -> SymbolId {
+        self.ssa.read_reg(self.block_idx, reg)
     }
 
     /// Lifts all instructions into pc-spanned HIL statements in bytecode order.
@@ -218,7 +220,8 @@ impl<'a> Lifter<'a> {
                     self.assign_reg(*reg, self.const_expr(*index as usize));
                 }
                 Instr::Move { dest, src } => {
-                    self.assign_reg(*dest, HilExpr::Symbol(self.get_reg_symbol(*src)))
+                    let sym = self.get_reg_symbol(*src);
+                    self.assign_reg(*dest, HilExpr::Symbol(sym))
                 }
                 Instr::GetGlobal { dest, key, .. } => {
                     self.assign_reg(
@@ -227,9 +230,10 @@ impl<'a> Lifter<'a> {
                     );
                 }
                 Instr::SetGlobal { src, key, .. } => {
+                    let sym = self.get_reg_symbol(*src);
                     self.assign(
                         HilExpr::Global(self.const_string(*key as usize).into()),
-                        HilExpr::Symbol(self.get_reg_symbol(*src)),
+                        HilExpr::Symbol(sym),
                     );
                 }
                 Instr::GetUpval { dest, upval } => {
@@ -240,7 +244,8 @@ impl<'a> Lifter<'a> {
                     let upval_sym = self.upvalues[*upval as usize];
                     let src_sym = self.get_reg_symbol(*src);
 
-                    self.arena[upval_sym].mutability = Mutability::Mutable;
+                    // TODO
+                    // self.arena[upval_sym].mutability = Mutability::Mutable;
 
                     self.assign(HilExpr::Symbol(upval_sym), HilExpr::Symbol(src_sym))
                 }
@@ -270,28 +275,32 @@ impl<'a> Lifter<'a> {
                     dest, table, key, ..
                 } => {
                     let key_str = self.const_string(*key as usize);
+                    let sym = self.get_reg_symbol(*table);
                     self.assign_reg(
                         *dest,
                         HilExpr::GetField {
-                            obj: Box::new(HilExpr::Symbol(self.get_reg_symbol(*table))),
+                            obj: Box::new(HilExpr::Symbol(sym)),
                             field: key_str.into(),
                         },
                     );
                 }
                 Instr::GetTable { dest, table, key } => {
+                    let table_sym = self.get_reg_symbol(*table);
+                    let key_sym = self.get_reg_symbol(*key);
                     self.assign_reg(
                         *dest,
                         HilExpr::GetIndex {
-                            obj: Box::new(HilExpr::Symbol(self.get_reg_symbol(*table))),
-                            index: Box::new(HilExpr::Symbol(self.get_reg_symbol(*key))),
+                            obj: Box::new(HilExpr::Symbol(table_sym)),
+                            index: Box::new(HilExpr::Symbol(key_sym)),
                         },
                     );
                 }
                 Instr::GetTableN { dest, table, index } => {
+                    let sym = self.get_reg_symbol(*table);
                     self.assign_reg(
                         *dest,
                         HilExpr::GetIndex {
-                            obj: Box::new(HilExpr::Symbol(self.get_reg_symbol(*table))),
+                            obj: Box::new(HilExpr::Symbol(sym)),
                             index: Box::new(HilExpr::Number(*index as f64)),
                         },
                     );
@@ -299,98 +308,110 @@ impl<'a> Lifter<'a> {
                 Instr::SetTableKS {
                     src, table, key, ..
                 } => {
+                    let table_sym = self.get_reg_symbol(*table);
+                    let value_sym = self.get_reg_symbol(*src);
                     self.push(HilStmt::SetField {
-                        table: self.get_reg_symbol(*table),
+                        table: table_sym,
                         key: self.const_string(*key as usize).into(),
-                        value: HilExpr::Symbol(self.get_reg_symbol(*src)),
+                        value: HilExpr::Symbol(value_sym),
                     });
                 }
                 Instr::SetTableN { src, table, index } => {
+                    let table_sym = self.get_reg_symbol(*table);
+                    let value_sym = self.get_reg_symbol(*src);
                     self.assign(
                         HilExpr::GetIndex {
-                            obj: Box::new(HilExpr::Symbol(self.get_reg_symbol(*table))),
+                            obj: Box::new(HilExpr::Symbol(table_sym)),
                             index: Box::new(HilExpr::Number(*index as f64)),
                         },
-                        HilExpr::Symbol(self.get_reg_symbol(*src)),
+                        HilExpr::Symbol(value_sym),
                     );
                 }
                 Instr::SetTable { src, table, key } => {
+                    let table_sym = self.get_reg_symbol(*table);
+                    let key_sym = self.get_reg_symbol(*key);
+                    let value_sym = self.get_reg_symbol(*src);
                     self.assign(
                         HilExpr::GetIndex {
-                            obj: Box::new(HilExpr::Symbol(self.get_reg_symbol(*table))),
-                            index: Box::new(HilExpr::Symbol(self.get_reg_symbol(*key))),
+                            obj: Box::new(HilExpr::Symbol(table_sym)),
+                            index: Box::new(HilExpr::Symbol(key_sym)),
                         },
-                        HilExpr::Symbol(self.get_reg_symbol(*src)),
+                        HilExpr::Symbol(value_sym),
                     );
                 }
 
                 // reg op reg — covers all arithmetic and logical RR forms.
-                instr @ (Instr::Add { dest, a, b }
+                Instr::Add { dest, a, b }
                 | Instr::Sub { dest, a, b }
                 | Instr::Mul { dest, a, b }
                 | Instr::Div { dest, a, b }
                 | Instr::Mod { dest, a, b }
                 | Instr::Pow { dest, a, b }
                 | Instr::And { dest, a, b }
-                | Instr::Or { dest, a, b }) => {
+                | Instr::Or { dest, a, b } => {
+                    let lhs_sym = self.get_reg_symbol(*a);
+                    let rhs_sym = self.get_reg_symbol(*b);
                     self.assign_reg(
                         *dest,
                         HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Symbol(self.get_reg_symbol(*a))),
-                            op: binop_for_instr(instr),
-                            rhs: Box::new(HilExpr::Symbol(self.get_reg_symbol(*b))),
+                            lhs: Box::new(HilExpr::Symbol(lhs_sym)),
+                            op: binop_for_instr(&instr),
+                            rhs: Box::new(HilExpr::Symbol(rhs_sym)),
                         },
                     );
                 }
 
                 // reg op const(number) — the RHS is always a numeric constant.
-                instr @ (Instr::AddK { dest, reg, k }
+                Instr::AddK { dest, reg, k }
                 | Instr::SubK { dest, reg, k }
                 | Instr::MulK { dest, reg, k }
                 | Instr::DivK { dest, reg, k }
                 | Instr::ModK { dest, reg, k }
-                | Instr::PowK { dest, reg, k }) => {
+                | Instr::PowK { dest, reg, k } => {
                     let num = match self.consts[*k as usize] {
                         Constant::Number(x) => x,
                         _ => unreachable!(
                             "*K arithmetic instructions can only reference number constants"
                         ),
                     };
+                    let lhs_sym = self.get_reg_symbol(*reg);
                     self.assign_reg(
                         *dest,
                         HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Symbol(self.get_reg_symbol(*reg))),
-                            op: binop_for_instr(instr),
+                            lhs: Box::new(HilExpr::Symbol(lhs_sym)),
+                            op: binop_for_instr(&instr),
                             rhs: Box::new(HilExpr::Number(num)),
                         },
                     );
                 }
 
                 // const(number) op reg — operands are flipped; only Sub and Div have this form.
-                instr @ (Instr::SubRK { dest, k, reg } | Instr::DivRK { dest, k, reg }) => {
+                Instr::SubRK { dest, k, reg } | Instr::DivRK { dest, k, reg } => {
                     let num = match self.consts[*k as usize] {
                         Constant::Number(x) => x,
                         _ => unreachable!(
                             "*RK arithmetic instructions can only reference number constants"
                         ),
                     };
+                    let rhs_sym = self.get_reg_symbol(*reg);
                     self.assign_reg(
                         *dest,
                         HilExpr::Binary {
                             lhs: Box::new(HilExpr::Number(num)),
-                            op: binop_for_instr(instr),
-                            rhs: Box::new(HilExpr::Symbol(self.get_reg_symbol(*reg))),
+                            op: binop_for_instr(&instr),
+                            rhs: Box::new(HilExpr::Symbol(rhs_sym)),
                         },
                     );
                 }
 
                 // reg op const(any) — And/Or can short-circuit against any constant type.
-                instr @ (Instr::AndK { dest, reg, k } | Instr::OrK { dest, reg, k }) => {
+                Instr::AndK { dest, reg, k } | Instr::OrK { dest, reg, k } => {
+                    let lhs_sym = self.get_reg_symbol(*reg);
                     self.assign_reg(
                         *dest,
                         HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Symbol(self.get_reg_symbol(*reg))),
-                            op: binop_for_instr(instr),
+                            lhs: Box::new(HilExpr::Symbol(lhs_sym)),
+                            op: binop_for_instr(&instr),
                             rhs: Box::new(const_expr(self.consts, usize::from(*k))),
                         },
                     );
@@ -401,27 +422,18 @@ impl<'a> Lifter<'a> {
                     self.assign_reg(*dest, expr);
                 }
 
-                Instr::Not { dest, reg } => self.assign_reg(
-                    *dest,
-                    HilExpr::Unary {
-                        op: UnOp::Not,
-                        expr: Box::new(HilExpr::Symbol(self.get_reg_symbol(*reg))),
-                    },
-                ),
-                Instr::Minus { dest, reg } => self.assign_reg(
-                    *dest,
-                    HilExpr::Unary {
-                        op: UnOp::Minus,
-                        expr: Box::new(HilExpr::Symbol(self.get_reg_symbol(*reg))),
-                    },
-                ),
-                Instr::Length { dest, reg } => self.assign_reg(
-                    *dest,
-                    HilExpr::Unary {
-                        op: UnOp::Length,
-                        expr: Box::new(HilExpr::Symbol(self.get_reg_symbol(*reg))),
-                    },
-                ),
+                Instr::Not { dest, reg }
+                | Instr::Minus { dest, reg }
+                | Instr::Length { dest, reg } => {
+                    let sym = self.get_reg_symbol(*reg);
+                    self.assign_reg(
+                        *dest,
+                        HilExpr::Unary {
+                            op: unop_for_instr(&instr),
+                            expr: Box::new(HilExpr::Symbol(sym)),
+                        },
+                    )
+                }
 
                 // Both variants produce an empty table that SETLIST fills in.
                 Instr::NewTable { dest, .. } | Instr::DupTable { dest, .. } => {
@@ -588,8 +600,9 @@ impl<'a> Lifter<'a> {
             ),
         };
 
+        let table_sym = self.get_reg_symbol(table);
         self.push(HilStmt::SetList {
-            table: self.get_reg_symbol(table),
+            table: table_sym,
             index,
             values,
             has_variadic_tail,
@@ -670,11 +683,12 @@ impl<'a> Lifter<'a> {
                 .stmts
                 .push(HilStmt::Call(expr.inner).to_spanned(expr.pc)),
             HilExpr::VarArgs => {
-                let symbol_id = self.arena.alloc(Symbol::new(base, expr.pc));
-                self.state[base as usize] = Some(symbol_id);
+                let sym = self.ssa.alloc_symbol(Symbol::new(base));
+                self.ssa.write_reg(self.block_idx, base, sym);
+
                 self.stmts.push(
                     HilStmt::Assign {
-                        left: HilExpr::Symbol(symbol_id),
+                        left: HilExpr::Symbol(sym),
                         value: HilExpr::VarArgs,
                     }
                     .to_spanned(expr.pc),
@@ -742,7 +756,7 @@ impl<'a> Lifter<'a> {
 
 /// Lifts one instruction slice into raw HIL statements.
 #[must_use]
-pub fn lift<'a>(ctx: LiftContext<'a>) -> Vec<Spanned<HilStmt>> {
+pub fn lift<'a, 'cfg>(ctx: LiftContext<'a, 'cfg>) -> Vec<Spanned<HilStmt>> {
     let lifter = Lifter::new(ctx);
     let stmts = lifter.run();
 

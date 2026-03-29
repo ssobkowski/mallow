@@ -117,6 +117,6 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
     /// scope or any parent scopes.
     #[inline]
     pub fn contains(&self, name: &K) -> bool {
-        self.iter().any(|s| s.get(name).is_some())
+        self.iter().any(|s| s.contains(name))
     }
 }

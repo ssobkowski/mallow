@@ -9,7 +9,7 @@ use crate::{
             region::{RegionBlock, RegionNode},
         },
         ir::{HilExpr, HilStmt},
-        lifter::symbol::SymbolId,
+        lifter::ssa::SymbolId,
     },
     scopes::Scopes,
 };
@@ -199,11 +199,11 @@ impl Structurer {
             HilStmt::Call(expr) => Stmt::Expression {
                 expr: self.visit_expr(expr),
             },
-            HilStmt::Phi { target, operands } => {
+            HilStmt::Phi(node) => {
                 panic!(
                     "encountered unfolded phi node during structuring: target={}, operands={:?}",
-                    target.index(),
-                    operands
+                    node.target.index(),
+                    node.operands
                 )
             }
         }

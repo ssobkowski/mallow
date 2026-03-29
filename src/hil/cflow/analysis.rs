@@ -2,9 +2,10 @@ use std::collections::HashSet;
 
 use smallvec::SmallVec;
 
-use crate::hil::lifter::symbol::SymbolId;
-
-use super::graph::{BlockExit, ControlFlowGraph};
+use crate::hil::{
+    cflow::graph::{BlockExit, ControlFlowGraph},
+    lifter::ssa::SymbolId,
+};
 
 /// Walks a branch to locate its most likely merge successor.
 ///
@@ -185,7 +186,7 @@ pub struct NumericForTail {
 #[must_use]
 pub fn resolve_numeric_for_tail(
     prep_block: usize,
-    base: usize,
+    base: u8,
     prep_target_block: usize,
     cfg: &ControlFlowGraph,
 ) -> Option<NumericForTail> {
@@ -230,7 +231,7 @@ pub struct GenericForTail<'cfg> {
 #[must_use]
 pub fn resolve_generic_for_tail<'a>(
     prep_block: usize,
-    base: usize,
+    base: u8,
     prep_target_block: usize,
     cfg: &'a ControlFlowGraph,
 ) -> Option<GenericForTail<'a>> {
