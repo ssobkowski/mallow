@@ -10,6 +10,7 @@ use crate::{
     ast::BinOp,
     disasm::Proto,
     hil::{
+        cflow::union_find::UnionFind,
         common::{const_expr, decoded_count},
         ir::{HilExpr, HilStmt, HilTableItem, PhiNode, Spanned, ToSpanned as _},
         lifter::{
@@ -671,7 +672,18 @@ impl ControlFlowGraph {
         ssa.seal_blocks();
         ssa.finish(&mut blocks);
 
-        resolve_ssa_symbols(&mut blocks, &ssa);
+        let mut disjoint_set = UnionFind::new();
+        for block in &blocks {
+            for stmt in &block.stmts {
+                if let HilStmt::Phi(phi) = &stmt.inner {
+                    for (_, operand) in &phi.operands {
+                        disjoint_set.union(phi.target, *operand);
+                    }
+                }
+            }
+        }
+
+        resolve_ssa_symbols(&mut blocks, &ssa, &mut disjoint_set);
 
         let blocks = loop {
             let (changed, new_blocks) = fold_short_circuits(blocks);
@@ -784,6 +796,10 @@ impl ControlFlowGraph {
             .collect();
 
         for (target, operands) in phis {
+            if operands.iter().all(|(_, version)| *version == target) {
+                continue;
+            }
+
             // Emit the target declaration in the idom block. The structurer
             // will determine whether to make it a declaration or not.
             self.blocks[idom].stmts.push(
@@ -796,6 +812,9 @@ impl ControlFlowGraph {
 
             // In each operand block insert the `target = operand` statement.
             for (op_block_idx, version) in operands {
+                if version == target {
+                    continue;
+                }
                 self.blocks[op_block_idx].stmts.push(
                     HilStmt::Assign {
                         left: HilExpr::Symbol(target),
@@ -1101,79 +1120,85 @@ fn fold_short_circuits(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
     (was_changed, blocks)
 }
 
-fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa) {
-    fn resolve(sym: &mut SymbolId, ssa: &Ssa) {
-        *sym = ssa.resolve(*sym)
+fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<SymbolId>) {
+    fn resolve(sym: &mut SymbolId, ssa: &Ssa, djs: &mut UnionFind<SymbolId>) {
+        let resolved = ssa.resolve(*sym);
+        *sym = djs.find(resolved);
     }
 
-    fn walk_stmt(stmt: &mut HilStmt, ssa: &Ssa) {
+    fn walk_stmt(stmt: &mut HilStmt, ssa: &Ssa, djs: &mut UnionFind<SymbolId>) {
         match stmt {
             HilStmt::Assign { left, value } => {
-                walk_expr(left, ssa);
-                walk_expr(value, ssa);
+                walk_expr(left, ssa, djs);
+                walk_expr(value, ssa, djs);
             }
             HilStmt::AssignMany { left, value } => {
                 for sym in left {
-                    resolve(sym, ssa);
+                    resolve(sym, ssa, djs);
                 }
-                walk_expr(value, ssa);
+                walk_expr(value, ssa, djs);
             }
-            HilStmt::Call(expr) => walk_expr(expr, ssa),
+            HilStmt::Call(expr) => walk_expr(expr, ssa, djs),
             HilStmt::SetField { table, value, .. } => {
-                resolve(table, ssa);
-                walk_expr(value, ssa);
+                resolve(table, ssa, djs);
+                walk_expr(value, ssa, djs);
             }
             HilStmt::SetList { table, values, .. } => {
-                resolve(table, ssa);
+                resolve(table, ssa, djs);
                 for v in values {
-                    walk_expr(v, ssa);
+                    walk_expr(v, ssa, djs);
                 }
             }
-            _ => {}
+            HilStmt::Phi(phi) => {
+                resolve(&mut phi.target, ssa, djs);
+                for (_, op) in &mut phi.operands {
+                    resolve(op, ssa, djs);
+                }
+            }
         }
     }
 
-    fn walk_expr(expr: &mut HilExpr, ssa: &Ssa) {
+    fn walk_expr(expr: &mut HilExpr, ssa: &Ssa, djs: &mut UnionFind<SymbolId>) {
         match expr {
             HilExpr::Symbol(sym) => {
-                resolve(sym, ssa);
+                resolve(sym, ssa, djs);
             }
 
             HilExpr::GetField { obj, .. } => {
-                walk_expr(obj, ssa);
+                walk_expr(obj, ssa, djs);
             }
             HilExpr::GetIndex { obj, index } => {
-                walk_expr(obj, ssa);
-                walk_expr(index, ssa);
+                walk_expr(obj, ssa, djs);
+                walk_expr(index, ssa, djs);
             }
             HilExpr::Call { fun, args } => {
-                walk_expr(fun, ssa);
+                walk_expr(fun, ssa, djs);
                 for arg in args {
-                    walk_expr(arg, ssa);
+                    walk_expr(arg, ssa, djs);
                 }
             }
             HilExpr::MethodCall { object, args, .. } => {
-                walk_expr(object, ssa);
+                walk_expr(object, ssa, djs);
                 for arg in args {
-                    walk_expr(arg, ssa);
+                    walk_expr(arg, ssa, djs);
                 }
             }
             HilExpr::Binary { lhs, rhs, .. } => {
-                walk_expr(lhs, ssa);
-                walk_expr(rhs, ssa);
+                walk_expr(lhs, ssa, djs);
+                walk_expr(rhs, ssa, djs);
             }
             HilExpr::Unary { expr, .. } => {
-                walk_expr(expr, ssa);
+                walk_expr(expr, ssa, djs);
             }
             HilExpr::Table { items } => {
                 for item in items {
                     match item {
-                        HilTableItem::List(expr) => walk_expr(expr, ssa),
+                        HilTableItem::List(expr) => walk_expr(expr, ssa, djs),
                         HilTableItem::Index(k, v) => {
-                            walk_expr(k, ssa);
-                            walk_expr(v, ssa);
+                            walk_expr(k, ssa, djs);
+                            walk_expr(v, ssa, djs);
                         }
-                        HilTableItem::Packed(expr) => walk_expr(expr, ssa),
+                        HilTableItem::Packed(expr) => walk_expr(expr, ssa, djs),
                     }
                 }
             }
@@ -1181,31 +1206,31 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa) {
         }
     }
 
-    fn walk_exit(exit: &mut BlockExit, ssa: &Ssa) {
+    fn walk_exit(exit: &mut BlockExit, ssa: &Ssa, djs: &mut UnionFind<SymbolId>) {
         match exit {
             BlockExit::CondJump { cond, .. } => {
-                walk_expr(cond, ssa);
+                walk_expr(cond, ssa, djs);
             }
             BlockExit::FornPrep {
                 start, end, step, ..
             } => {
-                resolve(start, ssa);
-                resolve(end, ssa);
-                resolve(step, ssa);
+                resolve(start, ssa, djs);
+                resolve(end, ssa, djs);
+                resolve(step, ssa, djs);
             }
             BlockExit::ForgPrep { exprs, .. } => {
                 for e in exprs {
-                    resolve(e, ssa);
+                    resolve(e, ssa, djs);
                 }
             }
             BlockExit::ForgLoop { vars, .. } => {
                 for v in vars {
-                    resolve(v, ssa);
+                    resolve(v, ssa, djs);
                 }
             }
             BlockExit::Return(values) => {
                 for v in values {
-                    walk_expr(v, ssa);
+                    walk_expr(v, ssa, djs);
                 }
             }
             _ => {}
@@ -1214,8 +1239,8 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa) {
 
     for block in blocks {
         for stmt in &mut block.stmts {
-            walk_stmt(&mut stmt.inner, ssa);
+            walk_stmt(&mut stmt.inner, ssa, djs);
         }
-        walk_exit(&mut block.exit, ssa);
+        walk_exit(&mut block.exit, ssa, djs);
     }
 }
