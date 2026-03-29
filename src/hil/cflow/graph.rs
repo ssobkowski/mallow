@@ -648,7 +648,7 @@ impl ControlFlowGraph {
                     body_block: *body_block,
                     exit_block: *exit_block,
                     vars: (0..*result_count)
-                        .map(|i| ssa.read_reg(block_id, i as u8))
+                        .map(|i| ssa.read_reg(block_id, *base + 3 + i as u8))
                         .collect(),
                 },
                 RawBlockExit::Return { base, count } => match decoded_count(*count) {
