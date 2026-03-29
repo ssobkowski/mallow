@@ -3,98 +3,120 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use libtest_mimic::{Arguments, Failed, Trial};
 use tempfile::TempDir;
 
-#[test]
-fn decompile_cases_roundtrip() {
-    let cases = discover_cases();
-    assert!(!cases.is_empty(), "no test cases found in tests/cases");
-
-    for case_dir in cases {
-        run_case(&case_dir);
-    }
-}
-
-fn discover_cases() -> Vec<PathBuf> {
-    let mut cases: Vec<_> = fs::read_dir(cases_root())
-        .unwrap_or_else(|error| panic!("failed to read test cases directory: {error}"))
-        .filter_map(|entry| {
-            let entry =
-                entry.unwrap_or_else(|error| panic!("failed to read test case entry: {error}"));
-            let path = entry.path();
-            path.is_dir().then_some(path)
+fn main() {
+    let args = Arguments::from_args();
+    let trials = discover_cases()
+        .into_iter()
+        .map(|case_dir| {
+            Trial::test(
+                case_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<invalid utf8>")
+                    .to_string(),
+                move || run_case(&case_dir),
+            )
         })
         .collect();
 
-    cases.sort();
-    cases
+    libtest_mimic::run(&args, trials).exit();
 }
 
-fn run_case(case_dir: &Path) {
-    let case_name = case_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("<invalid utf8>");
-    let source_path = case_dir.join("source.luau");
-    assert!(
-        source_path.is_file(),
-        "test case '{case_name}' is missing source.luau"
-    );
+#[derive(Debug)]
+enum CaseError {
+    MissingSource,
+    CompileError(String),
+    DecompileError(String),
+    SourceRunError(String),
+    DecompiledRunError(String),
+    OutputMismatch { source: String, decompiled: String },
+    ExpectedMismatch { expected: String, actual: String },
+}
 
-    let expected_output_path = case_dir.join("expected.out");
-    let temp_dir =
-        TempDir::new().unwrap_or_else(|error| panic!("failed to create temp dir: {error}"));
-    let bytecode_path = temp_dir.path().join("compiled.out");
-    let decompiled_path = temp_dir.path().join("decompiled.luau");
-
-    compile_luau(&source_path, &bytecode_path, case_name);
-    decompile_bytecode(&bytecode_path, &decompiled_path, case_name);
-
-    let source_output = run_luau(&source_path, case_name, "source.luau");
-    let decompiled_output = run_luau(&decompiled_path, case_name, "decompiled.luau");
-
-    assert_eq!(
-        source_output, decompiled_output,
-        "case '{case_name}' produced different output after decompilation"
-    );
-
-    if expected_output_path.is_file() {
-        let expected_output = normalize_output(
-            &fs::read_to_string(&expected_output_path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to read expected output for case '{case_name}' at {}: {error}",
-                    expected_output_path.display()
-                )
-            }),
-        );
-
-        assert_eq!(
-            expected_output, source_output,
-            "case '{case_name}' source output does not match expected.out"
-        );
+impl std::fmt::Display for CaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSource => write!(f, "missing source.luau"),
+            Self::CompileError(msg) => write!(f, "luau-compile failed:\n{msg}"),
+            Self::DecompileError(msg) => write!(f, "luaudec decompile failed:\n{msg}"),
+            Self::SourceRunError(msg) => write!(f, "source.luau failed to run:\n{msg}"),
+            Self::DecompiledRunError(msg) => write!(f, "decompiled.luau failed to run:\n{msg}"),
+            Self::OutputMismatch { source, decompiled } => write!(
+                f,
+                "output mismatch after decompilation\n--- source ---\n{source}\n--- decompiled ---\n{decompiled}"
+            ),
+            Self::ExpectedMismatch { expected, actual } => write!(
+                f,
+                "output does not match expected.out\n--- expected ---\n{expected}\n--- actual ---\n{actual}"
+            ),
+        }
     }
 }
 
-fn compile_luau(source_path: &Path, bytecode_path: &Path, case_name: &str) {
+fn run_case(case_dir: &Path) -> Result<(), Failed> {
+    let source_path = case_dir.join("source.luau");
+    if !source_path.is_file() {
+        return Err(CaseError::MissingSource.into());
+    }
+
+    let expected_output_path = case_dir.join("expected.out");
+    let temp_dir =
+        TempDir::new().map_err(|e| Failed::from(format!("failed to create temp dir: {e}")))?;
+    let bytecode_path = temp_dir.path().join("compiled.out");
+    let decompiled_path = temp_dir.path().join("decompiled.luau");
+
+    compile_luau(&source_path, &bytecode_path)?;
+    decompile_bytecode(&bytecode_path, &decompiled_path)?;
+
+    let source_output = run_luau(&source_path, "source.luau")?;
+    let decompiled_output = run_luau(&decompiled_path, "decompiled.luau")?;
+
+    if source_output != decompiled_output {
+        return Err(CaseError::OutputMismatch {
+            source: source_output,
+            decompiled: decompiled_output,
+        }
+        .into());
+    }
+
+    if expected_output_path.is_file() {
+        let raw = fs::read_to_string(&expected_output_path)
+            .map_err(|e| Failed::from(format!("failed to read expected.out: {e}")))?;
+        let expected = normalize_output(&raw);
+
+        if expected != source_output {
+            return Err(CaseError::ExpectedMismatch {
+                expected,
+                actual: source_output,
+            }
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn compile_luau(source_path: &Path, bytecode_path: &Path) -> Result<(), Failed> {
     let output = Command::new(luau_compile_exe())
         .arg("--binary")
         .arg(source_path)
         .output()
-        .unwrap_or_else(|error| {
-            panic!("failed to run luau-compile.exe for case '{case_name}': {error}")
-        });
+        .map_err(|e| Failed::from(format!("failed to spawn luau-compile: {e}")))?;
 
-    assert_command_success(&output, case_name, "luau-compile.exe");
+    if !output.status.success() {
+        return Err(CaseError::CompileError(format_output(&output)).into());
+    }
 
-    fs::write(bytecode_path, &output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "failed to write compiled bytecode for case '{case_name}' to {}: {error}",
-            bytecode_path.display()
-        )
-    });
+    fs::write(bytecode_path, &output.stdout)
+        .map_err(|e| Failed::from(format!("failed to write bytecode: {e}")))?;
+
+    Ok(())
 }
 
-fn decompile_bytecode(bytecode_path: &Path, decompiled_path: &Path, case_name: &str) {
+fn decompile_bytecode(bytecode_path: &Path, decompiled_path: &Path) -> Result<(), Failed> {
     let output = Command::new(luaudec_exe())
         .arg("decompile")
         .arg("-i")
@@ -102,36 +124,56 @@ fn decompile_bytecode(bytecode_path: &Path, decompiled_path: &Path, case_name: &
         .arg("-o")
         .arg(decompiled_path)
         .output()
-        .unwrap_or_else(|error| panic!("failed to run luaudec for case '{case_name}': {error}"));
+        .map_err(|e| Failed::from(format!("failed to spawn luaudec: {e}")))?;
 
-    assert_command_success(&output, case_name, "luaudec decompile");
+    if !output.status.success() {
+        return Err(CaseError::DecompileError(format_output(&output)).into());
+    }
+
+    Ok(())
 }
 
-fn run_luau(script_path: &Path, case_name: &str, label: &str) -> String {
+fn run_luau(script_path: &Path, label: &str) -> Result<String, Failed> {
     let output = Command::new(luau_exe())
         .arg(script_path)
         .output()
-        .unwrap_or_else(|error| panic!("failed to run luau.exe for case '{case_name}': {error}"));
+        .map_err(|e| Failed::from(format!("failed to spawn luau for {label}: {e}")))?;
 
-    assert_command_success(&output, case_name, label);
-    normalize_output(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn assert_command_success(output: &Output, case_name: &str, command_name: &str) {
-    if output.status.success() {
-        return;
+    if !output.status.success() {
+        let err = if label == "source.luau" {
+            CaseError::SourceRunError(format_output(&output))
+        } else {
+            CaseError::DecompiledRunError(format_output(&output))
+        };
+        return Err(err.into());
     }
 
-    panic!(
-        "case '{case_name}' failed during {command_name}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+    Ok(normalize_output(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn format_output(output: &Output) -> String {
+    format!(
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
+    )
 }
 
 fn normalize_output(output: &str) -> String {
     output.replace("\r\n", "\n")
+}
+
+fn discover_cases() -> Vec<PathBuf> {
+    let mut cases: Vec<_> = fs::read_dir(cases_root())
+        .unwrap_or_else(|e| panic!("failed to read cases dir: {e}"))
+        .filter_map(|entry| {
+            let path = entry.unwrap_or_else(|e| panic!("bad entry: {e}")).path();
+            path.is_dir().then_some(path)
+        })
+        .collect();
+    cases.sort();
+    cases
 }
 
 fn cases_root() -> PathBuf {
@@ -140,28 +182,18 @@ fn cases_root() -> PathBuf {
         .join("cases")
 }
 
-/// Returns the path to the `luau` executable.
-/// Checks the repo root first, then falls back to looking it up on PATH.
 fn luau_exe() -> PathBuf {
     find_external_exe("luau")
 }
-
-/// Returns the path to the `luau-compile` executable.
-/// Checks the repo root first, then falls back to looking it up on PATH.
 fn luau_compile_exe() -> PathBuf {
     find_external_exe("luau-compile")
 }
 
-/// Resolves an external executable by name. First checks whether it exists in
-/// the repo root (for users who placed it there), and if not, returns just the
-/// bare executable name so the OS will resolve it from `PATH`.
 fn find_external_exe(stem: &str) -> PathBuf {
     let local = repo_root().join(exe_name(stem));
     if local.is_file() {
         return local;
     }
-
-    // Fall back to bare name — Command will search PATH for it.
     PathBuf::from(exe_name(stem))
 }
 

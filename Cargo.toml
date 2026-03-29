@@ -12,4 +12,9 @@ thiserror = "2.0.18"
 
 [dev-dependencies]
 indoc = "2.0.7"
+libtest-mimic = "0.8.2"
 tempfile = "3.26.0"
+
+[[test]]
+name = "decompiler"
+harness = false
