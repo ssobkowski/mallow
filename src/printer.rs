@@ -318,6 +318,26 @@ impl AstPrinter {
                     self.write(")");
                 }
             }
+            Expr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                let prec = 0;
+                let needs_parens = prec < parent_prec;
+                if needs_parens {
+                    self.write("(");
+                }
+                self.write("if ");
+                self.walk_expr(condition, 0, Side::None);
+                self.write(" then ");
+                self.walk_expr(then_expr, 0, Side::None);
+                self.write(" else ");
+                self.walk_expr(else_expr, 0, Side::None);
+                if needs_parens {
+                    self.write(")");
+                }
+            }
             Expr::AnonymousFunction { params, body } => {
                 let prec = 1;
                 let needs_parens = prec < parent_prec;

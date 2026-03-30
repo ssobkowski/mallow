@@ -10,7 +10,7 @@ use crate::{
     ast::BinOp,
     disasm::Proto,
     hil::{
-        cflow::union_find::UnionFind,
+        cflow::{common::invert_condition, union_find::UnionFind},
         common::{const_expr, decoded_count},
         ir::{HilExpr, HilStmt, HilTableItem, PhiNode, Spanned, ToSpanned as _},
         lifter::{
@@ -760,7 +760,7 @@ impl ControlFlowGraph {
         }
 
         let blocks = loop {
-            let (changed, new_blocks) = fold_short_circuits(blocks);
+            let (changed, new_blocks) = fold_condition_diamonds(blocks);
             if !changed {
                 break new_blocks;
             }
@@ -1107,13 +1107,95 @@ fn build_loop_indexes(blocks: &[Block]) -> (HashMap<u8, Vec<usize>>, HashMap<u8,
     (numeric_loops_by_base, generic_loops_by_base)
 }
 
-/// Folds Lua's `and/or` ternary pattern into a cohesive if-else control flow.
+#[must_use]
+fn block_jump_target(block: &Block) -> Option<usize> {
+    match block.exit {
+        BlockExit::Jump(target) | BlockExit::Fallthrough(target) => Some(target),
+        _ => None,
+    }
+}
+
+#[must_use]
+fn match_bool_assignment(block: &Block) -> Option<(SymbolId, bool)> {
+    let [
+        Spanned {
+            inner:
+                HilStmt::Assign {
+                    left: HilExpr::Symbol(symbol),
+                    value: HilExpr::Bool(value),
+                },
+            ..
+        },
+    ] = &block.stmts[..]
+    else {
+        return None;
+    };
+
+    Some((*symbol, *value))
+}
+
+#[must_use]
+fn match_single_assignment(block: &Block) -> Option<(SymbolId, HilExpr)> {
+    let [
+        Spanned {
+            inner:
+                HilStmt::Assign {
+                    left: HilExpr::Symbol(symbol),
+                    value,
+                },
+            ..
+        },
+    ] = &block.stmts[..]
+    else {
+        return None;
+    };
+
+    Some((*symbol, value.clone()))
+}
+
+#[must_use]
+fn match_truthy_guard(block: &Block) -> Option<(SymbolId, HilExpr, usize, usize)> {
+    let (result, value) = match_single_assignment(block)?;
+    let BlockExit::CondJump {
+        cond: HilExpr::Symbol(cond_reg),
+        then_block,
+        else_block,
+    } = block.exit
+    else {
+        return None;
+    };
+
+    if cond_reg != result {
+        return None;
+    }
+
+    Some((result, value, then_block, else_block))
+}
+
+#[must_use]
+fn last_assigned_symbol(block: &Block) -> Option<(SymbolId, HilExpr)> {
+    let Spanned {
+        inner:
+            HilStmt::Assign {
+                left: HilExpr::Symbol(symbol),
+                value,
+            },
+        ..
+    } = block.stmts.last()?
+    else {
+        return None;
+    };
+
+    Some((*symbol, value.clone()))
+}
+
+/// Folds condition diamonds back into expression-producing control flow.
 ///
 /// # Returns
 ///
 /// A tuple of `(changed, blocks)` where `changed` is `true` if any short-circuit
 /// folding was performed, and `blocks` is the modified block list.
-fn fold_short_circuits(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
+fn fold_condition_diamonds(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
     // Lua itself lacks a native ternary operator, so `cond and x or y` compiles into
     // a diamond-shaped CFG: the condition is checked first, and if truthy, the result
     // register is checked again to guard against falsy `x` values.
@@ -1138,56 +1220,97 @@ fn fold_short_circuits(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
             _ => continue,
         };
 
-        let (then_d, else_e) = match blocks.get(then_b).map(|b| &b.exit) {
-            Some(BlockExit::CondJump {
-                then_block,
-                else_block,
-                ..
-            }) => (*then_block, *else_block),
-            _ => continue,
-        };
-
-        if else_b != else_e {
-            continue;
-        }
-
-        // This will match only if the then block has a single assignment
-        // of a register to a register, which is the "truthy check" (Luau
-        // needs to MOVE this register before the jump)
-        if let [
-            Spanned {
-                inner:
-                    HilStmt::Assign {
-                        left: HilExpr::Symbol(result_reg),
-                        value: HilExpr::Symbol(cond_expr),
-                    },
-                ..
-            },
-        ] = &blocks[then_b].stmts[..]
+        if let (
+            Some(then_merge),
+            Some(else_merge),
+            Some((then_target, then_value)),
+            Some((else_target, else_value)),
+        ) = (
+            block_jump_target(&blocks[then_b]),
+            block_jump_target(&blocks[else_b]),
+            match_bool_assignment(&blocks[then_b]),
+            match_bool_assignment(&blocks[else_b]),
+        ) && then_merge == else_merge
+            && then_target == else_target
+            && then_value != else_value
         {
-            // copy out before the borrow dies
-            let result_reg = *result_reg;
-            let cond_expr = *cond_expr;
-            // immutable borrow of self.blocks[then_b] ends here
+            let value = if then_value {
+                cond.clone()
+            } else {
+                invert_condition(cond.clone())
+            };
 
             blocks[i].stmts.push(
                 HilStmt::Assign {
-                    left: HilExpr::Symbol(result_reg),
-                    value: HilExpr::Binary {
-                        lhs: Box::new(cond),
-                        op: BinOp::And,
-                        rhs: Box::new(HilExpr::Symbol(cond_expr)),
-                    },
+                    left: HilExpr::Symbol(then_target),
+                    value,
                 }
                 .to_spanned(0),
             );
+            blocks[i].exit = BlockExit::Jump(then_merge);
+            was_changed = true;
+            continue;
+        }
 
-            blocks[i].exit = BlockExit::CondJump {
-                cond: HilExpr::Symbol(result_reg),
-                then_block: then_d,
-                else_block: else_b,
-            };
+        if let Some((result_reg, truthy_value, then_d, else_e)) =
+            match_truthy_guard(&blocks[then_b])
+        {
+            if else_b == else_e {
+                blocks[i].stmts.push(
+                    HilStmt::Assign {
+                        left: HilExpr::Symbol(result_reg),
+                        value: HilExpr::Binary {
+                            lhs: Box::new(cond.clone()),
+                            op: BinOp::And,
+                            rhs: Box::new(truthy_value),
+                        },
+                    }
+                    .to_spanned(0),
+                );
 
+                blocks[i].exit = BlockExit::CondJump {
+                    cond: HilExpr::Symbol(result_reg),
+                    then_block: then_d,
+                    else_block: else_b,
+                };
+
+                was_changed = true;
+                continue;
+            }
+        }
+
+        if let (
+            Some((result_reg, prefix_value)),
+            BlockExit::CondJump {
+                cond: HilExpr::Symbol(cond_reg),
+                then_block,
+                else_block,
+            },
+            Some((else_target, else_value)),
+            Some(else_merge),
+        ) = (
+            last_assigned_symbol(&blocks[i]),
+            blocks[i].exit.clone(),
+            match_single_assignment(&blocks[else_b]),
+            block_jump_target(&blocks[else_b]),
+        ) && cond_reg == result_reg
+            && else_target == result_reg
+            && then_block == else_merge
+            && else_block == else_b
+        {
+            if let Some(last_stmt) = blocks[i].stmts.last_mut() {
+                *last_stmt = HilStmt::Assign {
+                    left: HilExpr::Symbol(result_reg),
+                    value: HilExpr::Binary {
+                        lhs: Box::new(prefix_value),
+                        op: BinOp::Or,
+                        rhs: Box::new(else_value),
+                    },
+                }
+                .to_spanned(0);
+            }
+
+            blocks[i].exit = BlockExit::Jump(then_block);
             was_changed = true;
         }
     }
@@ -1260,6 +1383,15 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
             }
             HilExpr::Unary { expr, .. } => {
                 walk_expr(expr, ssa, djs);
+            }
+            HilExpr::If {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                walk_expr(condition, ssa, djs);
+                walk_expr(then_expr, ssa, djs);
+                walk_expr(else_expr, ssa, djs);
             }
             HilExpr::Table { items } => {
                 for item in items {

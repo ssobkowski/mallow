@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use smallvec::SmallVec;
 
-use crate::ast::UnOp;
+use crate::hil::cflow::common::invert_condition;
 use crate::hil::ir::HilExpr;
 use crate::hil::lifter::ssa::SymbolId;
 
@@ -281,14 +281,5 @@ impl<'a> RegionBuilder<'a> {
         }
 
         self.build_region_with_loop(branch_start, stop_at, loop_exit)
-    }
-}
-
-// todo: this is really basic
-#[must_use]
-fn invert_condition(expr: HilExpr) -> HilExpr {
-    HilExpr::Unary {
-        op: UnOp::Not,
-        expr: Box::new(expr),
     }
 }

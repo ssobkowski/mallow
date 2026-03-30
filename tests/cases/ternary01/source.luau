@@ -1,0 +1,7 @@
+print("tt", true and "B" or "C")
+print("tf", true and false or "C")
+print("tn", true and nil or "C")
+print("ft", false and "B" or "C")
+print("or_false", false or "fallback")
+print("or_nil", nil or "fallback")
+print("or_keep", "keep" or "fallback")

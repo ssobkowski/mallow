@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use smol_str::format_smolstr;
 
@@ -75,6 +75,34 @@ impl Structurer {
                 else_branch,
                 ..
             } => {
+                let mut then_assigned = HashSet::new();
+                self.collect_assigned_symbols_in_region(then_branch, cfg, &mut then_assigned);
+
+                let mut else_assigned = HashSet::new();
+                self.collect_assigned_symbols_in_region(else_branch, cfg, &mut else_assigned);
+
+                let mut hoisted: Vec<_> = then_assigned
+                    .intersection(&else_assigned)
+                    .copied()
+                    .filter(|sym| !self.scopes.contains(sym))
+                    .collect();
+                hoisted.sort_by_key(|sym| sym.index());
+
+                if !hoisted.is_empty() {
+                    for sym in &hoisted {
+                        self.scopes.declare(*sym, ());
+                    }
+
+                    let names = hoisted
+                        .iter()
+                        .map(|sym| self.get_symbol_name(sym))
+                        .collect();
+                    buf.push(Stmt::LocalDeclaration {
+                        names,
+                        values: Vec::new(),
+                    });
+                }
+
                 let then_body = self.visit_region(then_branch, cfg);
                 let else_body =
                     (!else_branch.nodes.is_empty()).then(|| self.visit_region(else_branch, cfg));
@@ -150,6 +178,65 @@ impl Structurer {
 
         for stmt in &block.stmts {
             buf.push(self.visit_stmt(&stmt.inner));
+        }
+    }
+
+    fn collect_assigned_symbols_in_region(
+        &self,
+        region: &RegionBlock,
+        cfg: &ControlFlowGraph,
+        out: &mut HashSet<SymbolId>,
+    ) {
+        for node in &region.nodes {
+            self.collect_assigned_symbols_in_node(node, cfg, out);
+        }
+    }
+
+    fn collect_assigned_symbols_in_node(
+        &self,
+        node: &RegionNode,
+        cfg: &ControlFlowGraph,
+        out: &mut HashSet<SymbolId>,
+    ) {
+        match node {
+            RegionNode::BasicBlock { block } => {
+                for stmt in &cfg.blocks[*block].stmts {
+                    self.collect_assigned_symbols_in_stmt(&stmt.inner, out);
+                }
+            }
+            RegionNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.collect_assigned_symbols_in_region(then_branch, cfg, out);
+                self.collect_assigned_symbols_in_region(else_branch, cfg, out);
+            }
+            RegionNode::While { body, .. }
+            | RegionNode::RepeatUntil { body, .. }
+            | RegionNode::NumericFor { body, .. }
+            | RegionNode::GenericFor { body, .. } => {
+                self.collect_assigned_symbols_in_region(body, cfg, out);
+            }
+            RegionNode::Continue | RegionNode::Break | RegionNode::Return { .. } => {}
+        }
+    }
+
+    fn collect_assigned_symbols_in_stmt(&self, stmt: &HilStmt, out: &mut HashSet<SymbolId>) {
+        match stmt {
+            HilStmt::Assign {
+                left: HilExpr::Symbol(sym),
+                ..
+            } => {
+                out.insert(*sym);
+            }
+            HilStmt::Assign { .. }
+            | HilStmt::SetList { .. }
+            | HilStmt::Call(_)
+            | HilStmt::Phi(_) => {}
+            HilStmt::AssignMany { left, .. } => {
+                out.extend(left.iter().copied());
+            }
         }
     }
 
@@ -299,6 +386,15 @@ impl Structurer {
             HilExpr::Unary { op, expr } => Expr::Unary {
                 op: *op,
                 expr: Box::new(self.visit_expr(expr)),
+            },
+            HilExpr::If {
+                condition,
+                then_expr,
+                else_expr,
+            } => Expr::IfElse {
+                condition: Box::new(self.visit_expr(condition)),
+                then_expr: Box::new(self.visit_expr(then_expr)),
+                else_expr: Box::new(self.visit_expr(else_expr)),
             },
             HilExpr::Global(name) => Expr::Named(Identifier::new(name.clone())),
             HilExpr::Import(import) => Expr::Named(Identifier::new(import.clone())),

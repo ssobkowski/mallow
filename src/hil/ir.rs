@@ -64,6 +64,12 @@ pub enum HilExpr {
     },
     /// An unary expression.
     Unary { op: UnOp, expr: Box<HilExpr> },
+    /// A Luau if-expression (`if cond then a else b`).
+    If {
+        condition: Box<HilExpr>,
+        then_expr: Box<HilExpr>,
+        else_expr: Box<HilExpr>,
+    },
     /// A table constructor with a list of implicit values.
     Table { items: Vec<HilTableItem> },
     /// Vararg expression (`...`).

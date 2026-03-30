@@ -180,6 +180,15 @@ pub enum Expr {
         /// Method arguments.
         args: Vec<Expr>,
     },
+    /// Luau if-expression (`if cond then a else b`).
+    IfElse {
+        /// Condition expression.
+        condition: Box<Expr>,
+        /// Then branch value.
+        then_expr: Box<Expr>,
+        /// Else branch value.
+        else_expr: Box<Expr>,
+    },
     /// Anonymous function expression.
     AnonymousFunction {
         /// Function parameters.
@@ -299,3 +308,4 @@ pub enum UnOp {
     Length,
     Not,
 }
+
