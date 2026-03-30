@@ -107,12 +107,6 @@ pub enum HilStmt {
     /// Unlike the [regular Assign](HilStmt::Assign), the left hand side of this assignment
     /// holds [SymbolId]s for the sake of simplicity, as no other lvalue gets emitted by the luau compiler.
     AssignMany { left: Vec<SymbolId>, value: HilExpr },
-    /// A table-field assignment lowered from opcodes such as `SETTABLEKS`.
-    SetField {
-        table: SymbolId,
-        key: SmolStr,
-        value: HilExpr,
-    },
     /// A bulk array write lowered from `SETLIST`.
     SetList {
         table: SymbolId,

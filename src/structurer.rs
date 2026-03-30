@@ -25,18 +25,6 @@ struct Structurer {
     current_func: usize,
 }
 
-pub fn structure(functions: Vec<StructuredFunction>, entry: usize) -> Block {
-    let mut st = Structurer {
-        functions,
-        entry,
-        scopes: Scopes::new(),
-        names: HashMap::new(),
-        current_func: entry,
-    };
-
-    st.visit_entry()
-}
-
 impl Structurer {
     fn visit_entry(&mut self) -> Block {
         self.visit_function(self.entry)
@@ -217,13 +205,6 @@ impl Structurer {
                     }
                 }
             }
-            HilStmt::SetField { table, key, value } => Stmt::Assignment {
-                lhs: vec![Expr::Field {
-                    base: Box::new(self.visit_expr(&HilExpr::Symbol(*table))),
-                    field: Identifier::new(key.clone()),
-                }],
-                rhs: vec![self.visit_expr(value)],
-            },
             HilStmt::SetList {
                 table,
                 index,
@@ -321,10 +302,21 @@ impl Structurer {
             },
             HilExpr::Global(name) => Expr::Named(Identifier::new(name.clone())),
             HilExpr::Import(import) => Expr::Named(Identifier::new(import.clone())),
-            HilExpr::GetField { obj, field } => Expr::Field {
-                base: Box::new(self.visit_expr(obj)),
-                field: Identifier::new(field.clone()),
-            },
+            HilExpr::GetField { obj, field } => {
+                let base = Box::new(self.visit_expr(obj));
+
+                if is_valid_luau_identifier(&field) {
+                    Expr::Field {
+                        base,
+                        field: Identifier::new(field.clone()),
+                    }
+                } else {
+                    Expr::Index {
+                        base,
+                        index: Box::new(Expr::Literal(Literal::String(field.clone()))),
+                    }
+                }
+            }
             HilExpr::GetIndex { obj, index } => Expr::Index {
                 base: Box::new(self.visit_expr(obj)),
                 index: Box::new(self.visit_expr(index)),
@@ -396,4 +388,44 @@ impl Structurer {
 
         Expr::AnonymousFunction { params, body }
     }
+}
+
+fn is_valid_luau_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+
+    // 1. Must start with a letter or underscore
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+
+    // 2. Remaining characters must be alphanumeric or underscore
+    for c in chars {
+        if !c.is_ascii_alphanumeric() && c != '_' {
+            return false;
+        }
+    }
+
+    // 3. Must not be a strict reserved keyword
+    const KEYWORDS: [&str; 21] = [
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
+        "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+    ];
+    !KEYWORDS.contains(&s)
+}
+
+pub fn structure(functions: Vec<StructuredFunction>, entry: usize) -> Block {
+    let mut st = Structurer {
+        functions,
+        entry,
+        scopes: Scopes::new(),
+        names: HashMap::new(),
+        current_func: entry,
+    };
+
+    st.visit_entry()
 }

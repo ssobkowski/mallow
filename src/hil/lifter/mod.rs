@@ -306,11 +306,14 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                 } => {
                     let table_sym = self.get_reg_symbol(*table);
                     let value_sym = self.get_reg_symbol(*src);
-                    self.push(HilStmt::SetField {
-                        table: table_sym,
-                        key: self.const_string(*key as usize).into(),
-                        value: HilExpr::Symbol(value_sym),
-                    });
+
+                    self.assign(
+                        HilExpr::GetField {
+                            obj: Box::new(HilExpr::Symbol(table_sym)),
+                            field: self.const_string(*key as usize).into(),
+                        },
+                        HilExpr::Symbol(value_sym),
+                    );
                 }
                 Instr::SetTableN { src, table, index } => {
                     let table_sym = self.get_reg_symbol(*table);

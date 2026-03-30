@@ -550,13 +550,13 @@ impl ControlFlowGraph {
         let mut ssa = Ssa::new(&predecessors, &mut arena);
 
         for i in 0..proto.num_params {
-            let sym = ssa.alloc_symbol(Symbol::reg(i as u8));
-            ssa.write_reg(0, i as u8, sym);
+            let sym = ssa.alloc_symbol(Symbol::reg(i));
+            ssa.write_reg(0, i, sym);
         }
 
         for i in 0..proto.num_upvals {
-            let sym = ssa.alloc_symbol(Symbol::upval(i as u8));
-            ssa.write_upval(0, i as u8, sym);
+            let sym = ssa.alloc_symbol(Symbol::upval(i));
+            ssa.write_upval(0, i, sym);
         }
 
         for block_id in compute_rpo(0, &successors) {
@@ -748,10 +748,10 @@ impl ControlFlowGraph {
             let id = ssa
                 .arena_iter()
                 .find_map(|(id, sym)| {
-                    if let SymbolKind::Upvalue(idx) = sym.kind {
-                        if idx == i {
-                            return Some(id);
-                        }
+                    if let SymbolKind::Upvalue(idx) = sym.kind
+                        && idx == i
+                    {
+                        return Some(id);
                     }
                     None
                 })
@@ -1214,10 +1214,6 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
                 walk_expr(value, ssa, djs);
             }
             HilStmt::Call(expr) => walk_expr(expr, ssa, djs),
-            HilStmt::SetField { table, value, .. } => {
-                resolve(table, ssa, djs);
-                walk_expr(value, ssa, djs);
-            }
             HilStmt::SetList { table, values, .. } => {
                 resolve(table, ssa, djs);
                 for v in values {

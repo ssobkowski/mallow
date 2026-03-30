@@ -221,7 +221,6 @@ fn interferes_with_build(stmt: &HilStmt, reg: u8) -> bool {
         HilStmt::SetList { table, values, .. } if *table == reg => {
             values.iter().any(|e| reads_register_expr(e, reg))
         }
-        HilStmt::SetField { table, value, .. } if *table == reg => reads_register_expr(value, reg),
         _ => reads_register(stmt, reg),
     }
 }

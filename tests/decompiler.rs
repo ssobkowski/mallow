@@ -165,15 +165,13 @@ fn normalize_output(output: &str) -> String {
 }
 
 fn discover_cases() -> Vec<PathBuf> {
-    let mut cases: Vec<_> = fs::read_dir(cases_root())
+    fs::read_dir(cases_root())
         .unwrap_or_else(|e| panic!("failed to read cases dir: {e}"))
         .filter_map(|entry| {
             let path = entry.unwrap_or_else(|e| panic!("bad entry: {e}")).path();
             path.is_dir().then_some(path)
         })
-        .collect();
-    cases.sort();
-    cases
+        .collect()
 }
 
 fn cases_root() -> PathBuf {
