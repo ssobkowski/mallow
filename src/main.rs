@@ -7,19 +7,15 @@ mod printer;
 mod scopes;
 mod structurer;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, process::Command};
 
 use clap::{Parser, Subcommand};
 
-use crate::hil::StructuredFunction;
+use crate::{disasm::DisasmError, hil::StructuredFunction};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// Enable verbose logging
-    #[arg(short, long, global = true)]
-    verbose: bool,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -28,26 +24,47 @@ struct Cli {
 enum Commands {
     /// Disassemble a bytecode file
     Disasm {
-        /// Path to the bytecode file
+        /// Path to the input bytecode file
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Path to the output file (optional)
-        /// If not provided, output will be printed to stdout
+        /// Output file path. Prints to stdout if omitted
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Decompile a bytecode file to a readable luau source code
+    /// Decompile a bytecode file to Luau source code
     Decompile {
-        /// Path to the bytecode file
+        /// Path to the input bytecode file
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Path to the output file (optional)
-        /// If not provided, output will be printed to stdout
+        /// Output file path. Prints to stdout if omitted
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Compile a Luau source file and decompile the resulting bytecode
+    Roundtrip {
+        /// Path to the input Luau source file
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output file path. Prints to stdout if omitted
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
+
+fn decompile_bytecode(bytecode: &[u8]) -> Result<String, DisasmError> {
+    let diasssembled = disasm::disassemble(bytecode)?;
+
+    let fns: Vec<_> = diasssembled
+        .protos
+        .iter()
+        .map(|proto| StructuredFunction::from_proto(proto, &diasssembled.protos))
+        .collect();
+
+    let ast = structurer::structure(fns, diasssembled.entry_proto as usize);
+    Ok(printer::print(&ast))
 }
 
 fn main() {
@@ -69,23 +86,43 @@ fn main() {
         }
         Commands::Decompile { input, output } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
-
-            let disassembled = match disasm::disassemble(&bytecode) {
-                Ok(d) => d,
+            let code = match decompile_bytecode(&bytecode) {
+                Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Error during disassembly: {}", e);
+                    eprintln!("Error during decompilation: {}", e);
                     return;
                 }
             };
 
-            let fns: Vec<_> = disassembled
-                .protos
-                .iter()
-                .map(|proto| StructuredFunction::from_proto(proto, &disassembled.protos))
-                .collect();
+            if let Err(e) = write_output(output, &code) {
+                eprintln!("Error writing decompilation output: {e}");
+            }
+        }
+        Commands::Roundtrip { input, output } => {
+            let compile_out = match Command::new("luau-compile")
+                .arg("--binary")
+                .arg(input)
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("failed to spawn luau-compile: {e}");
+                    return;
+                }
+            };
 
-            let ast = structurer::structure(fns, disassembled.entry_proto as usize);
-            let code = printer::print(&ast);
+            if !compile_out.status.success() {
+                eprintln!("failed to compile: {:?}", &output);
+                return;
+            }
+
+            let code = match decompile_bytecode(&compile_out.stdout) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error during decompilation: {}", e);
+                    return;
+                }
+            };
 
             if let Err(e) = write_output(output, &code) {
                 eprintln!("Error writing decompilation output: {e}");

@@ -1,6 +1,6 @@
 [package]
 name = "luaudec"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -8,12 +8,12 @@ clap = { version = "4.5.60", features = ["derive"] }
 id-arena = "2.3.0"
 smallvec = "1.15.1"
 smol_str = "0.3.5"
+tempfile = "3.26.0"
 thiserror = "2.0.18"
 
 [dev-dependencies]
 indoc = "2.0.7"
 libtest-mimic = "0.8.2"
-tempfile = "3.26.0"
 
 [[test]]
 name = "decompiler"
