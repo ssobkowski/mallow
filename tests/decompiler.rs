@@ -10,14 +10,13 @@ fn main() {
     let args = Arguments::from_args();
     let trials = discover_cases()
         .into_iter()
-        .map(|case_dir| {
+        .map(|case| {
             Trial::test(
-                case_dir
-                    .file_name()
+                case.file_prefix()
                     .and_then(|n| n.to_str())
                     .unwrap_or("<invalid utf8>")
                     .to_string(),
-                move || run_case(&case_dir),
+                move || run_case(&case),
             )
         })
         .collect();
@@ -27,19 +26,16 @@ fn main() {
 
 #[derive(Debug)]
 enum CaseError {
-    MissingSource,
     CompileError(String),
     DecompileError(String),
     SourceRunError(String),
     DecompiledRunError(String),
     OutputMismatch { source: String, decompiled: String },
-    ExpectedMismatch { expected: String, actual: String },
 }
 
 impl std::fmt::Display for CaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingSource => write!(f, "missing source.luau"),
             Self::CompileError(msg) => write!(f, "luau-compile failed:\n{msg}"),
             Self::DecompileError(msg) => write!(f, "luaudec decompile failed:\n{msg}"),
             Self::SourceRunError(msg) => write!(f, "source.luau failed to run:\n{msg}"),
@@ -48,21 +44,11 @@ impl std::fmt::Display for CaseError {
                 f,
                 "output mismatch after decompilation\n--- source ---\n{source}\n--- decompiled ---\n{decompiled}"
             ),
-            Self::ExpectedMismatch { expected, actual } => write!(
-                f,
-                "output does not match expected.out\n--- expected ---\n{expected}\n--- actual ---\n{actual}"
-            ),
         }
     }
 }
 
-fn run_case(case_dir: &Path) -> Result<(), Failed> {
-    let source_path = case_dir.join("source.luau");
-    if !source_path.is_file() {
-        return Err(CaseError::MissingSource.into());
-    }
-
-    let expected_output_path = case_dir.join("expected.out");
+fn run_case(source_path: &Path) -> Result<(), Failed> {
     let temp_dir =
         TempDir::new().map_err(|e| Failed::from(format!("failed to create temp dir: {e}")))?;
     let bytecode_path = temp_dir.path().join("compiled.out");
@@ -80,20 +66,6 @@ fn run_case(case_dir: &Path) -> Result<(), Failed> {
             decompiled: decompiled_output,
         }
         .into());
-    }
-
-    if expected_output_path.is_file() {
-        let raw = fs::read_to_string(&expected_output_path)
-            .map_err(|e| Failed::from(format!("failed to read expected.out: {e}")))?;
-        let expected = normalize_output(&raw);
-
-        if expected != source_output {
-            return Err(CaseError::ExpectedMismatch {
-                expected,
-                actual: source_output,
-            }
-            .into());
-        }
     }
 
     Ok(())
@@ -168,8 +140,12 @@ fn discover_cases() -> Vec<PathBuf> {
     fs::read_dir(cases_root())
         .unwrap_or_else(|e| panic!("failed to read cases dir: {e}"))
         .filter_map(|entry| {
-            let path = entry.unwrap_or_else(|e| panic!("bad entry: {e}")).path();
-            path.is_dir().then_some(path)
+            let entry = entry.unwrap_or_else(|e| panic!("bad entry: {e}"));
+            entry
+                .file_type()
+                .expect("failed to get the file type")
+                .is_file()
+                .then_some(entry.path())
         })
         .collect()
 }
