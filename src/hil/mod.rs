@@ -10,6 +10,7 @@ pub mod cflow;
 pub mod common;
 pub mod ir;
 pub mod lifter;
+pub mod passes;
 
 #[derive(Debug, Clone)]
 pub struct StructuredFunction {

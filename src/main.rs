@@ -57,11 +57,13 @@ enum Commands {
 fn decompile_bytecode(bytecode: &[u8]) -> Result<String, DisasmError> {
     let diasssembled = disasm::disassemble(bytecode)?;
 
-    let fns: Vec<_> = diasssembled
+    let mut fns: Vec<_> = diasssembled
         .protos
         .iter()
         .map(|proto| StructuredFunction::from_proto(proto, &diasssembled.protos))
         .collect();
+
+    hil::passes::run(&mut fns);
 
     let ast = structurer::structure(fns, diasssembled.entry_proto as usize);
     Ok(printer::print(&ast))
