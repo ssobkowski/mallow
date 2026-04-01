@@ -133,12 +133,13 @@ impl Structurer {
             }
             RegionNode::NumericFor {
                 body,
+                var,
                 start,
                 end,
                 step,
                 ..
             } => {
-                let var = self.get_symbol_name(start);
+                let var = self.get_symbol_name(var);
                 let start = Expr::Named(self.get_symbol_name(start));
                 let end = Expr::Named(self.get_symbol_name(end));
                 let step = Some(Expr::Named(self.get_symbol_name(step)));

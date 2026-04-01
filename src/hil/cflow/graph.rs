@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     ops::Range,
 };
 
@@ -26,6 +26,8 @@ use crate::{
 pub struct RawBlock {
     /// The range of instructions indices that belong to this block, excluding the potential exit instruction.
     instr_range: Range<usize>,
+    /// Registers written by an unlifted terminator instruction.
+    exit_writes: SmallVec<[u8; 4]>,
     exit: RawBlockExit,
 }
 
@@ -129,6 +131,7 @@ pub enum BlockExit {
         base: u8,
         body_block: usize,
         exit_block: usize,
+        var: SymbolId,
         start: SymbolId,
         end: SymbolId,
         step: SymbolId,
@@ -317,6 +320,11 @@ impl ControlFlowGraph {
                 (end, Some(last_instr))
             } else {
                 (end, None)
+            };
+            let exit_writes = if is_branch_or_return {
+                last_instr.written_registers()
+            } else {
+                SmallVec::new()
             };
 
             let exit_instr_idx = end.saturating_sub(1);
@@ -538,6 +546,7 @@ impl ControlFlowGraph {
 
             raw_blocks.push(RawBlock {
                 instr_range: start..body_end,
+                exit_writes,
                 exit,
             });
         }
@@ -568,6 +577,13 @@ impl ControlFlowGraph {
                 ssa: &mut ssa,
                 block_idx: block_id,
             });
+
+            // Some terminators, such as FORGLOOP, write registers even though they
+            // are modeled as block exits and never pass through the lifter.
+            for &reg in &raw_blocks[block_id].exit_writes {
+                let sym = ssa.alloc_symbol(Symbol::reg(reg));
+                ssa.write_reg(block_id, reg, sym);
+            }
 
             let exit = match &raw_blocks[block_id].exit {
                 RawBlockExit::Jump(t) => BlockExit::Jump(*t),
@@ -607,6 +623,7 @@ impl ControlFlowGraph {
                     body_block,
                     exit_block,
                 } => {
+                    let var = ssa.read_reg(*body_block, *base + 2);
                     let start = ssa.read_reg(block_id, *base + 2);
                     let end = ssa.read_reg(block_id, *base);
                     let step = ssa.read_reg(block_id, *base + 1);
@@ -614,6 +631,7 @@ impl ControlFlowGraph {
                         base: *base,
                         body_block: *body_block,
                         exit_block: *exit_block,
+                        var,
                         start,
                         end,
                         step,
@@ -655,7 +673,7 @@ impl ControlFlowGraph {
                     body_block: *body_block,
                     exit_block: *exit_block,
                     vars: (0..*result_count)
-                        .map(|i| ssa.read_reg(block_id, *base + 3 + i as u8))
+                        .map(|i| ssa.read_reg(*body_block, *base + 3 + i as u8))
                         .collect(),
                 },
                 RawBlockExit::Return { base, count } => match decoded_count(*count) {
@@ -715,10 +733,13 @@ impl ControlFlowGraph {
         ssa.finish(&mut blocks);
 
         let mut disjoint_set = UnionFind::new();
-        for block in &blocks {
+        for (block_idx, block) in blocks.iter().enumerate() {
             for stmt in &block.stmts {
                 if let HilStmt::Phi(phi) = &stmt.inner {
-                    for (_, operand) in &phi.operands {
+                    for (pred_block, operand) in &phi.operands {
+                        if is_loop_header_seed_operand(&blocks, block_idx, *pred_block) {
+                            continue;
+                        }
                         disjoint_set.union(phi.target, *operand);
                     }
                 }
@@ -858,6 +879,23 @@ impl ControlFlowGraph {
             return;
         };
 
+        let mut loop_header_targets = HashSet::new();
+        for pred_idx in self.predecessors(block_idx) {
+            match &self.blocks[*pred_idx].exit {
+                BlockExit::FornPrep {
+                    body_block, var, ..
+                } if *body_block == block_idx => {
+                    loop_header_targets.insert(*var);
+                }
+                BlockExit::ForgLoop {
+                    body_block, vars, ..
+                } if *body_block == block_idx => {
+                    loop_header_targets.extend(vars.iter().copied());
+                }
+                _ => {}
+            }
+        }
+
         let phis: Vec<_> = self.blocks[block_idx]
             .stmts
             .extract_if(.., |stmt| matches!(stmt.inner, HilStmt::Phi { .. }))
@@ -871,6 +909,12 @@ impl ControlFlowGraph {
             .collect();
 
         for (target, operands) in phis {
+            // Skip unfolding phi nodes of loop header targets, as the loop itself
+            // initializes the variable.
+            if loop_header_targets.contains(&target) {
+                continue;
+            }
+
             if operands.iter().all(|(_, version)| *version == target) {
                 continue;
             }
@@ -1105,6 +1149,19 @@ fn build_loop_indexes(blocks: &[Block]) -> (HashMap<u8, Vec<usize>>, HashMap<u8,
     }
 
     (numeric_loops_by_base, generic_loops_by_base)
+}
+
+#[must_use]
+fn is_loop_header_seed_operand(blocks: &[Block], block_idx: usize, pred_block: usize) -> bool {
+    let Some(pred) = blocks.get(pred_block) else {
+        return false;
+    };
+
+    matches!(
+        pred.exit,
+        BlockExit::FornPrep { body_block, .. } | BlockExit::ForgPrep { body_block, .. }
+            if body_block == block_idx
+    )
 }
 
 #[must_use]
@@ -1415,8 +1472,13 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
                 walk_expr(cond, ssa, djs);
             }
             BlockExit::FornPrep {
-                start, end, step, ..
+                var,
+                start,
+                end,
+                step,
+                ..
             } => {
+                resolve(var, ssa, djs);
                 resolve(start, ssa, djs);
                 resolve(end, ssa, djs);
                 resolve(step, ssa, djs);

@@ -363,6 +363,10 @@ impl Instr {
                 );
                 (base..base + *var_count).collect()
             }
+            Instr::FornLoop { base, .. } => {
+                let reg = *base + 2;
+                smallvec![reg]
+            }
 
             Instr::Call {
                 func, ret_count, ..

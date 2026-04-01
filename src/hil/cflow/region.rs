@@ -42,6 +42,7 @@ pub enum RegionNode {
     /// A structured numeric `for` loop recovered from `FORNPREP/FORNLOOP`.
     NumericFor {
         body: RegionBlock,
+        var: SymbolId,
         start: SymbolId,
         end: SymbolId,
         step: SymbolId,
@@ -198,6 +199,7 @@ impl<'a> RegionBuilder<'a> {
                 BlockExit::FornPrep {
                     base,
                     body_block,
+                    var,
                     start,
                     end,
                     step,
@@ -213,6 +215,7 @@ impl<'a> RegionBuilder<'a> {
                         );
                         nodes.push(RegionNode::NumericFor {
                             body,
+                            var: *var,
                             start: *start,
                             end: *end,
                             step: *step,
