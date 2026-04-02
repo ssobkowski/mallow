@@ -172,6 +172,7 @@ impl VisitorMut for Inliner {
         if let HilExpr::Symbol(sym) = expr
             && let Some(v) = self.vars.get(sym)
             && self.can_inline(v)
+            && !v.expr.reads_symbol(sym)
         {
             self.was_changed = true;
             *expr = v.expr.clone();

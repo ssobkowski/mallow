@@ -76,6 +76,39 @@ pub enum HilExpr {
     VarArgs,
 }
 
+impl HilExpr {
+    pub fn reads_symbol(&self, sym: &SymbolId) -> bool {
+        match self {
+            HilExpr::Symbol(s) => s == sym,
+            HilExpr::GetField { obj, .. } => obj.reads_symbol(sym),
+            HilExpr::GetIndex { obj, index } => obj.reads_symbol(sym) || index.reads_symbol(sym),
+            HilExpr::Call { fun, args } => {
+                fun.reads_symbol(sym) || args.iter().any(|arg| arg.reads_symbol(sym))
+            }
+            HilExpr::MethodCall { object, args, .. } => {
+                object.reads_symbol(sym) || args.iter().any(|arg| arg.reads_symbol(sym))
+            }
+            HilExpr::Binary { lhs, rhs, .. } => lhs.reads_symbol(sym) || rhs.reads_symbol(sym),
+            HilExpr::Unary { expr, .. } => expr.reads_symbol(sym),
+            HilExpr::If {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                condition.reads_symbol(sym)
+                    || then_expr.reads_symbol(sym)
+                    || else_expr.reads_symbol(sym)
+            }
+            HilExpr::Table { items } => items.iter().any(|item| match item {
+                HilTableItem::List(expr) => expr.reads_symbol(sym),
+                HilTableItem::Index(key, value) => key.reads_symbol(sym) || value.reads_symbol(sym),
+                HilTableItem::Packed(expr) => expr.reads_symbol(sym),
+            }),
+            _ => false,
+        }
+    }
+}
+
 /// One closure capture operand attached to a nested function literal.
 #[derive(Debug, Clone)]
 pub enum HilCapture {
