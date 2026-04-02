@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
+use std::ops::Index;
 
 /// Represents a single lexical scope, tracking variable names and
 /// their associated values (if any).
@@ -36,11 +38,31 @@ impl<K: Hash + Eq, V> Scope<K, V> {
         self.variables.get(name)
     }
 
+    /// Gets a mutable reference to a variable in the scope, if it exists.
+    #[inline]
+    pub fn get_mut(&mut self, name: &K) -> Option<&mut V> {
+        self.variables.get_mut(name)
+    }
+
     /// Returns whether the scope contains a variable with the given name.
     #[inline]
     #[must_use]
     pub fn contains(&self, name: &K) -> bool {
         self.variables.contains_key(name)
+    }
+
+    /// Returns an [`Entry`] for the given name, allowing mutation of the value.
+    #[inline]
+    pub fn entry(&mut self, name: K) -> Entry<'_, K, V> {
+        self.variables.entry(name)
+    }
+}
+
+impl<K: Hash + Eq, V> Index<&K> for Scope<K, V> {
+    type Output = V;
+
+    fn index(&self, name: &K) -> &Self::Output {
+        self.variables.index(name)
     }
 }
 
@@ -65,6 +87,8 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
     /// Pushes a new scope onto the stack.
     #[inline]
     pub fn push_scope(&mut self) -> &mut Scope<K, V> {
+        // TODO: https://github.com/rust-lang/rust/issues/151252
+        // perhaps it will get introduced with rust 1.95?
         self.scopes.push(Scope::new());
         self.scopes.last_mut().expect("scope was just pushed")
     }
@@ -85,6 +109,12 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Scope<K, V>> {
         self.scopes.iter().rev()
+    }
+
+    /// Returns a mutable iterator over the scopes from innermost to outermost.
+    #[inline]
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Scope<K, V>> {
+        self.scopes.iter_mut().rev()
     }
 
     /// Pops the current scope from the stack.
@@ -111,6 +141,14 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
     #[must_use]
     pub fn get(&self, name: &K) -> Option<&V> {
         self.iter().find_map(|s| s.get(name))
+    }
+
+    /// Returns a mutable reference to a variable in the current scope, if it exists.
+    /// If one cannot be found in the current scope, it will search
+    /// parent scopes until it finds one or exhausts all scopes.
+    #[inline]
+    pub fn get_mut(&mut self, name: &K) -> Option<&mut V> {
+        self.iter_mut().find_map(|s| s.get_mut(name))
     }
 
     /// Returns whether the given name is declared in the current

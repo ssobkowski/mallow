@@ -23,7 +23,10 @@ pub fn invert_condition(expr: HilExpr) -> HilExpr {
                 }
             }
         }
-        HilExpr::Unary { op, expr: inner } if op == UnOp::Not => *inner,
+        HilExpr::Unary {
+            op: UnOp::Not,
+            expr: inner,
+        } => *inner,
         _ => HilExpr::Unary {
             op: UnOp::Not,
             expr: Box::new(expr),

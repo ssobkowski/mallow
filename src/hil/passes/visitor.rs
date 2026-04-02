@@ -58,6 +58,8 @@ pub trait Visitor {
         self.visit_symbol(sym);
     }
 
+    fn visit_capture(&mut self, _index: usize, _sym: SymbolId) {}
+
     fn visit_symbol(&mut self, _sym: SymbolId) {}
 
     fn visit_number(&mut self, _number: f64) {}
@@ -119,6 +121,8 @@ pub trait VisitorMut {
         self.visit_symbol(sym);
     }
 
+    fn visit_capture(&mut self, _index: usize, _sym: &mut SymbolId) {}
+
     fn visit_symbol(&mut self, _sym: &mut SymbolId) {}
 
     fn visit_number(&mut self, _number: &mut f64) {}
@@ -166,7 +170,26 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
             visitor.visit_expr(condition);
             visitor.visit_region(body, cfg);
         }
-        RegionNode::NumericFor { body, .. } | RegionNode::GenericFor { body, .. } => {
+        RegionNode::NumericFor {
+            body,
+            var,
+            start,
+            end,
+            step,
+        } => {
+            visitor.visit_symbol(*var);
+            visitor.visit_expr(start);
+            visitor.visit_expr(end);
+            visitor.visit_expr(step);
+            visitor.visit_region(body, cfg);
+        }
+        RegionNode::GenericFor { body, vars, exprs } => {
+            for expr in exprs {
+                visitor.visit_expr(expr);
+            }
+            for var in vars {
+                visitor.visit_symbol(*var);
+            }
             visitor.visit_region(body, cfg);
         }
         RegionNode::Continue | RegionNode::Break => {}
@@ -220,8 +243,8 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
         HilExpr::Bool(value) => visitor.visit_bool(*value),
         HilExpr::Symbol(symbol) => visitor.visit_symbol(*symbol),
         HilExpr::Closure { captures, .. } => {
-            for capture in captures {
-                visitor.visit_symbol(*capture);
+            for (index, capture) in captures.iter().enumerate() {
+                visitor.visit_capture(index, *capture);
             }
         }
         HilExpr::Global(name) => visitor.visit_global(name),
@@ -327,7 +350,26 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
             visitor.visit_expr(condition);
             visitor.visit_region(body, cfg);
         }
-        RegionNode::NumericFor { body, .. } | RegionNode::GenericFor { body, .. } => {
+        RegionNode::NumericFor {
+            body,
+            var,
+            start,
+            end,
+            step,
+        } => {
+            visitor.visit_symbol(var);
+            visitor.visit_expr(start);
+            visitor.visit_expr(end);
+            visitor.visit_expr(step);
+            visitor.visit_region(body, cfg);
+        }
+        RegionNode::GenericFor { body, vars, exprs } => {
+            for expr in exprs {
+                visitor.visit_expr(expr);
+            }
+            for var in vars {
+                visitor.visit_symbol(var);
+            }
             visitor.visit_region(body, cfg);
         }
         RegionNode::Continue | RegionNode::Break => {}
@@ -380,8 +422,8 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut HilExpr
         HilExpr::Bool(value) => visitor.visit_bool(value),
         HilExpr::Symbol(symbol) => visitor.visit_symbol(symbol),
         HilExpr::Closure { captures, .. } => {
-            for capture in captures {
-                visitor.visit_symbol(capture);
+            for (index, capture) in captures.iter_mut().enumerate() {
+                visitor.visit_capture(index, capture);
             }
         }
         HilExpr::Global(name) => visitor.visit_global(name),

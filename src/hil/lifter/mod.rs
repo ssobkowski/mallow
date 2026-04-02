@@ -1,4 +1,3 @@
-// mod passes;
 pub mod ssa;
 
 use ssa::Ssa;

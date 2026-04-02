@@ -140,9 +140,9 @@ impl Structurer {
                 ..
             } => {
                 let var = self.get_symbol_name(var);
-                let start = Expr::Named(self.get_symbol_name(start));
-                let end = Expr::Named(self.get_symbol_name(end));
-                let step = Some(Expr::Named(self.get_symbol_name(step)));
+                let start = self.visit_expr(start);
+                let end = self.visit_expr(end);
+                let step = Some(self.visit_expr(step));
 
                 let body = self.visit_region(body, cfg);
                 buf.push(Stmt::NumericFor {
@@ -157,10 +157,7 @@ impl Structurer {
                 vars, exprs, body, ..
             } => {
                 let vars = vars.iter().map(|s| self.get_symbol_name(s)).collect();
-                let exprs = exprs
-                    .iter()
-                    .map(|sym| Expr::Named(self.get_symbol_name(sym)))
-                    .collect();
+                let exprs = exprs.iter().map(|expr| self.visit_expr(expr)).collect();
                 let body = self.visit_region(body, cfg);
                 buf.push(Stmt::GenericFor { vars, exprs, body });
             }
@@ -402,7 +399,7 @@ impl Structurer {
             HilExpr::GetField { obj, field } => {
                 let base = Box::new(self.visit_expr(obj));
 
-                if is_valid_luau_identifier(&field) {
+                if is_valid_luau_identifier(field) {
                     Expr::Field {
                         base,
                         field: Identifier::new(field.clone()),

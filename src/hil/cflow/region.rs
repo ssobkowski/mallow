@@ -43,15 +43,15 @@ pub enum RegionNode {
     NumericFor {
         body: RegionBlock,
         var: SymbolId,
-        start: SymbolId,
-        end: SymbolId,
-        step: SymbolId,
+        start: HilExpr,
+        end: HilExpr,
+        step: HilExpr,
     },
     /// A structured generic `for` loop recovered from `FORGPREP/FORGLOOP`.
     GenericFor {
         body: RegionBlock,
         vars: SmallVec<[SymbolId; 3]>,
-        exprs: [SymbolId; 3],
+        exprs: [HilExpr; 3],
     },
     /// Explicit `continue` edge for a recovered loop.
     Continue,
@@ -216,9 +216,9 @@ impl<'a> RegionBuilder<'a> {
                         nodes.push(RegionNode::NumericFor {
                             body,
                             var: *var,
-                            start: *start,
-                            end: *end,
-                            step: *step,
+                            start: start.clone(),
+                            end: end.clone(),
+                            step: step.clone(),
                         });
                         curr_id = tail.exit;
                     } else {
@@ -244,7 +244,7 @@ impl<'a> RegionBuilder<'a> {
                         );
                         nodes.push(RegionNode::GenericFor {
                             vars: tail.vars.clone(),
-                            exprs: *exprs,
+                            exprs: exprs.clone(),
                             body,
                         });
                         curr_id = tail.exit;

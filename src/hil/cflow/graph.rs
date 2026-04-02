@@ -132,9 +132,9 @@ pub enum BlockExit {
         body_block: usize,
         exit_block: usize,
         var: SymbolId,
-        start: SymbolId,
-        end: SymbolId,
-        step: SymbolId,
+        start: HilExpr,
+        end: HilExpr,
+        step: HilExpr,
     },
     FornLoop {
         base: u8,
@@ -145,7 +145,7 @@ pub enum BlockExit {
         base: u8,
         body_block: usize,
         exit_block: usize,
-        exprs: [SymbolId; 3],
+        exprs: [HilExpr; 3],
     },
     ForgLoop {
         base: u8,
@@ -632,9 +632,9 @@ impl ControlFlowGraph {
                         body_block: *body_block,
                         exit_block: *exit_block,
                         var,
-                        start,
-                        end,
-                        step,
+                        start: HilExpr::Symbol(start),
+                        end: HilExpr::Symbol(end),
+                        step: HilExpr::Symbol(step),
                     }
                 }
                 RawBlockExit::FornLoop {
@@ -652,9 +652,9 @@ impl ControlFlowGraph {
                     exit_block,
                 } => {
                     let exprs = [
-                        ssa.read_reg(block_id, *base),
-                        ssa.read_reg(block_id, *base + 1),
-                        ssa.read_reg(block_id, *base + 2),
+                        HilExpr::Symbol(ssa.read_reg(block_id, *base)),
+                        HilExpr::Symbol(ssa.read_reg(block_id, *base + 1)),
+                        HilExpr::Symbol(ssa.read_reg(block_id, *base + 2)),
                     ];
                     BlockExit::ForgPrep {
                         base: *base,
@@ -1311,29 +1311,28 @@ fn fold_condition_diamonds(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
 
         if let Some((result_reg, truthy_value, then_d, else_e)) =
             match_truthy_guard(&blocks[then_b])
+            && else_b == else_e
         {
-            if else_b == else_e {
-                blocks[i].stmts.push(
-                    HilStmt::Assign {
-                        left: HilExpr::Symbol(result_reg),
-                        value: HilExpr::Binary {
-                            lhs: Box::new(cond.clone()),
-                            op: BinOp::And,
-                            rhs: Box::new(truthy_value),
-                        },
-                    }
-                    .to_spanned(0),
-                );
+            blocks[i].stmts.push(
+                HilStmt::Assign {
+                    left: HilExpr::Symbol(result_reg),
+                    value: HilExpr::Binary {
+                        lhs: Box::new(cond.clone()),
+                        op: BinOp::And,
+                        rhs: Box::new(truthy_value),
+                    },
+                }
+                .to_spanned(0),
+            );
 
-                blocks[i].exit = BlockExit::CondJump {
-                    cond: HilExpr::Symbol(result_reg),
-                    then_block: then_d,
-                    else_block: else_b,
-                };
+            blocks[i].exit = BlockExit::CondJump {
+                cond: HilExpr::Symbol(result_reg),
+                then_block: then_d,
+                else_block: else_b,
+            };
 
-                was_changed = true;
-                continue;
-            }
+            was_changed = true;
+            continue;
         }
 
         if let (
@@ -1479,13 +1478,13 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
                 ..
             } => {
                 resolve(var, ssa, djs);
-                resolve(start, ssa, djs);
-                resolve(end, ssa, djs);
-                resolve(step, ssa, djs);
+                walk_expr(start, ssa, djs);
+                walk_expr(end, ssa, djs);
+                walk_expr(step, ssa, djs);
             }
             BlockExit::ForgPrep { exprs, .. } => {
                 for e in exprs {
-                    resolve(e, ssa, djs);
+                    walk_expr(e, ssa, djs);
                 }
             }
             BlockExit::ForgLoop { vars, .. } => {
