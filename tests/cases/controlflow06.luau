@@ -1,7 +1,7 @@
 local rows = {
     { 1, 2, 3 },
     { 4, 5 },
-    { 6 },
+    { 6, 7, 8, 9 },
 }
 
 for row_index, row in ipairs(rows) do
@@ -10,9 +10,10 @@ for row_index, row in ipairs(rows) do
     for column_index, value in ipairs(row) do
         if column_index % 2 == 0 then
             row_total = row_total + value * 2
-        else
-            row_total = row_total + value
+            continue
         end
+
+        row_total = row_total + value
     end
 
     print("row", row_index, row_total)
