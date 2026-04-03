@@ -112,7 +112,7 @@ impl Block {
     pub fn dummy() -> Self {
         Self {
             stmts: Vec::new(),
-            exit: BlockExit::Return(Vec::new()),
+            exit: BlockExit::Return(SmallVec::new()),
         }
     }
 }
@@ -153,7 +153,7 @@ pub enum BlockExit {
         exit_block: usize,
         vars: SmallVec<[SymbolId; 3]>,
     },
-    Return(Vec<HilExpr>),
+    Return(SmallVec<[HilExpr; 3]>),
 }
 
 impl BlockExit {
@@ -678,7 +678,7 @@ impl ControlFlowGraph {
                 },
                 RawBlockExit::Return { base, count } => match decoded_count(*count) {
                     Count::Variadic => {
-                        let mut rets = Vec::new();
+                        let mut rets = SmallVec::new();
                         if let Some(multiret) = pending_multiret.take() {
                             if multiret.base >= *base {
                                 for i in *base..multiret.base {

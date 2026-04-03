@@ -58,7 +58,7 @@ pub enum RegionNode {
     /// Explicit `break` edge from a loop body.
     Break,
     /// Explicit return.
-    Return { values: Vec<HilExpr> },
+    Return { values: SmallVec<[HilExpr; 3]> },
 }
 
 /// Stateful region builder used to avoid recursive region expansion loops.
