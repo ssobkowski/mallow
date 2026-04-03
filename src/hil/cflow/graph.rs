@@ -410,8 +410,8 @@ impl ControlFlowGraph {
                             op: BinOp::Gt,
                             rhs: CondRhs::Reg(aux),
                         },
-                        then_block: block_idx + 1,
-                        else_block: pc_to_block_idx(&entries, target),
+                        then_block: pc_to_block_idx(&entries, target),
+                        else_block: block_idx + 1,
                     }
                 }
                 Some(Instr::JumpIfLt { reg, aux, offset }) => {
@@ -729,6 +729,24 @@ impl ControlFlowGraph {
             ssa.mark_filled(block_id);
         }
 
+        // Braun's algorithm is lazy. If a variable is modified in a repeat..until loop,
+        // the header might never read it, preventing a Phi node from forming and fragmenting
+        // the variable. We force a read on all registers at every loop header to guarantee
+        // the Union-Find stitches them together.
+        for (src, targets) in successors.iter().enumerate() {
+            for &target in targets {
+                // Heuristic: If target <= src, it's a backedge, making target a loop header.
+                if target <= src {
+                    for r in 0..proto.max_stack_size {
+                        ssa.read_reg(target, r);
+                    }
+                    for u in 0..proto.num_upvals {
+                        ssa.read_upval(target, u);
+                    }
+                }
+            }
+        }
+
         ssa.seal_blocks();
         ssa.finish(&mut blocks);
 
@@ -788,12 +806,18 @@ impl ControlFlowGraph {
         }
 
         let blocks = loop {
-            let (changed, new_blocks) = fold_condition_diamonds(blocks);
-            if !changed {
+            let (changed_cd, new_blocks) = fold_condition_diamonds(blocks);
+
+            let successors = build_successors(new_blocks.iter().map(|b| b.exit.exit_targets()));
+            let predecessors = build_predecessors(&successors);
+            let (changed_sc, new_blocks) = fold_short_circuits(new_blocks, &predecessors);
+
+            if !changed_cd && !changed_sc {
                 break new_blocks;
             }
             blocks = new_blocks;
         };
+
         let (numeric_loops_by_base, generic_loops_by_base) = build_loop_indexes(&blocks);
 
         // Rebuild after folding
@@ -1440,6 +1464,80 @@ fn thread_jumps(blocks: &mut [Block]) -> bool {
     was_changed
 }
 
+/// Folds cascaded conditional jumps into single short-circuited AND/OR conditions.
+fn fold_short_circuits(mut blocks: Vec<Block>, predecessors: &[Vec<usize>]) -> (bool, Vec<Block>) {
+    let mut was_changed = false;
+
+    for i in 0..blocks.len() {
+        let (cond_a, then_a, else_a) = match &blocks[i].exit {
+            BlockExit::CondJump {
+                cond,
+                then_block,
+                else_block,
+            } => (cond.clone(), *then_block, *else_block),
+            _ => continue,
+        };
+
+        // AND Folding: `if A then (if B then T else F) else F` -> `if A and B then T else F`
+        if predecessors[then_a].len() == 1 && is_safe_to_hoist(&blocks[then_a]) {
+            if let BlockExit::CondJump {
+                cond: cond_b,
+                then_block: then_b,
+                else_block: else_b,
+            } = blocks[then_a].exit.clone()
+            {
+                if else_a == else_b {
+                    // Steal the safe statements and move them before our combined condition
+                    let mut stmts = std::mem::take(&mut blocks[then_a].stmts);
+                    blocks[i].stmts.append(&mut stmts);
+
+                    blocks[i].exit = BlockExit::CondJump {
+                        cond: HilExpr::Binary {
+                            lhs: Box::new(cond_a.clone()),
+                            op: BinOp::And,
+                            rhs: Box::new(cond_b),
+                        },
+                        then_block: then_b,
+                        else_block: else_a,
+                    };
+                    was_changed = true;
+                    continue;
+                }
+            }
+        }
+
+        // OR Folding: `if A then T else (if B then T else F)` -> `if A or B then T else F`
+        if predecessors[else_a].len() == 1 && is_safe_to_hoist(&blocks[else_a]) {
+            if let BlockExit::CondJump {
+                cond: cond_b,
+                then_block: then_b,
+                else_block: else_b,
+            } = blocks[else_a].exit.clone()
+            {
+                if then_a == then_b {
+                    // Steal the safe statements and move them before our combined condition
+                    let mut stmts = std::mem::take(&mut blocks[else_a].stmts);
+                    blocks[i].stmts.append(&mut stmts);
+
+                    blocks[i].exit = BlockExit::CondJump {
+                        cond: HilExpr::Binary {
+                            lhs: Box::new(cond_a.clone()),
+                            op: BinOp::Or,
+                            rhs: Box::new(cond_b),
+                        },
+                        then_block: then_a,
+                        else_block: else_b,
+                    };
+                    was_changed = true;
+                    continue;
+                }
+            }
+        }
+    }
+
+    (was_changed, blocks)
+}
+
 fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<SymbolId>) {
     fn resolve(sym: &mut SymbolId, ssa: &Ssa, djs: &mut UnionFind<SymbolId>) {
         let resolved = ssa.resolve(*sym);
@@ -1573,4 +1671,22 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
         }
         walk_exit(&mut block.exit, ssa, djs);
     }
+}
+
+fn is_safe_to_hoist(block: &Block) -> bool {
+    block.stmts.iter().all(|stmt| {
+        if let HilStmt::Assign { value, .. } = &stmt.inner {
+            matches!(
+                value,
+                HilExpr::Number(_)
+                    | HilExpr::Bool(_)
+                    | HilExpr::String(_)
+                    | HilExpr::Nil
+                    | HilExpr::Symbol(_)
+                    | HilExpr::Import(_)
+            )
+        } else {
+            false
+        }
+    })
 }

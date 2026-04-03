@@ -130,39 +130,102 @@ impl<'a> RegionBuilder<'a> {
                     let then_backedges = branch_has_plain_backedge(*then_block, curr_id, self.cfg);
                     let else_backedges = branch_has_plain_backedge(*else_block, curr_id, self.cfg);
 
-                    if then_backedges != else_backedges {
+                    let then_is_continue = Some(*then_block) == stop_at;
+                    let else_is_continue = Some(*else_block) == stop_at;
+
+                    if then_backedges != else_backedges && !then_is_continue && !else_is_continue {
                         let (loop_block, exit_branch, loop_branch_is_then) = if then_backedges {
                             (*then_block, *else_block, true)
                         } else {
                             (*else_block, *then_block, false)
                         };
+
                         let exit_block =
                             find_loop_exit_block(curr_id, exit_branch, loop_block, self.cfg);
 
-                        let mut body = self.build_region_with_loop(
-                            loop_block,
-                            Some(curr_id),
-                            Some(exit_block),
-                        );
+                        // We already know this is a loop header (either then or else is a backedge
+                        // to the current block), the way to distinguish a while from a repeat..until
+                        // is that repeat..until will have already been visited - repeat..until's CondJump
+                        // is at the bottom, while while's CondJump is at the top.
+                        let is_repeat =
+                            loop_block < curr_id || visited_in_region.contains(&loop_block);
 
-                        if loop_branch_is_then {
-                            // while
-                            nodes.push(RegionNode::While {
-                                condition: cond.clone(),
-                                body,
-                            });
+                        // until <cond> is inverse of while <cond> - but the logic for `loop_branch_is_then`
+                        // still stands, so we flip it with a XOR if it's a repeat loop
+                        let condition = if loop_branch_is_then ^ is_repeat {
+                            cond.clone()
                         } else {
-                            // repeat..until
-                            if matches!(nodes.last(), Some(RegionNode::BasicBlock { block: b }) if *b == curr_id)
-                            {
-                                nodes.pop();
-                                body.nodes
-                                    .insert(0, RegionNode::BasicBlock { block: curr_id });
-                            }
+                            invert_condition(cond.clone())
+                        };
 
+                        if is_repeat {
+                            // We have already inserted the loop's body as regular region nodes. The loop body
+                            // is essentially everything up to block 'loop_block'.
+
+                            // We find the "split point" between what is our body and what is not.
+                            let split = nodes
+                                .iter()
+                                .rposition(|node| matches!(node, RegionNode::BasicBlock { block } if *block < loop_block))
+                                .map_or(0, |i| i + 1);
+                            // Then remove everything up to that point that we have added previously.
+                            let loop_body: Vec<_> = nodes.drain(split..).collect();
                             nodes.push(RegionNode::RepeatUntil {
-                                condition: cond.clone(),
-                                body,
+                                condition,
+                                body: RegionBlock { nodes: loop_body },
+                            })
+                        } else if exit_branch == exit_block {
+                            // A standard while loop - the exit branch doesn't contain any hidden
+                            // statements we care about, so we can safely extract the condition.
+                            let body = self.build_region_with_loop(
+                                loop_block,
+                                Some(curr_id),
+                                Some(exit_block),
+                            );
+                            nodes.push(RegionNode::While { condition, body });
+                        } else {
+                            // The exit branch is an early break containing statements (like `found = index; break`).
+                            // If we extract this as a `while cond` loop, we will set `curr_id = exit_block` and
+                            // completely skip processing the exit branch, deleting its statements.
+                            // To preserve them, we emit a `while true do` loop and treat the condition as an `If`.
+                            let header_node = if !block.stmts.is_empty() {
+                                Some(nodes.pop().unwrap())
+                            } else {
+                                None
+                            };
+
+                            let break_cond = if loop_branch_is_then {
+                                invert_condition(cond.clone())
+                            } else {
+                                cond.clone()
+                            };
+
+                            let break_node = RegionNode::If {
+                                condition: break_cond,
+                                // Safely parse the exit branch so we don't lose the statements.
+                                then_branch: self.build_branch_region(
+                                    exit_branch,
+                                    Some(exit_block),
+                                    Some(exit_block),
+                                ),
+                                else_branch: RegionBlock::default(),
+                            };
+
+                            let mut loop_body = Vec::new();
+                            if let Some(node) = header_node {
+                                loop_body.push(node);
+                            }
+                            loop_body.push(break_node);
+
+                            let rest = self.build_region_with_loop(
+                                loop_block,
+                                Some(curr_id),
+                                Some(exit_block),
+                            );
+                            loop_body.extend(rest.nodes);
+
+                            nodes.push(RegionNode::While {
+                                condition: HilExpr::Bool(true),
+                                body: RegionBlock { nodes: loop_body },
                             });
                         }
 
@@ -170,11 +233,65 @@ impl<'a> RegionBuilder<'a> {
                         continue;
                     }
 
-                    let merge_block = find_if_else_join(*then_block, *else_block, self.cfg);
-                    let mut then_branch =
-                        self.build_branch_region(*then_block, merge_block, loop_exit);
-                    let mut else_branch =
-                        self.build_branch_region(*else_block, merge_block, loop_exit);
+                    // Detect if either branch immediately jumps to the loop boundaries.
+                    // stop_at = loop header (Continue), loop_exit = loop end (Break)
+                    let then_is_break = Some(*then_block) == loop_exit;
+                    let else_is_break = Some(*else_block) == loop_exit;
+
+                    let then_terminal = then_is_continue || then_is_break;
+                    let else_terminal = else_is_continue || else_is_break;
+
+                    let merge_block;
+                    let mut then_branch = RegionBlock::default();
+                    let mut else_branch = RegionBlock::default();
+
+                    if then_terminal && else_terminal {
+                        // Case 1: Both branches exit the loop, (e.g. if <cond> then break else continue end),
+                        // there is no merge point because control flow never survives this block
+                        merge_block = None;
+                        if then_is_continue {
+                            then_branch.nodes.push(RegionNode::Continue);
+                        }
+                        if then_is_break {
+                            then_branch.nodes.push(RegionNode::Break);
+                        }
+                        if else_is_continue {
+                            else_branch.nodes.push(RegionNode::Continue);
+                        }
+                        if else_is_break {
+                            else_branch.nodes.push(RegionNode::Break);
+                        }
+                    } else if then_terminal {
+                        // Case 2: `then` is an early exit.
+                        // We do NOT want to put the rest of the loop inside the `else` block.
+                        // By setting `merge_block = else_block` and leaving `else_branch` empty,
+                        // we force the structurer to emit `if cond then break end`, and then
+                        // naturally process `else_block` as the next sequential statements.
+                        merge_block = Some(*else_block);
+                        if then_is_continue {
+                            then_branch.nodes.push(RegionNode::Continue);
+                        }
+                        if then_is_break {
+                            then_branch.nodes.push(RegionNode::Break);
+                        }
+                    } else if else_terminal {
+                        // Case 3: `else` is an early exit.
+                        // Exact same logic as above, but flipped. `then_branch` is deliberately empty.
+                        merge_block = Some(*then_block);
+                        if else_is_continue {
+                            else_branch.nodes.push(RegionNode::Continue);
+                        }
+                        if else_is_break {
+                            else_branch.nodes.push(RegionNode::Break);
+                        }
+                    } else {
+                        // Case 4: Standard if/else
+                        // Neither branch is a loop exit. We safely find where they rejoin in the CFG,
+                        // and recursively build both branches up to that point.
+                        merge_block = find_if_else_join(*then_block, *else_block, self.cfg);
+                        then_branch = self.build_branch_region(*then_block, merge_block, loop_exit);
+                        else_branch = self.build_branch_region(*else_block, merge_block, loop_exit);
+                    }
 
                     // Invert then-branch and else-branch if then-branch is empty, and else-branch isn't
                     // (CFG's short circuit folding leaves if's like that.) It also simply looks better.
