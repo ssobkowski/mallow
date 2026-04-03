@@ -780,6 +780,13 @@ impl ControlFlowGraph {
             upvalues.push(disjoint_set.find(id));
         }
 
+        loop {
+            let changed = thread_jumps(&mut blocks);
+            if !changed {
+                break;
+            }
+        }
+
         let blocks = loop {
             let (changed, new_blocks) = fold_condition_diamonds(blocks);
             if !changed {
@@ -1372,6 +1379,65 @@ fn fold_condition_diamonds(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
     }
 
     (was_changed, blocks)
+}
+
+/// Folds blocks with no statements and single jump exits.
+///
+/// # Returns
+/// `true` if any blocks were folded, `false` otherwise.
+fn thread_jumps(blocks: &mut [Block]) -> bool {
+    let mut was_changed = false;
+    for block_idx in 0..blocks.len() {
+        if !matches!(
+            &blocks[block_idx].exit,
+            BlockExit::Jump(_) | BlockExit::Fallthrough(_) | BlockExit::CondJump { .. },
+        ) {
+            continue;
+        }
+
+        let folded = blocks[block_idx].exit.exit_targets().map(|target| {
+            let target_block = &blocks[target?];
+            if target_block.stmts.is_empty() {
+                match target_block.exit {
+                    BlockExit::Jump(next) | BlockExit::Fallthrough(next) => {
+                        return Some(next);
+                    }
+                    _ => {}
+                }
+            }
+
+            None
+        });
+
+        match &blocks[block_idx].exit {
+            BlockExit::Jump(_) | BlockExit::Fallthrough(_) => {
+                if let Some(folded_jump) = folded[0] {
+                    blocks[block_idx].exit = BlockExit::Jump(folded_jump);
+                    was_changed = true;
+                }
+            }
+            BlockExit::CondJump {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let then_block = *then_block;
+                let else_block = *else_block;
+
+                let [folded_then, folded_else] = folded;
+                if folded_then.is_some() || folded_else.is_some() {
+                    blocks[block_idx].exit = BlockExit::CondJump {
+                        cond: cond.clone(),
+                        then_block: folded_then.unwrap_or(then_block),
+                        else_block: folded_else.unwrap_or(else_block),
+                    };
+                    was_changed = true;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    was_changed
 }
 
 fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<SymbolId>) {

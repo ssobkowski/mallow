@@ -315,9 +315,20 @@ fn linear_fallthrough_reaches(
     false
 }
 
+/// Returns whether the edge 'source -> destination' is a backedge.
+#[must_use]
+fn is_backedge(source: usize, destination: usize, cfg: &ControlFlowGraph) -> bool {
+    // In a reducible CFG, an edge is a backedge if the destination dominates the source.
+    cfg.dominates(destination, source)
+}
+
 /// Returns whether `start` can reach `target` through a non-`for` backedge.
 #[must_use]
 pub fn branch_has_plain_backedge(start: usize, target: usize, cfg: &ControlFlowGraph) -> bool {
+    if is_backedge(target, start, cfg) {
+        return true;
+    }
+
     let mut stack = vec![start];
     let mut seen = HashSet::new();
 
