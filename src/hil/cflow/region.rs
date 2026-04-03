@@ -144,9 +144,9 @@ impl<'a> RegionBuilder<'a> {
                             find_loop_exit_block(curr_id, exit_branch, loop_block, self.cfg);
 
                         // We already know this is a loop header (either then or else is a backedge
-                        // to the current block), the way to distinguish a while from a repeat..until
-                        // is that repeat..until will have already been visited - repeat..until's CondJump
-                        // is at the bottom, while while's CondJump is at the top.
+                        // to the current block). The way to distinguish a while from a repeat..until
+                        // is that repeat..until has already been visited - repeat..until's CondJump
+                        // is at the bottom, whereas while's CondJump is at the top.
                         let is_repeat =
                             loop_block < curr_id || visited_in_region.contains(&loop_block);
 
