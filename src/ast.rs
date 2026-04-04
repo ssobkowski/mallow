@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use smol_str::SmolStr;
 
 /// An identifier such as `foo`.
@@ -289,6 +291,28 @@ impl BinOp {
     }
 }
 
+impl Display for BinOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BinOp::Add => write!(f, "+"),
+            BinOp::Sub => write!(f, "-"),
+            BinOp::Mul => write!(f, "*"),
+            BinOp::Div => write!(f, "/"),
+            BinOp::Mod => write!(f, "%"),
+            BinOp::Pow => write!(f, "^"),
+            BinOp::Eq => write!(f, "=="),
+            BinOp::Ne => write!(f, "~="),
+            BinOp::Lt => write!(f, "<"),
+            BinOp::Lte => write!(f, "<="),
+            BinOp::Gt => write!(f, ">"),
+            BinOp::Gte => write!(f, ">="),
+            BinOp::And => write!(f, "and"),
+            BinOp::Or => write!(f, "or"),
+            BinOp::Concat => write!(f, ".."),
+        }
+    }
+}
+
 /// Compound assignment operator.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompoundBinOp {
@@ -307,4 +331,14 @@ pub enum UnOp {
     Minus,
     Length,
     Not,
+}
+
+impl Display for UnOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnOp::Minus => write!(f, "-"),
+            UnOp::Length => write!(f, "#"),
+            UnOp::Not => write!(f, "not"),
+        }
+    }
 }

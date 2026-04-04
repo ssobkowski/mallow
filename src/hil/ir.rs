@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use smol_str::SmolStr;
 
 use crate::ast::{BinOp, UnOp};
@@ -109,6 +111,68 @@ impl HilExpr {
     }
 }
 
+impl Display for HilExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HilExpr::Nil => write!(f, "nil"),
+            HilExpr::Number(n) => write!(f, "{}", n),
+            HilExpr::String(s) => write!(f, "\"{}\"", s),
+            HilExpr::Bool(b) => write!(f, "{}", b),
+            HilExpr::Symbol(s) => write!(f, "v{}", s.index()),
+            HilExpr::Closure { .. } => write!(f, "<closure>"),
+            HilExpr::Global(g) => write!(f, "{}", g),
+            HilExpr::Import(i) => write!(f, "import(\"{}\")", i),
+            HilExpr::GetField { obj, field } => write!(f, "{}.{}", obj, field),
+            HilExpr::GetIndex { obj, index } => write!(f, "{}[{}]", obj, index),
+            HilExpr::Call { fun, args } => {
+                write!(f, "call {}(", fun)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            }
+            HilExpr::MethodCall {
+                object,
+                method,
+                args,
+            } => {
+                write!(f, "call {}:{}(", object, method)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            }
+            HilExpr::Binary { lhs, op, rhs } => write!(f, "{} {} {}", lhs, op, rhs),
+            HilExpr::Unary { op, expr } => {
+                if op == &UnOp::Not {
+                    write!(f, "not ({})", expr)
+                } else {
+                    write!(f, "{}{}", op, expr)
+                }
+            }
+            HilExpr::If {
+                condition,
+                then_expr,
+                else_expr,
+            } => write!(f, "if {} then {} else {}", condition, then_expr, else_expr),
+            HilExpr::Table { items } => {
+                if items.is_empty() {
+                    write!(f, "{{}}")
+                } else {
+                    unimplemented!()
+                }
+            }
+            HilExpr::VarArgs => write!(f, "..."),
+        }
+    }
+}
+
 /// One closure capture operand attached to a nested function literal.
 #[derive(Debug, Clone)]
 pub enum HilCapture {
@@ -157,6 +221,49 @@ pub enum HilStmt {
     Call(HilExpr),
     /// A "Phi-Node", used for merging symbols between region blocks.
     Phi(PhiNode),
+}
+
+impl Display for HilStmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HilStmt::Assign { left, value } => write!(f, "{} = {}", left, value),
+            HilStmt::AssignMany { left, value } => {
+                for (i, lv) in left.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "v{}", lv.index())?;
+                }
+                write!(f, " = {}", value)
+            }
+            HilStmt::SetList {
+                table,
+                index,
+                values,
+                has_variadic_tail,
+            } => {
+                write!(
+                    f,
+                    "setlist v{}[{}..{}] = [",
+                    table.index(),
+                    index,
+                    *index as usize + values.len()
+                )?;
+                for (i, v) in values.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", v)?;
+                }
+                if *has_variadic_tail {
+                    write!(f, ", ...")?;
+                }
+                write!(f, "]")
+            }
+            HilStmt::Call(expr) => write!(f, "{}", expr),
+            HilStmt::Phi(_) => Ok(()),
+        }
+    }
 }
 
 pub trait ToSpanned {

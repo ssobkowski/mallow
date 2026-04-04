@@ -1,11 +1,14 @@
 [package]
 name = "luaudec"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
 id-arena = "2.3.0"
+opener = { version = "0.8.4", optional = true }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.149", optional = true }
 smallvec = "1.15.1"
 smol_str = "0.3.5"
 tempfile = "3.26.0"
@@ -14,6 +17,10 @@ thiserror = "2.0.18"
 [dev-dependencies]
 indoc = "2.0.7"
 libtest-mimic = "0.8.2"
+
+[features]
+default = []
+visualize = ["dep:opener", "dep:serde", "dep:serde_json"]
 
 [[test]]
 name = "decompiler"

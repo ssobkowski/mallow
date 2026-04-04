@@ -71,7 +71,7 @@ pub enum RawBlockExit {
 impl RawBlockExit {
     /// Returns successor targets encoded in one block exit.
     #[must_use]
-    fn exit_targets(&self) -> [Option<usize>; 2] {
+    fn targets(&self) -> [Option<usize>; 2] {
         match self {
             RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => [Some(*target), None],
             RawBlockExit::CondJump {
@@ -114,6 +114,11 @@ impl Block {
             stmts: Vec::new(),
             exit: BlockExit::Return(SmallVec::new()),
         }
+    }
+
+    /// Returns the exit targets of this block.
+    pub fn exit_targets(&self) -> [Option<usize>; 2] {
+        self.exit.targets()
     }
 }
 
@@ -159,7 +164,7 @@ pub enum BlockExit {
 impl BlockExit {
     /// Returns successor targets encoded in one block exit.
     #[must_use]
-    fn exit_targets(&self) -> [Option<usize>; 2] {
+    pub fn targets(&self) -> [Option<usize>; 2] {
         match self {
             BlockExit::Jump(target) | BlockExit::Fallthrough(target) => [Some(*target), None],
             BlockExit::CondJump {
@@ -551,7 +556,7 @@ impl ControlFlowGraph {
             });
         }
 
-        let successors = build_successors(raw_blocks.iter().map(|b| b.exit.exit_targets()));
+        let successors = build_successors(raw_blocks.iter().map(|b| b.exit.targets()));
         let predecessors = build_predecessors(&successors);
 
         let mut arena = Arena::new();
@@ -808,7 +813,7 @@ impl ControlFlowGraph {
         let blocks = loop {
             let (changed_cd, new_blocks) = fold_condition_diamonds(blocks);
 
-            let successors = build_successors(new_blocks.iter().map(|b| b.exit.exit_targets()));
+            let successors = build_successors(new_blocks.iter().map(|b| b.exit_targets()));
             let predecessors = build_predecessors(&successors);
             let (changed_sc, new_blocks) = fold_short_circuits(new_blocks, &predecessors);
 
@@ -821,7 +826,7 @@ impl ControlFlowGraph {
         let (numeric_loops_by_base, generic_loops_by_base) = build_loop_indexes(&blocks);
 
         // Rebuild after folding
-        let successors = build_successors(blocks.iter().map(|b| b.exit.exit_targets()));
+        let successors = build_successors(blocks.iter().map(|b| b.exit_targets()));
         let predecessors = build_predecessors(&successors);
         let immediate_dominators = build_immediate_dominators(0, &successors, &predecessors);
 
@@ -1419,7 +1424,7 @@ fn thread_jumps(blocks: &mut [Block]) -> bool {
             continue;
         }
 
-        let folded = blocks[block_idx].exit.exit_targets().map(|target| {
+        let folded = blocks[block_idx].exit_targets().map(|target| {
             let target_block = &blocks[target?];
             if target_block.stmts.is_empty() {
                 match target_block.exit {

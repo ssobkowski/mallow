@@ -1,6 +1,9 @@
 *
 
 !.gitignore
+!.gitattributes
+!assets/
+!assets/**/*
 !src/
 !src/**/*
 !tests

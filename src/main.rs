@@ -52,6 +52,13 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Generate a control flow graph visualization for a bytecode file
+    #[cfg(feature = "visualize")]
+    Visualize {
+        /// Path to the input bytecode file
+        #[arg(short, long)]
+        input: PathBuf,
+    },
 }
 
 fn decompile_bytecode(bytecode: &[u8]) -> Result<String, DisasmError> {
@@ -128,6 +135,17 @@ fn main() {
 
             if let Err(e) = write_output(output, &code) {
                 eprintln!("Error writing decompilation output: {e}");
+            }
+        }
+        #[cfg(feature = "visualize")]
+        Commands::Visualize { input } => {
+            let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
+            let disasm = disasm::disassemble(&bytecode).expect("failed to disassemble");
+            for proto in &disasm.protos {
+                use crate::hil::cflow::{graph::ControlFlowGraph, visualize::dump_cfg};
+
+                let cfg = ControlFlowGraph::from_proto(proto, &disasm.protos);
+                dump_cfg(&cfg, &format!("Proto {}", proto.index));
             }
         }
     }
