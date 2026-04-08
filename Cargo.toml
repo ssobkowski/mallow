@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
+either = "1.15.0"
 id-arena = "2.3.0"
 opener = { version = "0.8.4", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }

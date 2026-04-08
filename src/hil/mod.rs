@@ -3,6 +3,7 @@ use crate::{
     hil::cflow::{
         graph::ControlFlowGraph,
         region::{RegionBlock, RegionBuilder},
+        region2,
     },
 };
 
@@ -26,6 +27,12 @@ impl StructuredFunction {
         let cfg = ControlFlowGraph::from_proto(proto, all_protos);
         let mut region = RegionBuilder::new(&cfg);
         let root = region.build_region(cfg.entry_block, None);
+
+        eprintln!("{:#?}", cfg);
+
+        let re2 = region2::structure(&cfg);
+        eprintln!("{:#?}", re2);
+
         Self {
             cfg,
             root,
