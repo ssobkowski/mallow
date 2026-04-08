@@ -586,12 +586,16 @@ impl<'a> FoldableGraph<'a> {
                     eprintln!("kind: {:#?}", kind);
                     eprintln!("body: {:?}", body_blocks_used);
 
-                    // this is quite ugly
+                    // this is quite ugly - it could be cleaned up into a single iterator
+                    // with itertools, but i don't think this single case justifies a dependency
                     let mut body_nodes: Vec<_> = self
                         .nodes
                         .extract_if(|id, _| body_blocks_used.contains(id))
                         .collect();
                     body_nodes.sort_unstable_by_key(|(id, _)| *id);
+
+                    // TODO: these blocks should have the loop's control-flow affecting
+                    // blocks (continue/break) lifted before making them the node.
                     let body_ast = RegionNode::merge(body_nodes.into_iter().map(|(_, b)| b));
 
                     let loop_id = self.next_id();
@@ -647,6 +651,7 @@ impl<'a> FoldableGraph<'a> {
 
     fn structure(&mut self) {
         loop {
+            // TODO: the loops should be processed innermost->outermost
             if self.collapse_loops() {
                 eprintln!("Collapsed loops");
                 continue;
