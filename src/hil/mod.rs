@@ -2,8 +2,7 @@ use crate::{
     disasm::Proto,
     hil::cflow::{
         graph::ControlFlowGraph,
-        region::{RegionBlock, RegionBuilder},
-        region2,
+        region2::{self, RegionNode},
     },
 };
 
@@ -16,7 +15,7 @@ pub mod passes;
 #[derive(Debug, Clone)]
 pub struct StructuredFunction {
     pub cfg: ControlFlowGraph,
-    pub root: RegionBlock,
+    pub root: RegionNode,
 
     pub num_params: u8,
     pub is_vararg: bool,
@@ -25,13 +24,10 @@ pub struct StructuredFunction {
 impl StructuredFunction {
     pub fn from_proto(proto: &Proto, all_protos: &[Proto]) -> Self {
         let cfg = ControlFlowGraph::from_proto(proto, all_protos);
-        let mut region = RegionBuilder::new(&cfg);
-        let root = region.build_region(cfg.entry_block, None);
-
         eprintln!("{:#?}", cfg);
 
-        let re2 = region2::structure(&cfg);
-        eprintln!("{:#?}", re2);
+        let root = region2::structure(&cfg);
+        eprintln!("Region: {:#?}", root);
 
         Self {
             cfg,

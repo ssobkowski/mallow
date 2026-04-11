@@ -6,10 +6,7 @@ use crate::{
     ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem, UnOp},
     hil::{
         StructuredFunction,
-        cflow::{
-            graph::ControlFlowGraph,
-            region::{RegionBlock, RegionNode},
-        },
+        cflow::{graph::ControlFlowGraph, region2::RegionNode},
         ir::{HilExpr, HilStmt, HilTableItem},
         lifter::ssa::SymbolId,
     },
@@ -58,17 +55,20 @@ impl Structurer {
         name
     }
 
-    fn visit_region(&mut self, region: &RegionBlock, cfg: &ControlFlowGraph) -> Block {
+    fn visit_region(&mut self, region: &RegionNode, cfg: &ControlFlowGraph) -> Block {
         let mut stmts = Vec::new();
-        for node in &region.nodes {
-            self.visit_node(node, cfg, &mut stmts);
-        }
+        self.visit_node(region, cfg, &mut stmts);
         Block::with_stmts(stmts)
     }
 
     fn visit_node(&mut self, node: &RegionNode, cfg: &ControlFlowGraph, buf: &mut Vec<Stmt>) {
         match node {
             RegionNode::BasicBlock { block } => self.visit_block(*block, cfg, buf),
+            RegionNode::Sequence { nodes } => {
+                for n in nodes {
+                    self.visit_node(n, cfg, buf);
+                }
+            }
             RegionNode::If {
                 condition,
                 then_branch,
@@ -79,7 +79,9 @@ impl Structurer {
                 self.collect_assigned_symbols_in_region(then_branch, cfg, &mut then_assigned);
 
                 let mut else_assigned = HashSet::new();
-                self.collect_assigned_symbols_in_region(else_branch, cfg, &mut else_assigned);
+                if let Some(else_branch) = else_branch {
+                    self.collect_assigned_symbols_in_region(else_branch, cfg, &mut else_assigned);
+                }
 
                 let mut hoisted: Vec<_> = then_assigned
                     .intersection(&else_assigned)
@@ -104,8 +106,7 @@ impl Structurer {
                 }
 
                 let then_body = self.visit_region(then_branch, cfg);
-                let else_body =
-                    (!else_branch.nodes.is_empty()).then(|| self.visit_region(else_branch, cfg));
+                let else_body = else_branch.as_ref().map(|e| self.visit_region(e, cfg));
 
                 buf.push(Stmt::If {
                     condition: self.visit_expr(condition),
@@ -168,6 +169,7 @@ impl Structurer {
                     values: values.iter().map(|expr| self.visit_expr(expr)).collect(),
                 });
             }
+            RegionNode::VirtualExit => unreachable!(),
         }
     }
 
@@ -181,13 +183,11 @@ impl Structurer {
 
     fn collect_assigned_symbols_in_region(
         &self,
-        region: &RegionBlock,
+        region: &RegionNode,
         cfg: &ControlFlowGraph,
         out: &mut HashSet<SymbolId>,
     ) {
-        for node in &region.nodes {
-            self.collect_assigned_symbols_in_node(node, cfg, out);
-        }
+        self.collect_assigned_symbols_in_node(region, cfg, out);
     }
 
     fn collect_assigned_symbols_in_node(
@@ -202,13 +202,20 @@ impl Structurer {
                     self.collect_assigned_symbols_in_stmt(&stmt.inner, out);
                 }
             }
+            RegionNode::Sequence { nodes } => {
+                for n in nodes {
+                    self.collect_assigned_symbols_in_node(n, cfg, out);
+                }
+            }
             RegionNode::If {
                 then_branch,
                 else_branch,
                 ..
             } => {
                 self.collect_assigned_symbols_in_region(then_branch, cfg, out);
-                self.collect_assigned_symbols_in_region(else_branch, cfg, out);
+                if let Some(else_branch) = else_branch {
+                    self.collect_assigned_symbols_in_region(else_branch, cfg, out);
+                }
             }
             RegionNode::While { body, .. }
             | RegionNode::RepeatUntil { body, .. }
@@ -217,6 +224,7 @@ impl Structurer {
                 self.collect_assigned_symbols_in_region(body, cfg, out);
             }
             RegionNode::Continue | RegionNode::Break | RegionNode::Return { .. } => {}
+            RegionNode::VirtualExit => unreachable!(),
         }
     }
 

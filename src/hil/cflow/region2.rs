@@ -94,6 +94,10 @@ pub enum RegionNode {
     Break,
     /// Explicit return.
     Return { values: SmallVec<[HilExpr; 3]> },
+
+    /// A temporary scaffolding node used to merge multiple physical exits
+    /// into a Single-Entry, Single-Exit (SESE) graph.
+    VirtualExit,
 }
 
 impl RegionNode {
@@ -112,31 +116,168 @@ impl RegionNode {
 
     /// Recursively replaces raw basic blocks that jump to the loop header/exit
     /// with explicit Break and Continue nodes.
-    pub fn resolve_escapes(&mut self, header: usize, exit: usize, cfg: &ControlFlowGraph) {
+    pub fn resolve_escapes(
+        &mut self,
+        continue_target: usize,
+        continue_target_alt: Option<usize>,
+        exit: usize,
+        cfg: &ControlFlowGraph,
+        region_map: &HashMap<usize, usize>,
+    ) {
         match self {
-            RegionNode::Sequence { nodes } => nodes
-                .iter_mut()
-                .for_each(|n| n.resolve_escapes(header, exit, cfg)),
+            RegionNode::Sequence { nodes } => nodes.iter_mut().for_each(|n| {
+                n.resolve_escapes(continue_target, continue_target_alt, exit, cfg, region_map)
+            }),
             RegionNode::If {
                 then_branch,
                 else_branch,
                 ..
             } => {
-                then_branch.resolve_escapes(header, exit, cfg);
+                then_branch.resolve_escapes(
+                    continue_target,
+                    continue_target_alt,
+                    exit,
+                    cfg,
+                    region_map,
+                );
                 if let Some(e) = else_branch {
-                    e.resolve_escapes(header, exit, cfg);
+                    e.resolve_escapes(continue_target, continue_target_alt, exit, cfg, region_map);
                 }
             }
             RegionNode::BasicBlock { block } => {
-                let targets = cfg.blocks[*block].exit_targets();
-                let is_continue = targets == [Some(header), None];
-                let is_break = targets == [Some(exit), None];
+                let exit_node = &cfg.blocks[*block].exit;
+                let replacement = match exit_node {
+                    BlockExit::Jump(raw_target) | BlockExit::Fallthrough(raw_target) => {
+                        let active = region_map[raw_target];
+                        if active == continue_target {
+                            Some(RegionNode::Continue)
+                        } else if active == exit {
+                            Some(RegionNode::Break)
+                        } else {
+                            None
+                        }
+                    }
+                    BlockExit::CondJump {
+                        cond,
+                        then_block,
+                        else_block,
+                    } => {
+                        let active_then = region_map[then_block];
+                        let active_else = region_map[else_block];
 
-                if is_continue || is_break {
-                    let terminal = if is_continue {
-                        RegionNode::Continue
+                        let then_terminal = if active_then == continue_target
+                            || continue_target_alt.is_some_and(|t| active_then == t)
+                        {
+                            Some(RegionNode::Continue)
+                        } else if active_then == exit {
+                            Some(RegionNode::Break)
+                        } else {
+                            None
+                        };
+
+                        let else_terminal = if active_else == continue_target
+                            || continue_target_alt.is_some_and(|t| active_else == t)
+                        {
+                            Some(RegionNode::Continue)
+                        } else if active_else == exit {
+                            Some(RegionNode::Break)
+                        } else {
+                            None
+                        };
+
+                        match (then_terminal, else_terminal) {
+                            (None, None) => None,
+                            (Some(terminal), None) => Some(RegionNode::If {
+                                condition: cond.clone(),
+                                then_branch: Box::new(terminal),
+                                else_branch: None,
+                            }),
+                            (None, Some(terminal)) => Some(RegionNode::If {
+                                condition: invert_condition(cond.clone()),
+                                then_branch: Box::new(terminal),
+                                else_branch: None,
+                            }),
+                            (Some(then_terminal), Some(else_terminal)) => Some(RegionNode::If {
+                                condition: cond.clone(),
+                                then_branch: Box::new(then_terminal),
+                                else_branch: Some(Box::new(else_terminal)),
+                            }),
+                        }
+                    }
+                    _ => None,
+                };
+
+                if let Some(terminal) = replacement {
+                    if cfg.blocks[*block].stmts.is_empty() {
+                        *self = terminal;
                     } else {
-                        RegionNode::Break
+                        *self = RegionNode::Sequence {
+                            nodes: vec![RegionNode::BasicBlock { block: *block }, terminal],
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn strip_virtual_exits(&mut self) {
+        match self {
+            RegionNode::Sequence { nodes } => {
+                nodes.retain(|n| !matches!(n, RegionNode::VirtualExit));
+                for node in nodes {
+                    node.strip_virtual_exits();
+                }
+            }
+            RegionNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                then_branch.strip_virtual_exits();
+                if let Some(e) = else_branch {
+                    e.strip_virtual_exits();
+                }
+            }
+            RegionNode::While { body, .. }
+            | RegionNode::RepeatUntil { body, .. }
+            | RegionNode::NumericFor { body, .. }
+            | RegionNode::GenericFor { body, .. } => {
+                body.strip_virtual_exits();
+            }
+            _ => {}
+        }
+    }
+
+    /// Recursively replaces raw basic blocks that terminate with a return
+    /// with explicit Return nodes.
+    fn resolve_returns(&mut self, cfg: &ControlFlowGraph) {
+        match self {
+            RegionNode::Sequence { nodes } => {
+                for node in nodes.iter_mut() {
+                    node.resolve_returns(cfg);
+                }
+            }
+            RegionNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                then_branch.resolve_returns(cfg);
+                if let Some(e) = else_branch {
+                    e.resolve_returns(cfg);
+                }
+            }
+            RegionNode::While { body, .. }
+            | RegionNode::RepeatUntil { body, .. }
+            | RegionNode::NumericFor { body, .. }
+            | RegionNode::GenericFor { body, .. } => {
+                body.resolve_returns(cfg);
+            }
+            RegionNode::BasicBlock { block } => {
+                if let BlockExit::Return(values) = &cfg.blocks[*block].exit {
+                    let terminal = RegionNode::Return {
+                        values: values.clone(),
                     };
 
                     if cfg.blocks[*block].stmts.is_empty() {
@@ -149,6 +290,29 @@ impl RegionNode {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Returns whether this node starts with the given raw CFG block.
+    ///
+    /// Sequence nodes recurse into their first child so merged wrappers do not
+    /// hide the real leading block.
+    fn starts_with_block(&self, block: usize) -> bool {
+        match self {
+            RegionNode::BasicBlock { block: id } => *id == block,
+            RegionNode::Sequence { nodes } => nodes
+                .first()
+                .is_some_and(|first| first.starts_with_block(block)),
+            _ => false,
+        }
+    }
+
+    /// Returns whether this node ends in an explicit loop escape statement.
+    fn ends_with_escape(&self) -> bool {
+        match self {
+            RegionNode::Continue | RegionNode::Break => true,
+            RegionNode::Sequence { nodes } => nodes.last().is_some_and(|n| n.ends_with_escape()),
+            _ => false,
         }
     }
 }
@@ -198,10 +362,7 @@ impl<'a> FoldableGraph<'a> {
             let virtual_exit_id = id_counter;
             id_counter += 1;
 
-            nodes.insert(
-                virtual_exit_id,
-                RegionNode::BasicBlock { block: usize::MAX },
-            );
+            nodes.insert(virtual_exit_id, RegionNode::VirtualExit);
 
             for node in terminal_nodes {
                 successors.entry(node).or_default().push(virtual_exit_id);
@@ -211,6 +372,32 @@ impl<'a> FoldableGraph<'a> {
 
             virtual_exit_id
         };
+
+        let mut reachable = HashSet::new();
+        let mut stack = vec![cfg.entry_block];
+        while let Some(node) = stack.pop() {
+            if reachable.insert(node) {
+                if let Some(succs) = successors.get(&node) {
+                    stack.extend(succs.iter().copied());
+                }
+            }
+        }
+
+        let all_nodes: Vec<_> = nodes.keys().copied().collect();
+        for node in all_nodes {
+            if !reachable.contains(&node) {
+                nodes.remove(&node);
+
+                if let Some(succs) = successors.remove(&node) {
+                    for succ in succs {
+                        if let Some(preds) = predecessors.get_mut(&succ) {
+                            preds.retain(|&p| p != node);
+                        }
+                    }
+                }
+                predecessors.remove(&node);
+            }
+        }
 
         FoldableGraph {
             cfg,
@@ -395,6 +582,80 @@ impl<'a> FoldableGraph<'a> {
         }
     }
 
+    fn node_emits_statements(&self, node: &RegionNode) -> bool {
+        match node {
+            RegionNode::BasicBlock { block } => !self.cfg.blocks[*block].stmts.is_empty(),
+            RegionNode::Sequence { nodes } => {
+                nodes.iter().any(|node| self.node_emits_statements(node))
+            }
+            RegionNode::If { .. }
+            | RegionNode::While { .. }
+            | RegionNode::RepeatUntil { .. }
+            | RegionNode::NumericFor { .. }
+            | RegionNode::GenericFor { .. }
+            | RegionNode::Continue
+            | RegionNode::Break
+            | RegionNode::Return { .. } => true,
+            RegionNode::VirtualExit => false,
+        }
+    }
+
+    /// Rebuilds a loop-header branch into a structured one-armed guard.
+    ///
+    /// This is used when one header successor is an escape path and the other
+    /// is normal loop body flow, so escape code is emitted before remaining
+    /// body statements.
+    fn fold_head_escape_guard(&self, head_node: RegionNode, body_ast: RegionNode) -> RegionNode {
+        let Some((mut cond, then_block, else_block)) = self.extract_cond_jump(&head_node) else {
+            return RegionNode::merge([head_node, body_ast]);
+        };
+
+        let RegionNode::Sequence { mut nodes } = body_ast else {
+            return RegionNode::merge([head_node, body_ast]);
+        };
+
+        let then_idx = nodes
+            .iter()
+            .position(|node| node.starts_with_block(then_block));
+        let else_idx = nodes
+            .iter()
+            .position(|node| node.starts_with_block(else_block));
+
+        let Some((escape_idx, invert)) = (match (then_idx, else_idx) {
+            (Some(t), Some(e)) if t != e => {
+                let then_escape = nodes[t].ends_with_escape();
+                let else_escape = nodes[e].ends_with_escape();
+
+                if then_escape && !else_escape {
+                    Some((t, false))
+                } else if else_escape && !then_escape {
+                    Some((e, true))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }) else {
+            return RegionNode::merge([head_node, RegionNode::Sequence { nodes }]);
+        };
+
+        if invert {
+            cond = invert_condition(cond);
+        }
+
+        let escape_node = nodes.remove(escape_idx);
+        let mut guarded = Vec::with_capacity(nodes.len() + 2);
+        guarded.push(head_node);
+        guarded.push(RegionNode::If {
+            condition: cond,
+            then_branch: Box::new(escape_node),
+            else_branch: None,
+        });
+        guarded.extend(nodes);
+
+        RegionNode::Sequence { nodes: guarded }
+    }
+
     /// Returns whether `dom` dominates `node`.
     #[must_use]
     pub fn dominates(&mut self, dom: usize, node: usize) -> bool {
@@ -445,8 +706,6 @@ impl<'a> FoldableGraph<'a> {
         //
         // Both patterns must also not have any loop edges.
 
-        let mut changed = false;
-
         let mut work = self.post_order();
         work.reverse();
 
@@ -484,17 +743,9 @@ impl<'a> FoldableGraph<'a> {
                         && self.exact_successors(node).is_some_and(|s| s == [tail])
                 };
 
-                // A block is an escape body if it only comes from Head, but goes to something
-                // other than Tail.
-                let is_escape_body = |node: usize, tail: usize| {
-                    self.exact_predecessors(node).is_some_and(|p| p == [head])
-                        && self.exact_successors(node).is_some_and(|s| s != [tail])
-                };
-
                 // TODO: clean this shitchain up
                 let mut then_node_id = None;
                 let mut else_node_id = None;
-                let mut escapes_to = None;
 
                 if left == tail && is_strict_body(right, tail) {
                     // If-Then (The body is on the FALSE path)
@@ -507,23 +758,6 @@ impl<'a> FoldableGraph<'a> {
                     // If-Then-Else
                     then_node_id = Some(left);
                     else_node_id = Some(right);
-                } else if left == tail && is_escape_body(right, tail) {
-                    let esc = self.successors[&right][0];
-                    if esc == head {
-                        continue;
-                    }
-
-                    then_node_id = Some(right);
-                    cond = invert_condition(cond);
-                    escapes_to = Some(esc);
-                } else if right == tail && is_escape_body(left, tail) {
-                    let esc = self.successors[&left][0];
-                    if esc == head {
-                        continue;
-                    }
-
-                    then_node_id = Some(left);
-                    escapes_to = Some(esc);
                 }
 
                 let Some(then_node_id) = then_node_id else {
@@ -558,18 +792,7 @@ impl<'a> FoldableGraph<'a> {
                     tail_preds.push(new_id)
                 }
 
-                let mut new_succs = vec![tail];
-                if let Some(escape_tgt) = escapes_to {
-                    new_succs.push(escape_tgt);
-                    if let Some(escape_preds) = self.predecessors.get_mut(&escape_tgt) {
-                        for p in escape_preds.iter_mut() {
-                            if *p == then_node_id {
-                                *p = new_id;
-                            }
-                        }
-                    }
-                }
-                self.successors.insert(new_id, new_succs);
+                self.successors.insert(new_id, vec![tail]);
 
                 self.successors.remove(&head);
                 self.successors.remove(&then_node_id);
@@ -585,12 +808,11 @@ impl<'a> FoldableGraph<'a> {
                 }
                 self.invalidate_doms();
 
-                work.push(new_id);
-                changed = true;
+                return true;
             }
         }
 
-        changed
+        false
     }
 
     /// Returns the first found backedge from `node` if one exists, otherwise `None`.
@@ -604,31 +826,32 @@ impl<'a> FoldableGraph<'a> {
         None
     }
 
+    /// Identifies all nodes belonging to a SESE loop region.
     #[must_use]
-    fn backward_reachable_without_target(&mut self, start: usize, target: usize) -> HashSet<usize> {
-        let mut stack = vec![start];
+    fn get_loop_region(&mut self, head: usize, exit: usize) -> HashSet<usize> {
+        self.post_order()
+            .into_iter()
+            .filter(|&node| self.dominates(head, node) && !self.dominates(exit, node))
+            .collect()
+    }
+
+    /// Computes the standard "natural loop" (only nodes that reach the backedge)
+    /// strictly to safely identify the loop type and exit block.
+    #[must_use]
+    fn get_natural_loop(&self, head: usize, tail: usize) -> HashSet<usize> {
+        let mut stack = vec![tail];
         let mut seen = HashSet::new();
+        seen.insert(head);
 
-        while let Some(block) = stack.pop() {
-            if block == target || !seen.insert(block) {
-                continue;
-            }
-
-            // This below is some of the worst fucking code I have ever written, handling
-            // borrow checker in the most retarded way possible.
-            let preds_len = match self.predecessors.get(&block) {
-                Some(p) => p.len(),
-                None => continue,
-            };
-
-            for i in 0..preds_len {
-                let pred = self.predecessors[&block][i];
-                if pred != target && self.dominates(target, pred) {
-                    stack.push(pred);
+        while let Some(node) = stack.pop() {
+            if seen.insert(node) {
+                if let Some(preds) = self.predecessors.get(&node) {
+                    stack.extend(preds.iter().copied());
                 }
             }
         }
 
+        seen.remove(&head);
         seen
     }
 
@@ -708,36 +931,38 @@ impl<'a> FoldableGraph<'a> {
         }
 
         // repeat..until: condition is evaluated at the tail.
-        if let Some((cond, then_tgt, else_tgt)) = self.extract_cond_jump(&self.nodes[&tail])
-            && (then_tgt == head || else_tgt == head)
-        {
-            let (exit_block, invert) = if then_tgt == head {
-                (else_tgt, true) // Branches to head on TRUE, meaning it repeats while true (until false)
-            } else {
-                (then_tgt, false)
-            };
+        if let Some((cond, raw_then, raw_else)) = self.extract_cond_jump(&self.nodes[&tail]) {
+            let active_then = self.region_for_block[&raw_then];
+            let active_else = self.region_for_block[&raw_else];
+            if active_then == head || active_else == head {
+                let (exit_block, invert) = if active_then == head {
+                    (active_else, true) // Branches to head on TRUE, meaning it repeats while true (until false)
+                } else {
+                    (active_then, false)
+                };
 
-            let final_cond = if invert { invert_condition(cond) } else { cond };
-            return Some(Loop::RepeatUntil {
-                cond: final_cond,
-                exit_block,
-            });
+                let final_cond = if invert { invert_condition(cond) } else { cond };
+                return Some(Loop::RepeatUntil {
+                    cond: final_cond,
+                    exit_block,
+                });
+            }
         }
 
         // while: condition is evaluated at the head.
-        if let Some((cond, then_tgt, else_tgt)) = self.extract_cond_jump(&self.nodes[&head]) {
+        if let Some((cond, raw_then, raw_else)) = self.extract_cond_jump(&self.nodes[&head]) {
             // One branch must go into the loop body, the other must exit.
-            let active_then_tgt = self.region_for_block[&then_tgt];
-            let active_else_tgt = self.region_for_block[&else_tgt];
+            let active_then = self.region_for_block[&raw_then];
+            let active_else = self.region_for_block[&raw_else];
 
-            let then_in_body = body_blocks.contains(&active_then_tgt) || active_then_tgt == tail;
-            let else_in_body = body_blocks.contains(&active_else_tgt) || active_else_tgt == tail;
+            let then_in_body = body_blocks.contains(&active_then) || active_then == tail;
+            let else_in_body = body_blocks.contains(&active_else) || active_else == tail;
 
             if then_in_body != else_in_body {
                 let (exit_block, invert) = if then_in_body {
-                    (else_tgt, false)
+                    (active_else, false)
                 } else {
-                    (then_tgt, true)
+                    (active_then, true)
                 };
 
                 let final_cond = if invert { invert_condition(cond) } else { cond };
@@ -763,15 +988,17 @@ impl<'a> FoldableGraph<'a> {
 
         while let Some(head) = work.pop() {
             if let Some(tail) = self.find_backedge(head) {
-                let body_blocks_used = self.backward_reachable_without_target(tail, head);
+                let body_blocks_used = self.get_natural_loop(head, tail);
 
                 // We can expect two types of a loop here:
                 // 1. while: the backedge is an unconditional jump, while the head either jumps to the body or the loop exit
                 // 2. repeat..until: the backedge is a conditional jump, the header can be any block
                 if let Some(kind) = self.identify_loop(head, tail, &body_blocks_used) {
+                    let body_blocks_used = self.get_loop_region(head, kind.exit_block());
+
                     let mut body_nodes: Vec<_> = self
                         .nodes
-                        .extract_if(|id, _| body_blocks_used.contains(id))
+                        .extract_if(|id, _| body_blocks_used.contains(id) && *id != head)
                         .collect();
 
                     let po_rank: HashMap<_, _> = self
@@ -786,24 +1013,48 @@ impl<'a> FoldableGraph<'a> {
                     let mut body_ast = RegionNode::merge(body_nodes.into_iter().map(|(_, b)| b));
 
                     // While loops jump to the head, repeat..until/for loops jump to the tail.
-                    let continue_tgt = match &kind {
-                        Loop::While { .. } => head,
-                        _ => tail,
+                    let (continue_tgt, continue_tgt_alt) = match &kind {
+                        Loop::While { .. } => (head, Some(tail)),
+                        _ => (tail, None),
                     };
-                    body_ast.resolve_escapes(continue_tgt, kind.exit_block(), self.cfg);
+                    body_ast.resolve_escapes(
+                        continue_tgt,
+                        continue_tgt_alt,
+                        kind.exit_block(),
+                        self.cfg,
+                        &self.region_for_block,
+                    );
 
                     let loop_id = self.next_id();
                     let head_node = self.nodes.remove(&head).unwrap();
 
                     let (region_entry, loop_node, exit_block) = match kind {
-                        Loop::While { cond, exit_block } => (
-                            head,
-                            RegionNode::While {
-                                condition: cond,
-                                body: Box::new(body_ast),
-                            },
-                            exit_block,
-                        ),
+                        Loop::While { cond, exit_block } => {
+                            // in case the head node emits statements, we need to insert a break guard
+                            let loop_node = if self.node_emits_statements(&head_node) {
+                                let break_guard = RegionNode::If {
+                                    condition: invert_condition(cond),
+                                    then_branch: Box::new(RegionNode::Break),
+                                    else_branch: None,
+                                };
+
+                                RegionNode::While {
+                                    condition: HilExpr::Bool(true),
+                                    body: Box::new(RegionNode::merge([
+                                        head_node,
+                                        break_guard,
+                                        body_ast,
+                                    ])),
+                                }
+                            } else {
+                                RegionNode::While {
+                                    condition: cond,
+                                    body: Box::new(body_ast),
+                                }
+                            };
+
+                            (head, loop_node, exit_block)
+                        }
                         Loop::RepeatUntil { cond, exit_block } => (
                             head,
                             RegionNode::RepeatUntil {
@@ -821,7 +1072,7 @@ impl<'a> FoldableGraph<'a> {
                             exit_block,
                         } => {
                             let prep_node = self.nodes.remove(&prep_block).unwrap();
-                            let for_body = RegionNode::merge([head_node, body_ast]);
+                            let for_body = self.fold_head_escape_guard(head_node, body_ast);
                             let for_node = RegionNode::NumericFor {
                                 var,
                                 start,
@@ -921,7 +1172,7 @@ impl<'a> FoldableGraph<'a> {
 
             let block_successors = successors
                 .get(&block)
-                .unwrap_or_else(|| panic!("No successors found for block {}", block));
+                .map_or(&[] as &[usize], |p| p.as_slice());
 
             for &succ in block_successors {
                 if !visited.contains(&succ) {
@@ -1013,10 +1264,18 @@ pub fn build_idoms_sparse(
     sparse_doms
 }
 
-pub fn structure(cfg: &ControlFlowGraph) -> HashMap<usize, RegionNode> {
+pub fn structure(cfg: &ControlFlowGraph) -> RegionNode {
     let mut fg = FoldableGraph::new(cfg);
 
     fg.structure();
 
-    fg.nodes
+    if fg.nodes.iter().len() != 1 {
+        eprintln!("Failed to structure region properly");
+        eprintln!("{:#?}", fg.nodes);
+    }
+
+    let mut root = fg.nodes.remove(&fg.entry_node).unwrap();
+    root.strip_virtual_exits();
+    root.resolve_returns(cfg);
+    root
 }

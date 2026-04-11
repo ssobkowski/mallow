@@ -4,7 +4,7 @@ use crate::hil::{
     StructuredFunction,
     cflow::{
         graph::{Block, ControlFlowGraph},
-        region::{RegionBlock, RegionNode},
+        region2::RegionNode,
     },
     ir::{HilExpr, HilStmt, HilTableItem, PhiNode, Spanned},
     lifter::ssa::SymbolId,
@@ -15,7 +15,7 @@ pub trait Visitor {
         walk_function(self, fun);
     }
 
-    fn visit_region(&mut self, region: &RegionBlock, cfg: &ControlFlowGraph) {
+    fn visit_region(&mut self, region: &RegionNode, cfg: &ControlFlowGraph) {
         walk_region(self, region, cfg);
     }
 
@@ -78,7 +78,7 @@ pub trait VisitorMut {
         walk_function_mut(self, fun);
     }
 
-    fn visit_region(&mut self, region: &mut RegionBlock, cfg: &mut ControlFlowGraph) {
+    fn visit_region(&mut self, region: &mut RegionNode, cfg: &mut ControlFlowGraph) {
         walk_region_mut(self, region, cfg);
     }
 
@@ -142,12 +142,10 @@ pub fn walk_function<V: Visitor + ?Sized>(visitor: &mut V, fun: &StructuredFunct
 
 pub fn walk_region<V: Visitor + ?Sized>(
     visitor: &mut V,
-    region: &RegionBlock,
+    region: &RegionNode,
     cfg: &ControlFlowGraph,
 ) {
-    for node in &region.nodes {
-        visitor.visit_node(node, cfg);
-    }
+    walk_node(visitor, region, cfg);
 }
 
 pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &ControlFlowGraph) {
@@ -157,6 +155,11 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
                 visitor.visit_block(*block, block_data, cfg);
             }
         }
+        RegionNode::Sequence { nodes } => {
+            for n in nodes {
+                visitor.visit_node(n, cfg);
+            }
+        }
         RegionNode::If {
             condition,
             then_branch,
@@ -164,7 +167,9 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
         } => {
             visitor.visit_expr(condition);
             visitor.visit_region(then_branch, cfg);
-            visitor.visit_region(else_branch, cfg);
+            if let Some(else_branch) = else_branch {
+                visitor.visit_region(else_branch, cfg);
+            }
         }
         RegionNode::While { condition, body } | RegionNode::RepeatUntil { condition, body } => {
             visitor.visit_expr(condition);
@@ -198,6 +203,7 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
                 visitor.visit_expr(value);
             }
         }
+        RegionNode::VirtualExit => {}
     }
 }
 
@@ -318,12 +324,10 @@ pub fn walk_function_mut<V: VisitorMut + ?Sized>(visitor: &mut V, fun: &mut Stru
 
 pub fn walk_region_mut<V: VisitorMut + ?Sized>(
     visitor: &mut V,
-    region: &mut RegionBlock,
+    region: &mut RegionNode,
     cfg: &mut ControlFlowGraph,
 ) {
-    for node in &mut region.nodes {
-        visitor.visit_node(node, cfg);
-    }
+    visitor.visit_node(region, cfg);
 }
 
 pub fn walk_node_mut<V: VisitorMut + ?Sized>(
@@ -337,6 +341,11 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
                 visitor.visit_block(*block, block_data);
             }
         }
+        RegionNode::Sequence { nodes } => {
+            for n in nodes {
+                visitor.visit_node(n, cfg);
+            }
+        }
         RegionNode::If {
             condition,
             then_branch,
@@ -344,7 +353,9 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
         } => {
             visitor.visit_expr(condition);
             visitor.visit_region(then_branch, cfg);
-            visitor.visit_region(else_branch, cfg);
+            if let Some(else_branch) = else_branch {
+                visitor.visit_region(else_branch, cfg);
+            }
         }
         RegionNode::While { condition, body } | RegionNode::RepeatUntil { condition, body } => {
             visitor.visit_expr(condition);
@@ -378,6 +389,7 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
                 visitor.visit_expr(value);
             }
         }
+        RegionNode::VirtualExit => {}
     }
 }
 
