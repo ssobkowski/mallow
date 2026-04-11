@@ -736,12 +736,20 @@ impl ControlFlowGraph {
 
         // Braun's algorithm is lazy. If a variable is modified in a repeat..until loop,
         // the header might never read it, preventing a Phi node from forming and fragmenting
-        // the variable. We force a read on all registers at every loop header to guarantee
-        // the Union-Find stitches them together.
+        // the variable. We force a read on all registers at loop headers reached by plain
+        // backedges so Union-Find can stitch those versions together.
+        //
+        // Numeric/generic for-loop latches are excluded: seeding all registers there creates
+        // a wave of synthetic Phi nodes for temporary loop-body registers that later unfold
+        // into noisy preheader copies.
         for (src, targets) in successors.iter().enumerate() {
             for &target in targets {
                 // Heuristic: If target <= src, it's a backedge, making target a loop header.
                 if target <= src {
+                    if !should_seed_loop_header(&raw_blocks[src].exit) {
+                        continue;
+                    }
+
                     for r in 0..proto.max_stack_size {
                         ssa.read_reg(target, r);
                     }
@@ -1198,6 +1206,11 @@ fn is_loop_header_seed_operand(blocks: &[Block], block_idx: usize, pred_block: u
         BlockExit::FornPrep { body_block, .. } | BlockExit::ForgPrep { body_block, .. }
             if body_block == block_idx
     )
+}
+
+#[must_use]
+const fn should_seed_loop_header(exit: &RawBlockExit) -> bool {
+    !matches!(exit, RawBlockExit::FornLoop { .. } | RawBlockExit::ForgLoop { .. })
 }
 
 #[must_use]
