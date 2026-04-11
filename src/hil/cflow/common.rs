@@ -45,3 +45,15 @@ fn invert_binop(op: BinOp) -> Option<BinOp> {
         _ => None,
     }
 }
+
+pub trait GraphView {
+    fn successors(&self, node: usize) -> &[usize];
+    fn predecessors(&self, node: usize) -> &[usize];
+    fn contains_node(&self, node: usize) -> bool;
+}
+
+pub trait GraphRewrite: GraphView {
+    fn redirect_predecessors(&mut self, from: usize, to: usize);
+    fn redirect_successors(&mut self, from: usize, to: usize);
+    fn remove_node(&mut self, node: usize);
+}
