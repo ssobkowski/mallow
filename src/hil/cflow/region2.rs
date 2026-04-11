@@ -1059,7 +1059,7 @@ impl<'a> FoldableGraph<'a> {
                             head,
                             RegionNode::RepeatUntil {
                                 condition: cond,
-                                body: Box::new(RegionNode::merge([head_node, body_ast])),
+                                body: Box::new(self.fold_head_escape_guard(head_node, body_ast)),
                             },
                             exit_block,
                         ),
@@ -1093,7 +1093,7 @@ impl<'a> FoldableGraph<'a> {
                             exit_block,
                         } => {
                             let prep_node = self.nodes.remove(&prep_block).unwrap();
-                            let for_body = RegionNode::merge([head_node, body_ast]);
+                            let for_body = self.fold_head_escape_guard(head_node, body_ast);
                             let for_node = RegionNode::GenericFor {
                                 vars,
                                 exprs,
