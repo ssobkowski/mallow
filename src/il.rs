@@ -380,7 +380,7 @@ impl Instr {
                     (base..base + n).collect()
                 }
                 // TODO: how do you even determine this?
-                Count::Variadic => todo!(),
+                Count::Variadic => smallvec![],
             },
 
             Instr::GetVarArgs { dest, count } => match decoded_count(*count) {

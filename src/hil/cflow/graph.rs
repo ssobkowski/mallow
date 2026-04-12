@@ -566,6 +566,7 @@ impl ControlFlowGraph {
         }
 
         for i in 0..proto.num_upvals {
+            // TODO: FUCK
             let sym = ssa.alloc_symbol(Symbol::upval(i));
             ssa.write_upval(0, i, sym);
         }
@@ -731,27 +732,41 @@ impl ControlFlowGraph {
             ssa.mark_filled(block_id);
         }
 
-        // Braun's algorithm is lazy. If a variable is modified in a repeat..until loop,
-        // the header might never read it, preventing a Phi node from forming and fragmenting
-        // the variable. We force a read on all registers at loop headers reached by plain
-        // backedges so Union-Find can stitch those versions together.
-        //
-        // Numeric/generic for-loop latches are excluded: seeding all registers there creates
-        // a wave of synthetic Phi nodes for temporary loop-body registers that later unfold
-        // into noisy preheader copies.
         for (src, targets) in successors.iter().enumerate() {
             for &target in targets {
-                // Heuristic: If target <= src, it's a backedge, making target a loop header.
                 if target <= src {
-                    if !should_seed_loop_header(&raw_blocks[src].exit) {
+                    if matches!(
+                        &raw_blocks[src].exit,
+                        RawBlockExit::FornLoop { .. } | RawBlockExit::ForgLoop { .. }
+                    ) {
                         continue;
                     }
 
-                    // for r in 0..proto.max_stack_size {
-                    //     ssa.read_reg(target, r);
-                    // }
+                    let mut loop_body = HashSet::new();
+                    loop_body.insert(target);
+                    let mut worklist = vec![src];
+                    while let Some(b) = worklist.pop() {
+                        if loop_body.insert(b) {
+                            worklist.extend(&predecessors[b]);
+                        }
+                    }
+
+                    // Only seed registers that are written somewhere inside the loop.
+                    // Seeding unwritten registers creates undef-sourced phis that
+                    // produce the noisy preheader copies you were worried about.
+                    let mut written_regs = HashSet::new();
+                    for &block_id in &loop_body {
+                        for (instr, _) in &instrs[raw_blocks[block_id].instr_range.clone()] {
+                            written_regs.extend(instr.written_registers());
+                        }
+                        written_regs.extend(raw_blocks[block_id].exit_writes.clone());
+                    }
+
                     for u in 0..proto.num_upvals {
                         ssa.read_upval(target, u);
+                    }
+                    for reg in written_regs {
+                        ssa.read_reg(target, reg);
                     }
                 }
             }
@@ -1161,14 +1176,6 @@ fn is_loop_header_seed_operand(blocks: &[Block], block_idx: usize, pred_block: u
         pred.exit,
         BlockExit::FornPrep { body_block, .. } | BlockExit::ForgPrep { body_block, .. }
             if body_block == block_idx
-    )
-}
-
-#[must_use]
-const fn should_seed_loop_header(exit: &RawBlockExit) -> bool {
-    !matches!(
-        exit,
-        RawBlockExit::FornLoop { .. } | RawBlockExit::ForgLoop { .. }
     )
 }
 
