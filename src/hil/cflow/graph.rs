@@ -750,9 +750,9 @@ impl ControlFlowGraph {
                         continue;
                     }
 
-                    for r in 0..proto.max_stack_size {
-                        ssa.read_reg(target, r);
-                    }
+                    // for r in 0..proto.max_stack_size {
+                    //     ssa.read_reg(target, r);
+                    // }
                     for u in 0..proto.num_upvals {
                         ssa.read_upval(target, u);
                     }
@@ -1210,7 +1210,10 @@ fn is_loop_header_seed_operand(blocks: &[Block], block_idx: usize, pred_block: u
 
 #[must_use]
 const fn should_seed_loop_header(exit: &RawBlockExit) -> bool {
-    !matches!(exit, RawBlockExit::FornLoop { .. } | RawBlockExit::ForgLoop { .. })
+    !matches!(
+        exit,
+        RawBlockExit::FornLoop { .. } | RawBlockExit::ForgLoop { .. }
+    )
 }
 
 #[must_use]
