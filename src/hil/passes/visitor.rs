@@ -171,7 +171,7 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
                 visitor.visit_region(else_branch, cfg);
             }
         }
-        RegionNode::While { condition, body } | RegionNode::RepeatUntil { condition, body } => {
+        RegionNode::While { condition, body } => {
             visitor.visit_expr(condition);
             visitor.visit_region(body, cfg);
         }
@@ -357,7 +357,7 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
                 visitor.visit_region(else_branch, cfg);
             }
         }
-        RegionNode::While { condition, body } | RegionNode::RepeatUntil { condition, body } => {
+        RegionNode::While { condition, body } => {
             visitor.visit_expr(condition);
             visitor.visit_region(body, cfg);
         }

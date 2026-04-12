@@ -91,28 +91,6 @@ impl AstPrinter {
                 self.walk_expr(expr, 0, Side::None);
                 self.newline();
             }
-            Stmt::Function {
-                name,
-                params,
-                body,
-                local,
-            } => {
-                self.write(if *local {
-                    "local function "
-                } else {
-                    "function "
-                });
-                self.write(name.as_str());
-                self.write("(");
-                self.write_params(params);
-                self.write(")");
-                self.newline();
-                self.indent += 1;
-                self.walk_block(body);
-                self.indent -= 1;
-                self.write("end");
-                self.newline();
-            }
             Stmt::GenericFor { vars, exprs, body } => {
                 self.write("for ");
                 for (i, var) in vars.iter().enumerate() {
@@ -200,16 +178,6 @@ impl AstPrinter {
                 self.walk_block(body);
                 self.indent -= 1;
                 self.write("end");
-                self.newline();
-            }
-            Stmt::Repeat { body, condition } => {
-                self.write("repeat");
-                self.newline();
-                self.indent += 1;
-                self.walk_block(body);
-                self.indent -= 1;
-                self.write("until ");
-                self.walk_expr(condition, 0, Side::None);
                 self.newline();
             }
             Stmt::Return { values } => {

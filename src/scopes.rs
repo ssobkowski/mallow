@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::ops::Index;
 
@@ -50,12 +49,6 @@ impl<K: Hash + Eq, V> Scope<K, V> {
     pub fn contains(&self, name: &K) -> bool {
         self.variables.contains_key(name)
     }
-
-    /// Returns an [`Entry`] for the given name, allowing mutation of the value.
-    #[inline]
-    pub fn entry(&mut self, name: K) -> Entry<'_, K, V> {
-        self.variables.entry(name)
-    }
 }
 
 impl<K: Hash + Eq, V> Index<&K> for Scope<K, V> {
@@ -93,12 +86,6 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
         self.scopes.last_mut().expect("scope was just pushed")
     }
 
-    /// Gets the current scope, if it exists.
-    #[inline]
-    pub fn top_scope(&self) -> Option<&Scope<K, V>> {
-        self.scopes.last()
-    }
-
     /// Gets the current scope mutably, if it exists.
     #[inline]
     pub fn top_scope_mut(&mut self) -> Option<&mut Scope<K, V>> {
@@ -109,12 +96,6 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Scope<K, V>> {
         self.scopes.iter().rev()
-    }
-
-    /// Returns a mutable iterator over the scopes from innermost to outermost.
-    #[inline]
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Scope<K, V>> {
-        self.scopes.iter_mut().rev()
     }
 
     /// Pops the current scope from the stack.
@@ -132,23 +113,6 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
         } else {
             false
         }
-    }
-
-    /// Returns a variable from the current scope, if it exists.
-    /// If one cannot be found in the current scope, it will search
-    /// parent scopes until it finds one or exhausts all scopes.
-    #[inline]
-    #[must_use]
-    pub fn get(&self, name: &K) -> Option<&V> {
-        self.iter().find_map(|s| s.get(name))
-    }
-
-    /// Returns a mutable reference to a variable in the current scope, if it exists.
-    /// If one cannot be found in the current scope, it will search
-    /// parent scopes until it finds one or exhausts all scopes.
-    #[inline]
-    pub fn get_mut(&mut self, name: &K) -> Option<&mut V> {
-        self.iter_mut().find_map(|s| s.get_mut(name))
     }
 
     /// Returns whether the given name is declared in the current

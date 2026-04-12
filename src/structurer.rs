@@ -123,15 +123,6 @@ impl Structurer {
                     body,
                 });
             }
-            RegionNode::RepeatUntil {
-                condition, body, ..
-            } => {
-                let body = self.visit_region(body, cfg);
-                buf.push(Stmt::Repeat {
-                    body,
-                    condition: self.visit_expr(condition),
-                })
-            }
             RegionNode::NumericFor {
                 body,
                 var,
@@ -218,7 +209,6 @@ impl Structurer {
                 }
             }
             RegionNode::While { body, .. }
-            | RegionNode::RepeatUntil { body, .. }
             | RegionNode::NumericFor { body, .. }
             | RegionNode::GenericFor { body, .. } => {
                 self.collect_assigned_symbols_in_region(body, cfg, out);

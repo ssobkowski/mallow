@@ -69,11 +69,6 @@ pub enum RegionNode {
         condition: HilExpr,
         body: Box<RegionNode>,
     },
-    /// A structured repeat/until loop recovered from backedges.
-    RepeatUntil {
-        condition: HilExpr,
-        body: Box<RegionNode>,
-    },
     /// A structured numeric `for` loop recovered from `FORNPREP/FORNLOOP`.
     NumericFor {
         var: SymbolId,
@@ -145,10 +140,6 @@ impl RegionNode {
                 }
             }
             RegionNode::BasicBlock { block } => {
-                if *block == continue_target && continue_target_alt.is_none() {
-                    return;
-                }
-
                 let exit_node = &cfg.blocks[*block].exit;
 
                 let replacement = match exit_node {
@@ -245,7 +236,6 @@ impl RegionNode {
                 }
             }
             RegionNode::While { body, .. }
-            | RegionNode::RepeatUntil { body, .. }
             | RegionNode::NumericFor { body, .. }
             | RegionNode::GenericFor { body, .. } => {
                 body.strip_virtual_exits();
@@ -274,7 +264,6 @@ impl RegionNode {
                 }
             }
             RegionNode::While { body, .. }
-            | RegionNode::RepeatUntil { body, .. }
             | RegionNode::NumericFor { body, .. }
             | RegionNode::GenericFor { body, .. } => {
                 body.resolve_returns(cfg);
@@ -615,7 +604,6 @@ impl<'a> FoldableGraph<'a> {
             }
             RegionNode::If { .. }
             | RegionNode::While { .. }
-            | RegionNode::RepeatUntil { .. }
             | RegionNode::NumericFor { .. }
             | RegionNode::GenericFor { .. }
             | RegionNode::Continue
@@ -678,8 +666,6 @@ impl<'a> FoldableGraph<'a> {
                 then_branch: Box::new(then_node.unwrap()),
                 else_branch: Some(Box::new(else_node.unwrap())),
             });
-            guarded.extend(nodes);
-
             return RegionNode::Sequence { nodes: guarded };
         }
 
@@ -828,7 +814,6 @@ impl<'a> FoldableGraph<'a> {
                 }
             }
             RegionNode::While { body, .. }
-            | RegionNode::RepeatUntil { body, .. }
             | RegionNode::NumericFor { body, .. }
             | RegionNode::GenericFor { body, .. } => self.normalize_escape_guards(body),
             _ => {}
@@ -1284,9 +1269,16 @@ impl<'a> FoldableGraph<'a> {
                             {
                                 let mut body = self.fold_head_escape_guard(head_node, body_ast);
                                 self.normalize_escape_guards(&mut body);
-                                RegionNode::RepeatUntil {
+
+                                let break_guard = RegionNode::If {
                                     condition: cond,
-                                    body: Box::new(body),
+                                    then_branch: Box::new(RegionNode::Break),
+                                    else_branch: None,
+                                };
+
+                                RegionNode::While {
+                                    condition: HilExpr::Bool(true),
+                                    body: Box::new(RegionNode::merge([body, break_guard])),
                                 }
                             },
                             exit_block,

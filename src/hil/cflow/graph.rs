@@ -229,9 +229,6 @@ pub struct ControlFlowGraph {
     pub predecessors: Vec<Vec<usize>>,
     pub immediate_dominators: Vec<Option<usize>>,
 
-    pub numeric_loops_by_base: HashMap<u8, Vec<usize>>,
-    pub generic_loops_by_base: HashMap<u8, Vec<usize>>,
-
     pub upvalues: Vec<SymbolId>,
 }
 
@@ -831,8 +828,6 @@ impl ControlFlowGraph {
             blocks = new_blocks;
         };
 
-        let (numeric_loops_by_base, generic_loops_by_base) = build_loop_indexes(&blocks);
-
         // Rebuild after folding
         let successors = build_successors(blocks.iter().map(|b| b.exit_targets()));
         let predecessors = build_predecessors(&successors);
@@ -844,27 +839,12 @@ impl ControlFlowGraph {
             successors,
             predecessors,
             immediate_dominators,
-            numeric_loops_by_base,
-            generic_loops_by_base,
             upvalues,
         };
         for i in 0..graph.blocks.len() {
             graph.unfold_phis(i);
         }
         graph
-    }
-
-    /// Returns all successor block ids for `block`.
-    ///
-    /// # Returns
-    /// - `&[usize]`: outgoing targets, or an empty slice for out-of-range `block`.
-    #[inline]
-    #[must_use]
-    pub fn successors(&self, block: usize) -> &[usize] {
-        self.successors
-            .get(block)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
     }
 
     /// Returns all predecessor block ids for `block`.
@@ -1169,30 +1149,6 @@ fn pc_to_block_idx(entries: &[usize], pc: usize) -> usize {
     assert!(!entries.is_empty());
     assert!(entries[0] <= pc);
     entries.partition_point(|&e| e <= pc) - 1
-}
-
-/// Indexes loop-tail blocks by Luau loop base register.
-///
-/// # Returns
-/// - numeric and generic loop-tail maps keyed by base register.
-#[must_use]
-fn build_loop_indexes(blocks: &[Block]) -> (HashMap<u8, Vec<usize>>, HashMap<u8, Vec<usize>>) {
-    let mut numeric_loops_by_base: HashMap<u8, Vec<usize>> = HashMap::new();
-    let mut generic_loops_by_base: HashMap<u8, Vec<usize>> = HashMap::new();
-
-    for (idx, block) in blocks.iter().enumerate() {
-        match block.exit {
-            BlockExit::FornLoop { base, .. } => {
-                numeric_loops_by_base.entry(base).or_default().push(idx)
-            }
-            BlockExit::ForgLoop { base, .. } => {
-                generic_loops_by_base.entry(base).or_default().push(idx)
-            }
-            _ => {}
-        }
-    }
-
-    (numeric_loops_by_base, generic_loops_by_base)
 }
 
 #[must_use]

@@ -35,11 +35,6 @@ pub struct Block {
 }
 
 impl Block {
-    /// Creates an empty block.
-    pub fn new() -> Self {
-        Self { stmts: Vec::new() }
-    }
-
     /// Creates a block with pre-populated statements.
     pub fn with_stmts(stmts: Vec<Stmt>) -> Self {
         Self { stmts }
@@ -74,17 +69,6 @@ pub enum Stmt {
     Expression {
         /// Expression being evaluated.
         expr: Expr,
-    },
-    /// Function declaration.
-    Function {
-        /// Function name.
-        name: Identifier,
-        /// Function parameters.
-        params: Vec<Parameter>,
-        /// Function body.
-        body: Block,
-        /// Whether this is `local function ...`.
-        local: bool,
     },
     /// Generic `for ... in ... do`.
     GenericFor {
@@ -123,13 +107,6 @@ pub enum Stmt {
         step: Option<Expr>,
         /// Loop body.
         body: Block,
-    },
-    /// `repeat ... until ...`.
-    Repeat {
-        /// Repeat body.
-        body: Block,
-        /// Termination condition.
-        condition: Expr,
     },
     /// `return ...`.
     Return {
