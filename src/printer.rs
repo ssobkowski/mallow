@@ -271,7 +271,15 @@ impl AstPrinter {
                 if needs_parens {
                     self.write("(");
                 }
+                let object_needs_parens =
+                    matches!(object.as_ref(), Expr::Literal(Literal::String(_)));
+                if object_needs_parens {
+                    self.write("(");
+                }
                 self.walk_expr(object, prec, Side::Left);
+                if object_needs_parens {
+                    self.write(")");
+                }
                 self.write(":");
                 self.write(method.as_str());
                 self.write("(");
