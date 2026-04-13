@@ -70,7 +70,7 @@ fn decompile_bytecode(bytecode: &[u8]) -> Result<String, DisasmError> {
         .map(|proto| StructuredFunction::from_proto(proto, &diasssembled.protos))
         .collect();
 
-    hil::passes::run(&mut fns);
+    // hil::passes::run(&mut fns);
 
     let ast = structurer::structure(fns, diasssembled.entry_proto as usize);
     Ok(printer::print(&ast))

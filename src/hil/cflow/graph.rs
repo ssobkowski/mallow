@@ -229,6 +229,7 @@ pub struct ControlFlowGraph {
     pub predecessors: Vec<Vec<usize>>,
     pub immediate_dominators: Vec<Option<usize>>,
 
+    pub params: Vec<SymbolId>,
     pub upvalues: Vec<SymbolId>,
 }
 
@@ -560,9 +561,11 @@ impl ControlFlowGraph {
         let mut blocks: Vec<Block> = vec![Block::dummy(); raw_blocks.len()];
         let mut ssa = Ssa::new(&predecessors, &mut arena);
 
+        let mut params = Vec::with_capacity(proto.num_params as usize);
         for i in 0..proto.num_params {
-            let sym = ssa.alloc_symbol(Symbol::reg(i));
+            let sym = ssa.alloc_symbol(Symbol::param(i));
             ssa.write_reg(0, i, sym);
+            params.push(sym);
         }
 
         for i in 0..proto.num_upvals {
@@ -780,7 +783,12 @@ impl ControlFlowGraph {
             for stmt in &block.stmts {
                 if let HilStmt::Phi(phi) = &stmt.inner {
                     for (pred_block, operand) in &phi.operands {
-                        if is_loop_header_seed_operand(&blocks, block_idx, *pred_block) {
+                        if is_loop_header_loop_var_operand(
+                            &blocks,
+                            block_idx,
+                            *pred_block,
+                            phi.target,
+                        ) {
                             continue;
                         }
                         disjoint_set.union(phi.target, *operand);
@@ -805,6 +813,10 @@ impl ControlFlowGraph {
         }
 
         resolve_ssa_symbols(&mut blocks, &ssa, &mut disjoint_set);
+
+        for sym in &mut params {
+            *sym = disjoint_set.find(ssa.resolve(*sym));
+        }
 
         let mut upvalues = Vec::with_capacity(proto.num_upvals as usize);
         for i in 0..proto.num_upvals {
@@ -854,6 +866,7 @@ impl ControlFlowGraph {
             successors,
             predecessors,
             immediate_dominators,
+            params,
             upvalues,
         };
         for i in 0..graph.blocks.len() {
@@ -1167,16 +1180,30 @@ fn pc_to_block_idx(entries: &[usize], pc: usize) -> usize {
 }
 
 #[must_use]
-fn is_loop_header_seed_operand(blocks: &[Block], block_idx: usize, pred_block: usize) -> bool {
+fn is_loop_header_loop_var_operand(
+    blocks: &[Block],
+    block_idx: usize,
+    pred_block: usize,
+    target: SymbolId,
+) -> bool {
     let Some(pred) = blocks.get(pred_block) else {
         return false;
     };
 
-    matches!(
-        pred.exit,
-        BlockExit::FornPrep { body_block, .. } | BlockExit::ForgPrep { body_block, .. }
-            if body_block == block_idx
-    )
+    match &pred.exit {
+        BlockExit::FornPrep {
+            body_block, var, ..
+        } if *body_block == block_idx => *var == target,
+        BlockExit::ForgPrep { body_block, .. } if *body_block == block_idx => {
+            blocks.get(block_idx).is_some_and(|block| {
+                matches!(
+                    &block.exit,
+                    BlockExit::ForgLoop { vars, .. } if vars.contains(&target)
+                )
+            })
+        }
+        _ => false,
+    }
 }
 
 #[must_use]

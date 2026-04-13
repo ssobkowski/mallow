@@ -69,6 +69,11 @@ impl AstPrinter {
                 }
                 self.newline();
             }
+            Stmt::Comment { text } => {
+                self.write("-- ");
+                self.write(text);
+                self.newline();
+            }
             Stmt::Break => {
                 self.write("break");
                 self.newline();

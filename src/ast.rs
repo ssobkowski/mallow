@@ -58,6 +58,11 @@ pub enum Stmt {
     },
     /// `break`.
     Break,
+    /// A single line comment.
+    Comment {
+        /// The comment text.
+        text: String,
+    },
     /// `continue`.
     Continue,
     /// `do ... end`.

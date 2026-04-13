@@ -11,7 +11,7 @@ pub type SymbolId = Id<Symbol>;
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
-    /// The original register or upvalue this symbol represents.
+    /// The original storage role this symbol represents.
     pub kind: SymbolKind,
     /// The mutability type of this symbol.
     pub mutability: Mutability,
@@ -21,6 +21,7 @@ pub struct Symbol {
 pub enum SymbolKind {
     Register(u8),
     Upvalue(u8),
+    Param(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,14 +37,6 @@ impl SsaVar {
             SsaVar::Upval(u) => 256 + u as usize,
         }
     }
-
-    const fn from_index(index: usize) -> Self {
-        if index < 256 {
-            SsaVar::Reg(index as u8)
-        } else {
-            SsaVar::Upval((index - 256) as u8)
-        }
-    }
 }
 
 impl Symbol {
@@ -57,6 +50,13 @@ impl Symbol {
     pub fn upval(index: u8) -> Self {
         Self {
             kind: SymbolKind::Upvalue(index),
+            mutability: Mutability::Immutable,
+        }
+    }
+
+    pub fn param(index: u8) -> Self {
+        Self {
+            kind: SymbolKind::Param(index),
             mutability: Mutability::Immutable,
         }
     }
@@ -101,10 +101,6 @@ impl<'a> Ssa<'a> {
 
     pub fn alloc_symbol(&mut self, symbol: Symbol) -> SymbolId {
         self.arena.alloc(symbol)
-    }
-
-    pub fn symbol(&self, id: SymbolId) -> &Symbol {
-        &self.arena[id]
     }
 
     pub fn arena_iter(&self) -> impl Iterator<Item = (SymbolId, &Symbol)> {

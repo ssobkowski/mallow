@@ -654,7 +654,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
             match self.next() {
                 Some(Instr::Capture { capture_type, reg }) => {
                     let symbol = match capture_type {
-                        0 | 1 => self.get_reg_symbol(reg),
+                        0 | 1 => self.ssa.read_reg(self.block_idx, reg),
                         2 => self.ssa.read_upval(self.block_idx, reg),
                         _ => unreachable!("unknown capture type: {capture_type}"),
                     };
