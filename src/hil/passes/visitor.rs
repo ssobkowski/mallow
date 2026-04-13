@@ -182,7 +182,7 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
             end,
             step,
         } => {
-            visitor.visit_symbol(*var);
+            visitor.visit_binding_symbol(*var);
             visitor.visit_expr(start);
             visitor.visit_expr(end);
             visitor.visit_expr(step);
@@ -193,7 +193,7 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
                 visitor.visit_expr(expr);
             }
             for var in vars {
-                visitor.visit_symbol(*var);
+                visitor.visit_binding_symbol(*var);
             }
             visitor.visit_region(body, cfg);
         }
@@ -368,7 +368,7 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
             end,
             step,
         } => {
-            visitor.visit_symbol(var);
+            visitor.visit_binding_symbol(var);
             visitor.visit_expr(start);
             visitor.visit_expr(end);
             visitor.visit_expr(step);
@@ -379,7 +379,7 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
                 visitor.visit_expr(expr);
             }
             for var in vars {
-                visitor.visit_symbol(var);
+                visitor.visit_binding_symbol(var);
             }
             visitor.visit_region(body, cfg);
         }
