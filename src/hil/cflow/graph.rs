@@ -1588,7 +1588,11 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
             HilExpr::Symbol(sym) => {
                 resolve(sym, ssa, djs);
             }
-
+            HilExpr::Closure { captures, .. } => {
+                for capture in captures {
+                    resolve(capture, ssa, djs);
+                }
+            }
             HilExpr::GetField { obj, .. } => {
                 walk_expr(obj, ssa, djs);
             }

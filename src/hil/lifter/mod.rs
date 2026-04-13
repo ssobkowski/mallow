@@ -446,31 +446,45 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                 } => self.lift_setlist(*table, *base, *count, *index),
 
                 Instr::NewClosure { dest, proto: index } => {
+                    let pc = self.current_pc();
+                    let sym = self.ssa.alloc_symbol(Symbol::reg(*dest));
+                    self.ssa.write_reg(self.block_idx, *dest, sym);
+
                     let resolved = self.parent_proto.protos[*index as usize];
                     let n_captures = self.proto_upval_count(resolved);
                     let captures = self.consume_captures(n_captures);
-                    self.assign_reg(
-                        *dest,
-                        HilExpr::Closure {
-                            proto: resolved,
-                            captures,
-                        },
+                    self.stmts.push(
+                        HilStmt::Assign {
+                            left: HilExpr::Symbol(sym),
+                            value: HilExpr::Closure {
+                                proto: resolved,
+                                captures,
+                            },
+                        }
+                        .to_spanned(pc),
                     );
                 }
 
                 Instr::DupClosure { dest, k } => {
+                    let pc = self.current_pc();
+                    let sym = self.ssa.alloc_symbol(Symbol::reg(*dest));
+                    self.ssa.write_reg(self.block_idx, *dest, sym);
+
                     let resolved = match self.consts.get(*k as usize) {
                         Some(Constant::Closure(proto_idx)) => *proto_idx as usize,
                         _ => panic!("DUPCLOSURE constant at index {} is not a closure", k),
                     };
                     let n_captures = self.proto_upval_count(resolved);
                     let captures = self.consume_captures(n_captures);
-                    self.assign_reg(
-                        *dest,
-                        HilExpr::Closure {
-                            proto: resolved,
-                            captures,
-                        },
+                    self.stmts.push(
+                        HilStmt::Assign {
+                            left: HilExpr::Symbol(sym),
+                            value: HilExpr::Closure {
+                                proto: resolved,
+                                captures,
+                            },
+                        }
+                        .to_spanned(pc),
                     );
                 }
 

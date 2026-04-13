@@ -284,8 +284,30 @@ impl Structurer {
         let block = &cfg.blocks[block_idx];
 
         for stmt in &block.stmts {
+            self.maybe_predeclare_recursive_local(&stmt.inner, buf);
             buf.push(self.visit_stmt(&stmt.inner));
         }
+    }
+
+    fn maybe_predeclare_recursive_local(&mut self, stmt: &HilStmt, buf: &mut Vec<Stmt>) {
+        let HilStmt::Assign {
+            left: HilExpr::Symbol(sym),
+            value: HilExpr::Closure { captures, .. },
+        } = stmt
+        else {
+            return;
+        };
+
+        if self.scopes.contains(sym) || !captures.iter().any(|capture| capture == sym) {
+            return;
+        }
+
+        self.scopes.declare(*sym, ());
+        let name = self.get_symbol_name(sym);
+        buf.push(Stmt::LocalDeclaration {
+            names: vec![name],
+            values: Vec::new(),
+        });
     }
 
     fn collect_assigned_symbols_in_region(
