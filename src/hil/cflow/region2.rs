@@ -306,6 +306,14 @@ impl RegionNode {
         match self {
             RegionNode::Continue | RegionNode::Break => true,
             RegionNode::Sequence { nodes } => nodes.last().is_some_and(|n| n.ends_with_escape()),
+            RegionNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                then_branch.ends_with_escape()
+                    && else_branch.as_ref().is_some_and(|e| e.ends_with_escape())
+            }
             _ => false,
         }
     }
@@ -613,11 +621,15 @@ impl<'a> FoldableGraph<'a> {
         }
     }
 
-    /// Rebuilds a loop-header branch into a structured one-armed guard.
+    /// Restructures a loop header's conditional branch into a structured if-then-else
+    /// or one-armed if guard, pulling the target branches out of the body sequence.
     ///
-    /// This is used when one header successor is an escape path and the other
-    /// is normal loop body flow, so escape code is emitted before remaining
-    /// body statements.
+    /// When the loop header has a CondJump, this function identifies the branch targets
+    /// in the body sequence and restructures them. If both targets end with escape
+    /// (break/continue), they're pulled into an if-then-else at the top. If only one
+    /// target escapes, a one-armed guard is created. If neither escapes, both branches
+    /// are still restructured into an if-then-else since the conditional must be
+    /// represented in the output.
     fn fold_head_escape_guard(&self, head_node: RegionNode, body_ast: RegionNode) -> RegionNode {
         let Some((mut cond, then_block, else_block)) = self.extract_cond_jump(&head_node) else {
             return RegionNode::merge([head_node, body_ast]);
@@ -636,7 +648,9 @@ impl<'a> FoldableGraph<'a> {
 
         let Some((then_idx, else_idx)) = (match (then_idx, else_idx) {
             (Some(t), Some(e)) if t != e => Some((t, e)),
-            _ => None,
+            _ => {
+                return RegionNode::merge([head_node, RegionNode::Sequence { nodes }]);
+            }
         }) else {
             return RegionNode::merge([head_node, RegionNode::Sequence { nodes }]);
         };
@@ -670,32 +684,63 @@ impl<'a> FoldableGraph<'a> {
             return RegionNode::Sequence { nodes: guarded };
         }
 
-        let Some((escape_idx, invert)) = (if then_escape {
+        if let Some((escape_idx, invert)) = if then_escape {
             Some((then_idx, false))
         } else if else_escape {
             Some((else_idx, true))
         } else {
             None
-        }) else {
-            return RegionNode::merge([head_node, RegionNode::Sequence { nodes }]);
-        };
+        } {
+            if invert {
+                cond = invert_condition(cond);
+            }
 
-        if invert {
-            cond = invert_condition(cond);
+            let mut guarded = Vec::with_capacity(nodes.len() + 2);
+            guarded.push(head_node);
+
+            let escape_node = nodes.remove(escape_idx);
+            guarded.push(RegionNode::If {
+                condition: cond,
+                then_branch: Box::new(escape_node),
+                else_branch: None,
+            });
+            guarded.extend(nodes);
+
+            return RegionNode::Sequence { nodes: guarded };
         }
 
-        let mut guarded = Vec::with_capacity(nodes.len() + 2);
-        guarded.push(head_node);
+        // Neither branch always escapes, but both targets are present in the body.
+        // Restructure into an if-then-else to properly represent the conditional.
+        // Remaining nodes (after removing then and else targets) are appended to
+        // the then branch, as they logically belong to the "then" path's fall-through.
+        let mut then_node_val = None;
+        let mut else_node_val = None;
+        let mut remove_order = [then_idx, else_idx];
+        remove_order.sort_unstable_by(|a, b| b.cmp(a));
 
-        let escape_node = nodes.remove(escape_idx);
-        guarded.push(RegionNode::If {
-            condition: cond,
-            then_branch: Box::new(escape_node),
-            else_branch: None,
-        });
-        guarded.extend(nodes);
+        for idx in remove_order {
+            let removed = nodes.remove(idx);
+            if idx == then_idx {
+                then_node_val = Some(removed);
+            } else {
+                else_node_val = Some(removed);
+            }
+        }
 
-        RegionNode::Sequence { nodes: guarded }
+        let then_branch =
+            RegionNode::merge(std::iter::once(then_node_val.unwrap()).chain(nodes.into_iter()));
+        let else_branch = else_node_val.unwrap();
+
+        RegionNode::Sequence {
+            nodes: vec![
+                head_node,
+                RegionNode::If {
+                    condition: cond,
+                    then_branch: Box::new(then_branch),
+                    else_branch: Some(Box::new(else_branch)),
+                },
+            ],
+        }
     }
 
     /// Folds one conditional in a sequence into an explicit escape guard.
@@ -1265,7 +1310,10 @@ impl<'a> FoldableGraph<'a> {
 
                             (head, loop_node, effective_exit)
                         }
-                        Loop::RepeatUntil { cond: _, exit_block } => (
+                        Loop::RepeatUntil {
+                            cond: _,
+                            exit_block,
+                        } => (
                             head,
                             {
                                 let mut body = self.fold_head_escape_guard(head_node, body_ast);
