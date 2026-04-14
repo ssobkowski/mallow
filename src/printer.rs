@@ -1,5 +1,5 @@
 use crate::{
-    ast::{BinOp, Block, Expr, Literal, Parameter, Stmt, TableItem, UnOp},
+    ast::{BinOp, Block, CompoundBinOp, Expr, Literal, Parameter, Stmt, TableItem, UnOp},
     common::escape_string,
 };
 
@@ -72,6 +72,14 @@ impl AstPrinter {
             Stmt::Comment { text } => {
                 self.write("-- ");
                 self.write(text);
+                self.newline();
+            }
+            Stmt::CompoundAssignment { lhs, op, rhs } => {
+                self.walk_expr(lhs, 0, Side::None);
+                self.write(" ");
+                self.write(compound_binary_symbol(op));
+                self.write(" ");
+                self.walk_expr(rhs, 0, Side::None);
                 self.newline();
             }
             Stmt::Break => {
@@ -501,6 +509,18 @@ fn unary_symbol(op: &UnOp) -> &'static str {
         UnOp::Minus => "-",
         UnOp::Length => "#",
         UnOp::Not => "not",
+    }
+}
+
+fn compound_binary_symbol(op: &CompoundBinOp) -> &'static str {
+    match op {
+        CompoundBinOp::Add => "+=",
+        CompoundBinOp::Sub => "-=",
+        CompoundBinOp::Mul => "*=",
+        CompoundBinOp::Div => "/=",
+        CompoundBinOp::Mod => "%=",
+        CompoundBinOp::Pow => "^=",
+        CompoundBinOp::Concat => "..=",
     }
 }
 

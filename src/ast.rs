@@ -63,6 +63,15 @@ pub enum Stmt {
         /// The comment text.
         text: String,
     },
+    /// Compount assignment statement, e.g. `a += 5`
+    CompoundAssignment {
+        /// Left-hand side expression.
+        lhs: Expr,
+        /// Operator.
+        op: CompoundBinOp,
+        /// Right-hand side expression.
+        rhs: Expr,
+    },
     /// `continue`.
     Continue,
     /// `do ... end`.
@@ -260,7 +269,7 @@ pub enum BinOp {
 
 impl BinOp {
     /// Returns the precedence level of this binary operator.
-    pub fn precedence(&self) -> u8 {
+    pub const fn precedence(&self) -> u8 {
         match self {
             BinOp::Or => 1,
             BinOp::And => 2,
@@ -270,6 +279,14 @@ impl BinOp {
             BinOp::Mul | BinOp::Div | BinOp::Mod => 6,
             BinOp::Pow => 8,
         }
+    }
+
+    /// Returns whether this binary operator is a compound operator.
+    pub const fn is_compound(&self) -> bool {
+        matches!(
+            self,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
+        )
     }
 }
 
@@ -305,6 +322,21 @@ pub enum CompoundBinOp {
     Mod,
     Pow,
     Concat,
+}
+
+impl From<BinOp> for CompoundBinOp {
+    fn from(op: BinOp) -> Self {
+        match op {
+            BinOp::Add => CompoundBinOp::Add,
+            BinOp::Sub => CompoundBinOp::Sub,
+            BinOp::Mul => CompoundBinOp::Mul,
+            BinOp::Div => CompoundBinOp::Div,
+            BinOp::Mod => CompoundBinOp::Mod,
+            BinOp::Pow => CompoundBinOp::Pow,
+            BinOp::Concat => CompoundBinOp::Concat,
+            _ => unreachable!(),
+        }
+    }
 }
 
 /// Unary operator.

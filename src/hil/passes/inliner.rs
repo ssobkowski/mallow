@@ -1,10 +1,15 @@
 use crate::{
     hil::{
         StructuredFunction,
-        cflow::graph::{Block, ControlFlowGraph},
+        cflow::{
+            graph::{Block, ControlFlowGraph},
+            region2::RegionNode,
+        },
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
-        passes::visitor::{Visitor, VisitorMut, walk_block_mut, walk_expr, walk_expr_mut},
+        passes::visitor::{
+            Visitor, VisitorMut, walk_block_mut, walk_expr, walk_expr_mut, walk_function, walk_node,
+        },
     },
     scopes::Scope,
 };
@@ -35,6 +40,17 @@ struct Analyzer {
 }
 
 impl Visitor for Analyzer {
+    fn visit_function(&mut self, fun: &StructuredFunction) {
+        // Parameters are inlined into themselves - essentially they need to be present
+        // in the vars array (see `is_inlinable_rhs`) and because they have no underlying
+        // value this just allows us to skip bindings like `v{N} = p{N}`.
+        for param in &fun.cfg.params {
+            self.vars.declare(*param, Var::new(HilExpr::Symbol(*param)));
+        }
+
+        walk_function(self, fun);
+    }
+
     fn visit_block(&mut self, _: usize, block: &Block, cfg: &ControlFlowGraph) {
         for up in &cfg.upvalues {
             // This can be inserted as a dummy expression, because upvalues are NEVER to be inlined.
@@ -44,29 +60,76 @@ impl Visitor for Analyzer {
         }
 
         for stmt in &block.stmts {
-            if let HilStmt::Assign {
-                left: HilExpr::Symbol(sym),
-                value,
-            } = &stmt.inner
-            {
-                match self.vars.get_mut(sym) {
-                    Some(var) => {
-                        var.write_count += 1;
-                        var.expr = value.clone();
+            match &stmt.inner {
+                HilStmt::Assign {
+                    left: HilExpr::Symbol(sym),
+                    value,
+                } => {
+                    match self.vars.get_mut(sym) {
+                        Some(var) => {
+                            var.write_count += 1;
+                            var.expr = value.clone();
+                        }
+                        None => {
+                            self.vars.declare(*sym, Var::new(value.clone()));
+                        }
                     }
-                    None => {
-                        self.vars.declare(*sym, Var::new(value.clone()));
+
+                    // Manually visit the rvalue of the assignments, as we would visit the same
+                    // stmt twice if we delegated this whole stmt to the `visit_stmt_spanned` below.
+                    self.visit_expr(value);
+                    continue;
+                }
+                HilStmt::AssignMany { left, value } => {
+                    // Block all tuple-assigns from being inlined. This can only be done in the
+                    // (TODO) "immediate use" pass.
+                    for sym in left {
+                        match self.vars.get_mut(&sym) {
+                            Some(var) => {
+                                var.write_count += 1;
+                                var.disqualified = true;
+                            }
+                            None => {
+                                // Initialize with a dummy expression, but immediately mark as not a candidate
+                                let mut var = Var::new(HilExpr::Nil);
+                                var.disqualified = true;
+                                self.vars.declare(*sym, var);
+                            }
+                        }
+                    }
+
+                    self.visit_expr(value);
+                    continue;
+                }
+                _ => {
+                    self.visit_stmt_spanned(stmt);
+                }
+            }
+        }
+    }
+
+    fn visit_node(&mut self, node: &RegionNode, cfg: &ControlFlowGraph) {
+        match node {
+            RegionNode::NumericFor { var, .. } => {
+                if let Some(existing) = self.vars.get_mut(var) {
+                    existing.write_count += 1;
+                } else {
+                    self.vars.declare(*var, Var::new(HilExpr::Symbol(*var)));
+                }
+            }
+            RegionNode::GenericFor { vars, .. } => {
+                for var in vars {
+                    if let Some(existing) = self.vars.get_mut(var) {
+                        existing.write_count += 1;
+                    } else {
+                        self.vars.declare(*var, Var::new(HilExpr::Symbol(*var)));
                     }
                 }
-
-                // Manually visit the rvalue of the assignments, as we would visit the same
-                // stmt twice if we delegated this whole stmt to the `visit_stmt_spanned` below.
-                self.visit_expr(value);
-                continue;
             }
-
-            self.visit_stmt_spanned(stmt);
+            _ => {}
         }
+
+        walk_node(self, node, cfg);
     }
 
     fn visit_expr(&mut self, expr: &HilExpr) {
@@ -78,23 +141,6 @@ impl Visitor for Analyzer {
         }
 
         walk_expr(self, expr);
-    }
-
-    fn visit_binding_symbol(&mut self, sym: SymbolId) {
-        // This gets called only on AssignMany. This inliner pass
-        // only supports inlining single-assignment variables.
-        match self.vars.get_mut(&sym) {
-            Some(var) => {
-                var.write_count += 1;
-                var.disqualified = true;
-            }
-            None => {
-                // Initialize with a dummy expression, but immediately mark as not a candidate
-                let mut var = Var::new(HilExpr::Nil);
-                var.disqualified = true;
-                self.vars.declare(sym, var);
-            }
-        }
     }
 
     fn visit_capture(&mut self, _: usize, sym: SymbolId) {
@@ -118,6 +164,13 @@ struct Inliner {
 }
 
 impl Inliner {
+    fn with_vars(vars: Scope<SymbolId, Var>) -> Self {
+        Self {
+            vars,
+            was_changed: false,
+        }
+    }
+
     fn can_inline(&self, var: &Var) -> bool {
         !var.disqualified
             && var.write_count == 1
@@ -188,11 +241,10 @@ impl VisitorMut for Inliner {
 pub fn run(fun: &mut StructuredFunction) {
     loop {
         let vars = Analyzer::analyze_function(fun);
-        let mut inliner = Inliner {
-            vars,
-            was_changed: false,
-        };
+
+        let mut inliner = Inliner::with_vars(vars);
         inliner.visit_function(fun);
+
         if !inliner.was_changed {
             break;
         }

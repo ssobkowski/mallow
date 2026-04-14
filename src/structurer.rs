@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
-use smol_str::{format_smolstr, SmolStr};
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
     ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem, UnOp},
     hil::{
+        StructuredFunction,
         cflow::{graph::ControlFlowGraph, region2::RegionNode},
         ir::{HilExpr, HilStmt, HilTableItem},
         lifter::ssa::SymbolId,
-        StructuredFunction,
     },
     scopes::Scopes,
 };
@@ -399,6 +399,17 @@ impl Structurer {
                         values: vec![right],
                     }
                 } else {
+                    if let Expr::Binary { lhs, op, rhs } = &right
+                        && lhs.as_ref() == &left_expr
+                        && op.is_compound()
+                    {
+                        return Stmt::CompoundAssignment {
+                            lhs: left_expr,
+                            op: (*op).into(),
+                            rhs: rhs.as_ref().clone(),
+                        };
+                    }
+
                     Stmt::Assignment {
                         lhs: vec![left_expr],
                         rhs: vec![right],

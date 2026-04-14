@@ -1,3 +1,4 @@
+pub mod common;
 pub mod ssa;
 
 use ssa::Ssa;
@@ -9,7 +10,10 @@ use crate::{
     hil::{
         common::{const_expr, decoded_count},
         ir::{HilExpr, HilStmt, Spanned, ToSpanned},
-        lifter::ssa::{Symbol, SymbolId},
+        lifter::{
+            common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL},
+            ssa::{Symbol, SymbolId},
+        },
     },
     il::{Constant, Count, Instr},
 };
@@ -668,8 +672,8 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
             match self.next() {
                 Some(Instr::Capture { capture_type, reg }) => {
                     let symbol = match capture_type {
-                        0 | 1 => self.ssa.read_reg(self.block_idx, reg),
-                        2 => self.ssa.read_upval(self.block_idx, reg),
+                        CAPTURE_VAL | CAPTURE_REF => self.ssa.read_reg(self.block_idx, reg),
+                        CAPTURE_UPVAL => self.ssa.read_upval(self.block_idx, reg),
                         _ => unreachable!("unknown capture type: {capture_type}"),
                     };
                     captures.push(symbol);

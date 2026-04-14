@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use smallvec::{SmallVec, smallvec};
 
 use crate::hil::common::decoded_count;

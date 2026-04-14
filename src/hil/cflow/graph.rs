@@ -14,7 +14,9 @@ use crate::{
         common::{const_expr, decoded_count},
         ir::{HilExpr, HilStmt, HilTableItem, PhiNode, Spanned, ToSpanned as _},
         lifter::{
-            LiftContext, lift,
+            LiftContext,
+            common::CAPTURE_REF,
+            lift,
             ssa::{Ssa, Symbol, SymbolId, SymbolKind},
         },
     },
@@ -797,16 +799,36 @@ impl ControlFlowGraph {
             }
         }
 
-        // Unify all versions of the same upvalue. Since upvalues are shared
-        // external state, all assignments and reads must refer to the same
-        // logical variable in the decompiled output.
-        let mut upval_versions: HashMap<u8, Vec<SymbolId>> = HashMap::new();
-        for (id, symbol) in ssa.arena_iter() {
-            if let SymbolKind::Upvalue(idx) = symbol.kind {
-                upval_versions.entry(idx).or_default().push(id);
+        // These need to be treated as shared mutable state across the function,
+        // just like upvalues, so we must unify all their SSA versions.
+        let mut captured_refs = HashSet::new();
+        for (instr, _) in instrs {
+            if let Instr::Capture {
+                capture_type: CAPTURE_REF,
+                reg,
+            } = instr
+            {
+                captured_refs.insert(*reg);
             }
         }
-        for versions in upval_versions.values() {
+
+        // Unify all versions of the same upvalue AND all versions of captured registers.
+        let mut upval_versions: HashMap<u8, Vec<SymbolId>> = HashMap::new();
+        let mut captured_versions: HashMap<u8, Vec<SymbolId>> = HashMap::new();
+
+        for (id, symbol) in ssa.arena_iter() {
+            match symbol.kind {
+                SymbolKind::Upvalue(idx) => {
+                    upval_versions.entry(idx).or_default().push(id);
+                }
+                SymbolKind::Register(idx) if captured_refs.contains(&idx) => {
+                    captured_versions.entry(idx).or_default().push(id);
+                }
+                _ => {}
+            }
+        }
+
+        for versions in upval_versions.values().chain(captured_versions.values()) {
             for i in 1..versions.len() {
                 disjoint_set.union(versions[0], versions[i]);
             }
@@ -1179,6 +1201,21 @@ fn pc_to_block_idx(entries: &[usize], pc: usize) -> usize {
     entries.partition_point(|&e| e <= pc) - 1
 }
 
+/// Determines whether a given Phi node operand comes from a loop preheader
+/// and targets the loop's internal iteration variables.
+///
+/// During SSA construction, Phi nodes are inserted at loop headers to merge
+/// values from the preheader (before the loop) and the latch (end of the loop).
+/// However, for Luau `for` loops, the iteration variables are initialized *by* the
+/// loop setup opcodes (`FornPrep` / `ForgPrep`), effectively shadowing whatever
+/// data was in those physical registers previously.
+///
+/// If the union-find algorithm links the loop variable's Phi target
+/// with the preheader's operand, the loop variable will incorrectly fuse with
+/// completely unrelated variables that just happened to share the same physical
+/// register earlier in the function (causing scope bleeding and duplicate variable
+/// declarations). This function identifies those specific operands so the
+/// SSA resolver can ignore them.
 #[must_use]
 fn is_loop_header_loop_var_operand(
     blocks: &[Block],
@@ -1194,14 +1231,16 @@ fn is_loop_header_loop_var_operand(
         BlockExit::FornPrep {
             body_block, var, ..
         } if *body_block == block_idx => *var == target,
-        BlockExit::ForgPrep { body_block, .. } if *body_block == block_idx => {
-            blocks.get(block_idx).is_some_and(|block| {
-                matches!(
-                    &block.exit,
-                    BlockExit::ForgLoop { vars, .. } if vars.contains(&target)
-                )
-            })
-        }
+        BlockExit::ForgPrep {
+            body_block,
+            exit_block,
+            ..
+        } if *body_block == block_idx => blocks.get(*exit_block).is_some_and(|block| {
+            matches!(
+                &block.exit,
+                BlockExit::ForgLoop { vars, .. } if vars.contains(&target)
+            )
+        }),
         _ => false,
     }
 }

@@ -6,7 +6,7 @@ use crate::hil::{
         graph::{Block, ControlFlowGraph},
         region2::RegionNode,
     },
-    ir::{HilExpr, HilStmt, HilTableItem, PhiNode, Spanned},
+    ir::{HilExpr, HilStmt, HilTableItem, Spanned},
     lifter::ssa::SymbolId,
 };
 
@@ -45,17 +45,6 @@ pub trait Visitor {
 
     fn visit_table_item(&mut self, item: &HilTableItem) {
         walk_table_item(self, item);
-    }
-
-    fn visit_phi(&mut self, phi: &PhiNode) {
-        self.visit_binding_symbol(phi.target);
-        for (_, operand) in &phi.operands {
-            self.visit_symbol(*operand);
-        }
-    }
-
-    fn visit_binding_symbol(&mut self, sym: SymbolId) {
-        self.visit_symbol(sym);
     }
 
     fn visit_capture(&mut self, _index: usize, _sym: SymbolId) {}
@@ -108,17 +97,6 @@ pub trait VisitorMut {
 
     fn visit_table_item(&mut self, item: &mut HilTableItem) {
         walk_table_item_mut(self, item);
-    }
-
-    fn visit_phi(&mut self, phi: &mut PhiNode) {
-        self.visit_binding_symbol(&mut phi.target);
-        for (_, operand) in &mut phi.operands {
-            self.visit_symbol(operand);
-        }
-    }
-
-    fn visit_binding_symbol(&mut self, sym: &mut SymbolId) {
-        self.visit_symbol(sym);
     }
 
     fn visit_capture(&mut self, _index: usize, _sym: &mut SymbolId) {}
@@ -182,7 +160,7 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
             end,
             step,
         } => {
-            visitor.visit_binding_symbol(*var);
+            visitor.visit_symbol(*var);
             visitor.visit_expr(start);
             visitor.visit_expr(end);
             visitor.visit_expr(step);
@@ -193,7 +171,7 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
                 visitor.visit_expr(expr);
             }
             for var in vars {
-                visitor.visit_binding_symbol(*var);
+                visitor.visit_symbol(*var);
             }
             visitor.visit_region(body, cfg);
         }
@@ -226,7 +204,7 @@ pub fn walk_stmt<V: Visitor + ?Sized>(visitor: &mut V, stmt: &HilStmt) {
         }
         HilStmt::AssignMany { left, value } => {
             for symbol in left {
-                visitor.visit_binding_symbol(*symbol);
+                visitor.visit_symbol(*symbol);
             }
             visitor.visit_expr(value);
         }
@@ -237,7 +215,7 @@ pub fn walk_stmt<V: Visitor + ?Sized>(visitor: &mut V, stmt: &HilStmt) {
             }
         }
         HilStmt::Call(expr) => visitor.visit_expr(expr),
-        HilStmt::Phi(phi) => visitor.visit_phi(phi),
+        HilStmt::Phi(_) => {}
     }
 }
 
@@ -296,7 +274,7 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
 
 pub fn walk_lvalue_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
     match expr {
-        HilExpr::Symbol(symbol) => visitor.visit_binding_symbol(*symbol),
+        HilExpr::Symbol(symbol) => visitor.visit_symbol(*symbol),
         HilExpr::GetField { obj, .. } => visitor.visit_expr(obj),
         HilExpr::GetIndex { obj, index } => {
             visitor.visit_expr(obj);
@@ -368,7 +346,7 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
             end,
             step,
         } => {
-            visitor.visit_binding_symbol(var);
+            visitor.visit_symbol(var);
             visitor.visit_expr(start);
             visitor.visit_expr(end);
             visitor.visit_expr(step);
@@ -379,7 +357,7 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
                 visitor.visit_expr(expr);
             }
             for var in vars {
-                visitor.visit_binding_symbol(var);
+                visitor.visit_symbol(var);
             }
             visitor.visit_region(body, cfg);
         }
@@ -411,7 +389,7 @@ pub fn walk_stmt_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmt: &mut HilStmt
         }
         HilStmt::AssignMany { left, value } => {
             for symbol in left {
-                visitor.visit_binding_symbol(symbol);
+                visitor.visit_symbol(symbol);
             }
             visitor.visit_expr(value);
         }
@@ -422,7 +400,7 @@ pub fn walk_stmt_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmt: &mut HilStmt
             }
         }
         HilStmt::Call(expr) => visitor.visit_expr(expr),
-        HilStmt::Phi(phi) => visitor.visit_phi(phi),
+        HilStmt::Phi(_) => {}
     }
 }
 
@@ -481,7 +459,7 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut HilExpr
 
 pub fn walk_lvalue_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut HilExpr) {
     match expr {
-        HilExpr::Symbol(symbol) => visitor.visit_binding_symbol(symbol),
+        HilExpr::Symbol(symbol) => visitor.visit_symbol(symbol),
         HilExpr::GetField { obj, .. } => visitor.visit_expr(obj),
         HilExpr::GetIndex { obj, index } => {
             visitor.visit_expr(obj);
