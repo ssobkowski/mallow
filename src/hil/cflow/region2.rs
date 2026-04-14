@@ -204,13 +204,9 @@ impl RegionNode {
                 };
 
                 if let Some(terminal) = replacement {
-                    if cfg.blocks[*block].stmts.is_empty() {
-                        *self = terminal;
-                    } else {
-                        *self = RegionNode::Sequence {
-                            nodes: vec![RegionNode::BasicBlock { block: *block }, terminal],
-                        };
-                    }
+                    *self = RegionNode::Sequence {
+                        nodes: vec![RegionNode::BasicBlock { block: *block }, terminal],
+                    };
                 }
             }
             _ => {}
@@ -274,13 +270,9 @@ impl RegionNode {
                         values: values.clone(),
                     };
 
-                    if cfg.blocks[*block].stmts.is_empty() {
-                        *self = terminal;
-                    } else {
-                        *self = RegionNode::Sequence {
-                            nodes: vec![RegionNode::BasicBlock { block: *block }, terminal],
-                        };
-                    }
+                    *self = RegionNode::Sequence {
+                        nodes: vec![RegionNode::BasicBlock { block: *block }, terminal],
+                    };
                 }
             }
             _ => {}
@@ -1501,18 +1493,15 @@ pub fn build_idoms_sparse(
     sparse_doms
 }
 
-pub fn structure(cfg: &ControlFlowGraph) -> RegionNode {
+pub fn structure(cfg: &ControlFlowGraph) -> (RegionNode, bool) {
     let mut fg = FoldableGraph::new(cfg);
 
     fg.structure();
 
-    if fg.nodes.iter().len() != 1 {
-        eprintln!("Failed to structure region properly");
-        eprintln!("{:#?}", fg.nodes);
-    }
+    let reduced = fg.nodes.iter().len() == 1;
 
     let mut root = fg.nodes.remove(&fg.entry_node).unwrap();
     root.strip_virtual_exits();
     root.resolve_returns(cfg);
-    root
+    (root, reduced)
 }

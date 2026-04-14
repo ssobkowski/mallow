@@ -23,7 +23,13 @@ pub struct StructuredFunction {
 impl StructuredFunction {
     pub fn from_proto(proto: &Proto, all_protos: &[Proto]) -> Self {
         let cfg = ControlFlowGraph::from_proto(proto, all_protos);
-        let root = region2::structure(&cfg);
+        let (root, was_reduced) = region2::structure(&cfg);
+
+        if !was_reduced {
+            eprintln!(
+                "[proto{was_reduced}] Failed to structure region properly. The output may be incorrect."
+            )
+        }
 
         Self {
             cfg,
