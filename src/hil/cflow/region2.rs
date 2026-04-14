@@ -143,11 +143,19 @@ impl RegionNode {
                 let exit_node = &cfg.blocks[*block].exit;
 
                 let replacement = match exit_node {
-                    BlockExit::Jump(raw_target) | BlockExit::Fallthrough(raw_target) => {
+                    BlockExit::Jump(raw_target) => {
                         let active = region_map[raw_target];
                         if active == continue_target {
                             Some(RegionNode::Continue)
                         } else if active == exit {
+                            Some(RegionNode::Break)
+                        } else {
+                            None
+                        }
+                    }
+                    BlockExit::Fallthrough(raw_target) => {
+                        let active = region_map[raw_target];
+                        if active == exit {
                             Some(RegionNode::Break)
                         } else {
                             None
@@ -658,6 +666,7 @@ impl<'a> FoldableGraph<'a> {
                 then_branch: Box::new(then_node.unwrap()),
                 else_branch: Some(Box::new(else_node.unwrap())),
             });
+            guarded.extend(nodes);
             return RegionNode::Sequence { nodes: guarded };
         }
 
@@ -1256,21 +1265,15 @@ impl<'a> FoldableGraph<'a> {
 
                             (head, loop_node, effective_exit)
                         }
-                        Loop::RepeatUntil { cond, exit_block } => (
+                        Loop::RepeatUntil { cond: _, exit_block } => (
                             head,
                             {
                                 let mut body = self.fold_head_escape_guard(head_node, body_ast);
                                 self.normalize_escape_guards(&mut body);
 
-                                let break_guard = RegionNode::If {
-                                    condition: cond,
-                                    then_branch: Box::new(RegionNode::Break),
-                                    else_branch: None,
-                                };
-
                                 RegionNode::While {
                                     condition: HilExpr::Bool(true),
-                                    body: Box::new(RegionNode::merge([body, break_guard])),
+                                    body: Box::new(body),
                                 }
                             },
                             exit_block,
