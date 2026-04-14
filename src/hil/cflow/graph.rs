@@ -737,6 +737,8 @@ impl ControlFlowGraph {
             ssa.mark_filled(block_id);
         }
 
+        let live_in_regs = compute_live_in_registers(&blocks, &raw_blocks, &successors, &ssa);
+
         for (src, targets) in successors.iter().enumerate() {
             for &target in targets {
                 if target <= src {
@@ -756,9 +758,6 @@ impl ControlFlowGraph {
                         }
                     }
 
-                    // Only seed registers that are written somewhere inside the loop.
-                    // Seeding unwritten registers creates undef-sourced phis that
-                    // produce the noisy preheader copies you were worried about.
                     let mut written_regs = HashSet::new();
                     for &block_id in &loop_body {
                         for (instr, _) in &instrs[raw_blocks[block_id].instr_range.clone()] {
@@ -767,11 +766,17 @@ impl ControlFlowGraph {
                         written_regs.extend(raw_blocks[block_id].exit_writes.clone());
                     }
 
+                    let loop_live_out =
+                        compute_loop_live_out_regs(&loop_body, &successors, &live_in_regs);
+
                     for u in 0..proto.num_upvals {
                         ssa.read_upval(target, u);
                     }
+
                     for reg in written_regs {
-                        ssa.read_reg(target, reg);
+                        if live_in_regs[target].contains(&reg) || loop_live_out.contains(&reg) {
+                            ssa.read_reg(target, reg);
+                        }
                     }
                 }
             }
@@ -1743,4 +1748,260 @@ fn is_safe_to_hoist(block: &Block) -> bool {
             false
         }
     })
+}
+
+fn symbol_register_map(ssa: &Ssa) -> HashMap<SymbolId, u8> {
+    ssa.arena_iter()
+        .filter_map(|(id, sym)| match sym.kind {
+            SymbolKind::Register(reg) => Some((id, reg)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn note_reg_use(
+    sym: SymbolId,
+    reg_of: &HashMap<SymbolId, u8>,
+    uses: &mut HashSet<u8>,
+    seen_defs: &HashSet<u8>,
+) {
+    if let Some(&reg) = reg_of.get(&sym) {
+        if !seen_defs.contains(&reg) {
+            uses.insert(reg);
+        }
+    }
+}
+
+fn collect_expr_reg_uses(
+    expr: &HilExpr,
+    reg_of: &HashMap<SymbolId, u8>,
+    uses: &mut HashSet<u8>,
+    seen_defs: &HashSet<u8>,
+) {
+    match expr {
+        HilExpr::Symbol(sym) => note_reg_use(*sym, reg_of, uses, seen_defs),
+        HilExpr::Closure { captures, .. } => {
+            for capture in captures {
+                note_reg_use(*capture, reg_of, uses, seen_defs);
+            }
+        }
+        HilExpr::GetField { obj, .. } => {
+            collect_expr_reg_uses(obj, reg_of, uses, seen_defs);
+        }
+        HilExpr::GetIndex { obj, index } => {
+            collect_expr_reg_uses(obj, reg_of, uses, seen_defs);
+            collect_expr_reg_uses(index, reg_of, uses, seen_defs);
+        }
+        HilExpr::Call { fun, args } => {
+            collect_expr_reg_uses(fun, reg_of, uses, seen_defs);
+            for arg in args {
+                collect_expr_reg_uses(arg, reg_of, uses, seen_defs);
+            }
+        }
+        HilExpr::MethodCall { object, args, .. } => {
+            collect_expr_reg_uses(object, reg_of, uses, seen_defs);
+            for arg in args {
+                collect_expr_reg_uses(arg, reg_of, uses, seen_defs);
+            }
+        }
+        HilExpr::Binary { lhs, rhs, .. } => {
+            collect_expr_reg_uses(lhs, reg_of, uses, seen_defs);
+            collect_expr_reg_uses(rhs, reg_of, uses, seen_defs);
+        }
+        HilExpr::Unary { expr, .. } => {
+            collect_expr_reg_uses(expr, reg_of, uses, seen_defs);
+        }
+        HilExpr::If {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_reg_uses(condition, reg_of, uses, seen_defs);
+            collect_expr_reg_uses(then_expr, reg_of, uses, seen_defs);
+            collect_expr_reg_uses(else_expr, reg_of, uses, seen_defs);
+        }
+        HilExpr::Table { items } => {
+            for item in items {
+                match item {
+                    HilTableItem::List(expr) | HilTableItem::Packed(expr) => {
+                        collect_expr_reg_uses(expr, reg_of, uses, seen_defs);
+                    }
+                    HilTableItem::Index(k, v) => {
+                        collect_expr_reg_uses(k, reg_of, uses, seen_defs);
+                        collect_expr_reg_uses(v, reg_of, uses, seen_defs);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_lvalue_reg_use_def(
+    lvalue: &HilExpr,
+    reg_of: &HashMap<SymbolId, u8>,
+    uses: &mut HashSet<u8>,
+    defs: &mut HashSet<u8>,
+    seen_defs: &mut HashSet<u8>,
+) {
+    match lvalue {
+        HilExpr::Symbol(sym) => {
+            if let Some(&reg) = reg_of.get(sym) {
+                defs.insert(reg);
+                seen_defs.insert(reg);
+            }
+        }
+        _ => {
+            collect_expr_reg_uses(lvalue, reg_of, uses, seen_defs);
+        }
+    }
+}
+
+fn collect_stmt_reg_use_def(
+    stmt: &HilStmt,
+    reg_of: &HashMap<SymbolId, u8>,
+    uses: &mut HashSet<u8>,
+    defs: &mut HashSet<u8>,
+    seen_defs: &mut HashSet<u8>,
+) {
+    match stmt {
+        HilStmt::Assign { left, value } => {
+            collect_expr_reg_uses(value, reg_of, uses, seen_defs);
+            collect_lvalue_reg_use_def(left, reg_of, uses, defs, seen_defs);
+        }
+        HilStmt::AssignMany { left, value } => {
+            collect_expr_reg_uses(value, reg_of, uses, seen_defs);
+            for sym in left {
+                if let Some(&reg) = reg_of.get(sym) {
+                    defs.insert(reg);
+                    seen_defs.insert(reg);
+                }
+            }
+        }
+        HilStmt::Call(expr) => {
+            collect_expr_reg_uses(expr, reg_of, uses, seen_defs);
+        }
+        HilStmt::SetList { table, values, .. } => {
+            note_reg_use(*table, reg_of, uses, seen_defs);
+            for value in values {
+                collect_expr_reg_uses(value, reg_of, uses, seen_defs);
+            }
+        }
+        HilStmt::Phi(phi) => {
+            if let Some(&reg) = reg_of.get(&phi.target) {
+                defs.insert(reg);
+                seen_defs.insert(reg);
+            }
+        }
+    }
+}
+
+fn collect_exit_reg_uses(
+    exit: &BlockExit,
+    reg_of: &HashMap<SymbolId, u8>,
+    uses: &mut HashSet<u8>,
+    seen_defs: &HashSet<u8>,
+) {
+    match exit {
+        BlockExit::CondJump { cond, .. } => {
+            collect_expr_reg_uses(cond, reg_of, uses, seen_defs);
+        }
+        BlockExit::FornPrep {
+            start, end, step, ..
+        } => {
+            collect_expr_reg_uses(start, reg_of, uses, seen_defs);
+            collect_expr_reg_uses(end, reg_of, uses, seen_defs);
+            collect_expr_reg_uses(step, reg_of, uses, seen_defs);
+        }
+        BlockExit::ForgPrep { exprs, .. } => {
+            for expr in exprs {
+                collect_expr_reg_uses(expr, reg_of, uses, seen_defs);
+            }
+        }
+        BlockExit::Return(values) => {
+            for value in values {
+                collect_expr_reg_uses(value, reg_of, uses, seen_defs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compute_live_in_registers(
+    blocks: &[Block],
+    raw_blocks: &[RawBlock],
+    successors: &[Vec<usize>],
+    ssa: &Ssa,
+) -> Vec<HashSet<u8>> {
+    let reg_of = symbol_register_map(ssa);
+
+    let mut block_uses = vec![HashSet::new(); blocks.len()];
+    let mut block_defs = vec![HashSet::new(); blocks.len()];
+
+    for (block_idx, block) in blocks.iter().enumerate() {
+        let mut seen_defs = HashSet::new();
+
+        for stmt in &block.stmts {
+            collect_stmt_reg_use_def(
+                &stmt.inner,
+                &reg_of,
+                &mut block_uses[block_idx],
+                &mut block_defs[block_idx],
+                &mut seen_defs,
+            );
+        }
+
+        collect_exit_reg_uses(&block.exit, &reg_of, &mut block_uses[block_idx], &seen_defs);
+
+        block_defs[block_idx].extend(raw_blocks[block_idx].exit_writes.iter().copied());
+    }
+
+    let mut live_in = vec![HashSet::new(); blocks.len()];
+    let mut live_out = vec![HashSet::new(); blocks.len()];
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        for block_idx in (0..blocks.len()).rev() {
+            let mut new_out = HashSet::new();
+            for &succ in &successors[block_idx] {
+                new_out.extend(live_in[succ].iter().copied());
+            }
+
+            let mut new_in = block_uses[block_idx].clone();
+            new_in.extend(
+                new_out
+                    .iter()
+                    .copied()
+                    .filter(|reg| !block_defs[block_idx].contains(reg)),
+            );
+
+            if new_out != live_out[block_idx] || new_in != live_in[block_idx] {
+                live_out[block_idx] = new_out;
+                live_in[block_idx] = new_in;
+                changed = true;
+            }
+        }
+    }
+
+    live_in
+}
+
+fn compute_loop_live_out_regs(
+    loop_body: &HashSet<usize>,
+    successors: &[Vec<usize>],
+    live_in_regs: &[HashSet<u8>],
+) -> HashSet<u8> {
+    let mut live_out = HashSet::new();
+
+    for &block_id in loop_body {
+        for &succ in &successors[block_id] {
+            if !loop_body.contains(&succ) {
+                live_out.extend(live_in_regs[succ].iter().copied());
+            }
+        }
+    }
+
+    live_out
 }
