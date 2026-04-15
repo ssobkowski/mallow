@@ -13,6 +13,8 @@ use crate::{
 pub struct Var {
     pub write_count: usize,
     pub read_count: usize,
+    /// If true, this variable is disqualified from inlining - it has a breaking
+    /// side effect (any upvalue/capture related symbol)
     pub disqualified: bool,
     /// The last expression that assigned to this variable.
     pub expr: HilExpr,

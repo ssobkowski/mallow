@@ -392,7 +392,9 @@ impl CfgNode {
                 if !buf.is_empty() {
                     out.push(RegionNode::BasicBlock { stmts: buf });
                 }
-                RegionNode::Sequence { nodes: out }
+                RegionNode::Sequence {
+                    nodes: flatten_regions(out),
+                }
             }
             CfgNode::If {
                 condition,
@@ -498,9 +500,10 @@ impl<'a> FoldableGraph<'a> {
         let mut stack = vec![cfg.entry_block];
         while let Some(node) = stack.pop() {
             if reachable.insert(node)
-                && let Some(succs) = successors.get(&node) {
-                    stack.extend(succs.iter().copied());
-                }
+                && let Some(succs) = successors.get(&node)
+            {
+                stack.extend(succs.iter().copied());
+            }
         }
 
         let all_nodes: Vec<_> = nodes.keys().copied().collect();
@@ -844,8 +847,7 @@ impl<'a> FoldableGraph<'a> {
             }
         }
 
-        let then_branch =
-            CfgNode::merge(std::iter::once(then_node_val.unwrap()).chain(nodes));
+        let then_branch = CfgNode::merge(std::iter::once(then_node_val.unwrap()).chain(nodes));
         let else_branch = else_node_val.unwrap();
 
         CfgNode::Sequence {
@@ -1172,9 +1174,10 @@ impl<'a> FoldableGraph<'a> {
 
         while let Some(node) = stack.pop() {
             if seen.insert(node)
-                && let Some(preds) = self.predecessors.get(&node) {
-                    stack.extend(preds.iter().copied());
-                }
+                && let Some(preds) = self.predecessors.get(&node)
+            {
+                stack.extend(preds.iter().copied());
+            }
         }
 
         seen.remove(&head);
@@ -1653,6 +1656,21 @@ pub fn build_idoms_sparse(
     }
 
     sparse_doms
+}
+
+fn flatten_regions(nodes: Vec<RegionNode>) -> Vec<RegionNode> {
+    let mut out = Vec::new();
+
+    for n in nodes {
+        match n {
+            RegionNode::Sequence { nodes: inner } => {
+                out.extend(flatten_regions(inner));
+            }
+            other => out.push(other),
+        }
+    }
+
+    out
 }
 
 pub fn structure(cfg: &ControlFlowGraph) -> (RegionNode, bool) {
