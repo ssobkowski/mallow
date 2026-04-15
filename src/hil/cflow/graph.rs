@@ -1421,6 +1421,32 @@ fn fold_condition_diamonds(mut blocks: Vec<Block>) -> (bool, Vec<Block>) {
             continue;
         }
 
+        if let Some((result_reg, truthy_value, then_d, else_e)) =
+            match_truthy_guard(&blocks[else_b])
+            && then_b == else_e
+        {
+            blocks[i].stmts.push(
+                HilStmt::Assign {
+                    left: HilExpr::Symbol(result_reg),
+                    value: HilExpr::Binary {
+                        lhs: Box::new(invert_condition(cond.clone())),
+                        op: BinOp::And,
+                        rhs: Box::new(truthy_value),
+                    },
+                }
+                .to_spanned(0),
+            );
+
+            blocks[i].exit = BlockExit::CondJump {
+                cond: HilExpr::Symbol(result_reg),
+                then_block: then_d,
+                else_block: then_b,
+            };
+
+            was_changed = true;
+            continue;
+        }
+
         if let (
             Some((result_reg, prefix_value)),
             BlockExit::CondJump {
@@ -1534,54 +1560,58 @@ fn fold_short_circuits(mut blocks: Vec<Block>, predecessors: &[Vec<usize>]) -> (
         };
 
         // AND Folding: `if A then (if B then T else F) else F` -> `if A and B then T else F`
-        if predecessors[then_a].len() == 1 && is_safe_to_hoist(&blocks[then_a])
+        if predecessors[then_a].len() == 1
+            && is_safe_to_hoist(&blocks[then_a])
             && let BlockExit::CondJump {
                 cond: cond_b,
                 then_block: then_b,
                 else_block: else_b,
             } = blocks[then_a].exit.clone()
-                && else_a == else_b {
-                    // Steal the safe statements and move them before our combined condition
-                    let mut stmts = std::mem::take(&mut blocks[then_a].stmts);
-                    blocks[i].stmts.append(&mut stmts);
+            && else_a == else_b
+        {
+            // Steal the safe statements and move them before our combined condition
+            let mut stmts = std::mem::take(&mut blocks[then_a].stmts);
+            blocks[i].stmts.append(&mut stmts);
 
-                    blocks[i].exit = BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(cond_a.clone()),
-                            op: BinOp::And,
-                            rhs: Box::new(cond_b),
-                        },
-                        then_block: then_b,
-                        else_block: else_a,
-                    };
-                    was_changed = true;
-                    continue;
-                }
+            blocks[i].exit = BlockExit::CondJump {
+                cond: HilExpr::Binary {
+                    lhs: Box::new(cond_a.clone()),
+                    op: BinOp::And,
+                    rhs: Box::new(cond_b),
+                },
+                then_block: then_b,
+                else_block: else_a,
+            };
+            was_changed = true;
+            continue;
+        }
 
         // OR Folding: `if A then T else (if B then T else F)` -> `if A or B then T else F`
-        if predecessors[else_a].len() == 1 && is_safe_to_hoist(&blocks[else_a])
+        if predecessors[else_a].len() == 1
+            && is_safe_to_hoist(&blocks[else_a])
             && let BlockExit::CondJump {
                 cond: cond_b,
                 then_block: then_b,
                 else_block: else_b,
             } = blocks[else_a].exit.clone()
-                && then_a == then_b {
-                    // Steal the safe statements and move them before our combined condition
-                    let mut stmts = std::mem::take(&mut blocks[else_a].stmts);
-                    blocks[i].stmts.append(&mut stmts);
+            && then_a == then_b
+        {
+            // Steal the safe statements and move them before our combined condition
+            let mut stmts = std::mem::take(&mut blocks[else_a].stmts);
+            blocks[i].stmts.append(&mut stmts);
 
-                    blocks[i].exit = BlockExit::CondJump {
-                        cond: HilExpr::Binary {
-                            lhs: Box::new(cond_a.clone()),
-                            op: BinOp::Or,
-                            rhs: Box::new(cond_b),
-                        },
-                        then_block: then_a,
-                        else_block: else_b,
-                    };
-                    was_changed = true;
-                    continue;
-                }
+            blocks[i].exit = BlockExit::CondJump {
+                cond: HilExpr::Binary {
+                    lhs: Box::new(cond_a.clone()),
+                    op: BinOp::Or,
+                    rhs: Box::new(cond_b),
+                },
+                then_block: then_a,
+                else_block: else_b,
+            };
+            was_changed = true;
+            continue;
+        }
     }
 
     (was_changed, blocks)
@@ -1760,9 +1790,10 @@ fn note_reg_use(
     seen_defs: &HashSet<u8>,
 ) {
     if let Some(&reg) = reg_of.get(&sym)
-        && !seen_defs.contains(&reg) {
-            uses.insert(reg);
-        }
+        && !seen_defs.contains(&reg)
+    {
+        uses.insert(reg);
+    }
 }
 
 fn collect_expr_reg_uses(
