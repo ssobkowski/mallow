@@ -1,10 +1,10 @@
 use crate::hil::StructuredFunction;
 
-mod inliner;
+mod inlining;
 pub mod visitor;
 
 pub fn run(fns: &mut [StructuredFunction]) {
     for fun in fns {
-        inliner::run(fun);
+        inlining::run(fun);
     }
 }
