@@ -1584,17 +1584,14 @@ impl<'a> FoldableGraph<'a> {
     fn structure(&mut self) {
         loop {
             if self.collapse_sequential() {
-                eprintln!("Collapsed sequential");
                 continue;
             }
 
             if self.collapse_conditional() {
-                eprintln!("Collapsed conditional");
                 continue;
             }
 
             if self.collapse_loops() {
-                eprintln!("Collapsed loops");
                 continue;
             }
 
