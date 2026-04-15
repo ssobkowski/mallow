@@ -1,6 +1,6 @@
 mod common;
 pub mod graph;
-pub mod region2;
+pub mod region;
 mod union_find;
 
 #[cfg(feature = "visualize")]

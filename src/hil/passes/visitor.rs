@@ -2,11 +2,8 @@ use smol_str::SmolStr;
 
 use crate::hil::{
     StructuredFunction,
-    cflow::{
-        graph::{Block, ControlFlowGraph},
-        region2::RegionNode,
-    },
-    ir::{HilExpr, HilStmt, HilTableItem, Spanned},
+    cflow::region::RegionNode,
+    ir::{HilExpr, HilStmt, HilTableItem},
     lifter::ssa::SymbolId,
 };
 
@@ -15,20 +12,12 @@ pub trait Visitor {
         walk_function(self, fun);
     }
 
-    fn visit_region(&mut self, region: &RegionNode, cfg: &ControlFlowGraph) {
-        walk_region(self, region, cfg);
+    fn visit_region(&mut self, region: &RegionNode) {
+        walk_region(self, region);
     }
 
-    fn visit_node(&mut self, node: &RegionNode, cfg: &ControlFlowGraph) {
-        walk_node(self, node, cfg);
-    }
-
-    fn visit_block(&mut self, block_id: usize, block: &Block, cfg: &ControlFlowGraph) {
-        walk_block(self, block_id, block, cfg);
-    }
-
-    fn visit_stmt_spanned(&mut self, stmt: &Spanned<HilStmt>) {
-        self.visit_stmt(&stmt.inner);
+    fn visit_block(&mut self, stmts: &[HilStmt]) {
+        walk_block(self, stmts);
     }
 
     fn visit_stmt(&mut self, stmt: &HilStmt) {
@@ -67,20 +56,12 @@ pub trait VisitorMut {
         walk_function_mut(self, fun);
     }
 
-    fn visit_region(&mut self, region: &mut RegionNode, cfg: &mut ControlFlowGraph) {
-        walk_region_mut(self, region, cfg);
+    fn visit_region(&mut self, region: &mut RegionNode) {
+        walk_region_mut(self, region);
     }
 
-    fn visit_node(&mut self, node: &mut RegionNode, cfg: &mut ControlFlowGraph) {
-        walk_node_mut(self, node, cfg);
-    }
-
-    fn visit_block(&mut self, block_id: usize, block: &mut Block) {
-        walk_block_mut(self, block_id, block);
-    }
-
-    fn visit_stmt_spanned(&mut self, stmt: &mut Spanned<HilStmt>) {
-        self.visit_stmt(&mut stmt.inner);
+    fn visit_block(&mut self, stmts: &mut Vec<HilStmt>) {
+        walk_block_mut(self, stmts);
     }
 
     fn visit_stmt(&mut self, stmt: &mut HilStmt) {
@@ -115,27 +96,17 @@ pub trait VisitorMut {
 }
 
 pub fn walk_function<V: Visitor + ?Sized>(visitor: &mut V, fun: &StructuredFunction) {
-    visitor.visit_region(&fun.root, &fun.cfg);
+    visitor.visit_region(&fun.root);
 }
 
-pub fn walk_region<V: Visitor + ?Sized>(
-    visitor: &mut V,
-    region: &RegionNode,
-    cfg: &ControlFlowGraph,
-) {
-    walk_node(visitor, region, cfg);
-}
-
-pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &ControlFlowGraph) {
+pub fn walk_region<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode) {
     match node {
-        RegionNode::BasicBlock { block } => {
-            if let Some(block_data) = cfg.blocks.get(*block) {
-                visitor.visit_block(*block, block_data, cfg);
-            }
+        RegionNode::BasicBlock { stmts } => {
+            visitor.visit_block(stmts);
         }
         RegionNode::Sequence { nodes } => {
             for n in nodes {
-                visitor.visit_node(n, cfg);
+                visitor.visit_region(n);
             }
         }
         RegionNode::If {
@@ -144,14 +115,14 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
             else_branch,
         } => {
             visitor.visit_expr(condition);
-            visitor.visit_region(then_branch, cfg);
+            visitor.visit_region(then_branch);
             if let Some(else_branch) = else_branch {
-                visitor.visit_region(else_branch, cfg);
+                visitor.visit_region(else_branch);
             }
         }
         RegionNode::While { condition, body } => {
             visitor.visit_expr(condition);
-            visitor.visit_region(body, cfg);
+            visitor.visit_region(body);
         }
         RegionNode::NumericFor {
             body,
@@ -164,7 +135,7 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
             visitor.visit_expr(start);
             visitor.visit_expr(end);
             visitor.visit_expr(step);
-            visitor.visit_region(body, cfg);
+            visitor.visit_region(body);
         }
         RegionNode::GenericFor { body, vars, exprs } => {
             for expr in exprs {
@@ -173,7 +144,7 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
             for var in vars {
                 visitor.visit_symbol(*var);
             }
-            visitor.visit_region(body, cfg);
+            visitor.visit_region(body);
         }
         RegionNode::Continue | RegionNode::Break => {}
         RegionNode::Return { values } => {
@@ -181,18 +152,12 @@ pub fn walk_node<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode, cfg: &
                 visitor.visit_expr(value);
             }
         }
-        RegionNode::VirtualExit => {}
     }
 }
 
-pub fn walk_block<V: Visitor + ?Sized>(
-    visitor: &mut V,
-    _block_id: usize,
-    block: &Block,
-    _cfg: &ControlFlowGraph,
-) {
-    for stmt in &block.stmts {
-        visitor.visit_stmt_spanned(stmt);
+pub fn walk_block<V: Visitor + ?Sized>(visitor: &mut V, stmts: &[HilStmt]) {
+    for stmt in stmts {
+        visitor.visit_stmt(stmt);
     }
 }
 
@@ -296,32 +261,17 @@ pub fn walk_table_item<V: Visitor + ?Sized>(visitor: &mut V, item: &HilTableItem
 
 pub fn walk_function_mut<V: VisitorMut + ?Sized>(visitor: &mut V, fun: &mut StructuredFunction) {
     let root = &mut fun.root;
-    let cfg = &mut fun.cfg;
-    visitor.visit_region(root, cfg);
+    visitor.visit_region(root);
 }
 
-pub fn walk_region_mut<V: VisitorMut + ?Sized>(
-    visitor: &mut V,
-    region: &mut RegionNode,
-    cfg: &mut ControlFlowGraph,
-) {
-    visitor.visit_node(region, cfg);
-}
-
-pub fn walk_node_mut<V: VisitorMut + ?Sized>(
-    visitor: &mut V,
-    node: &mut RegionNode,
-    cfg: &mut ControlFlowGraph,
-) {
+pub fn walk_region_mut<V: VisitorMut + ?Sized>(visitor: &mut V, node: &mut RegionNode) {
     match node {
-        RegionNode::BasicBlock { block } => {
-            if let Some(block_data) = cfg.blocks.get_mut(*block) {
-                visitor.visit_block(*block, block_data);
-            }
+        RegionNode::BasicBlock { stmts } => {
+            visitor.visit_block(stmts);
         }
         RegionNode::Sequence { nodes } => {
             for n in nodes {
-                visitor.visit_node(n, cfg);
+                visitor.visit_region(n);
             }
         }
         RegionNode::If {
@@ -330,14 +280,14 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
             else_branch,
         } => {
             visitor.visit_expr(condition);
-            visitor.visit_region(then_branch, cfg);
+            visitor.visit_region(then_branch);
             if let Some(else_branch) = else_branch {
-                visitor.visit_region(else_branch, cfg);
+                visitor.visit_region(else_branch);
             }
         }
         RegionNode::While { condition, body } => {
             visitor.visit_expr(condition);
-            visitor.visit_region(body, cfg);
+            visitor.visit_region(body);
         }
         RegionNode::NumericFor {
             body,
@@ -350,7 +300,7 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
             visitor.visit_expr(start);
             visitor.visit_expr(end);
             visitor.visit_expr(step);
-            visitor.visit_region(body, cfg);
+            visitor.visit_region(body);
         }
         RegionNode::GenericFor { body, vars, exprs } => {
             for expr in exprs {
@@ -359,7 +309,7 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
             for var in vars {
                 visitor.visit_symbol(var);
             }
-            visitor.visit_region(body, cfg);
+            visitor.visit_region(body);
         }
         RegionNode::Continue | RegionNode::Break => {}
         RegionNode::Return { values } => {
@@ -367,17 +317,12 @@ pub fn walk_node_mut<V: VisitorMut + ?Sized>(
                 visitor.visit_expr(value);
             }
         }
-        RegionNode::VirtualExit => {}
     }
 }
 
-pub fn walk_block_mut<V: VisitorMut + ?Sized>(
-    visitor: &mut V,
-    _block_id: usize,
-    block: &mut Block,
-) {
-    for stmt in &mut block.stmts {
-        visitor.visit_stmt_spanned(stmt);
+pub fn walk_block_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmts: &mut Vec<HilStmt>) {
+    for stmt in stmts {
+        visitor.visit_stmt(stmt);
     }
 }
 

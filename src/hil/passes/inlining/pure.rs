@@ -1,7 +1,6 @@
 use crate::{
     hil::{
         StructuredFunction,
-        cflow::graph::Block,
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
         passes::{
@@ -55,12 +54,12 @@ impl Inliner {
 }
 
 impl VisitorMut for Inliner {
-    fn visit_block(&mut self, block_id: usize, block: &mut Block) {
-        block.stmts.retain(|stmt| {
+    fn visit_block(&mut self, stmts: &mut Vec<HilStmt>) {
+        stmts.retain(|stmt| {
             if let HilStmt::Assign {
                 left: HilExpr::Symbol(sym),
                 ..
-            } = &stmt.inner
+            } = &stmt
                 && let Some(v) = self.vars.get(sym)
                 && self.can_inline(v)
             {
@@ -72,7 +71,7 @@ impl VisitorMut for Inliner {
             true
         });
 
-        walk_block_mut(self, block_id, block);
+        walk_block_mut(self, stmts);
     }
 
     fn visit_expr(&mut self, expr: &mut HilExpr) {

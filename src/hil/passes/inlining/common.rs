@@ -1,13 +1,10 @@
 use crate::{
     hil::{
         StructuredFunction,
-        cflow::{
-            graph::{Block, ControlFlowGraph},
-            region2::RegionNode,
-        },
+        cflow::region::RegionNode,
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
-        passes::visitor::{Visitor, walk_expr, walk_function, walk_node},
+        passes::visitor::{Visitor, walk_expr, walk_function, walk_region},
     },
     scopes::Scope,
 };
@@ -46,19 +43,19 @@ impl Visitor for Analyzer {
             self.vars.declare(*param, Var::new(HilExpr::Symbol(*param)));
         }
 
-        walk_function(self, fun);
-    }
-
-    fn visit_block(&mut self, _: usize, block: &Block, cfg: &ControlFlowGraph) {
-        for up in &cfg.upvalues {
+        for upvalue in &fun.upvalues {
             // This can be inserted as a dummy expression, because upvalues are NEVER to be inlined.
             let mut var = Var::new(HilExpr::Nil);
             var.disqualified = true;
-            self.vars.declare(*up, var);
+            self.vars.declare(*upvalue, var);
         }
 
-        for stmt in &block.stmts {
-            match &stmt.inner {
+        walk_function(self, fun);
+    }
+
+    fn visit_block(&mut self, stmts: &[HilStmt]) {
+        for stmt in stmts {
+            match &stmt {
                 HilStmt::Assign {
                     left: HilExpr::Symbol(sym),
                     value,
@@ -100,13 +97,13 @@ impl Visitor for Analyzer {
                     continue;
                 }
                 _ => {
-                    self.visit_stmt_spanned(stmt);
+                    self.visit_stmt(stmt);
                 }
             }
         }
     }
 
-    fn visit_node(&mut self, node: &RegionNode, cfg: &ControlFlowGraph) {
+    fn visit_region(&mut self, node: &RegionNode) {
         match node {
             RegionNode::NumericFor { var, .. } => {
                 if let Some(existing) = self.vars.get_mut(var) {
@@ -127,7 +124,7 @@ impl Visitor for Analyzer {
             _ => {}
         }
 
-        walk_node(self, node, cfg);
+        walk_region(self, node);
     }
 
     fn visit_expr(&mut self, expr: &HilExpr) {

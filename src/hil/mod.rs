@@ -1,8 +1,11 @@
 use crate::{
     disasm::Proto,
-    hil::cflow::{
-        graph::ControlFlowGraph,
-        region2::{self, RegionNode},
+    hil::{
+        cflow::{
+            graph::ControlFlowGraph,
+            region::{self, RegionNode},
+        },
+        lifter::ssa::SymbolId,
     },
 };
 
@@ -17,13 +20,14 @@ pub struct StructuredFunction {
     pub cfg: ControlFlowGraph,
     pub root: RegionNode,
 
+    pub upvalues: Vec<SymbolId>,
     pub is_vararg: bool,
 }
 
 impl StructuredFunction {
     pub fn from_proto(proto: &Proto, all_protos: &[Proto]) -> Self {
         let cfg = ControlFlowGraph::from_proto(proto, all_protos);
-        let (root, was_reduced) = region2::structure(&cfg);
+        let (root, was_reduced) = region::structure(&cfg);
 
         if !was_reduced {
             eprintln!(
@@ -31,9 +35,12 @@ impl StructuredFunction {
             )
         }
 
+        let upvalues = cfg.upvalues.clone();
+
         Self {
             cfg,
             root,
+            upvalues,
             is_vararg: proto.is_vararg,
         }
     }

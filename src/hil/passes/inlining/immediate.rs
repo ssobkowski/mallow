@@ -1,7 +1,6 @@
 use crate::{
     hil::{
         StructuredFunction,
-        cflow::graph::Block,
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
         passes::{
@@ -56,14 +55,14 @@ impl Inliner {
 }
 
 impl VisitorMut for Inliner {
-    fn visit_block(&mut self, _: usize, block: &mut Block) {
-        if block.stmts.is_empty() {
+    fn visit_block(&mut self, stmts: &mut Vec<HilStmt>) {
+        if stmts.is_empty() {
             return;
         }
 
         let mut i = 0;
-        while i < block.stmts.len() - 1 {
-            let (sym, value) = if let HilStmt::Assign { left, value } = &block.stmts[i].inner
+        while i < stmts.len() - 1 {
+            let (sym, value) = if let HilStmt::Assign { left, value } = &stmts[i]
                 && let HilExpr::Symbol(sym) = left
             {
                 (*sym, value)
@@ -73,18 +72,18 @@ impl VisitorMut for Inliner {
             };
 
             if self.vars.get(&sym).is_some_and(|v| v.read_count == 1)
-                && appears_once(sym, &block.stmts[i + 1].inner)
-                && let Some(inlined) = substitute_exact(&block.stmts[i + 1].inner, sym, value)
+                && appears_once(sym, &stmts[i + 1])
+                && let Some(inlined) = substitute_exact(&stmts[i + 1], sym, value)
             {
                 eprintln!("Chain:");
-                eprintln!("  {}", block.stmts[i].inner);
-                eprintln!("  {}", block.stmts[i + 1].inner);
+                eprintln!("  {}", stmts[i]);
+                eprintln!("  {}", stmts[i + 1]);
                 eprintln!("is inlineable into");
                 eprintln!("  {}", inlined);
                 eprintln!();
 
-                block.stmts.get_mut(i).unwrap().inner = inlined;
-                block.stmts.remove(i + 1);
+                *stmts.get_mut(i).unwrap() = inlined;
+                stmts.remove(i + 1);
 
                 self.was_changed = true;
 

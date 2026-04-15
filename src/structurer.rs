@@ -6,7 +6,7 @@ use crate::{
     ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem, UnOp},
     hil::{
         StructuredFunction,
-        cflow::{graph::ControlFlowGraph, region2::RegionNode},
+        cflow::region::RegionNode,
         ir::{HilExpr, HilStmt, HilTableItem},
         lifter::ssa::SymbolId,
     },
@@ -110,9 +110,7 @@ impl Structurer {
         let mut block = Block::with_stmts(vec![Stmt::Comment {
             text: format!("proto {}", proto_idx),
         }]);
-        block
-            .stmts
-            .extend(self.visit_region(&fun.root, &fun.cfg).stmts);
+        block.stmts.extend(self.visit_region(&fun.root).stmts);
         self.scopes.pop_scope();
 
         self.current_ctx = old_ctx;
@@ -167,18 +165,18 @@ impl Structurer {
         self.reserve_symbol_name_fresh(ctx_idx, sym, is_param)
     }
 
-    fn visit_region(&mut self, region: &RegionNode, cfg: &ControlFlowGraph) -> Block {
+    fn visit_region(&mut self, region: &RegionNode) -> Block {
         let mut stmts = Vec::new();
-        self.visit_node(region, cfg, &mut stmts);
+        self.visit_node(region, &mut stmts);
         Block::with_stmts(stmts)
     }
 
-    fn visit_node(&mut self, node: &RegionNode, cfg: &ControlFlowGraph, buf: &mut Vec<Stmt>) {
+    fn visit_node(&mut self, node: &RegionNode, buf: &mut Vec<Stmt>) {
         match node {
-            RegionNode::BasicBlock { block } => self.visit_block(*block, cfg, buf),
+            RegionNode::BasicBlock { stmts } => self.visit_block(stmts, buf),
             RegionNode::Sequence { nodes } => {
                 for n in nodes {
-                    self.visit_node(n, cfg, buf);
+                    self.visit_node(n, buf);
                 }
             }
             RegionNode::If {
@@ -188,11 +186,11 @@ impl Structurer {
                 ..
             } => {
                 let mut then_assigned = HashSet::new();
-                self.collect_assigned_symbols_in_region(then_branch, cfg, &mut then_assigned);
+                self.collect_assigned_symbols_in_region(then_branch, &mut then_assigned);
 
                 let mut else_assigned = HashSet::new();
                 if let Some(else_branch) = else_branch {
-                    self.collect_assigned_symbols_in_region(else_branch, cfg, &mut else_assigned);
+                    self.collect_assigned_symbols_in_region(else_branch, &mut else_assigned);
                 }
 
                 let mut hoisted: Vec<_> = then_assigned
@@ -217,8 +215,8 @@ impl Structurer {
                     });
                 }
 
-                let then_body = self.visit_region(then_branch, cfg);
-                let else_body = else_branch.as_ref().map(|e| self.visit_region(e, cfg));
+                let then_body = self.visit_region(then_branch);
+                let else_body = else_branch.as_ref().map(|e| self.visit_region(e));
 
                 buf.push(Stmt::If {
                     condition: self.visit_expr(condition),
@@ -229,7 +227,7 @@ impl Structurer {
             RegionNode::While {
                 condition, body, ..
             } => {
-                let body = self.visit_region(body, cfg);
+                let body = self.visit_region(body);
                 buf.push(Stmt::While {
                     condition: self.visit_expr(condition),
                     body,
@@ -249,7 +247,7 @@ impl Structurer {
                 let end = self.visit_expr(end);
                 let step = Some(self.visit_expr(step));
 
-                let body = self.visit_region(body, cfg);
+                let body = self.visit_region(body);
                 buf.push(Stmt::NumericFor {
                     var,
                     start,
@@ -266,7 +264,7 @@ impl Structurer {
                 }
                 let vars = vars.iter().map(|s| self.get_symbol_name(s)).collect();
                 let exprs = exprs.iter().map(|expr| self.visit_expr(expr)).collect();
-                let body = self.visit_region(body, cfg);
+                let body = self.visit_region(body);
                 buf.push(Stmt::GenericFor { vars, exprs, body });
             }
             RegionNode::Continue => buf.push(Stmt::Continue),
@@ -276,16 +274,13 @@ impl Structurer {
                     values: values.iter().map(|expr| self.visit_expr(expr)).collect(),
                 });
             }
-            RegionNode::VirtualExit => unreachable!(),
         }
     }
 
-    fn visit_block(&mut self, block_idx: usize, cfg: &ControlFlowGraph, buf: &mut Vec<Stmt>) {
-        let block = &cfg.blocks[block_idx];
-
-        for stmt in &block.stmts {
-            self.maybe_predeclare_recursive_local(&stmt.inner, buf);
-            buf.push(self.visit_stmt(&stmt.inner));
+    fn visit_block(&mut self, stmts: &[HilStmt], buf: &mut Vec<Stmt>) {
+        for stmt in stmts {
+            self.maybe_predeclare_recursive_local(stmt, buf);
+            buf.push(self.visit_stmt(stmt));
         }
     }
 
@@ -310,30 +305,16 @@ impl Structurer {
         });
     }
 
-    fn collect_assigned_symbols_in_region(
-        &self,
-        region: &RegionNode,
-        cfg: &ControlFlowGraph,
-        out: &mut HashSet<SymbolId>,
-    ) {
-        self.collect_assigned_symbols_in_node(region, cfg, out);
-    }
-
-    fn collect_assigned_symbols_in_node(
-        &self,
-        node: &RegionNode,
-        cfg: &ControlFlowGraph,
-        out: &mut HashSet<SymbolId>,
-    ) {
+    fn collect_assigned_symbols_in_region(&self, node: &RegionNode, out: &mut HashSet<SymbolId>) {
         match node {
-            RegionNode::BasicBlock { block } => {
-                for stmt in &cfg.blocks[*block].stmts {
-                    self.collect_assigned_symbols_in_stmt(&stmt.inner, out);
+            RegionNode::BasicBlock { stmts } => {
+                for stmt in stmts {
+                    self.collect_assigned_symbols_in_stmt(stmt, out);
                 }
             }
             RegionNode::Sequence { nodes } => {
                 for n in nodes {
-                    self.collect_assigned_symbols_in_node(n, cfg, out);
+                    self.collect_assigned_symbols_in_region(n, out);
                 }
             }
             RegionNode::If {
@@ -341,18 +322,17 @@ impl Structurer {
                 else_branch,
                 ..
             } => {
-                self.collect_assigned_symbols_in_region(then_branch, cfg, out);
+                self.collect_assigned_symbols_in_region(then_branch, out);
                 if let Some(else_branch) = else_branch {
-                    self.collect_assigned_symbols_in_region(else_branch, cfg, out);
+                    self.collect_assigned_symbols_in_region(else_branch, out);
                 }
             }
             RegionNode::While { body, .. }
             | RegionNode::NumericFor { body, .. }
             | RegionNode::GenericFor { body, .. } => {
-                self.collect_assigned_symbols_in_region(body, cfg, out);
+                self.collect_assigned_symbols_in_region(body, out);
             }
             RegionNode::Continue | RegionNode::Break | RegionNode::Return { .. } => {}
-            RegionNode::VirtualExit => unreachable!(),
         }
     }
 

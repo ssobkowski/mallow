@@ -1534,14 +1534,13 @@ fn fold_short_circuits(mut blocks: Vec<Block>, predecessors: &[Vec<usize>]) -> (
         };
 
         // AND Folding: `if A then (if B then T else F) else F` -> `if A and B then T else F`
-        if predecessors[then_a].len() == 1 && is_safe_to_hoist(&blocks[then_a]) {
-            if let BlockExit::CondJump {
+        if predecessors[then_a].len() == 1 && is_safe_to_hoist(&blocks[then_a])
+            && let BlockExit::CondJump {
                 cond: cond_b,
                 then_block: then_b,
                 else_block: else_b,
             } = blocks[then_a].exit.clone()
-            {
-                if else_a == else_b {
+                && else_a == else_b {
                     // Steal the safe statements and move them before our combined condition
                     let mut stmts = std::mem::take(&mut blocks[then_a].stmts);
                     blocks[i].stmts.append(&mut stmts);
@@ -1558,18 +1557,15 @@ fn fold_short_circuits(mut blocks: Vec<Block>, predecessors: &[Vec<usize>]) -> (
                     was_changed = true;
                     continue;
                 }
-            }
-        }
 
         // OR Folding: `if A then T else (if B then T else F)` -> `if A or B then T else F`
-        if predecessors[else_a].len() == 1 && is_safe_to_hoist(&blocks[else_a]) {
-            if let BlockExit::CondJump {
+        if predecessors[else_a].len() == 1 && is_safe_to_hoist(&blocks[else_a])
+            && let BlockExit::CondJump {
                 cond: cond_b,
                 then_block: then_b,
                 else_block: else_b,
             } = blocks[else_a].exit.clone()
-            {
-                if then_a == then_b {
+                && then_a == then_b {
                     // Steal the safe statements and move them before our combined condition
                     let mut stmts = std::mem::take(&mut blocks[else_a].stmts);
                     blocks[i].stmts.append(&mut stmts);
@@ -1586,8 +1582,6 @@ fn fold_short_circuits(mut blocks: Vec<Block>, predecessors: &[Vec<usize>]) -> (
                     was_changed = true;
                     continue;
                 }
-            }
-        }
     }
 
     (was_changed, blocks)
@@ -1765,11 +1759,10 @@ fn note_reg_use(
     uses: &mut HashSet<u8>,
     seen_defs: &HashSet<u8>,
 ) {
-    if let Some(&reg) = reg_of.get(&sym) {
-        if !seen_defs.contains(&reg) {
+    if let Some(&reg) = reg_of.get(&sym)
+        && !seen_defs.contains(&reg) {
             uses.insert(reg);
         }
-    }
 }
 
 fn collect_expr_reg_uses(
