@@ -34,7 +34,10 @@ impl<'a> VisitorMut for StmtRewriter<'a> {
         {
             *expr = self.expr.clone();
             self.change_count += 1;
+            return;
         }
+
+        walk_expr_mut(self, expr);
     }
 }
 
@@ -60,7 +63,7 @@ impl VisitorMut for Inliner {
 
         let mut i = 0;
         while i < block.stmts.len() - 1 {
-            let candidate = if let HilStmt::Assign { left, value } = &block.stmts[i].inner
+            let (sym, value) = if let HilStmt::Assign { left, value } = &block.stmts[i].inner
                 && let HilExpr::Symbol(sym) = left
             {
                 (*sym, value)
@@ -69,10 +72,9 @@ impl VisitorMut for Inliner {
                 continue;
             };
 
-            let sym = candidate.0;
             if self.vars.get(&sym).is_some_and(|v| v.read_count == 1)
                 && appears_once(sym, &block.stmts[i + 1].inner)
-                && let Some(inlined) = substitute_exact(&block.stmts[i + 1].inner, candidate)
+                && let Some(inlined) = substitute_exact(&block.stmts[i + 1].inner, sym, value)
             {
                 eprintln!("Chain:");
                 eprintln!("  {}", block.stmts[i].inner);
@@ -87,7 +89,7 @@ impl VisitorMut for Inliner {
                 self.was_changed = true;
 
                 // i is now at the place of the next stmt
-                return;
+                continue;
             }
 
             i += 1;
@@ -108,12 +110,12 @@ impl Visitor for Walker {
     }
 }
 
-fn substitute_exact(stmt: &HilStmt, var: (SymbolId, &HilExpr)) -> Option<HilStmt> {
+fn substitute_exact(stmt: &HilStmt, sym: SymbolId, expr: &HilExpr) -> Option<HilStmt> {
     let mut cloned = stmt.clone();
 
     let mut rewriter = StmtRewriter {
-        sym: var.0,
-        expr: var.1,
+        sym,
+        expr,
         change_count: 0,
     };
     rewriter.visit_stmt(&mut cloned);
@@ -133,9 +135,11 @@ fn appears_once(sym: SymbolId, stmt: &HilStmt) -> bool {
 
 pub fn run(fun: &mut StructuredFunction) {
     loop {
-        let analysis = Analyzer::analyze_function(fun);
-        let mut inliner = Inliner::with_vars(analysis);
+        let vars = Analyzer::analyze_function(fun);
+
+        let mut inliner = Inliner::with_vars(vars);
         inliner.visit_function(fun);
+
         if !inliner.was_changed {
             break;
         }
