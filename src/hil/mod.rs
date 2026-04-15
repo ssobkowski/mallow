@@ -31,7 +31,8 @@ impl StructuredFunction {
 
         if !was_reduced {
             eprintln!(
-                "[proto{was_reduced}] Failed to structure region properly. The output may be incorrect."
+                "[proto {}] Failed to structure region properly. The output may be incorrect.",
+                proto.index
             )
         }
 
