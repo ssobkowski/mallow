@@ -1756,18 +1756,36 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
     }
 }
 
+fn is_pure_expr(expr: &HilExpr) -> bool {
+    match expr {
+        HilExpr::Nil
+        | HilExpr::Number(_)
+        | HilExpr::String(_)
+        | HilExpr::Bool(_)
+        | HilExpr::Symbol(_)
+        | HilExpr::Import(_)
+        | HilExpr::Global(_)
+        | HilExpr::VarArgs => true,
+        HilExpr::GetField { obj, .. } => is_pure_expr(obj),
+        HilExpr::GetIndex { obj, index } => is_pure_expr(obj) && is_pure_expr(index),
+        HilExpr::Binary { lhs, rhs, .. } => is_pure_expr(lhs) && is_pure_expr(rhs),
+        HilExpr::Unary { expr, .. } => is_pure_expr(expr),
+        HilExpr::If {
+            condition,
+            then_expr,
+            else_expr,
+        } => is_pure_expr(condition) && is_pure_expr(then_expr) && is_pure_expr(else_expr),
+        HilExpr::Call { .. }
+        | HilExpr::MethodCall { .. }
+        | HilExpr::Table { .. }
+        | HilExpr::Closure { .. } => false,
+    }
+}
+
 fn is_safe_to_hoist(block: &Block) -> bool {
     block.stmts.iter().all(|stmt| {
         if let HilStmt::Assign { value, .. } = &stmt.inner {
-            matches!(
-                value,
-                HilExpr::Number(_)
-                    | HilExpr::Bool(_)
-                    | HilExpr::String(_)
-                    | HilExpr::Nil
-                    | HilExpr::Symbol(_)
-                    | HilExpr::Import(_)
-            )
+            is_pure_expr(value)
         } else {
             false
         }
