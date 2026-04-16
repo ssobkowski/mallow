@@ -34,8 +34,13 @@ impl Inliner {
     fn is_inlinable_rhs(&self, expr: &HilExpr) -> bool {
         // TODO: Check the todo in `hil::common::invert_condition`. This can be applied here (i think)
         match expr {
-            // A symbol can be inlined if it's not an upvalue, ie. if this symbol is a potential candidate
-            HilExpr::Symbol(sym) => self.vars.get(sym).is_some_and(|v| !v.disqualified),
+            // A symbol can be inlined only when its value is stable for the whole function.
+            // Otherwise a copied temporary can capture an old value and become wrong after
+            // substitutions (for example, when doing a swap via a temporary).
+            HilExpr::Symbol(sym) => self
+                .vars
+                .get(sym)
+                .is_some_and(|v| !v.disqualified && v.write_count == 1),
             HilExpr::Number(_)
             | HilExpr::String(_)
             | HilExpr::Bool(_)
