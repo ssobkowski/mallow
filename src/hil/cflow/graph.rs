@@ -14,9 +14,7 @@ use crate::{
         common::{const_expr, decoded_count},
         ir::{HilExpr, HilStmt, HilTableItem, PhiNode, Spanned, ToSpanned as _},
         lifter::{
-            LiftContext,
-            common::CAPTURE_REF,
-            lift,
+            LiftContext, lift,
             ssa::{Ssa, Symbol, SymbolId, SymbolKind},
         },
     },
@@ -804,36 +802,41 @@ impl ControlFlowGraph {
             }
         }
 
-        // These need to be treated as shared mutable state across the function,
-        // just like upvalues, so we must unify all their SSA versions.
-        let mut captured_refs = HashSet::new();
-        for (instr, _) in instrs {
-            if let Instr::Capture {
-                capture_type: CAPTURE_REF,
-                reg,
-            } = instr
-            {
-                captured_refs.insert(*reg);
-            }
-        }
-
-        // Unify all versions of the same upvalue AND all versions of captured registers.
-        let mut upval_versions: HashMap<u8, Vec<SymbolId>> = HashMap::new();
-        let mut captured_versions: HashMap<u8, Vec<SymbolId>> = HashMap::new();
-
+        // Unify all versions of the same upvalue.
+        let mut upval_versions: HashMap<_, Vec<_>> = HashMap::new();
         for (id, symbol) in ssa.arena_iter() {
             match symbol.kind {
                 SymbolKind::Upvalue(idx) => {
                     upval_versions.entry(idx).or_default().push(id);
                 }
-                SymbolKind::Register(idx) if captured_refs.contains(&idx) => {
-                    captured_versions.entry(idx).or_default().push(id);
+                _ => {}
+            }
+        }
+
+        for versions in upval_versions.values() {
+            for i in 1..versions.len() {
+                disjoint_set.union(versions[0], versions[i]);
+            }
+        }
+
+        // Unify captured-by-reference register versions by their lifetime
+        // generation. The lifter tags these as `CapturedRegister`; a
+        // `CLOSEUPVALS` starts a new generation and register reuse after that
+        // must remain distinct.
+        let mut captured_versions: HashMap<_, Vec<_>> = HashMap::new();
+        for (id, symbol) in ssa.arena_iter() {
+            match symbol.kind {
+                SymbolKind::CapturedRegister { reg, generation } => {
+                    captured_versions
+                        .entry((reg, generation))
+                        .or_default()
+                        .push(id);
                 }
                 _ => {}
             }
         }
 
-        for versions in upval_versions.values().chain(captured_versions.values()) {
+        for versions in captured_versions.values() {
             for i in 1..versions.len() {
                 disjoint_set.union(versions[0], versions[i]);
             }
@@ -1795,7 +1798,7 @@ fn is_safe_to_hoist(block: &Block) -> bool {
 fn symbol_register_map(ssa: &Ssa) -> HashMap<SymbolId, u8> {
     ssa.arena_iter()
         .filter_map(|(id, sym)| match sym.kind {
-            SymbolKind::Register(reg) => Some((id, reg)),
+            SymbolKind::Register(reg) | SymbolKind::CapturedRegister { reg, .. } => Some((id, reg)),
             _ => None,
         })
         .collect()

@@ -98,6 +98,9 @@ pub struct Lifter<'a, 'cfg> {
 
     stmts: Vec<Spanned<HilStmt>>,
     pending_multiret: Option<MultiRet>,
+
+    reg_generations: [u16; 256],
+    open_captured_ref: [Option<u16>; 256],
 }
 
 impl<'a, 'cfg> Lifter<'a, 'cfg> {
@@ -112,6 +115,8 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
             block_idx: ctx.block_idx,
             stmts: Vec::new(),
             pending_multiret: None,
+            reg_generations: [0; 256],
+            open_captured_ref: [None; 256],
         }
     }
 
@@ -149,9 +154,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         (0..count)
             .map(|i| {
                 let reg = start + i;
-                let sym = self.ssa.alloc_symbol(Symbol::reg(reg));
-                self.ssa.write_reg(self.block_idx, reg, sym);
-                sym
+                self.alloc_reg_symbol(reg)
             })
             .collect()
     }
@@ -190,8 +193,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         debug_assert!(ip < self.instrs.len());
         let pc = self.instrs[ip].1;
 
-        let sym = self.ssa.alloc_symbol(Symbol::reg(reg));
-        self.ssa.write_reg(self.block_idx, reg, sym);
+        let sym = self.alloc_reg_symbol(reg);
 
         self.stmts.push(
             HilStmt::Assign {
@@ -204,6 +206,36 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 
     fn get_reg_symbol(&mut self, reg: u8) -> SymbolId {
         self.ssa.read_reg(self.block_idx, reg)
+    }
+
+    fn alloc_reg_symbol(&mut self, reg: u8) -> SymbolId {
+        let symbol = match self.open_captured_ref[reg as usize] {
+            Some(generation) => Symbol::captured_reg(reg, generation),
+            None => Symbol::reg(reg),
+        };
+
+        let sym = self.ssa.alloc_symbol(symbol);
+        self.ssa.write_reg(self.block_idx, reg, sym);
+        sym
+    }
+
+    fn note_close_upvals(&mut self, from_reg: u8) {
+        for generation in &mut self.reg_generations[from_reg as usize..] {
+            *generation = generation.saturating_add(1);
+        }
+
+        for captured in &mut self.open_captured_ref[from_reg as usize..] {
+            *captured = None;
+        }
+    }
+
+    fn promote_capture_ref(&mut self, reg: u8) -> SymbolId {
+        let generation = self.reg_generations[reg as usize];
+        self.open_captured_ref[reg as usize] = Some(generation);
+
+        let sym = self.ssa.read_reg(self.block_idx, reg);
+        self.ssa.promote_to_captured_reg(sym, reg, generation);
+        sym
     }
 
     /// Lifts all instructions into pc-spanned HIL statements in bytecode order.
@@ -451,8 +483,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 
                 Instr::NewClosure { dest, proto: index } => {
                     let pc = self.current_pc();
-                    let sym = self.ssa.alloc_symbol(Symbol::reg(*dest));
-                    self.ssa.write_reg(self.block_idx, *dest, sym);
+                    let sym = self.alloc_reg_symbol(*dest);
 
                     let resolved = self.parent_proto.protos[*index as usize];
                     let n_captures = self.proto_upval_count(resolved);
@@ -471,8 +502,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 
                 Instr::DupClosure { dest, k } => {
                     let pc = self.current_pc();
-                    let sym = self.ssa.alloc_symbol(Symbol::reg(*dest));
-                    self.ssa.write_reg(self.block_idx, *dest, sym);
+                    let sym = self.alloc_reg_symbol(*dest);
 
                     let resolved = match self.consts.get(*k as usize) {
                         Some(Constant::Closure(proto_idx)) => *proto_idx as usize,
@@ -492,14 +522,15 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                     );
                 }
 
+                Instr::CloseUpvals { reg } => self.note_close_upvals(*reg),
+
                 // Bookkeeping-only opcodes that the decompiler does not need to model.
                 Instr::FastCall1 { .. }
                 | Instr::FastCall2 { .. }
                 | Instr::FastCall2K { .. }
                 | Instr::FastCall3 { .. }
                 | Instr::FastCall { .. }
-                | Instr::PrepVarArgs { .. }
-                | Instr::CloseUpvals { .. } => {}
+                | Instr::PrepVarArgs { .. } => {}
 
                 Instr::Capture { .. } => unreachable!(
                     "CAPTURE instructions should have been consumed by NEWCLOSURE/DUPCLOSURE handling"
@@ -672,7 +703,8 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
             match self.next() {
                 Some(Instr::Capture { capture_type, reg }) => {
                     let symbol = match capture_type {
-                        CAPTURE_VAL | CAPTURE_REF => self.ssa.read_reg(self.block_idx, reg),
+                        CAPTURE_VAL => self.ssa.read_reg(self.block_idx, reg),
+                        CAPTURE_REF => self.promote_capture_ref(reg),
                         CAPTURE_UPVAL => self.ssa.read_upval(self.block_idx, reg),
                         _ => unreachable!("unknown capture type: {capture_type}"),
                     };
@@ -696,8 +728,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                 .stmts
                 .push(HilStmt::Call(expr.inner).to_spanned(expr.pc)),
             HilExpr::VarArgs => {
-                let sym = self.ssa.alloc_symbol(Symbol::reg(base));
-                self.ssa.write_reg(self.block_idx, base, sym);
+                let sym = self.alloc_reg_symbol(base);
 
                 self.stmts.push(
                     HilStmt::Assign {

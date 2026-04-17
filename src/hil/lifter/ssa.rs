@@ -20,6 +20,7 @@ pub struct Symbol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Register(u8),
+    CapturedRegister { reg: u8, generation: u16 },
     Upvalue(u8),
     Param(u8),
 }
@@ -50,6 +51,13 @@ impl Symbol {
     pub fn upval(index: u8) -> Self {
         Self {
             kind: SymbolKind::Upvalue(index),
+            mutability: Mutability::Immutable,
+        }
+    }
+
+    pub fn captured_reg(reg: u8, generation: u16) -> Self {
+        Self {
+            kind: SymbolKind::CapturedRegister { reg, generation },
             mutability: Mutability::Immutable,
         }
     }
@@ -101,6 +109,10 @@ impl<'a> Ssa<'a> {
 
     pub fn alloc_symbol(&mut self, symbol: Symbol) -> SymbolId {
         self.arena.alloc(symbol)
+    }
+
+    pub fn promote_to_captured_reg(&mut self, symbol: SymbolId, reg: u8, generation: u16) {
+        self.arena[symbol].kind = SymbolKind::CapturedRegister { reg, generation };
     }
 
     pub fn arena_iter(&self) -> impl Iterator<Item = (SymbolId, &Symbol)> {
