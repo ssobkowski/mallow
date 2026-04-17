@@ -119,7 +119,7 @@ impl Display for HilExpr {
             HilExpr::String(s) => write!(f, "\"{}\"", s),
             HilExpr::Bool(b) => write!(f, "{}", b),
             HilExpr::Symbol(s) => write!(f, "v{}", s.index()),
-            HilExpr::Closure { .. } => write!(f, "<closure>"),
+            HilExpr::Closure { proto, .. } => write!(f, "<closure {}>", proto),
             HilExpr::Global(g) => write!(f, "{}", g),
             HilExpr::Import(i) => write!(f, "import(\"{}\")", i),
             HilExpr::GetField { obj, field } => write!(f, "{}.{}", obj, field),

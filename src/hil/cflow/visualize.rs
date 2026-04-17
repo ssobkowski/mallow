@@ -1,8 +1,8 @@
-use std::fmt::{Display, Write as _};
+use std::{fmt::Display, path::PathBuf};
+
+use serde_json::{Value, json};
 
 use super::graph::{Block, BlockExit, ControlFlowGraph};
-
-const ELK_JS: &str = include_str!("../../../assets/elk.bundled.js");
 
 const CHAR_W: f64 = 7.2;
 const LINE_H: f64 = 16.0;
@@ -126,12 +126,19 @@ struct Edge {
     src_port_order: usize,
 }
 
+struct GraphPayload {
+    tag: String,
+    elk_json: Value,
+    label_json: Value,
+    edge_color_json: Value,
+}
+
 impl ControlFlowGraph {
     fn is_reachable(&self, block: usize) -> bool {
         block == self.entry_block || !self.predecessors(block).is_empty()
     }
 
-    pub fn to_elk_html(&self, tag: &str) -> String {
+    fn graph_payload(&self, tag: &str) -> GraphPayload {
         let n = self.blocks.len();
 
         let depths = dom_depths(&self.immediate_dominators, self.entry_block);
@@ -228,15 +235,32 @@ impl ControlFlowGraph {
         let label_json = build_label_json(&labels, n);
         let edge_color_json = build_edge_color_json(&edges);
 
-        build_html(&elk_json, &label_json, &edge_color_json, tag)
+        GraphPayload {
+            tag: tag.to_owned(),
+            elk_json,
+            label_json,
+            edge_color_json,
+        }
     }
 }
 
-pub fn dump_cfg(cfg: &ControlFlowGraph, tag: &str) {
-    let html = cfg.to_elk_html(tag);
-    let path = std::env::temp_dir().join(format!("cfg_{tag}.html"));
-    std::fs::write(&path, &html).expect("failed to write cfg html");
-    opener::open(&path).expect("failed to open browser");
+pub fn dump_cfgs(cfgs: &[ControlFlowGraph], selected_index: usize, output: PathBuf) {
+    let payloads: Vec<_> = cfgs
+        .iter()
+        .enumerate()
+        .map(|(i, cfg)| cfg.graph_payload(&format!("Proto {i}")))
+        .collect();
+
+    let selected_index = selected_index.min(payloads.len().saturating_sub(1));
+    let title = payloads.get(selected_index).map_or_else(
+        || "CFG".to_owned(),
+        |payload| format!("CFG: {}", payload.tag),
+    );
+
+    let graphs_json = build_graphs_json(&payloads);
+    let html = build_html(&graphs_json, selected_index, &title);
+
+    std::fs::write(&output, &html).expect("failed to write cfg html");
 }
 
 fn build_elk_json(
@@ -246,248 +270,124 @@ fn build_elk_json(
     in_edges: &[Vec<&Edge>],
     depths: &[usize],
     n: usize,
-) -> String {
-    let mut s = String::new();
+) -> Value {
+    let children: Vec<_> = (0..n)
+        .filter_map(|i| {
+            let label = labels[i].as_ref()?;
+            let (w, h) = node_size(label);
+            let y_hint = depths[i] as f64 * LAYER_H_HINT;
 
-    s.push_str(r#"{"id":"root","layoutOptions":{"#);
-    s.push_str(r#""elk.algorithm":"layered","#);
-    s.push_str(r#""elk.direction":"DOWN","#);
-    s.push_str(r#""elk.spacing.nodeNode":"50","#);
-    s.push_str(r#""elk.layered.spacing.nodeNodeBetweenLayers":"60","#);
-    s.push_str(r#""elk.edgeRouting":"ORTHOGONAL","#);
-    s.push_str(r#""elk.layered.unnecessaryBendpoints":"true","#);
-    s.push_str(r#""elk.layered.layeringStrategy":"INTERACTIVE","#);
-    s.push_str(r#""elk.layered.crossingMinimization.strategy":"LAYER_SWEEP","#);
-    s.push_str(r#""elk.layered.crossingMinimization.greedySwitch.type":"TWO_SIDED","#);
-    s.push_str(r#""elk.layered.crossingMinimization.forceNodeModelOrder":"false","#);
-    s.push_str(r#""elk.layered.nodePlacement.strategy":"NETWORK_SIMPLEX","#);
-    s.push_str(r#""elk.layered.cycleBreaking.strategy":"GREEDY""#);
-    s.push_str(r#"},"children":["#);
+            let ports: Vec<_> = out_edges[i]
+                .iter()
+                .map(|e| {
+                    json!({
+                        "id": format!("block_{i}_S_{}", e.id),
+                        "properties": {
+                            "port.side": "SOUTH",
+                            "port.index": e.src_port_order.to_string()
+                        }
+                    })
+                })
+                .chain(in_edges[i].iter().enumerate().map(|(pi, e)| {
+                    json!({
+                        "id": format!("block_{i}_N_{}", e.id),
+                        "properties": {
+                            "port.side": "NORTH",
+                            "port.index": pi.to_string()
+                        }
+                    })
+                }))
+                .collect();
 
-    let mut first_node = true;
-    for i in 0..n {
-        let Some(label) = &labels[i] else { continue };
-        if !first_node {
-            s.push(',');
-        }
-        first_node = false;
+            Some(json!({
+                "id": format!("block_{i}"),
+                "width": w,
+                "height": h,
+                "y": y_hint,
+                "properties": { "elk.portConstraints": "FIXED_ORDER" },
+                "ports": ports
+            }))
+        })
+        .collect();
 
-        let (w, h) = node_size(label);
-        let y_hint = depths[i] as f64 * LAYER_H_HINT;
-
-        write!(
-            s,
-            r#"{{"id":"block_{i}","width":{w:.1},"height":{h:.1},"y":{y_hint:.1},"#
-        )
-        .unwrap();
-        s.push_str(r#""properties":{"elk.portConstraints":"FIXED_ORDER"},"ports":["#);
-
-        let mut first_port = true;
-        for e in &out_edges[i] {
-            if !first_port {
-                s.push(',');
+    let edges: Vec<_> = edges
+        .iter()
+        .map(|e| {
+            let mut edge = json!({
+                "id": e.id.to_string(),
+                "sources": [format!("block_{}_S_{}", e.src, e.id)],
+                "targets": [format!("block_{}_N_{}", e.dst, e.id)]
+            });
+            if e.is_back {
+                edge["properties"] = json!({ "elk.edge.type": "BACKEDGE" });
             }
-            first_port = false;
-            write!(s,
-                r#"{{"id":"block_{i}_S_{eid}","properties":{{"port.side":"SOUTH","port.index":"{order}"}}}}"#,
-                eid = e.id, order = e.src_port_order
-            ).unwrap();
-        }
+            edge
+        })
+        .collect();
 
-        for (pi, e) in in_edges[i].iter().enumerate() {
-            if !first_port {
-                s.push(',');
-            }
-            first_port = false;
-            write!(s,
-                r#"{{"id":"block_{i}_N_{eid}","properties":{{"port.side":"NORTH","port.index":"{order}"}}}}"#,
-                eid = e.id, order = pi
-            ).unwrap();
-        }
-
-        s.push_str("]}");
-    }
-
-    s.push_str(r#"],"edges":["#);
-    for (i, e) in edges.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        write!(
-            s,
-            r#"{{"id":"{eid}","sources":["block_{src}_S_{eid}"],"targets":["block_{dst}_N_{eid}"]"#,
-            eid = e.id,
-            src = e.src,
-            dst = e.dst
-        )
-        .unwrap();
-        if e.is_back {
-            s.push_str(r#","properties":{"elk.edge.type":"BACKEDGE"}"#);
-        }
-        s.push('}');
-    }
-    s.push_str("]}");
-    s
+    json!({
+        "id": "root",
+        "layoutOptions": {
+            "elk.algorithm": "layered",
+            "elk.direction": "DOWN",
+            "elk.spacing.nodeNode": "50",
+            "elk.layered.spacing.nodeNodeBetweenLayers": "60",
+            "elk.edgeRouting": "ORTHOGONAL",
+            "elk.layered.unnecessaryBendpoints": "true",
+            "elk.layered.layeringStrategy": "INTERACTIVE",
+            "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
+            "elk.layered.crossingMinimization.greedySwitch.type": "TWO_SIDED",
+            "elk.layered.crossingMinimization.forceNodeModelOrder": "false",
+            "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
+            "elk.layered.cycleBreaking.strategy": "GREEDY"
+        },
+        "children": children,
+        "edges": edges
+    })
 }
 
-fn build_label_json(labels: &[Option<NodeLabel>], n: usize) -> String {
-    let mut s = String::from('{');
-    let mut first = true;
-    for i in 0..n {
-        let Some(label) = &labels[i] else { continue };
-        if !first {
-            s.push(',');
-        }
-        first = false;
-        write!(
-            s,
-            r#""block_{i}":{{"header":{},"lines":["#,
-            serde_json::to_string(&label.header).unwrap()
-        )
-        .unwrap();
-        for (li, (text, bold)) in label.lines.iter().enumerate() {
-            if li > 0 {
-                s.push(',');
-            }
-            write!(
-                s,
-                r#"{{"text":{},"bold":{bold}}}"#,
-                serde_json::to_string(text).unwrap()
-            )
-            .unwrap();
-        }
-        s.push_str("]}");
-    }
-    s.push('}');
-    s
+fn build_label_json(labels: &[Option<NodeLabel>], n: usize) -> Value {
+    (0..n)
+        .filter_map(|i| {
+            let label = labels[i].as_ref()?;
+            let lines: Vec<Value> = label
+                .lines
+                .iter()
+                .map(|(text, bold)| json!({ "text": text, "bold": bold }))
+                .collect();
+
+            Some((
+                format!("block_{i}"),
+                json!({ "header": label.header, "lines": lines }),
+            ))
+        })
+        .collect()
 }
 
-fn build_edge_color_json(edges: &[Edge]) -> String {
-    let mut s = String::from('{');
-    for (i, e) in edges.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        write!(s, r#""{}":"{}""#, e.id, e.color).unwrap();
-    }
-    s.push('}');
-    s
+fn build_edge_color_json(edges: &[Edge]) -> Value {
+    edges
+        .iter()
+        .map(|e| (e.id.to_string(), json!(e.color)))
+        .collect()
 }
 
-fn build_html(elk_json: &str, label_json: &str, edge_colors: &str, title: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>CFG: {title}</title>
-  <script>{ELK_JS}</script>
-  <style>
-    body {{ margin: 0; padding: 20px; background: #f5f5f5; }}
-    svg  {{ display: block; }}
-  </style>
-</head>
-<body>
-<div id="cfg" style="font-family:monospace;color:#888;padding:1rem;">computing layout...</div>
-<script>
-const C=7.2,LH=16,HH=24,HP=10,VP=8;
-const elkGraph={elk_json};
-const nodeLabels={label_json};
-const edgeColors={edge_colors};
-const colorName={{'#2196F3':'blue','#4CAF50':'green','#f44336':'red'}};
-const NS='http://www.w3.org/2000/svg';
+fn build_graphs_json(graphs: &[GraphPayload]) -> Value {
+    graphs
+        .iter()
+        .map(|graph| {
+            json!({
+                "tag": graph.tag,
+                "elkGraph": graph.elk_json,
+                "nodeLabels": graph.label_json,
+                "edgeColors": graph.edge_color_json
+            })
+        })
+        .collect()
+}
 
-function el(tag,attrs,...ch){{
-  const e=document.createElementNS(NS,tag);
-  for(const[k,v]of Object.entries(attrs))e.setAttribute(k,v);
-  for(const c of ch)c&&e.appendChild(c);
-  return e;
-}}
-function tx(content,attrs){{
-  const t=document.createElementNS(NS,'text');
-  for(const[k,v]of Object.entries(attrs))t.setAttribute(k,v);
-  t.textContent=content;
-  return t;
-}}
-
-new ELK().layout(elkGraph).then(layout=>{{
-  const M=24;
-  let mx=0,my=0;
-  layout.children.forEach(n=>{{mx=Math.max(mx,n.x+n.width);my=Math.max(my,n.y+n.height);}});
-
-  const svg=el('svg',{{width:mx+M*2,height:my+M*2,xmlns:NS}});
-
-  // arrowhead markers
-  const defs=el('defs',{{}});
-  for(const[nm,col]of[['blue','#2196F3'],['green','#4CAF50'],['red','#f44336']]){{
-    const mk=el('marker',{{
-      id:`arr-${{nm}}`,markerWidth:'8',markerHeight:'6',
-      refX:'7',refY:'3',orient:'auto'
-    }});
-    mk.appendChild(el('path',{{d:'M0,0 L0,6 L8,3 z',fill:col}}));
-    defs.appendChild(mk);
-  }}
-  // dashed marker variants for back edges
-  for(const[nm,col]of[['blue','#2196F3'],['green','#4CAF50'],['red','#f44336']]){{
-    const mk=el('marker',{{
-      id:`arr-dash-${{nm}}`,markerWidth:'8',markerHeight:'6',
-      refX:'7',refY:'3',orient:'auto'
-    }});
-    mk.appendChild(el('path',{{d:'M0,0 L0,6 L8,3 z',fill:col,opacity:'0.6'}}));
-    defs.appendChild(mk);
-  }}
-  svg.appendChild(defs);
-
-  const g=el('g',{{transform:`translate(${{M}},${{M}})`}});
-
-  // edges (behind nodes)
-  layout.edges.forEach(edge=>{{
-    if(!edge.sections)return;
-    const color=edgeColors[edge.id];
-    const cn=colorName[color];
-    const isBack=edge.properties&&edge.properties['elk.edge.type']==='BACKEDGE';
-    edge.sections.forEach(sec=>{{
-      const pts=[sec.startPoint,...(sec.bendPoints||[]),sec.endPoint];
-      const d='M '+pts.map(p=>`${{p.x}} ${{p.y}}`).join(' L ');
-      g.appendChild(el('path',{{
-        d, fill:'none', stroke:color,
-        'stroke-width':'1.5',
-        'stroke-dasharray':isBack?'6,3':'none',
-        'opacity':isBack?'0.6':'1',
-        'marker-end':`url(#arr-${{isBack?'dash-':''}}${{cn}})`
-      }}));
-    }});
-  }});
-
-  // nodes
-  layout.children.forEach(n=>{{
-    const data=nodeLabels[n.id];
-    const{{x,y,width:w,height:h}}=n;
-    g.appendChild(el('rect',{{x,y,width:w,height:h,fill:'white',stroke:'#555','stroke-width':'1'}}));
-    g.appendChild(el('rect',{{x,y,width:w,height:HH,fill:'#E0E0E0',stroke:'none'}}));
-    g.appendChild(el('line',{{x1:x,y1:y+HH,x2:x+w,y2:y+HH,stroke:'#aaa','stroke-width':'0.5'}}));
-    g.appendChild(tx(data.header,{{
-      x:x+w/2,y:y+HH/2+4,
-      'text-anchor':'middle',
-      'font-family':'Courier,monospace','font-size':'12',
-      'font-weight':'bold',fill:'#111'
-    }}));
-    data.lines.forEach((line,i)=>{{
-      g.appendChild(tx(line.text,{{
-        x:x+HP,y:y+HH+VP+i*LH+12,
-        'font-family':'Courier,monospace','font-size':'12',
-        'font-weight':line.bold?'bold':'normal',fill:'#111'
-      }}));
-    }});
-  }});
-
-  svg.appendChild(g);
-  document.getElementById('cfg').replaceChildren(svg);
-}}).catch(err=>{{
-  document.getElementById('cfg').textContent='ELK layout error: '+err;
-}});
-</script>
-</body>
-</html>"#
-    )
+fn build_html(graphs_json: &Value, selected_index: usize, title: &str) -> String {
+    include_str!("../../../assets/cfg.html")
+        .replace("__GRAPHS_JSON__", &graphs_json.to_string())
+        .replace("__SELECTED_INDEX__", &selected_index.to_string())
+        .replace("__BASE_TITLE__", &serde_json::to_string(title).unwrap())
 }

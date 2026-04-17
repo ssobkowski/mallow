@@ -58,6 +58,10 @@ enum Commands {
         /// Path to the input bytecode file
         #[arg(short, long)]
         input: PathBuf,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: PathBuf,
     },
 }
 
@@ -138,15 +142,19 @@ fn main() {
             }
         }
         #[cfg(feature = "visualize")]
-        Commands::Visualize { input } => {
+        Commands::Visualize { input, output } => {
+            use crate::hil::cflow::{graph::ControlFlowGraph, visualize::dump_cfgs};
+
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
             let disasm = disasm::disassemble(&bytecode).expect("failed to disassemble");
-            for proto in &disasm.protos {
-                use crate::hil::cflow::{graph::ControlFlowGraph, visualize::dump_cfg};
 
-                let cfg = ControlFlowGraph::from_proto(proto, &disasm.protos);
-                dump_cfg(&cfg, &format!("Proto {}", proto.index));
-            }
+            let cfgs: Vec<_> = disasm
+                .protos
+                .iter()
+                .map(|proto| ControlFlowGraph::from_proto(proto, &disasm.protos))
+                .collect();
+
+            dump_cfgs(&cfgs, disasm.entry_proto as usize, output);
         }
     }
 }

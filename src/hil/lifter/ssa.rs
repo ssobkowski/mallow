@@ -79,6 +79,8 @@ pub enum Mutability {
 }
 
 pub struct Ssa<'a> {
+    // 0-255: normal registers
+    // 256-511: upvalue registers
     defs: Vec<[Option<SymbolId>; 512]>,
     predecessors: &'a [Vec<usize>],
     arena: &'a mut Arena<Symbol>,

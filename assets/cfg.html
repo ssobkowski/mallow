@@ -1,0 +1,359 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>mallow</title>
+    <script
+      src="https://unpkg.com/elkjs@0.11.1/lib/elk.bundled.js"
+      integrity="sha384-k7OFwtsMfFyYU75zZhPkC8VRASnGrW1pxavUnozOiO2B5M5gv6PYGOkEYZTrVtvo"
+      crossorigin="anonymous"
+    ></script>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "Cascadia Mono", "Consolas", "Courier New", monospace;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #1a1a1a;
+        color: #d4d4d4;
+      }
+      #layout {
+        height: 100vh;
+        padding: 14px;
+        display: grid;
+        grid-template-columns: 220px 1fr;
+        gap: 10px;
+      }
+      #sidebar {
+        background: #252526;
+        border: 1px solid #3e3e42;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      #proto-list {
+        min-height: 0;
+        padding: 4px;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .proto-item {
+        appearance: none;
+        border: 1px solid transparent;
+        background: transparent;
+        color: #cccccc;
+        font: inherit;
+        font-size: 12px;
+        text-align: left;
+        padding: 5px 8px;
+        cursor: pointer;
+      }
+      .proto-item:hover {
+        background: #2a2d2e;
+        border-color: #3e3e42;
+      }
+      .proto-item.active {
+        background: #094771;
+        color: #d4d4d4;
+        border-color: transparent;
+      }
+      #main {
+        min-width: 0;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      #cfg {
+        flex: 1;
+        min-height: 0;
+        color: #6a6a6a;
+        font-size: 12px;
+        padding: 12px;
+        background: #1a1a1a;
+        overflow: auto;
+      }
+      svg {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="layout">
+      <aside id="sidebar">
+        <div id="proto-list" role="listbox" aria-label="Protos"></div>
+      </aside>
+      <main id="main">
+        <div id="cfg">preparing graphs...</div>
+      </main>
+    </div>
+    <script>
+      // node geometry constants
+      const LINE_HEIGHT = 16; // px per body line
+      const HEADER_H = 24; // header row height
+      const HORIZ_PAD = 10; // horizontal text padding
+      const VERT_PAD = 8; // vertical text padding
+
+      const graphs = __GRAPHS_JSON__;
+      const initialIndex = __SELECTED_INDEX__;
+      const baseTitle = __BASE_TITLE__;
+
+      const NODE_BODY = "#252526";
+      const NODE_HEADER = "#2d2d2d";
+      const NODE_BORDER = "#3e3e42";
+      const NODE_SEP = "#3e3e42";
+      const TEXT_BODY = "#d4d4d4";
+      const TEXT_HEADER = "#9cdcfe";
+
+      const EDGE_BLUE = "#569cd6";
+      const EDGE_GREEN = "#4ec9b0";
+      const EDGE_RED = "#f44747";
+
+      const NS = "http://www.w3.org/2000/svg";
+
+      function hexToId(hex) {
+        return hex.replace("#", "");
+      }
+
+      function ensureMarkers(defs, color) {
+        const id = hexToId(color);
+        if (defs.querySelector(`#arr-${id}`)) return;
+
+        const mk = el("marker", {
+          id: `arr-${id}`,
+          markerWidth: "8",
+          markerHeight: "6",
+          refX: "7",
+          refY: "3",
+          orient: "auto",
+        });
+        mk.appendChild(el("path", { d: "M0,0 L0,6 L8,3 z", fill: color }));
+        defs.appendChild(mk);
+
+        const mkd = el("marker", {
+          id: `arr-dash-${id}`,
+          markerWidth: "8",
+          markerHeight: "6",
+          refX: "7",
+          refY: "3",
+          orient: "auto",
+        });
+        mkd.appendChild(
+          el("path", { d: "M0,0 L0,6 L8,3 z", fill: color, opacity: "0.5" }),
+        );
+        defs.appendChild(mkd);
+      }
+
+      const cfgHost = document.getElementById("cfg");
+      const protoList = document.getElementById("proto-list");
+      const elk = new ELK();
+      const layoutCache = new Map();
+      let renderToken = 0;
+      let selectedProto = -1;
+
+      document.title = baseTitle;
+
+      function el(tag, attrs, ...children) {
+        const e = document.createElementNS(NS, tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+        for (const c of children) c && e.appendChild(c);
+        return e;
+      }
+
+      function tx(content, attrs) {
+        const t = document.createElementNS(NS, "text");
+        for (const [k, v] of Object.entries(attrs)) t.setAttribute(k, v);
+        t.textContent = content;
+        return t;
+      }
+
+      function renderSvg(layout, nodeLabels, edgeColors) {
+        const MARGIN = 24;
+        let maxX = 0,
+          maxY = 0;
+        for (const n of layout.children ?? []) {
+          maxX = Math.max(maxX, n.x + n.width);
+          maxY = Math.max(maxY, n.y + n.height);
+        }
+
+        const svg = el("svg", {
+          width: maxX + MARGIN * 2,
+          height: maxY + MARGIN * 2,
+          xmlns: NS,
+        });
+        const defs = el("defs", {});
+        svg.appendChild(defs);
+
+        const g = el("g", { transform: `translate(${MARGIN},${MARGIN})` });
+
+        for (const edge of layout.edges ?? []) {
+          if (!edge.sections) continue;
+          const color = edgeColors[edge.id] ?? EDGE_BLUE;
+          const id = hexToId(color);
+          const isBack = edge.properties?.["elk.edge.type"] === "BACKEDGE";
+          ensureMarkers(defs, color);
+
+          for (const sec of edge.sections) {
+            const pts = [
+              sec.startPoint,
+              ...(sec.bendPoints ?? []),
+              sec.endPoint,
+            ];
+            const d = "M " + pts.map((p) => `${p.x} ${p.y}`).join(" L ");
+            g.appendChild(
+              el("path", {
+                d,
+                fill: "none",
+                stroke: color,
+                "stroke-width": "1.5",
+                "stroke-dasharray": isBack ? "6,3" : "none",
+                opacity: isBack ? "0.7" : "1",
+                "marker-end": `url(#arr-${isBack ? "dash-" : ""}${id})`,
+              }),
+            );
+          }
+        }
+
+        for (const n of layout.children ?? []) {
+          const data = nodeLabels[n.id];
+          if (!data) continue;
+          const { x, y, width: w, height: h } = n;
+
+          g.appendChild(
+            el("rect", {
+              x,
+              y,
+              width: w,
+              height: h,
+              fill: NODE_BODY,
+              stroke: NODE_BORDER,
+              "stroke-width": "1",
+            }),
+          );
+          g.appendChild(
+            el("rect", {
+              x,
+              y,
+              width: w,
+              height: HEADER_H,
+              fill: NODE_HEADER,
+              stroke: "none",
+            }),
+          );
+          g.appendChild(
+            el("line", {
+              x1: x,
+              y1: y + HEADER_H,
+              x2: x + w,
+              y2: y + HEADER_H,
+              stroke: NODE_SEP,
+              "stroke-width": "0.5",
+            }),
+          );
+          g.appendChild(
+            tx(data.header, {
+              x: x + w / 2,
+              y: y + HEADER_H / 2 + 4,
+              "text-anchor": "middle",
+              "font-family":
+                '"Cascadia Mono", "Consolas", "Courier New", monospace',
+              "font-size": "12",
+              "font-weight": "bold",
+              fill: TEXT_HEADER,
+            }),
+          );
+
+          for (const [i, line] of data.lines.entries()) {
+            g.appendChild(
+              tx(line.text, {
+                x: x + HORIZ_PAD,
+                y: y + HEADER_H + VERT_PAD + i * LINE_HEIGHT + 12,
+                "font-family":
+                  '"Cascadia Mono", "Consolas", "Courier New", monospace',
+                "font-size": "12",
+                "font-weight": line.bold ? "bold" : "normal",
+                fill: TEXT_BODY,
+              }),
+            );
+          }
+        }
+
+        svg.appendChild(g);
+        return svg;
+      }
+
+      async function renderProto(index) {
+        const graph = graphs[index];
+        if (!graph) {
+          cfgHost.textContent = "No CFG graphs to display.";
+          return;
+        }
+
+        selectedProto = index;
+        setActiveProto(index);
+        document.title = `CFG: ${graph.tag}`;
+
+        const token = ++renderToken;
+
+        let layout = layoutCache.get(index);
+        if (!layout) {
+          try {
+            layout = await elk.layout(graph.elkGraph);
+          } catch (err) {
+            if (token !== renderToken) return;
+            cfgHost.textContent = "ELK layout error: " + err;
+            return;
+          }
+          if (token !== renderToken) return;
+          layoutCache.set(index, layout);
+        }
+
+        const svg = renderSvg(layout, graph.nodeLabels, graph.edgeColors);
+        if (token !== renderToken) return;
+        cfgHost.replaceChildren(svg);
+      }
+
+      function setActiveProto(index) {
+        for (const item of protoList.querySelectorAll(".proto-item")) {
+          const isActive = Number(item.dataset.index) === index;
+          item.classList.toggle("active", isActive);
+          item.setAttribute("aria-selected", isActive ? "true" : "false");
+          if (isActive) item.scrollIntoView({ block: "nearest" });
+        }
+      }
+
+      function initProtoList() {
+        for (const [index, graph] of graphs.entries()) {
+          const item = document.createElement("button");
+          item.type = "button";
+          item.className = "proto-item";
+          item.dataset.index = String(index);
+          item.setAttribute("role", "option");
+          item.setAttribute("aria-selected", "false");
+          item.textContent = graph.tag;
+          item.addEventListener("click", () => {
+            if (index !== selectedProto)
+              renderProto(index).catch(console.error);
+          });
+          protoList.appendChild(item);
+        }
+      }
+
+      if (!Array.isArray(graphs) || graphs.length === 0) {
+        protoList.textContent = "No protos";
+        cfgHost.textContent = "No CFG graphs to display.";
+      } else {
+        initProtoList();
+        renderProto(Math.min(initialIndex, graphs.length - 1)).catch(
+          console.error,
+        );
+      }
+    </script>
+  </body>
+</html>
