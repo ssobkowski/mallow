@@ -15,3 +15,6 @@ local function pair()
 end
 
 print(pair())
+
+local ok, x, y, z = pcall(returns_many)
+print(ok, x, y, z)
