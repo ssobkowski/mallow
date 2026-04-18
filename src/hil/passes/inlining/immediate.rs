@@ -356,7 +356,7 @@ impl VisitorMut for Inliner {
             let next = &stmts[i + 1];
 
             if let Some(inlined) = self.try_inline(curr, next) {
-                *stmts.get_mut(i).unwrap() = inlined;
+                stmts[i] = inlined;
                 stmts.remove(i + 1);
                 self.was_changed = true;
                 continue; // i is now at the place of the next stmt

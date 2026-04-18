@@ -434,16 +434,9 @@ impl AstPrinter {
                     self.walk_expr(value, 0, Side::None);
                 }
                 TableItem::Indexed { index, value } => {
-                    if let Expr::Literal(Literal::String(s)) = index
-                        && is_valid_luau_identifier(s)
-                    {
-                        self.write(s.as_str());
-                        self.write(" = ");
-                    } else {
-                        self.write("[");
-                        self.walk_expr(index, 0, Side::None);
-                        self.write("] = ");
-                    }
+                    self.write("[");
+                    self.walk_expr(index, 0, Side::None);
+                    self.write("] = ");
                     self.walk_expr(value, 0, Side::None);
                 }
                 TableItem::Implicit { value } => {

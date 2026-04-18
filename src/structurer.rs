@@ -4,6 +4,7 @@ use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
     ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem, UnOp},
+    common::is_valid_luau_identifier,
     hil::{
         StructuredFunction,
         cflow::region::RegionNode,
@@ -596,10 +597,22 @@ impl Structurer {
                 HilTableItem::List(expr) => TableItem::Implicit {
                     value: self.visit_expr(expr),
                 },
-                HilTableItem::Index(key, value) => TableItem::Indexed {
-                    index: self.visit_expr(key),
-                    value: self.visit_expr(value),
-                },
+                HilTableItem::Index(key, value) => {
+                    let value = self.visit_expr(value);
+                    if let HilExpr::String(s) = key
+                        && is_valid_luau_identifier(&s)
+                    {
+                        TableItem::Named {
+                            name: Identifier::new(s.clone()),
+                            value,
+                        }
+                    } else {
+                        TableItem::Indexed {
+                            index: self.visit_expr(key),
+                            value,
+                        }
+                    }
+                }
             })
             .collect()
     }
@@ -636,34 +649,6 @@ impl Structurer {
 
         Expr::AnonymousFunction { params, body }
     }
-}
-
-fn is_valid_luau_identifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-
-    let mut chars = s.chars();
-    let first = chars.next().unwrap();
-
-    // 1. Must start with a letter or underscore
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return false;
-    }
-
-    // 2. Remaining characters must be alphanumeric or underscore
-    for c in chars {
-        if !c.is_ascii_alphanumeric() && c != '_' {
-            return false;
-        }
-    }
-
-    // 3. Must not be a strict reserved keyword
-    const KEYWORDS: [&str; 21] = [
-        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
-        "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
-    ];
-    !KEYWORDS.contains(&s)
 }
 
 pub fn structure(functions: Vec<StructuredFunction>, entry: usize) -> Block {

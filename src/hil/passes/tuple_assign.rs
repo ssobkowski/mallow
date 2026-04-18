@@ -1,6 +1,6 @@
 use crate::hil::{
     StructuredFunction,
-    ir::{HilExpr, HilStmt, HilTableItem},
+    ir::{HilExpr, HilStmt},
     lifter::ssa::SymbolId,
     passes::visitor::{VisitorMut, walk_block_mut},
 };
