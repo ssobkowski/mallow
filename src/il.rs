@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::fmt;
+
 use smallvec::{SmallVec, smallvec};
 
 use crate::hil::common::decoded_count;
@@ -756,6 +758,201 @@ impl Instr {
 impl From<u32> for Instr {
     fn from(value: u32) -> Self {
         Self::new(value, None).unwrap_or_else(|err| panic!("{err}"))
+    }
+}
+
+impl fmt::Display for Instr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // basic loads/moves
+            Instr::Nop => write!(f, "NOP"),
+            Instr::Break => write!(f, "BREAK"),
+            Instr::LoadNil { reg } => write!(f, "LOADNIL R{reg}"),
+            Instr::LoadB { reg, value, jump } => write!(f, "LOADB R{reg} {value} +{jump}"),
+            Instr::LoadN { reg, value } => write!(f, "LOADN R{reg} {value}"),
+            Instr::LoadK { reg, index } => write!(f, "LOADK R{reg} K{index}"),
+            Instr::Move { dest, src } => write!(f, "MOVE R{dest} R{src}"),
+
+            // globals/upvalues/imports
+            // `slot` is a runtime cache hint, not meaningful in disassembly
+            Instr::GetGlobal { dest, key, .. } => write!(f, "GETGLOBAL R{dest} K{key}"),
+            Instr::SetGlobal { src, key, .. } => write!(f, "SETGLOBAL R{src} K{key}"),
+            Instr::GetUpval { dest, upval } => write!(f, "GETUPVAL R{dest} U{upval}"),
+            Instr::SetUpval { src, upval } => write!(f, "SETUPVAL R{src} U{upval}"),
+            Instr::CloseUpvals { reg } => write!(f, "CLOSEUPVALS R{reg}"),
+            // `path` is the aux word encoding the import chain, shown separately if needed
+            Instr::GetImport { dest, index, .. } => write!(f, "GETIMPORT R{dest} {index}"),
+
+            // table access
+            Instr::GetTable { dest, table, key } => write!(f, "GETTABLE R{dest} R{table} R{key}"),
+            Instr::SetTable { src, table, key } => write!(f, "SETTABLE R{src} R{table} R{key}"),
+            Instr::GetTableKS {
+                dest, table, key, ..
+            } => write!(f, "GETTABLEKS R{dest} R{table} K{key}"),
+            Instr::SetTableKS {
+                src, table, key, ..
+            } => write!(f, "SETTABLEKS R{src} R{table} K{key}"),
+            Instr::GetTableN { dest, table, index } => {
+                write!(f, "GETTABLEN R{dest} R{table} {index}")
+            }
+            Instr::SetTableN { src, table, index } => {
+                write!(f, "SETTABLEN R{src} R{table} {index}")
+            }
+            Instr::NewClosure { dest, proto } => write!(f, "NEWCLOSURE R{dest} P{proto}"),
+            Instr::NameCall {
+                dest,
+                object,
+                method,
+                ..
+            } => write!(f, "NAMECALL R{dest} R{object} K{method}"),
+
+            // calls, returns, branches
+            Instr::Call {
+                func,
+                arg_count,
+                ret_count,
+            } => write!(f, "CALL R{func} {arg_count} {ret_count}"),
+            Instr::Return { base, count } => write!(f, "RETURN R{base} {count}"),
+            Instr::Jump { offset } => write!(f, "JUMP {offset:+}"),
+            Instr::JumpBack { offset } => write!(f, "JUMPBACK {offset:+}"),
+            Instr::JumpIf { reg, offset } => write!(f, "JUMPIF R{reg} {offset:+}"),
+            Instr::JumpIfNot { reg, offset } => write!(f, "JUMPIFNOT R{reg} {offset:+}"),
+            Instr::JumpIfEq { reg, aux, offset } => write!(f, "JUMPIFEQ R{reg} R{aux} {offset:+}"),
+            Instr::JumpIfLe { reg, aux, offset } => write!(f, "JUMPIFLE R{reg} R{aux} {offset:+}"),
+            Instr::JumpIfLt { reg, aux, offset } => write!(f, "JUMPIFLT R{reg} R{aux} {offset:+}"),
+            Instr::JumpIfNotEq { reg, aux, offset } => {
+                write!(f, "JUMPIFNOTEQ R{reg} R{aux} {offset:+}")
+            }
+            Instr::JumpIfNotLe { reg, aux, offset } => {
+                write!(f, "JUMPIFNOTLE R{reg} R{aux} {offset:+}")
+            }
+            Instr::JumpIfNotLt { reg, aux, offset } => {
+                write!(f, "JUMPIFNOTLT R{reg} R{aux} {offset:+}")
+            }
+
+            // arithmetic/logical/unary
+            Instr::Add { dest, a, b } => write!(f, "ADD R{dest} R{a} R{b}"),
+            Instr::Sub { dest, a, b } => write!(f, "SUB R{dest} R{a} R{b}"),
+            Instr::Mul { dest, a, b } => write!(f, "MUL R{dest} R{a} R{b}"),
+            Instr::Div { dest, a, b } => write!(f, "DIV R{dest} R{a} R{b}"),
+            Instr::Mod { dest, a, b } => write!(f, "MOD R{dest} R{a} R{b}"),
+            Instr::Pow { dest, a, b } => write!(f, "POW R{dest} R{a} R{b}"),
+            Instr::AddK { dest, reg, k } => write!(f, "ADDK R{dest} R{reg} K{k}"),
+            Instr::SubK { dest, reg, k } => write!(f, "SUBK R{dest} R{reg} K{k}"),
+            Instr::MulK { dest, reg, k } => write!(f, "MULK R{dest} R{reg} K{k}"),
+            Instr::DivK { dest, reg, k } => write!(f, "DIVK R{dest} R{reg} K{k}"),
+            Instr::ModK { dest, reg, k } => write!(f, "MODK R{dest} R{reg} K{k}"),
+            Instr::PowK { dest, reg, k } => write!(f, "POWK R{dest} R{reg} K{k}"),
+            Instr::And { dest, a, b } => write!(f, "AND R{dest} R{a} R{b}"),
+            Instr::Or { dest, a, b } => write!(f, "OR R{dest} R{a} R{b}"),
+            Instr::AndK { dest, reg, k } => write!(f, "ANDK R{dest} R{reg} K{k}"),
+            Instr::OrK { dest, reg, k } => write!(f, "ORK R{dest} R{reg} K{k}"),
+            Instr::Concat { dest, a, b } => write!(f, "CONCAT R{dest} R{a} R{b}"),
+            Instr::Not { dest, reg } => write!(f, "NOT R{dest} R{reg}"),
+            Instr::Minus { dest, reg } => write!(f, "MINUS R{dest} R{reg}"),
+            Instr::Length { dest, reg } => write!(f, "LENGTH R{dest} R{reg}"),
+
+            // table construction and loop ops
+            Instr::NewTable {
+                dest,
+                hash_size,
+                array_size,
+            } => write!(f, "NEWTABLE R{dest} {hash_size} {array_size}"),
+            Instr::DupTable { dest, k } => write!(f, "DUPTABLE R{dest} K{k}"),
+            Instr::SetList {
+                table,
+                base,
+                count,
+                index,
+            } => write!(f, "SETLIST R{table} R{base} {count} {index}"),
+            Instr::FornPrep { base, offset } => write!(f, "FORNPREP R{base} {offset:+}"),
+            Instr::FornLoop { base, offset } => write!(f, "FORNLOOP R{base} {offset:+}"),
+            Instr::ForgLoop {
+                base,
+                offset,
+                var_count,
+                ..
+            } => write!(f, "FORGLOOP R{base} {offset:+} {var_count}"),
+            Instr::ForgPrepInext { base, offset } => write!(f, "FORGPREP_INEXT R{base} {offset:+}"),
+            Instr::ForgPrepNext { base, offset } => write!(f, "FORGPREP_NEXT R{base} {offset:+}"),
+            Instr::ForgPrep { base, offset } => write!(f, "FORGPREP R{base} {offset:+}"),
+
+            // fastcall, varargs, closure helpers, extended ops
+            Instr::FastCall { builtin, jump } => write!(f, "FASTCALL {builtin} {jump:+}"),
+            Instr::FastCall1 { builtin, arg, jump } => {
+                write!(f, "FASTCALL1 {builtin} R{arg} {jump:+}")
+            }
+            Instr::FastCall2 {
+                builtin,
+                arg1,
+                arg2,
+                jump,
+            } => write!(f, "FASTCALL2 {builtin} R{arg1} R{arg2} {jump:+}"),
+            Instr::FastCall2K {
+                builtin,
+                arg,
+                k,
+                jump,
+            } => write!(f, "FASTCALL2K {builtin} R{arg} K{k} {jump:+}"),
+            Instr::FastCall3 {
+                builtin,
+                arg1,
+                arg2,
+                arg3,
+                jump,
+            } => write!(f, "FASTCALL3 {builtin} R{arg1} R{arg2} R{arg3} {jump:+}"),
+            Instr::NativeCall => write!(f, "NATIVECALL"),
+            Instr::GetVarArgs { dest, count } => write!(f, "GETVARARGS R{dest} {count}"),
+            Instr::PrepVarArgs { nparams } => write!(f, "PREPVARARGS {nparams}"),
+            Instr::DupClosure { dest, k } => write!(f, "DUPCLOSURE R{dest} K{k}"),
+            Instr::Capture { capture_type, reg } => write!(f, "CAPTURE {capture_type} R{reg}"),
+            Instr::LoadKX { dest, k } => write!(f, "LOADKX R{dest} K{k}"),
+            Instr::JumpX { offset } => write!(f, "JUMPX {offset:+}"),
+            Instr::Coverage => write!(f, "COVERAGE"),
+            Instr::SubRK { dest, k, reg } => write!(f, "SUBRK R{dest} K{k} R{reg}"),
+            Instr::DivRK { dest, k, reg } => write!(f, "DIVRK R{dest} K{k} R{reg}"),
+
+            // extended comparisons — invert flag shown as trailing `!`
+            Instr::JumpXEqKNil {
+                reg,
+                invert,
+                offset,
+            } => {
+                write!(f, "JUMPXEQKNIL R{reg} {offset:+}")?;
+                if *invert { write!(f, " !") } else { Ok(()) }
+            }
+            Instr::JumpXEqKB {
+                reg,
+                k,
+                invert,
+                offset,
+            } => {
+                write!(f, "JUMPXEQKB R{reg} {k} {offset:+}")?;
+                if *invert { write!(f, " !") } else { Ok(()) }
+            }
+            Instr::JumpXEqKN {
+                reg,
+                k,
+                invert,
+                offset,
+            } => {
+                write!(f, "JUMPXEQKN R{reg} K{k} {offset:+}")?;
+                if *invert { write!(f, " !") } else { Ok(()) }
+            }
+            Instr::JumpXEqKS {
+                reg,
+                k,
+                invert,
+                offset,
+            } => {
+                write!(f, "JUMPXEQKS R{reg} K{k} {offset:+}")?;
+                if *invert { write!(f, " !") } else { Ok(()) }
+            }
+
+            // floor division
+            Instr::IDiv { dest, a, b } => write!(f, "IDIV R{dest} R{a} R{b}"),
+            Instr::IDivK { dest, reg, k } => write!(f, "IDIVK R{dest} R{reg} K{k}"),
+        }
     }
 }
 

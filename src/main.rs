@@ -89,7 +89,7 @@ fn main() {
 
             match disasm::disassemble(&bytecode) {
                 Ok(d) => {
-                    let content = format!("{:#?}", &d);
+                    let content = d.to_string();
                     if let Err(e) = write_output(output, &content) {
                         eprintln!("Error writing disassembly output: {e}");
                     }

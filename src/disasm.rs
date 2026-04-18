@@ -1,4 +1,7 @@
-use std::io::{Cursor, Read};
+use std::{
+    fmt,
+    io::{Cursor, Read},
+};
 
 use thiserror::Error;
 
@@ -106,13 +109,6 @@ pub struct Disassembly {
     pub entry_proto: u64,
 }
 
-impl Disassembly {
-    #[inline]
-    pub fn entry(&self) -> &Proto {
-        &self.protos[self.entry_proto as usize]
-    }
-}
-
 struct Disassembler<'a> {
     cursor: Cursor<&'a [u8]>,
 }
@@ -126,7 +122,7 @@ impl<'a> Disassembler<'a> {
 
     fn parse(mut self) -> Result<Disassembly, DisasmError> {
         let version = self.read::<u8>()?;
-        if version != 5 && version != 6 {
+        if version != 6 {
             return Err(DisasmError::UnsupportedVersion(version));
         }
 
@@ -326,6 +322,26 @@ impl<'a> Disassembler<'a> {
     fn read_vec<T: FromLeBytes>(&mut self) -> Result<Vec<T>, DisasmError> {
         let len = self.read_varint()? as usize;
         (0..len).map(|_| self.read::<T>()).collect()
+    }
+}
+
+impl fmt::Display for Disassembly {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for proto in &self.protos {
+            writeln!(
+                f,
+                "Proto {} ({} params, {} upvalues)",
+                proto.index, proto.num_params, proto.num_upvals
+            )?;
+
+            for (instr, pc) in &proto.instrs {
+                writeln!(f, "{pc}: {instr}")?;
+            }
+
+            writeln!(f, "")?;
+        }
+
+        Ok(())
     }
 }
 
