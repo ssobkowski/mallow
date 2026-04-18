@@ -1,6 +1,6 @@
 use crate::{
     ast::{BinOp, Block, CompoundBinOp, Expr, Literal, Parameter, Stmt, TableItem, UnOp},
-    common::{escape_string, is_valid_luau_identifier},
+    common::escape_string,
 };
 
 pub fn print(block: &Block) -> String {
@@ -261,7 +261,14 @@ impl AstPrinter {
                 if needs_parens {
                     self.write("(");
                 }
+                let func_needs_parens = needs_prefix_wrap(func);
+                if func_needs_parens {
+                    self.write("(");
+                }
                 self.walk_expr(func, prec, Side::Left);
+                if func_needs_parens {
+                    self.write(")");
+                }
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
@@ -284,8 +291,7 @@ impl AstPrinter {
                 if needs_parens {
                     self.write("(");
                 }
-                let object_needs_parens =
-                    matches!(object.as_ref(), Expr::Literal(Literal::String(_)));
+                let object_needs_parens = needs_prefix_wrap(object);
                 if object_needs_parens {
                     self.write("(");
                 }
@@ -351,7 +357,14 @@ impl AstPrinter {
                 if needs_parens {
                     self.write("(");
                 }
+                let base_needs_parens = needs_prefix_wrap(base);
+                if base_needs_parens {
+                    self.write("(");
+                }
                 self.walk_expr(base, prec, Side::Left);
+                if base_needs_parens {
+                    self.write(")");
+                }
                 self.write(".");
                 self.write(field.as_str());
                 if needs_parens {
@@ -364,7 +377,14 @@ impl AstPrinter {
                 if needs_parens {
                     self.write("(");
                 }
+                let base_needs_parens = needs_prefix_wrap(base);
+                if base_needs_parens {
+                    self.write("(");
+                }
                 self.walk_expr(base, prec, Side::Left);
+                if base_needs_parens {
+                    self.write(")");
+                }
                 self.write("[");
                 self.walk_expr(index, 0, Side::None);
                 self.write("]");
@@ -475,6 +495,13 @@ fn needs_parens(prec: u8, parent_prec: u8, assoc: Assoc, side: Side) -> bool {
                 (assoc, side),
                 (Assoc::Left, Side::Right) | (Assoc::Right, Side::Left)
             ))
+}
+
+fn needs_prefix_wrap(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(_) | Expr::Table { .. } | Expr::AnonymousFunction { .. } | Expr::IfElse { .. }
+    )
 }
 
 fn binary_assoc(op: &BinOp) -> Assoc {

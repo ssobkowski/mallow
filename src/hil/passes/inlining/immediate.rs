@@ -25,13 +25,23 @@ struct SingleSymbolRewriter<'a> {
 impl<'a> VisitorMut for SingleSymbolRewriter<'a> {
     fn visit_stmt(&mut self, stmt: &mut HilStmt) {
         if let HilStmt::Assign { value, .. } = stmt {
-            walk_expr_mut(self, value);
+            self.visit_expr(value);
             return;
         }
         walk_stmt_mut(self, stmt);
     }
 
     fn visit_expr(&mut self, expr: &mut HilExpr) {
+        if let HilExpr::Call { fun, args } = expr
+            && matches!(self.expr, HilExpr::Closure { .. })
+            && matches!(fun.as_ref(), HilExpr::Symbol(s) if *s == self.sym)
+        {
+            for arg in args {
+                walk_expr_mut(self, arg);
+            }
+            return;
+        }
+
         if let HilExpr::Symbol(s) = expr
             && *s == self.sym
         {
