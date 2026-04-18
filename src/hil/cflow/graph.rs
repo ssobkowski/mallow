@@ -569,7 +569,6 @@ impl ControlFlowGraph {
         }
 
         for i in 0..proto.num_upvals {
-            // TODO: FUCK
             let sym = ssa.alloc_symbol(Symbol::upval(i));
             ssa.write_upval(0, i, sym);
         }
@@ -1061,7 +1060,6 @@ fn compute_rpo(entry_block: usize, successors: &[Vec<usize>]) -> Vec<usize> {
     let mut visited = vec![false; len];
     let mut post_order = Vec::with_capacity(len);
 
-    // TODO: Use iterated stack here? This might overflow, though I have not hit that yet.
     fn dfs(
         block: usize,
         successors: &[Vec<usize>],
@@ -1690,15 +1688,6 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
             HilExpr::Unary { expr, .. } => {
                 walk_expr(expr, ssa, djs);
             }
-            HilExpr::If {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                walk_expr(condition, ssa, djs);
-                walk_expr(then_expr, ssa, djs);
-                walk_expr(else_expr, ssa, djs);
-            }
             HilExpr::Table { items } => {
                 for item in items {
                     match item {
@@ -1707,7 +1696,6 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
                             walk_expr(k, ssa, djs);
                             walk_expr(v, ssa, djs);
                         }
-                        HilTableItem::Packed(expr) => walk_expr(expr, ssa, djs),
                     }
                 }
             }
@@ -1773,11 +1761,6 @@ fn is_pure_expr(expr: &HilExpr) -> bool {
         HilExpr::GetIndex { obj, index } => is_pure_expr(obj) && is_pure_expr(index),
         HilExpr::Binary { lhs, rhs, .. } => is_pure_expr(lhs) && is_pure_expr(rhs),
         HilExpr::Unary { expr, .. } => is_pure_expr(expr),
-        HilExpr::If {
-            condition,
-            then_expr,
-            else_expr,
-        } => is_pure_expr(condition) && is_pure_expr(then_expr) && is_pure_expr(else_expr),
         HilExpr::Call { .. }
         | HilExpr::MethodCall { .. }
         | HilExpr::Table { .. }
@@ -1856,19 +1839,10 @@ fn collect_expr_reg_uses(
         HilExpr::Unary { expr, .. } => {
             collect_expr_reg_uses(expr, reg_of, uses, seen_defs);
         }
-        HilExpr::If {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            collect_expr_reg_uses(condition, reg_of, uses, seen_defs);
-            collect_expr_reg_uses(then_expr, reg_of, uses, seen_defs);
-            collect_expr_reg_uses(else_expr, reg_of, uses, seen_defs);
-        }
         HilExpr::Table { items } => {
             for item in items {
                 match item {
-                    HilTableItem::List(expr) | HilTableItem::Packed(expr) => {
+                    HilTableItem::List(expr) => {
                         collect_expr_reg_uses(expr, reg_of, uses, seen_defs);
                     }
                     HilTableItem::Index(k, v) => {

@@ -521,15 +521,6 @@ impl Structurer {
                 op: *op,
                 expr: Box::new(self.visit_expr(expr)),
             },
-            HilExpr::If {
-                condition,
-                then_expr,
-                else_expr,
-            } => Expr::IfElse {
-                condition: Box::new(self.visit_expr(condition)),
-                then_expr: Box::new(self.visit_expr(then_expr)),
-                else_expr: Box::new(self.visit_expr(else_expr)),
-            },
             HilExpr::Global(name) => Expr::Named(Identifier::new(name.clone())),
             HilExpr::Import(import) => Expr::Named(Identifier::new(import.clone())),
             HilExpr::GetField { obj, field } => {
@@ -581,9 +572,6 @@ impl Structurer {
                 HilTableItem::Index(key, value) => TableItem::Indexed {
                     index: self.visit_expr(key),
                     value: self.visit_expr(value),
-                },
-                HilTableItem::Packed(expr) => TableItem::Implicit {
-                    value: self.visit_expr(expr),
                 },
             })
             .collect()

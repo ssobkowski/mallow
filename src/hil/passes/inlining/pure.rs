@@ -96,7 +96,8 @@ impl VisitorMut for Inliner {
     }
 }
 
-pub fn run(fun: &mut StructuredFunction) {
+pub fn run(fun: &mut StructuredFunction) -> bool {
+    let mut changed = false;
     loop {
         let vars = Analyzer::analyze_function(fun);
 
@@ -106,5 +107,8 @@ pub fn run(fun: &mut StructuredFunction) {
         if !inliner.was_changed {
             break;
         }
+        changed = true
     }
+
+    changed
 }

@@ -220,15 +220,6 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
             visitor.visit_expr(rhs);
         }
         HilExpr::Unary { expr, .. } => visitor.visit_expr(expr),
-        HilExpr::If {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            visitor.visit_expr(condition);
-            visitor.visit_expr(then_expr);
-            visitor.visit_expr(else_expr);
-        }
         HilExpr::Table { items } => {
             for item in items {
                 visitor.visit_table_item(item);
@@ -251,7 +242,7 @@ pub fn walk_lvalue_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
 
 pub fn walk_table_item<V: Visitor + ?Sized>(visitor: &mut V, item: &HilTableItem) {
     match item {
-        HilTableItem::List(expr) | HilTableItem::Packed(expr) => visitor.visit_expr(expr),
+        HilTableItem::List(expr) => visitor.visit_expr(expr),
         HilTableItem::Index(key, value) => {
             visitor.visit_expr(key);
             visitor.visit_expr(value);
@@ -385,15 +376,6 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut HilExpr
             visitor.visit_expr(rhs);
         }
         HilExpr::Unary { expr, .. } => visitor.visit_expr(expr),
-        HilExpr::If {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            visitor.visit_expr(condition);
-            visitor.visit_expr(then_expr);
-            visitor.visit_expr(else_expr);
-        }
         HilExpr::Table { items } => {
             for item in items {
                 visitor.visit_table_item(item);
@@ -416,7 +398,7 @@ pub fn walk_lvalue_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut 
 
 pub fn walk_table_item_mut<V: VisitorMut + ?Sized>(visitor: &mut V, item: &mut HilTableItem) {
     match item {
-        HilTableItem::List(expr) | HilTableItem::Packed(expr) => visitor.visit_expr(expr),
+        HilTableItem::List(expr) => visitor.visit_expr(expr),
         HilTableItem::Index(key, value) => {
             visitor.visit_expr(key);
             visitor.visit_expr(value);

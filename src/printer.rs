@@ -1,6 +1,6 @@
 use crate::{
     ast::{BinOp, Block, CompoundBinOp, Expr, Literal, Parameter, Stmt, TableItem, UnOp},
-    common::escape_string,
+    common::{escape_string, is_valid_luau_identifier},
 };
 
 pub fn print(block: &Block) -> String {
@@ -434,9 +434,16 @@ impl AstPrinter {
                     self.walk_expr(value, 0, Side::None);
                 }
                 TableItem::Indexed { index, value } => {
-                    self.write("[");
-                    self.walk_expr(index, 0, Side::None);
-                    self.write("] = ");
+                    if let Expr::Literal(Literal::String(s)) = index
+                        && is_valid_luau_identifier(s)
+                    {
+                        self.write(s.as_str());
+                        self.write(" = ");
+                    } else {
+                        self.write("[");
+                        self.walk_expr(index, 0, Side::None);
+                        self.write("] = ");
+                    }
                     self.walk_expr(value, 0, Side::None);
                 }
                 TableItem::Implicit { value } => {

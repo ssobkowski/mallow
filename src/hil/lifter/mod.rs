@@ -5,7 +5,7 @@ use ssa::Ssa;
 
 use crate::{
     ast::{BinOp, UnOp},
-    common::{escape_string, is_lua_ident},
+    common::{escape_string, is_valid_luau_identifier},
     disasm::Proto,
     hil::{
         common::{const_expr, decoded_count},
@@ -778,7 +778,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         let ids = [(path >> 20) & 0x3ff, (path >> 10) & 0x3ff, path & 0x3ff];
 
         let first = self.const_string(ids[0] as usize);
-        let mut out = if is_lua_ident(&first) {
+        let mut out = if is_valid_luau_identifier(&first) {
             first
         } else {
             format!("_G[\"{}\"]", escape_string(&first))
@@ -786,7 +786,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 
         for id in ids.iter().skip(1).take(count - 1) {
             let key = self.const_string(*id as usize);
-            if is_lua_ident(&key) {
+            if is_valid_luau_identifier(&key) {
                 out.push('.');
                 out.push_str(&key);
             } else {

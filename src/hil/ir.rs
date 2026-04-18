@@ -66,12 +66,6 @@ pub enum HilExpr {
     },
     /// An unary expression.
     Unary { op: UnOp, expr: Box<HilExpr> },
-    /// A Luau if-expression (`if cond then a else b`).
-    If {
-        condition: Box<HilExpr>,
-        then_expr: Box<HilExpr>,
-        else_expr: Box<HilExpr>,
-    },
     /// A table constructor with a list of implicit values.
     Table { items: Vec<HilTableItem> },
     /// Vararg expression (`...`).
@@ -92,19 +86,9 @@ impl HilExpr {
             }
             HilExpr::Binary { lhs, rhs, .. } => lhs.reads_symbol(sym) || rhs.reads_symbol(sym),
             HilExpr::Unary { expr, .. } => expr.reads_symbol(sym),
-            HilExpr::If {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                condition.reads_symbol(sym)
-                    || then_expr.reads_symbol(sym)
-                    || else_expr.reads_symbol(sym)
-            }
             HilExpr::Table { items } => items.iter().any(|item| match item {
                 HilTableItem::List(expr) => expr.reads_symbol(sym),
                 HilTableItem::Index(key, value) => key.reads_symbol(sym) || value.reads_symbol(sym),
-                HilTableItem::Packed(expr) => expr.reads_symbol(sym),
             }),
             _ => false,
         }
@@ -156,11 +140,6 @@ impl Display for HilExpr {
                     write!(f, "{}{}", op, expr)
                 }
             }
-            HilExpr::If {
-                condition,
-                then_expr,
-                else_expr,
-            } => write!(f, "if {} then {} else {}", condition, then_expr, else_expr),
             HilExpr::Table { items } => {
                 if items.is_empty() {
                     write!(f, "{{}}")
@@ -173,15 +152,6 @@ impl Display for HilExpr {
     }
 }
 
-/// One closure capture operand attached to a nested function literal.
-#[derive(Debug, Clone)]
-pub enum HilCapture {
-    /// Capture a local from the current frame by its value.
-    Value(SymbolId),
-    /// Capture a local from the current frame by its reference.
-    Ref(SymbolId),
-}
-
 /// An entry in the table constructor.
 #[derive(Debug, Clone)]
 pub enum HilTableItem {
@@ -189,9 +159,6 @@ pub enum HilTableItem {
     List(HilExpr),
     /// A generic expression-keyed dictionary value, e.g., `[key] = value`
     Index(HilExpr, HilExpr),
-    /// An array of packed expressions, that needs to be unpacked into the target
-    /// table. Used to carry over multirets into the table constructor.
-    Packed(HilExpr),
 }
 
 #[derive(Debug, Clone)]

@@ -79,7 +79,7 @@ impl Visitor for Analyzer {
                 }
                 HilStmt::AssignMany { left, value } => {
                     // Block all tuple-assigns from being inlined. This can only be done in the
-                    // (TODO) "immediate use" pass.
+                    // immediate inlining pass.
                     for sym in left {
                         match self.vars.get_mut(sym) {
                             Some(var) => {
