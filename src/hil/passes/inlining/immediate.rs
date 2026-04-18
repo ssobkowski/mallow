@@ -1,12 +1,16 @@
+use smallvec::SmallVec;
+
 use crate::{
     hil::{
-        StructuredFunction,
+        ReturnArity, StructuredFunction,
         cflow::region::RegionNode,
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
         passes::{
             inlining::common::{Analyzer, Var},
-            visitor::{Visitor, VisitorMut, walk_expr_mut, walk_region_mut, walk_stmt_mut},
+            visitor::{
+                Visitor, VisitorMut, walk_expr, walk_expr_mut, walk_region_mut, walk_stmt_mut,
+            },
         },
     },
     scopes::Scope,
@@ -28,23 +32,23 @@ impl<'a> VisitorMut for SingleSymbolRewriter<'a> {
     }
 
     fn visit_expr(&mut self, expr: &mut HilExpr) {
-        if let HilExpr::Symbol(s) = expr {
-            if *s == self.sym {
-                *expr = self.expr.clone();
-                self.change_count += 1;
-                return;
-            }
+        if let HilExpr::Symbol(s) = expr
+            && *s == self.sym
+        {
+            *expr = self.expr.clone();
+            self.change_count += 1;
+            return;
         }
         walk_expr_mut(self, expr);
     }
 }
 
-struct Walker {
+struct SingleWalker {
     sym: SymbolId,
     count: usize,
 }
 
-impl Visitor for Walker {
+impl Visitor for SingleWalker {
     fn visit_symbol(&mut self, sym: SymbolId) {
         if sym == self.sym {
             self.count += 1;
@@ -52,14 +56,60 @@ impl Visitor for Walker {
     }
 }
 
+struct TupleWalker<'a> {
+    syms: &'a [HilExpr],
+    count: usize,
+}
+
+impl<'a> Visitor for TupleWalker<'a> {
+    fn visit_expr(&mut self, expr: &HilExpr) {
+        if let HilExpr::Call { args, .. } | HilExpr::MethodCall { args, .. } = expr
+            && self.syms == args
+        {
+            self.count += 1;
+        }
+
+        walk_expr(self, expr);
+    }
+}
+
+struct TupleSymbolRewriter<'a> {
+    syms: &'a [HilExpr],
+    expr: &'a HilExpr,
+    change_count: usize,
+}
+
+impl<'a> VisitorMut for TupleSymbolRewriter<'a> {
+    fn visit_expr(&mut self, expr: &mut HilExpr) {
+        if let HilExpr::Call { args, .. } | HilExpr::MethodCall { args, .. } = expr
+            && self.syms == args
+        {
+            args.clear();
+            args.push(self.expr.clone());
+            self.change_count += 1;
+            return;
+        }
+
+        walk_expr_mut(self, expr);
+    }
+}
+
 trait Substitutable: Clone {
     fn appears_in(&self, sym: SymbolId) -> bool;
+    fn appear_in(&self, syms: &[HilExpr]) -> bool;
     fn substitute_exact(&self, sym: SymbolId, expr: &HilExpr) -> Option<Self>;
+    fn substitute_tuple_exact(&self, syms: &[HilExpr], expr: &HilExpr) -> Option<Self>;
 }
 
 impl Substitutable for HilStmt {
     fn appears_in(&self, sym: SymbolId) -> bool {
-        let mut walker = Walker { sym, count: 0 };
+        let mut walker = SingleWalker { sym, count: 0 };
+        walker.visit_stmt(self);
+        walker.count > 0
+    }
+
+    fn appear_in(&self, syms: &[HilExpr]) -> bool {
+        let mut walker = TupleWalker { syms, count: 0 };
         walker.visit_stmt(self);
         walker.count > 0
     }
@@ -78,13 +128,32 @@ impl Substitutable for HilStmt {
             None
         }
     }
+
+    fn substitute_tuple_exact(&self, syms: &[HilExpr], expr: &HilExpr) -> Option<Self> {
+        let mut cloned = self.clone();
+        let mut rewriter = TupleSymbolRewriter {
+            syms,
+            expr,
+            change_count: 0,
+        };
+        rewriter.visit_stmt(&mut cloned);
+        if rewriter.change_count == 1 {
+            Some(cloned)
+        } else {
+            None
+        }
+    }
 }
 
 impl Substitutable for HilExpr {
     fn appears_in(&self, sym: SymbolId) -> bool {
-        let mut walker = Walker { sym, count: 0 };
+        let mut walker = SingleWalker { sym, count: 0 };
         walker.visit_expr(self);
         walker.count > 0
+    }
+
+    fn appear_in(&self, _: &[HilExpr]) -> bool {
+        false
     }
 
     fn substitute_exact(&self, sym: SymbolId, expr: &HilExpr) -> Option<Self> {
@@ -101,41 +170,103 @@ impl Substitutable for HilExpr {
             None
         }
     }
+
+    fn substitute_tuple_exact(&self, _: &[HilExpr], _: &HilExpr) -> Option<Self> {
+        None
+    }
 }
 
 struct Inliner {
     vars: Scope<SymbolId, Var>,
+    return_arities: Vec<ReturnArity>,
     was_changed: bool,
 }
 
 impl Inliner {
-    fn with_vars(vars: Scope<SymbolId, Var>) -> Self {
+    fn with_vars(vars: Scope<SymbolId, Var>, return_arities: &[ReturnArity]) -> Self {
         Self {
             vars,
+            return_arities: return_arities.to_vec(),
             was_changed: false,
         }
     }
 
-    fn try_inline<T: Substitutable>(&self, decl: &HilStmt, target: &T) -> Option<T> {
-        let (sym, value) = if let HilStmt::Assign {
-            left: HilExpr::Symbol(sym),
-            value,
-        } = decl
-        {
-            (*sym, value)
-        } else {
+    fn can_inline_tuple_binding(&self, left: &[HilExpr], value: &HilExpr) -> bool {
+        !left.is_empty()
+            && left.iter().all(|lvalue| match lvalue {
+                HilExpr::Symbol(sym) => self
+                    .vars
+                    .get(sym)
+                    .is_some_and(|v| v.read_count == 1 && v.write_count == 1),
+                _ => true,
+            })
+            && self.expr_arity(value).is_some_and(|n| n == left.len())
+    }
+
+    fn try_inline_tuple_return(&self, decl: &HilStmt, values: &mut SmallVec<[HilExpr; 3]>) -> bool {
+        let HilStmt::AssignMany { left, value } = decl else {
+            return false;
+        };
+
+        if !self.can_inline_tuple_binding(left, value) || left.as_slice() != values.as_slice() {
+            return false;
+        }
+
+        values.clear();
+        values.push(value.clone());
+        true
+    }
+
+    fn expr_arity(&self, expr: &HilExpr) -> Option<usize> {
+        match expr {
+            HilExpr::Call { fun, .. } => self.call_arity(fun),
+            HilExpr::MethodCall { .. } => None,
+            HilExpr::VarArgs => None,
+            _ => Some(1),
+        }
+    }
+
+    fn call_arity(&self, fun: &HilExpr) -> Option<usize> {
+        let HilExpr::Closure { proto, .. } = fun else {
             return None;
         };
 
-        if self
-            .vars
-            .get(&sym)
-            .is_some_and(|v| v.read_count == 1 && !v.disqualified)
-            && target.appears_in(sym)
+        match self
+            .return_arities
+            .get(*proto)
+            .copied()
+            .unwrap_or(ReturnArity::Unknown)
         {
-            target.substitute_exact(sym, value)
-        } else {
-            None
+            ReturnArity::Exact(n) => Some(n),
+            ReturnArity::Unknown => None,
+        }
+    }
+
+    fn try_inline<T: Substitutable>(&self, decl: &HilStmt, target: &T) -> Option<T> {
+        match decl {
+            HilStmt::Assign {
+                left: HilExpr::Symbol(sym),
+                value,
+            } => {
+                if self
+                    .vars
+                    .get(sym)
+                    .is_some_and(|v| v.read_count == 1 && !v.disqualified)
+                    && target.appears_in(*sym)
+                {
+                    target.substitute_exact(*sym, value)
+                } else {
+                    None
+                }
+            }
+            HilStmt::AssignMany { left, value } => {
+                if self.can_inline_tuple_binding(left.as_slice(), value) && target.appear_in(left) {
+                    target.substitute_tuple_exact(left, value)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -144,27 +275,31 @@ impl Inliner {
         let mut applied = false;
 
         let mut check_expr = |expr: &mut HilExpr| {
-            if !applied {
-                if let Some(inlined) = self.try_inline(decl, expr) {
-                    *expr = inlined;
-                    applied = true;
-                }
+            if !applied && let Some(inlined) = self.try_inline(decl, expr) {
+                *expr = inlined;
+                applied = true;
             }
         };
 
         match right {
             RegionNode::BasicBlock { stmts } => {
-                if let Some(next) = stmts.first_mut() {
-                    if let Some(inlined) = self.try_inline(decl, next) {
-                        *next = inlined;
-                        applied = true;
-                    }
+                if let Some(next) = stmts.first_mut()
+                    && let Some(inlined) = self.try_inline(decl, next)
+                {
+                    *next = inlined;
+                    applied = true;
                 }
             }
             RegionNode::If { condition, .. } | RegionNode::While { condition, .. } => {
                 check_expr(condition)
             }
-            RegionNode::Return { values } => values.iter_mut().for_each(check_expr),
+            RegionNode::Return { values } => {
+                if self.try_inline_tuple_return(decl, values) {
+                    applied = true;
+                } else {
+                    values.iter_mut().for_each(check_expr);
+                }
+            }
             RegionNode::NumericFor {
                 start, end, step, ..
             } => {
@@ -172,7 +307,9 @@ impl Inliner {
                 check_expr(end);
                 check_expr(step);
             }
-            RegionNode::GenericFor { exprs, .. } => exprs.iter_mut().for_each(check_expr),
+            RegionNode::GenericFor { exprs, .. } => {
+                exprs.iter_mut().for_each(check_expr);
+            }
             _ => {}
         }
 
@@ -230,12 +367,13 @@ impl VisitorMut for Inliner {
     }
 }
 
-pub fn run(fun: &mut StructuredFunction) -> bool {
+pub fn run(fun: &mut StructuredFunction, return_arities: &[ReturnArity]) -> bool {
     let mut changed = false;
+
     loop {
         let vars = Analyzer::analyze_function(fun);
 
-        let mut inliner = Inliner::with_vars(vars);
+        let mut inliner = Inliner::with_vars(vars, return_arities);
         inliner.visit_function(fun);
 
         if !inliner.was_changed {

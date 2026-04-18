@@ -150,11 +150,11 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
             .collect()
     }
 
-    fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<SymbolId> {
+    fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<HilExpr> {
         (0..count)
             .map(|i| {
                 let reg = start + i;
-                self.alloc_reg_symbol(reg)
+                HilExpr::Symbol(self.alloc_reg_symbol(reg))
             })
             .collect()
     }

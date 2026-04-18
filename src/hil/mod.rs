@@ -15,13 +15,31 @@ pub mod ir;
 pub mod lifter;
 pub mod passes;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnArity {
+    Exact(usize),
+    Unknown,
+}
+
+impl ReturnArity {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (ReturnArity::Unknown, _) | (_, ReturnArity::Unknown) => ReturnArity::Unknown,
+            (ReturnArity::Exact(a), ReturnArity::Exact(b)) if a == b => ReturnArity::Exact(a),
+            _ => ReturnArity::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StructuredFunction {
+    pub proto: usize,
     pub cfg: ControlFlowGraph,
     pub root: RegionNode,
 
     pub upvalues: Vec<SymbolId>,
     pub is_vararg: bool,
+    pub return_arity: Option<ReturnArity>,
 }
 
 impl StructuredFunction {
@@ -39,10 +57,12 @@ impl StructuredFunction {
         let upvalues = cfg.upvalues.clone();
 
         Self {
+            proto: proto.index as usize,
             cfg,
             root,
             upvalues,
             is_vararg: proto.is_vararg,
+            return_arity: None,
         }
     }
 }

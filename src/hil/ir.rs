@@ -19,7 +19,7 @@ impl<T> Spanned<T> {
 }
 
 /// An expression in the high-level intermediate representation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HilExpr {
     /// The `nil` value.
     Nil,
@@ -93,6 +93,27 @@ impl HilExpr {
             _ => false,
         }
     }
+
+    pub fn is_pure(&self) -> bool {
+        match self {
+            HilExpr::Nil
+            | HilExpr::Number(_)
+            | HilExpr::String(_)
+            | HilExpr::Bool(_)
+            | HilExpr::Symbol(_)
+            | HilExpr::Global(_)
+            | HilExpr::Import(_) => true,
+            HilExpr::GetField { obj, .. } => obj.is_pure(),
+            HilExpr::GetIndex { obj, index } => obj.is_pure() && index.is_pure(),
+            HilExpr::Unary { expr, .. } => expr.is_pure(),
+            HilExpr::Binary { lhs, rhs, .. } => lhs.is_pure() && rhs.is_pure(),
+            HilExpr::Closure { .. }
+            | HilExpr::Call { .. }
+            | HilExpr::MethodCall { .. }
+            | HilExpr::Table { .. }
+            | HilExpr::VarArgs => false,
+        }
+    }
 }
 
 impl Display for HilExpr {
@@ -153,7 +174,7 @@ impl Display for HilExpr {
 }
 
 /// An entry in the table constructor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HilTableItem {
     /// An array-part value, e.g., `value` in `{ value }`
     List(HilExpr),
@@ -173,10 +194,7 @@ pub enum HilStmt {
     /// An assignment statement, like `foo = 123`.
     Assign { left: HilExpr, value: HilExpr },
     /// A multi-variable assignment statement, like `a, b = returns_tuple()`.
-    ///
-    /// Unlike the [regular Assign](HilStmt::Assign), the left hand side of this assignment
-    /// holds [SymbolId]s for the sake of simplicity, as no other lvalue gets emitted by the luau compiler.
-    AssignMany { left: Vec<SymbolId>, value: HilExpr },
+    AssignMany { left: Vec<HilExpr>, value: HilExpr },
     /// A bulk array write lowered from `SETLIST`.
     SetList {
         table: SymbolId,
@@ -199,7 +217,7 @@ impl Display for HilStmt {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "v{}", lv.index())?;
+                    write!(f, "{}", lv)?;
                 }
                 write!(f, " = {}", value)
             }

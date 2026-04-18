@@ -80,7 +80,14 @@ impl Visitor for Analyzer {
                 HilStmt::AssignMany { left, value } => {
                     // Block all tuple-assigns from being inlined. This can only be done in the
                     // immediate inlining pass.
-                    for sym in left {
+                    let symbols = left.iter().filter_map(|lv| {
+                        if let HilExpr::Symbol(sym) = lv {
+                            Some(sym)
+                        } else {
+                            None
+                        }
+                    });
+                    for sym in symbols {
                         match self.vars.get_mut(sym) {
                             Some(var) => {
                                 var.write_count += 1;

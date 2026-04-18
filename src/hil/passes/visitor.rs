@@ -168,8 +168,8 @@ pub fn walk_stmt<V: Visitor + ?Sized>(visitor: &mut V, stmt: &HilStmt) {
             visitor.visit_expr(value);
         }
         HilStmt::AssignMany { left, value } => {
-            for symbol in left {
-                visitor.visit_symbol(*symbol);
+            for lvalue in left {
+                visitor.visit_lvalue_expr(lvalue);
             }
             visitor.visit_expr(value);
         }
@@ -324,8 +324,8 @@ pub fn walk_stmt_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmt: &mut HilStmt
             visitor.visit_expr(value);
         }
         HilStmt::AssignMany { left, value } => {
-            for symbol in left {
-                visitor.visit_symbol(symbol);
+            for lvalue in left {
+                visitor.visit_lvalue_expr(lvalue);
             }
             visitor.visit_expr(value);
         }

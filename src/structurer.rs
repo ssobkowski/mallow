@@ -349,7 +349,11 @@ impl Structurer {
             | HilStmt::Call(_)
             | HilStmt::Phi(_) => {}
             HilStmt::AssignMany { left, .. } => {
-                out.extend(left.iter().copied());
+                for lvalue in left {
+                    if let HilExpr::Symbol(sym) = lvalue {
+                        out.insert(*sym);
+                    }
+                }
             }
         }
     }
@@ -397,10 +401,34 @@ impl Structurer {
                 }
             }
             HilStmt::AssignMany { left, value } => {
-                let all_declared = left.iter().all(|sym| self.scopes.contains(sym));
-
-                let names: Vec<_> = left.iter().map(|s| self.get_symbol_name(s)).collect();
                 let right = self.visit_expr(value);
+                if left
+                    .iter()
+                    .any(|lvalue| !matches!(lvalue, HilExpr::Symbol(_)))
+                {
+                    let lhs = left.iter().map(|lvalue| self.visit_expr(lvalue)).collect();
+                    return Stmt::Assignment {
+                        lhs,
+                        rhs: vec![right],
+                    };
+                }
+
+                let symbols: Vec<_> = left
+                    .iter()
+                    .map(|lvalue| {
+                        let HilExpr::Symbol(sym) = lvalue else {
+                            unreachable!("guarded by symbol-only branch")
+                        };
+                        *sym
+                    })
+                    .collect();
+
+                let all_declared = symbols.iter().all(|sym| self.scopes.contains(sym));
+
+                let names: Vec<_> = symbols
+                    .iter()
+                    .map(|sym| self.get_symbol_name(sym))
+                    .collect();
 
                 if all_declared {
                     Stmt::Assignment {
@@ -408,7 +436,7 @@ impl Structurer {
                         rhs: vec![right],
                     }
                 } else {
-                    for sym in left {
+                    for sym in &symbols {
                         self.scopes.declare(*sym, ());
                     }
                     Stmt::LocalDeclaration {
@@ -431,9 +459,8 @@ impl Structurer {
                     // We create a temporary table and then copy the contents of it into the
                     // true table with `table.move`
                     //
-                    // TODO: This is technically subject to some kind of global poisoning attack, so
-                    // perhaps a better way to handle this would be to have a pass before structuring
-                    // and after inlining that unfolds such SetLists into normal table constructors.
+                    // This should run only if the 'fold_tables' pass did not fold this SetList
+                    // into table constructor.
 
                     let temp_table_ident = Identifier::new("__t");
                     Stmt::Do {

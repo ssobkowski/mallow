@@ -804,11 +804,8 @@ impl ControlFlowGraph {
         // Unify all versions of the same upvalue.
         let mut upval_versions: HashMap<_, Vec<_>> = HashMap::new();
         for (id, symbol) in ssa.arena_iter() {
-            match symbol.kind {
-                SymbolKind::Upvalue(idx) => {
-                    upval_versions.entry(idx).or_default().push(id);
-                }
-                _ => {}
+            if let SymbolKind::Upvalue(idx) = symbol.kind {
+                upval_versions.entry(idx).or_default().push(id);
             }
         }
 
@@ -824,14 +821,11 @@ impl ControlFlowGraph {
         // must remain distinct.
         let mut captured_versions: HashMap<_, Vec<_>> = HashMap::new();
         for (id, symbol) in ssa.arena_iter() {
-            match symbol.kind {
-                SymbolKind::CapturedRegister { reg, generation } => {
-                    captured_versions
-                        .entry((reg, generation))
-                        .or_default()
-                        .push(id);
-                }
-                _ => {}
+            if let SymbolKind::CapturedRegister { reg, generation } = symbol.kind {
+                captured_versions
+                    .entry((reg, generation))
+                    .or_default()
+                    .push(id);
             }
         }
 
@@ -1631,8 +1625,8 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &Ssa, djs: &mut UnionFind<Symb
                 walk_expr(value, ssa, djs);
             }
             HilStmt::AssignMany { left, value } => {
-                for sym in left {
-                    resolve(sym, ssa, djs);
+                for lvalue in left {
+                    walk_expr(lvalue, ssa, djs);
                 }
                 walk_expr(value, ssa, djs);
             }
@@ -1890,10 +1884,17 @@ fn collect_stmt_reg_use_def(
         }
         HilStmt::AssignMany { left, value } => {
             collect_expr_reg_uses(value, reg_of, uses, seen_defs);
-            for sym in left {
-                if let Some(&reg) = reg_of.get(sym) {
-                    defs.insert(reg);
-                    seen_defs.insert(reg);
+            for lvalue in left {
+                match lvalue {
+                    HilExpr::Symbol(sym) => {
+                        if let Some(&reg) = reg_of.get(sym) {
+                            defs.insert(reg);
+                            seen_defs.insert(reg);
+                        }
+                    }
+                    _ => {
+                        collect_lvalue_reg_use_def(lvalue, reg_of, uses, defs, seen_defs);
+                    }
                 }
             }
         }
