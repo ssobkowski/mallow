@@ -37,7 +37,7 @@ impl std::fmt::Display for CaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CompileError(msg) => write!(f, "luau-compile failed:\n{msg}"),
-            Self::DecompileError(msg) => write!(f, "luaudec decompile failed:\n{msg}"),
+            Self::DecompileError(msg) => write!(f, "mallow decompile failed:\n{msg}"),
             Self::SourceRunError(msg) => write!(f, "source.luau failed to run:\n{msg}"),
             Self::DecompiledRunError(msg) => write!(f, "decompiled.luau failed to run:\n{msg}"),
             Self::OutputMismatch { source, decompiled } => write!(
@@ -89,14 +89,14 @@ fn compile_luau(source_path: &Path, bytecode_path: &Path) -> Result<(), Failed> 
 }
 
 fn decompile_bytecode(bytecode_path: &Path, decompiled_path: &Path) -> Result<(), Failed> {
-    let output = Command::new(luaudec_exe())
+    let output = Command::new(mallow_exe())
         .arg("decompile")
         .arg("-i")
         .arg(bytecode_path)
         .arg("-o")
         .arg(decompiled_path)
         .output()
-        .map_err(|e| Failed::from(format!("failed to spawn luaudec: {e}")))?;
+        .map_err(|e| Failed::from(format!("failed to spawn mallow: {e}")))?;
 
     if !output.status.success() {
         return Err(CaseError::DecompileError(format_output(&output)).into());
@@ -171,8 +171,8 @@ fn find_external_exe(stem: &str) -> PathBuf {
     PathBuf::from(exe_name(stem))
 }
 
-fn luaudec_exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_luaudec"))
+fn mallow_exe() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_mallow"))
 }
 
 fn repo_root() -> &'static Path {

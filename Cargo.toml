@@ -1,5 +1,5 @@
 [package]
-name = "luaudec"
+name = "mallow"
 version = "0.2.8"
 edition = "2024"
 
