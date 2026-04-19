@@ -3,10 +3,8 @@ use crate::{
         StructuredFunction,
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
-        passes::{
-            inlining::common::{Analyzer, Var},
-            visitor::{VisitorMut, walk_block_mut, walk_expr_mut},
-        },
+        passes::inlining::common::{Analyzer, Var},
+        visitor::{VisitorMut, walk_block_mut, walk_expr_mut},
     },
     scopes::Scope,
 };

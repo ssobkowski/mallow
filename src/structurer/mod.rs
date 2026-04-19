@@ -1,6 +1,8 @@
+mod name;
+
 use std::collections::{HashMap, HashSet};
 
-use smol_str::{SmolStr, format_smolstr};
+use smol_str::SmolStr;
 
 use crate::{
     ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem, UnOp},
@@ -10,50 +12,44 @@ use crate::{
         cflow::region::RegionNode,
         ir::{HilExpr, HilStmt, HilTableItem},
         lifter::ssa::SymbolId,
+        visitor::Visitor,
     },
     scopes::Scopes,
+    structurer::name::NameAllocator,
 };
 
 #[derive(Default)]
-struct NameAllocator {
-    used: HashSet<SmolStr>,
-    next_param: usize,
-    next_local: usize,
+struct Collector {
+    symbols: HashSet<SymbolId>,
 }
 
-impl NameAllocator {
-    fn reserve_exact(&mut self, preferred: SmolStr) -> Identifier {
-        if self.used.insert(preferred.clone()) {
-            return Identifier::new(preferred);
-        }
-
-        let mut counter = 0usize;
-        loop {
-            let candidate = format_smolstr!("{preferred}__{counter}");
-            if self.used.insert(candidate.clone()) {
-                return Identifier::new(candidate);
-            }
-            counter += 1;
-        }
+impl Collector {
+    fn collect_assigned_symbols(node: &RegionNode) -> HashSet<SymbolId> {
+        let mut collector = Collector::default();
+        collector.visit_region(node);
+        collector.symbols
     }
+}
 
-    fn fresh_param(&mut self) -> Identifier {
-        loop {
-            let candidate = format_smolstr!("p{}", self.next_param);
-            self.next_param += 1;
-            if self.used.insert(candidate.clone()) {
-                return Identifier::new(candidate);
+impl Visitor for Collector {
+    fn visit_stmt(&mut self, stmt: &HilStmt) {
+        match stmt {
+            HilStmt::Assign {
+                left: HilExpr::Symbol(sym),
+                ..
+            } => {
+                self.symbols.insert(*sym);
             }
-        }
-    }
-
-    fn fresh_local(&mut self) -> Identifier {
-        loop {
-            let candidate = format_smolstr!("v{}", self.next_local);
-            self.next_local += 1;
-            if self.used.insert(candidate.clone()) {
-                return Identifier::new(candidate);
+            HilStmt::AssignMany { left, .. } => {
+                self.symbols.extend(left.iter().filter_map(|lv| {
+                    if let HilExpr::Symbol(s) = lv {
+                        Some(*s)
+                    } else {
+                        None
+                    }
+                }));
             }
+            _ => {}
         }
     }
 }
@@ -186,13 +182,12 @@ impl Structurer {
                 else_branch,
                 ..
             } => {
-                let mut then_assigned = HashSet::new();
-                self.collect_assigned_symbols_in_region(then_branch, &mut then_assigned);
+                let then_assigned = Collector::collect_assigned_symbols(then_branch);
 
-                let mut else_assigned = HashSet::new();
-                if let Some(else_branch) = else_branch {
-                    self.collect_assigned_symbols_in_region(else_branch, &mut else_assigned);
-                }
+                let else_assigned = else_branch
+                    .as_ref()
+                    .map(|node| Collector::collect_assigned_symbols(node))
+                    .unwrap_or_default();
 
                 let mut hoisted: Vec<_> = then_assigned
                     .intersection(&else_assigned)
@@ -200,6 +195,14 @@ impl Structurer {
                     .filter(|sym| !self.scopes.contains(sym))
                     .collect();
                 hoisted.sort_by_key(|sym| sym.index());
+
+                if let Some(else_branch) = else_branch.as_ref()
+                    && let Some(ifelse) =
+                        self.emit_as_ifelse_expr(&hoisted, condition, then_branch, else_branch)
+                {
+                    buf.push(ifelse);
+                    return;
+                }
 
                 if !hoisted.is_empty() {
                     for sym in &hoisted {
@@ -304,59 +307,6 @@ impl Structurer {
             names: vec![name],
             values: Vec::new(),
         });
-    }
-
-    fn collect_assigned_symbols_in_region(&self, node: &RegionNode, out: &mut HashSet<SymbolId>) {
-        match node {
-            RegionNode::BasicBlock { stmts } => {
-                for stmt in stmts {
-                    self.collect_assigned_symbols_in_stmt(stmt, out);
-                }
-            }
-            RegionNode::Sequence { nodes } => {
-                for n in nodes {
-                    self.collect_assigned_symbols_in_region(n, out);
-                }
-            }
-            RegionNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.collect_assigned_symbols_in_region(then_branch, out);
-                if let Some(else_branch) = else_branch {
-                    self.collect_assigned_symbols_in_region(else_branch, out);
-                }
-            }
-            RegionNode::While { body, .. }
-            | RegionNode::NumericFor { body, .. }
-            | RegionNode::GenericFor { body, .. } => {
-                self.collect_assigned_symbols_in_region(body, out);
-            }
-            RegionNode::Continue | RegionNode::Break | RegionNode::Return { .. } => {}
-        }
-    }
-
-    fn collect_assigned_symbols_in_stmt(&self, stmt: &HilStmt, out: &mut HashSet<SymbolId>) {
-        match stmt {
-            HilStmt::Assign {
-                left: HilExpr::Symbol(sym),
-                ..
-            } => {
-                out.insert(*sym);
-            }
-            HilStmt::Assign { .. }
-            | HilStmt::SetList { .. }
-            | HilStmt::Call(_)
-            | HilStmt::Phi(_) => {}
-            HilStmt::AssignMany { left, .. } => {
-                for lvalue in left {
-                    if let HilExpr::Symbol(sym) = lvalue {
-                        out.insert(*sym);
-                    }
-                }
-            }
-        }
     }
 
     fn visit_stmt(&mut self, stmt: &HilStmt) -> Stmt {
@@ -649,6 +599,46 @@ impl Structurer {
         self.scopes = old_scopes;
 
         Expr::AnonymousFunction { params, body }
+    }
+
+    fn emit_as_ifelse_expr(
+        &mut self,
+        hoisted: &[SymbolId],
+        condition: &HilExpr,
+        then_branch: &RegionNode,
+        else_branch: &RegionNode,
+    ) -> Option<Stmt> {
+        // if-else expr cannot assign to tuples, only a single symbol
+        let [sym] = hoisted else { return None };
+
+        let single_assign_value = |node: &RegionNode| {
+            if let RegionNode::BasicBlock { stmts } = node {
+                let [stmt] = stmts.as_slice() else {
+                    return None;
+                };
+                match stmt {
+                    HilStmt::Assign { left, value } if left == &HilExpr::Symbol(*sym) => {
+                        Some(value.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+
+        let value_if_true = single_assign_value(&then_branch)?;
+        let value_if_false = single_assign_value(&else_branch)?;
+
+        self.scopes.declare(*sym, ());
+        Some(Stmt::LocalDeclaration {
+            names: vec![self.get_symbol_name(sym)],
+            values: vec![Expr::IfElse {
+                condition: Box::new(self.visit_expr(condition)),
+                then_expr: Box::new(self.visit_expr(&value_if_true)),
+                else_expr: Box::new(self.visit_expr(&value_if_false)),
+            }],
+        })
     }
 }
 

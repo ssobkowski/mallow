@@ -6,10 +6,8 @@ use crate::{
         cflow::region::RegionNode,
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
-        passes::{
-            inlining::common::{Analyzer, Var},
-            visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut, walk_region_mut},
-        },
+        passes::inlining::common::{Analyzer, Var},
+        visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut, walk_region_mut},
     },
     scopes::Scope,
 };

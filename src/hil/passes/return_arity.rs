@@ -2,7 +2,7 @@ use crate::hil::{
     ReturnArity, StructuredFunction,
     cflow::region::RegionNode,
     ir::HilExpr,
-    passes::visitor::{Visitor, walk_region},
+    visitor::{Visitor, walk_region},
 };
 
 struct ReturnCollector<'a> {

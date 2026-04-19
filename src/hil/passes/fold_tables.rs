@@ -6,7 +6,7 @@
 use crate::hil::{
     StructuredFunction,
     ir::{HilExpr, HilStmt, HilTableItem},
-    passes::visitor::VisitorMut,
+    visitor::VisitorMut,
 };
 
 #[derive(Default)]

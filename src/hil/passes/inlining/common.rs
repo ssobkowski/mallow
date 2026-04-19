@@ -4,7 +4,7 @@ use crate::{
         cflow::region::RegionNode,
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
-        passes::visitor::{Visitor, walk_expr, walk_function, walk_region},
+        visitor::{Visitor, walk_expr, walk_function, walk_region},
     },
     scopes::Scope,
 };

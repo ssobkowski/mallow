@@ -14,6 +14,7 @@ pub mod common;
 pub mod ir;
 pub mod lifter;
 pub mod passes;
+pub mod visitor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturnArity {

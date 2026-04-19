@@ -2,7 +2,7 @@ use crate::hil::{
     StructuredFunction,
     ir::{HilExpr, HilStmt},
     lifter::ssa::SymbolId,
-    passes::visitor::{VisitorMut, walk_block_mut},
+    visitor::{VisitorMut, walk_block_mut},
 };
 
 #[derive(Default)]

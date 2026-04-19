@@ -4,7 +4,6 @@ mod fold_tables;
 mod inlining;
 mod return_arity;
 mod tuple_assign;
-pub mod visitor;
 
 pub fn run(fns: &mut [StructuredFunction]) {
     return_arity::infer_all(fns);
