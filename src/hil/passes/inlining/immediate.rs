@@ -8,9 +8,7 @@ use crate::{
         lifter::ssa::SymbolId,
         passes::{
             inlining::common::{Analyzer, Var},
-            visitor::{
-                Visitor, VisitorMut, walk_expr, walk_expr_mut, walk_region_mut, walk_stmt_mut,
-            },
+            visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut, walk_region_mut},
         },
     },
     scopes::Scope,
@@ -23,14 +21,6 @@ struct SingleSymbolRewriter<'a> {
 }
 
 impl<'a> VisitorMut for SingleSymbolRewriter<'a> {
-    fn visit_stmt(&mut self, stmt: &mut HilStmt) {
-        if let HilStmt::Assign { value, .. } = stmt {
-            self.visit_expr(value);
-            return;
-        }
-        walk_stmt_mut(self, stmt);
-    }
-
     fn visit_expr(&mut self, expr: &mut HilExpr) {
         if let HilExpr::Call { fun, args } = expr
             && matches!(self.expr, HilExpr::Closure { .. })

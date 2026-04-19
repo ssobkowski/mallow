@@ -385,6 +385,7 @@ impl Structurer {
                     }
                 } else {
                     if let Expr::Binary { lhs, op, rhs } = &right
+                        && left.is_pure()
                         && lhs.as_ref() == &left_expr
                         && op.is_compound()
                     {
