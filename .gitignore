@@ -4,6 +4,8 @@
 !.gitattributes
 !assets/
 !assets/**/*
+!docs/
+!docs/**/*
 !src/
 !src/**/*
 !tests
