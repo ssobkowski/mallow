@@ -3,6 +3,7 @@ mod common;
 mod disasm;
 mod hil;
 mod il;
+mod logging;
 mod printer;
 mod scopes;
 mod structurer;
@@ -11,13 +12,21 @@ use std::{path::PathBuf, process::Command};
 
 use clap::{Parser, Subcommand};
 
-use crate::{disasm::DisasmError, hil::StructuredFunction};
+use crate::{
+    ast::Stmt,
+    disasm::{DisasmError, Disassembly},
+    hil::StructuredFunction,
+    logging::verbose,
+};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    #[arg(short, long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -65,8 +74,19 @@ enum Commands {
     },
 }
 
+fn disassemble_bytecode(bytecode: &[u8]) -> Result<Disassembly, DisasmError> {
+    verbose!("disassembling...");
+    let d = disasm::disassemble(bytecode)?;
+
+    verbose!(indent: 1, "LBC Version: {}", d.version);
+    verbose!(indent: 1, "Proto count: {}", d.protos.len());
+    verbose!(indent: 1, "Entry: {}", d.entry_proto);
+
+    Ok(d)
+}
+
 fn decompile_bytecode(bytecode: &[u8]) -> Result<String, DisasmError> {
-    let diasssembled = disasm::disassemble(bytecode)?;
+    let diasssembled = disassemble_bytecode(bytecode)?;
 
     let mut fns: Vec<_> = diasssembled
         .protos
@@ -74,20 +94,30 @@ fn decompile_bytecode(bytecode: &[u8]) -> Result<String, DisasmError> {
         .map(|proto| StructuredFunction::from_proto(proto, &diasssembled.protos))
         .collect();
 
+    verbose!("running passes...");
     hil::passes::run(&mut fns);
 
-    let ast = structurer::structure(fns, diasssembled.entry_proto as usize);
+    let mut ast = structurer::structure(fns, diasssembled.entry_proto as usize);
+    ast.stmts.insert(
+        0,
+        Stmt::Comment {
+            // this \n is technically wrong but i don't care, it's hack to get a whitespace after this header
+            text: format!("Decompiled by mallow {}\n", env!("CARGO_PKG_VERSION")),
+        },
+    );
+
     Ok(printer::print(&ast))
 }
 
 fn main() {
     let cli = Cli::parse();
+    logging::set_verbose(cli.verbose);
 
     match cli.command {
         Commands::Disasm { input, output } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
 
-            match disasm::disassemble(&bytecode) {
+            match disassemble_bytecode(&bytecode) {
                 Ok(d) => {
                     let content = d.to_string();
                     if let Err(e) = write_output(output, &content) {
@@ -99,6 +129,8 @@ fn main() {
         }
         Commands::Decompile { input, output } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
+
+            verbose!("decompiling...");
             let code = match decompile_bytecode(&bytecode) {
                 Ok(c) => c,
                 Err(e) => {
@@ -146,7 +178,7 @@ fn main() {
             use crate::hil::cflow::{graph::ControlFlowGraph, visualize::dump_cfgs};
 
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
-            let disasm = disasm::disassemble(&bytecode).expect("failed to disassemble");
+            let disasm = disassemble_bytecode(&bytecode).expect("failed to disassemble");
 
             let cfgs: Vec<_> = disasm
                 .protos

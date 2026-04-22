@@ -338,7 +338,7 @@ impl fmt::Display for Disassembly {
                 writeln!(f, "{pc}: {instr}")?;
             }
 
-            writeln!(f, "")?;
+            writeln!(f)?;
         }
 
         Ok(())

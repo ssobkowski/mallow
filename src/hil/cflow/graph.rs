@@ -859,8 +859,9 @@ impl ControlFlowGraph {
         }
 
         loop {
-            let changed = thread_jumps(&mut blocks);
-            if !changed {
+            let changed_cond = fold_constant_cond_jumps(&mut blocks);
+            let changed_jump = thread_jumps(&mut blocks);
+            if !changed_cond && !changed_jump {
                 break;
             }
         }
@@ -1325,6 +1326,50 @@ fn last_assigned_symbol(block: &Block) -> Option<(SymbolId, HilExpr)> {
     };
 
     Some((*symbol, value.clone()))
+}
+
+fn symbol_truthiness_in_block(block: &Block, symbol: SymbolId) -> Option<bool> {
+    block.stmts.iter().find_map(|stmt| {
+        let HilStmt::Assign {
+            left: HilExpr::Symbol(target),
+            value,
+        } = &stmt.inner
+        else {
+            return None;
+        };
+
+        (*target == symbol)
+            .then_some(value)
+            .and_then(|value| value.truthiness())
+    })
+}
+
+fn fold_constant_cond_jumps(blocks: &mut [Block]) -> bool {
+    let mut was_changed = false;
+
+    for block in blocks.iter_mut() {
+        let Some(target) = (match &block.exit {
+            BlockExit::CondJump {
+                cond,
+                then_block,
+                else_block,
+            } => match cond {
+                HilExpr::Symbol(symbol) => symbol_truthiness_in_block(block, *symbol)
+                    .map(|truthy| if truthy { *then_block } else { *else_block }),
+                _ => cond
+                    .truthiness()
+                    .map(|truthy| if truthy { *then_block } else { *else_block }),
+            },
+            _ => None,
+        }) else {
+            continue;
+        };
+
+        block.exit = BlockExit::Jump(target);
+        was_changed = true;
+    }
+
+    was_changed
 }
 
 /// Folds condition diamonds back into expression-producing control flow.

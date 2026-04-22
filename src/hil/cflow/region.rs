@@ -341,10 +341,10 @@ impl CfgNode {
         }
     }
 
-    /// Returns whether this node ends in an explicit loop escape statement.
+    /// Returns whether this node ends in an explicit terminal statement.
     fn ends_with_escape(&self) -> bool {
         match self {
-            CfgNode::Continue | CfgNode::Break => true,
+            CfgNode::Continue | CfgNode::Break | CfgNode::Return { .. } => true,
             CfgNode::Sequence { nodes } => nodes.last().is_some_and(|n| n.ends_with_escape()),
             CfgNode::If {
                 then_branch,
@@ -741,6 +741,28 @@ impl<'a> FoldableGraph<'a> {
         }
     }
 
+    fn node_ends_with_terminal(&self, node: &CfgNode) -> bool {
+        match node {
+            CfgNode::BasicBlock { block } => {
+                matches!(self.cfg.blocks[*block].exit, BlockExit::Return(_))
+            }
+            CfgNode::Sequence { nodes } => nodes
+                .last()
+                .is_some_and(|node| self.node_ends_with_terminal(node)),
+            CfgNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.node_ends_with_terminal(then_branch)
+                    && else_branch
+                        .as_ref()
+                        .is_some_and(|branch| self.node_ends_with_terminal(branch))
+            }
+            _ => node.ends_with_escape(),
+        }
+    }
+
     /// Restructures a loop header's conditional branch into a structured if-then-else
     /// or one-armed if guard, pulling the target branches out of the body sequence.
     ///
@@ -775,8 +797,8 @@ impl<'a> FoldableGraph<'a> {
             return CfgNode::merge([head_node, CfgNode::Sequence { nodes }]);
         };
 
-        let then_escape = nodes[then_idx].ends_with_escape();
-        let else_escape = nodes[else_idx].ends_with_escape();
+        let then_escape = self.node_ends_with_terminal(&nodes[then_idx]);
+        let else_escape = self.node_ends_with_terminal(&nodes[else_idx]);
 
         if then_escape && else_escape {
             let mut guarded = Vec::with_capacity(nodes.len() + 2);
@@ -880,7 +902,7 @@ impl<'a> FoldableGraph<'a> {
 
             if let Some(escape_idx) = then_idx
                 && else_idx.is_none()
-                && nodes[escape_idx].ends_with_escape()
+                && self.node_ends_with_terminal(&nodes[escape_idx])
             {
                 let suffix = nodes.split_off(i + 1);
                 let head = nodes.pop().unwrap();
@@ -904,7 +926,7 @@ impl<'a> FoldableGraph<'a> {
 
             if let Some(escape_idx) = else_idx
                 && then_idx.is_none()
-                && nodes[escape_idx].ends_with_escape()
+                && self.node_ends_with_terminal(&nodes[escape_idx])
             {
                 let suffix = nodes.split_off(i + 1);
                 let head = nodes.pop().unwrap();
@@ -936,8 +958,8 @@ impl<'a> FoldableGraph<'a> {
                 continue;
             }
 
-            let then_escape = nodes[then_idx].ends_with_escape();
-            let else_escape = nodes[else_idx].ends_with_escape();
+            let then_escape = self.node_ends_with_terminal(&nodes[then_idx]);
+            let else_escape = self.node_ends_with_terminal(&nodes[else_idx]);
             if !then_escape && !else_escape {
                 continue;
             }

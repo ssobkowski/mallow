@@ -94,7 +94,7 @@ impl HilExpr {
         }
     }
 
-    pub fn is_pure(&self) -> bool {
+    pub const fn is_pure(&self) -> bool {
         match self {
             HilExpr::Nil
             | HilExpr::Number(_)
@@ -112,6 +112,20 @@ impl HilExpr {
             | HilExpr::MethodCall { .. }
             | HilExpr::Table { .. }
             | HilExpr::VarArgs => false,
+        }
+    }
+
+    pub const fn truthiness(&self) -> Option<bool> {
+        match self {
+            HilExpr::Nil => Some(false),
+            HilExpr::Bool(value) => Some(*value),
+            HilExpr::Number(_)
+            | HilExpr::String(_)
+            | HilExpr::Closure { .. }
+            | HilExpr::Global(_)
+            | HilExpr::Import(_)
+            | HilExpr::Table { .. } => Some(true),
+            _ => None,
         }
     }
 }

@@ -488,7 +488,7 @@ impl AstPrinter {
     }
 }
 
-fn needs_parens(prec: u8, parent_prec: u8, assoc: Assoc, side: Side) -> bool {
+const fn needs_parens(prec: u8, parent_prec: u8, assoc: Assoc, side: Side) -> bool {
     prec < parent_prec
         || (prec == parent_prec
             && matches!(
@@ -497,21 +497,24 @@ fn needs_parens(prec: u8, parent_prec: u8, assoc: Assoc, side: Side) -> bool {
             ))
 }
 
-fn needs_prefix_wrap(expr: &Expr) -> bool {
+const fn needs_prefix_wrap(expr: &Expr) -> bool {
     matches!(
         expr,
-        Expr::Literal(_) | Expr::Table { .. } | Expr::AnonymousFunction { .. } | Expr::IfElse { .. }
+        Expr::Literal(_)
+            | Expr::Table { .. }
+            | Expr::AnonymousFunction { .. }
+            | Expr::IfElse { .. }
     )
 }
 
-fn binary_assoc(op: &BinOp) -> Assoc {
+const fn binary_assoc(op: &BinOp) -> Assoc {
     match op {
         BinOp::Concat | BinOp::Pow => Assoc::Right,
         _ => Assoc::Left,
     }
 }
 
-fn binary_symbol(op: &BinOp) -> &'static str {
+const fn binary_symbol(op: &BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",
         BinOp::Sub => "-",
@@ -531,7 +534,7 @@ fn binary_symbol(op: &BinOp) -> &'static str {
     }
 }
 
-fn unary_symbol(op: &UnOp) -> &'static str {
+const fn unary_symbol(op: &UnOp) -> &'static str {
     match op {
         UnOp::Minus => "-",
         UnOp::Length => "#",
@@ -539,7 +542,7 @@ fn unary_symbol(op: &UnOp) -> &'static str {
     }
 }
 
-fn compound_binary_symbol(op: &CompoundBinOp) -> &'static str {
+const fn compound_binary_symbol(op: &CompoundBinOp) -> &'static str {
     match op {
         CompoundBinOp::Add => "+=",
         CompoundBinOp::Sub => "-=",

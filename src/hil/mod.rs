@@ -7,6 +7,7 @@ use crate::{
         },
         lifter::ssa::SymbolId,
     },
+    logging::verbose,
 };
 
 pub mod cflow;
@@ -45,7 +46,17 @@ pub struct StructuredFunction {
 
 impl StructuredFunction {
     pub fn from_proto(proto: &Proto, all_protos: &[Proto]) -> Self {
+        verbose!(
+            "proto {} ({} params, {} upvalues)",
+            proto.index,
+            proto.num_params,
+            proto.num_upvals
+        );
+
+        verbose!(indent: 1, "building cfg...");
         let cfg = ControlFlowGraph::from_proto(proto, all_protos);
+
+        verbose!(indent: 1, "structuring region...");
         let (root, was_reduced) = region::structure(&cfg);
 
         if !was_reduced {

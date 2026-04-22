@@ -551,7 +551,7 @@ impl Structurer {
                 HilTableItem::Index(key, value) => {
                     let value = self.visit_expr(value);
                     if let HilExpr::String(s) = key
-                        && is_valid_luau_identifier(&s)
+                        && is_valid_luau_identifier(s)
                     {
                         TableItem::Named {
                             name: Identifier::new(s.clone()),
@@ -627,8 +627,8 @@ impl Structurer {
             }
         };
 
-        let value_if_true = single_assign_value(&then_branch)?;
-        let value_if_false = single_assign_value(&else_branch)?;
+        let value_if_true = single_assign_value(then_branch)?;
+        let value_if_false = single_assign_value(else_branch)?;
 
         self.scopes.declare(*sym, ());
         Some(Stmt::LocalDeclaration {
