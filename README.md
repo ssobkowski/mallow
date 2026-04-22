@@ -1,6 +1,8 @@
 # mallow
 
-a Luau bytecode disassembler and decompiler.
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
+a [Luau](https://luau.org) bytecode disassembler and decompiler.
 
 > **Note:** only Luau bytecode version 6 is supported.
 
@@ -101,9 +103,12 @@ mallow visualize -i <bytecode> -o <output.html>
 
 ## Testing
 
-Tests live in `tests/cases`. Each case is compiled with `luau-compile`, decompiled, and both versions are executed - stdout is compared for semantic equivalence rather than source text matching.
+Tests live in `tests/cases`. Each case is compiled with the Luau compiler, decompiled, and both versions are executed - stdout is compared for semantic equivalence rather than source text matching. Before running tests, make sure your compiler version emits a supported bytecode version.
+
+> **Note:** Testing mallow requires both the `luau` and `luau-compile` binaries in PATH.
 
 ```sh
 cargo test
 ```
 
+To test the "real world" reliability of mallow, integration tests are using real open source Lua/Luau scripts. Their authors and licenses can be found in the [third party notices](THIRD_PARTY_NOTICES) file.
