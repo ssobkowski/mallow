@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use smol_str::SmolStr;
 
 use crate::{
-    ast::{Block, Expr, Identifier, Literal, Parameter, Stmt, TableItem, UnOp},
+    ast::{Block, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt, TableItem, UnOp},
     common::is_valid_luau_identifier,
     hil::{
         StructuredFunction,
@@ -220,13 +220,22 @@ impl Structurer {
                 }
 
                 let then_body = self.visit_region(then_branch);
-                let else_body = else_branch.as_ref().map(|e| self.visit_region(e));
+                let else_clause = else_branch.as_ref().map(|e| {
+                    let region = self.visit_region(e);
 
-                buf.push(Stmt::If {
+                    // if the region is only one If statement we can fold into an elseif
+                    if let [Stmt::If(elseif)] = region.stmts.as_slice() {
+                        return ElseClause::If(Box::new(elseif.clone()));
+                    }
+
+                    ElseClause::Else(region)
+                });
+
+                buf.push(Stmt::If(If {
                     condition: self.visit_expr(condition),
                     then_body,
-                    else_body,
-                });
+                    else_clause,
+                }));
             }
             RegionNode::While {
                 condition, body, ..

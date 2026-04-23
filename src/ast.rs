@@ -94,14 +94,7 @@ pub enum Stmt {
         body: Block,
     },
     /// `if ... then ... [else ...] end`.
-    If {
-        /// Condition expression.
-        condition: Expr,
-        /// Then branch body.
-        then_body: Block,
-        /// Optional else branch body.
-        else_body: Option<Block>,
-    },
+    If(If),
     /// `local a, b = ...`.
     LocalDeclaration {
         /// Declared local names.
@@ -134,6 +127,26 @@ pub enum Stmt {
         /// Loop body.
         body: Block,
     },
+}
+
+/// An if statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct If {
+    /// Condition expression.
+    pub condition: Expr,
+    /// Then branch body.
+    pub then_body: Block,
+    /// Optional else clause.
+    pub else_clause: Option<ElseClause>,
+}
+
+/// An else clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElseClause {
+    /// Elseif clause.
+    If(Box<If>),
+    /// Else clause.
+    Else(Block),
 }
 
 /// An expression node.

@@ -1,5 +1,8 @@
 use crate::{
-    ast::{BinOp, Block, CompoundBinOp, Expr, Literal, Parameter, Stmt, TableItem, UnOp},
+    ast::{
+        BinOp, Block, CompoundBinOp, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem,
+        UnOp,
+    },
     common::escape_string,
 };
 
@@ -127,27 +130,8 @@ impl AstPrinter {
                 self.write("end");
                 self.newline();
             }
-            Stmt::If {
-                condition,
-                then_body,
-                else_body,
-            } => {
-                self.write("if ");
-                self.walk_expr(condition, 0, Side::None);
-                self.write(" then");
-                self.newline();
-                self.indent += 1;
-                self.walk_block(then_body);
-                self.indent -= 1;
-                if let Some(else_body) = else_body {
-                    self.write("else");
-                    self.newline();
-                    self.indent += 1;
-                    self.walk_block(else_body);
-                    self.indent -= 1;
-                }
-                self.write("end");
-                self.newline();
+            Stmt::If(if_stmt) => {
+                self.walk_if_stmt(if_stmt, true);
             }
             Stmt::LocalDeclaration { names, values } => {
                 self.write("local ");
@@ -217,6 +201,34 @@ impl AstPrinter {
                 self.write("end");
                 self.newline();
             }
+        }
+    }
+
+    fn walk_if_stmt(&mut self, if_stmt: &If, emit_end: bool) {
+        self.write("if ");
+        self.walk_expr(&if_stmt.condition, 0, Side::None);
+        self.write(" then");
+        self.newline();
+        self.indent += 1;
+        self.walk_block(&if_stmt.then_body);
+        self.indent -= 1;
+        match &if_stmt.else_clause {
+            Some(ElseClause::If(else_if)) => {
+                self.write("else");
+                self.walk_if_stmt(else_if, false);
+            }
+            Some(ElseClause::Else(block)) => {
+                self.write("else");
+                self.newline();
+                self.indent += 1;
+                self.walk_block(&block);
+                self.indent -= 1;
+            }
+            None => {}
+        }
+        if emit_end {
+            self.write("end");
+            self.newline();
         }
     }
 
