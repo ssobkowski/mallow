@@ -225,6 +225,17 @@ impl Inliner {
     }
 
     fn call_arity(&self, fun: &HilExpr) -> Option<usize> {
+        let name = match fun {
+            HilExpr::Global(name) | HilExpr::Import(name) => name.as_str(),
+            _ => "",
+        };
+        if !name.is_empty() {
+            return match name {
+                "ipairs" | "pairs" => Some(3),
+                _ => None,
+            };
+        }
+
         let HilExpr::Closure { proto, .. } = fun else {
             return None;
         };
@@ -306,7 +317,16 @@ impl Inliner {
                 check_expr(step);
             }
             RegionNode::GenericFor { exprs, .. } => {
-                exprs.iter_mut().for_each(check_expr);
+                if let HilStmt::AssignMany { left, value } = decl
+                    && self.can_inline_tuple_binding(left, value)
+                    && left.as_slice() == exprs.as_slice()
+                {
+                    exprs.clear();
+                    exprs.push(value.clone());
+                    applied = true;
+                } else {
+                    exprs.iter_mut().for_each(check_expr);
+                }
             }
             _ => {}
         }

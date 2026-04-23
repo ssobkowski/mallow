@@ -124,7 +124,7 @@ pub enum RegionNode {
     /// A structured generic `for` loop recovered from `FORGPREP/FORGLOOP`.
     GenericFor {
         vars: SmallVec<[SymbolId; 3]>,
-        exprs: [HilExpr; 3],
+        exprs: SmallVec<[HilExpr; 3]>,
         body: Box<RegionNode>,
     },
     /// Explicit `continue` edge for a recovered loop.
@@ -429,7 +429,7 @@ impl CfgNode {
                 vars, exprs, body, ..
             } => RegionNode::GenericFor {
                 vars,
-                exprs,
+                exprs: exprs.into(),
                 body: Box::new(body.lower(cfg)),
             },
             CfgNode::Continue => RegionNode::Continue,
