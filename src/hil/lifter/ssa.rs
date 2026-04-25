@@ -13,8 +13,6 @@ pub type SymbolId = Id<Symbol>;
 pub struct Symbol {
     /// The original storage role this symbol represents.
     pub kind: SymbolKind,
-    /// The mutability type of this symbol.
-    pub mutability: Mutability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,38 +42,26 @@ impl Symbol {
     pub fn reg(reg: u8) -> Self {
         Self {
             kind: SymbolKind::Register(reg),
-            mutability: Mutability::Immutable,
         }
     }
 
     pub fn upval(index: u8) -> Self {
         Self {
             kind: SymbolKind::Upvalue(index),
-            mutability: Mutability::Immutable,
         }
     }
 
     pub fn captured_reg(reg: u8, generation: u16) -> Self {
         Self {
             kind: SymbolKind::CapturedRegister { reg, generation },
-            mutability: Mutability::Immutable,
         }
     }
 
     pub fn param(index: u8) -> Self {
         Self {
             kind: SymbolKind::Param(index),
-            mutability: Mutability::Immutable,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Mutability {
-    /// Never reassigned
-    Immutable,
-    /// Reassigned at some point
-    Mutable,
 }
 
 pub struct Ssa<'a> {
@@ -235,10 +221,7 @@ impl<'a> Ssa<'a> {
 
         let replacement = same.unwrap_or_else(|| {
             let kind = self.arena[phi_sym].kind;
-            self.arena.alloc(Symbol {
-                kind,
-                mutability: Mutability::Immutable,
-            })
+            self.arena.alloc(Symbol { kind })
         });
 
         self.phi_to_operands.remove(&phi_sym);

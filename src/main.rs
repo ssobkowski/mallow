@@ -1,19 +1,18 @@
 mod ast;
 mod common;
 mod disasm;
+mod emitter;
 mod hil;
 mod il;
 mod logging;
 mod printer;
 mod scopes;
-mod structurer;
 
 use std::{path::PathBuf, process::Command};
 
 use clap::{Parser, Subcommand};
 
 use crate::{
-    ast::Stmt,
     disasm::{DisasmError, Disassembly},
     hil::StructuredFunction,
     logging::verbose,
@@ -93,20 +92,22 @@ fn decompile_bytecode(bytecode: &[u8]) -> Result<String, DisasmError> {
         .iter()
         .map(|proto| StructuredFunction::from_proto(proto, &diasssembled.protos))
         .collect();
+    let error = fns.iter().any(|f| !f.was_reduced);
 
     verbose!("running passes...");
     hil::passes::run(&mut fns);
 
-    let mut ast = structurer::structure(fns, diasssembled.entry_proto as usize);
-    ast.stmts.insert(
-        0,
-        Stmt::Comment {
-            // this \n is technically wrong but i don't care, it's hack to get a whitespace after this header
-            text: format!("Decompiled by mallow {}\n", env!("CARGO_PKG_VERSION")),
-        },
-    );
+    let ast = emitter::emit_ast(fns, diasssembled.entry_proto as usize);
 
-    Ok(printer::print(&ast))
+    let mut comments = vec![format!(
+        "Decompiled by mallow {}",
+        env!("CARGO_PKG_VERSION")
+    )];
+    if error {
+        comments.push("Failed to structure all functions - output may be incomplete".to_string());
+    }
+
+    Ok(printer::print(&ast, &comments))
 }
 
 fn main() {

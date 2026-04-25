@@ -42,6 +42,8 @@ pub struct StructuredFunction {
     pub upvalues: Vec<SymbolId>,
     pub is_vararg: bool,
     pub return_arity: Option<ReturnArity>,
+
+    pub was_reduced: bool,
 }
 
 impl StructuredFunction {
@@ -75,6 +77,7 @@ impl StructuredFunction {
             upvalues,
             is_vararg: proto.is_vararg,
             return_arity: None,
+            was_reduced,
         }
     }
 }

@@ -6,10 +6,23 @@ use crate::{
     common::escape_string,
 };
 
-pub fn print(block: &Block) -> String {
+pub fn print(block: &Block, top_comments: &[String]) -> String {
+    let mut buf = String::new();
+
+    if !top_comments.is_empty() {
+        for comment in top_comments {
+            buf.push_str("-- ");
+            buf.push_str(comment);
+            buf.push('\n');
+        }
+        buf.push('\n');
+    }
+
     let mut printer = AstPrinter::new();
     printer.walk_block(block);
-    printer.finish()
+    buf.push_str(&printer.finish());
+    buf.push('\n');
+    buf
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

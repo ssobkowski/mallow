@@ -1,5 +1,5 @@
 local function fallback(value)
-    return "[" .. tostring(value) .. "]"
+    return `[{value}]`
 end
 
 local function choose(n, value)

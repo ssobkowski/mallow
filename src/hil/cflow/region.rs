@@ -17,6 +17,8 @@ enum Loop {
     While {
         cond: HilExpr,
         exit_block: usize,
+        guard: Option<GuardTree>,
+        absorbed: Vec<usize>,
     },
     RepeatUntil {
         // We don't need to hold cond here as it's a conditional jump inside the body.
@@ -38,6 +40,46 @@ enum Loop {
         prep_block: usize,
         exit_block: usize,
     },
+}
+
+#[derive(Debug, Clone)]
+enum GuardTree {
+    Body,
+    Exit,
+    Branch {
+        node: usize,
+        condition: HilExpr,
+        then_branch: Box<GuardTree>,
+        else_branch: Box<GuardTree>,
+    },
+}
+
+#[derive(Debug)]
+struct GuardBuild {
+    tree: GuardTree,
+    exit_block: Option<usize>,
+    has_body: bool,
+    absorbed: HashSet<usize>,
+}
+
+impl GuardBuild {
+    fn body() -> Self {
+        Self {
+            tree: GuardTree::Body,
+            exit_block: None,
+            has_body: true,
+            absorbed: HashSet::new(),
+        }
+    }
+
+    fn exit(exit_block: usize) -> Self {
+        Self {
+            tree: GuardTree::Exit,
+            exit_block: Some(exit_block),
+            has_body: false,
+            absorbed: HashSet::new(),
+        }
+    }
 }
 
 impl Loop {
@@ -158,10 +200,26 @@ impl CfgNode {
         exit: usize,
         cfg: &ControlFlowGraph,
         region_map: &HashMap<usize, usize>,
+        require_empty_continue_target: bool,
     ) {
+        let is_continue_target = |raw_target: usize, active_target: usize| {
+            if active_target == continue_target {
+                !require_empty_continue_target || cfg.blocks[raw_target].stmts.is_empty()
+            } else {
+                continue_target_alt.is_some_and(|target| raw_target == target)
+            }
+        };
+
         match self {
             CfgNode::Sequence { nodes } => nodes.iter_mut().for_each(|n| {
-                n.resolve_escapes(continue_target, continue_target_alt, exit, cfg, region_map)
+                n.resolve_escapes(
+                    continue_target,
+                    continue_target_alt,
+                    exit,
+                    cfg,
+                    region_map,
+                    require_empty_continue_target,
+                )
             }),
             CfgNode::If {
                 then_branch,
@@ -174,9 +232,17 @@ impl CfgNode {
                     exit,
                     cfg,
                     region_map,
+                    require_empty_continue_target,
                 );
                 if let Some(e) = else_branch {
-                    e.resolve_escapes(continue_target, continue_target_alt, exit, cfg, region_map);
+                    e.resolve_escapes(
+                        continue_target,
+                        continue_target_alt,
+                        exit,
+                        cfg,
+                        region_map,
+                        require_empty_continue_target,
+                    );
                 }
             }
             CfgNode::BasicBlock { block } => {
@@ -185,7 +251,7 @@ impl CfgNode {
                 let replacement = match exit_node {
                     BlockExit::Jump(raw_target) => {
                         let active = region_map[raw_target];
-                        if active == continue_target {
+                        if is_continue_target(*raw_target, active) {
                             Some(CfgNode::Continue)
                         } else if active == exit {
                             Some(CfgNode::Break)
@@ -209,9 +275,7 @@ impl CfgNode {
                         let active_then = region_map[then_block];
                         let active_else = region_map[else_block];
 
-                        let then_terminal = if active_then == continue_target
-                            || continue_target_alt.is_some_and(|t| *then_block == t)
-                        {
+                        let then_terminal = if is_continue_target(*then_block, active_then) {
                             Some(CfgNode::Continue)
                         } else if active_then == exit {
                             Some(CfgNode::Break)
@@ -219,9 +283,7 @@ impl CfgNode {
                             None
                         };
 
-                        let else_terminal = if active_else == continue_target
-                            || continue_target_alt.is_some_and(|t| *else_block == t)
-                        {
+                        let else_terminal = if is_continue_target(*else_block, active_else) {
                             Some(CfgNode::Continue)
                         } else if active_else == exit {
                             Some(CfgNode::Break)
@@ -852,36 +914,98 @@ impl<'a> FoldableGraph<'a> {
         }
 
         // Neither branch always escapes, but both targets are present in the body.
-        // Restructure into an if-then-else to properly represent the conditional.
-        // Remaining nodes (after removing then and else targets) are appended to
-        // the then branch, as they logically belong to the "then" path's fall-through.
+        // Preserve the historical fall-through fold for ordinary guard shapes.
+        // The wider segment fold below is only for flattened loop regions, where
+        // the prep block and structured loop become adjacent siblings.
+        let has_flattened_loop_region = nodes.iter().any(|node| {
+            matches!(
+                node,
+                CfgNode::NumericFor { .. } | CfgNode::GenericFor { .. }
+            )
+        });
+
+        if !has_flattened_loop_region {
+            let mut then_node_val = None;
+            let mut else_node_val = None;
+            let mut remove_order = [then_idx, else_idx];
+            remove_order.sort_unstable_by(|a, b| b.cmp(a));
+
+            for idx in remove_order {
+                let removed = nodes.remove(idx);
+                if idx == then_idx {
+                    then_node_val = Some(removed);
+                } else {
+                    else_node_val = Some(removed);
+                }
+            }
+
+            let then_branch = CfgNode::merge(std::iter::once(then_node_val.unwrap()).chain(nodes));
+            let else_branch = else_node_val.unwrap();
+
+            return CfgNode::Sequence {
+                nodes: vec![
+                    head_node,
+                    CfgNode::If {
+                        condition: cond,
+                        then_branch: Box::new(then_branch),
+                        else_branch: Some(Box::new(else_branch)),
+                    },
+                ],
+            };
+        }
+
+        // Loop nodes can be flattened into adjacent siblings here. The branch is
+        // the target prelude plus the immediately following structured loop, not
+        // the later shared continuation.
+        let branch_end = |start: usize| {
+            let mut end = start + 1;
+            if matches!(
+                nodes.get(end),
+                Some(CfgNode::NumericFor { .. } | CfgNode::GenericFor { .. })
+            ) {
+                end += 1;
+            }
+            end
+        };
+
+        let then_end = branch_end(then_idx);
+        let else_end = branch_end(else_idx);
+
+        let ranges_overlap = then_idx < else_end && else_idx < then_end;
+        if ranges_overlap || then_idx == then_end || else_idx == else_end {
+            return CfgNode::merge([head_node, CfgNode::Sequence { nodes }]);
+        }
+
         let mut then_node_val = None;
         let mut else_node_val = None;
-        let mut remove_order = [then_idx, else_idx];
-        remove_order.sort_unstable_by(|a, b| b.cmp(a));
 
-        for idx in remove_order {
-            let removed = nodes.remove(idx);
-            if idx == then_idx {
-                then_node_val = Some(removed);
+        let mut remaining = Vec::with_capacity(nodes.len());
+        for (idx, node) in nodes.into_iter().enumerate() {
+            if (then_idx..then_end).contains(&idx) {
+                then_node_val.get_or_insert_with(|| CfgNode::Sequence { nodes: Vec::new() });
+                if let Some(CfgNode::Sequence { nodes }) = &mut then_node_val {
+                    nodes.push(node);
+                }
+            } else if (else_idx..else_end).contains(&idx) {
+                else_node_val.get_or_insert_with(|| CfgNode::Sequence { nodes: Vec::new() });
+                if let Some(CfgNode::Sequence { nodes }) = &mut else_node_val {
+                    nodes.push(node);
+                }
             } else {
-                else_node_val = Some(removed);
+                remaining.push(node);
             }
         }
 
-        let then_branch = CfgNode::merge(std::iter::once(then_node_val.unwrap()).chain(nodes));
-        let else_branch = else_node_val.unwrap();
+        let mut folded = Vec::with_capacity(remaining.len() + 2);
+        folded.push(head_node);
+        folded.push(CfgNode::If {
+            condition: cond,
+            then_branch: Box::new(then_node_val.unwrap()),
+            else_branch: Some(Box::new(else_node_val.unwrap())),
+        });
+        folded.extend(remaining);
 
-        CfgNode::Sequence {
-            nodes: vec![
-                head_node,
-                CfgNode::If {
-                    condition: cond,
-                    then_branch: Box::new(then_branch),
-                    else_branch: Some(Box::new(else_branch)),
-                },
-            ],
-        }
+        CfgNode::Sequence { nodes: folded }
     }
 
     /// Folds one conditional in a sequence into an explicit escape guard.
@@ -1166,6 +1290,182 @@ impl<'a> FoldableGraph<'a> {
         false
     }
 
+    fn collapse_acyclic_conditional(&mut self) -> bool {
+        let mut work = self.post_order();
+        work.reverse();
+
+        while let Some(head) = work.pop() {
+            if !self.nodes.contains_key(&head) || self.exact_successors::<2>(head).is_none() {
+                continue;
+            }
+
+            let Some(tail) = self.get_or_calc_postidoms().get(&head).copied() else {
+                continue;
+            };
+
+            let Some((mut cond, raw_then, raw_else)) = self.extract_cond_jump(&self.nodes[&head])
+            else {
+                continue;
+            };
+
+            let active_then = self.region_for_block[&raw_then];
+            let active_else = self.region_for_block[&raw_else];
+            let Some([left, right]) = self.exact_successors(head) else {
+                continue;
+            };
+
+            let (then_start, else_start) = if left == active_then && right == active_else {
+                (left, right)
+            } else if left == active_else && right == active_then {
+                cond = invert_condition(cond);
+                (right, left)
+            } else {
+                continue;
+            };
+
+            let mut then_seen = HashSet::new();
+            let Some((then_branch, then_used)) =
+                self.build_acyclic_branch(then_start, tail, &mut then_seen)
+            else {
+                continue;
+            };
+
+            let mut else_seen = HashSet::new();
+            let Some((else_branch, else_used)) =
+                self.build_acyclic_branch(else_start, tail, &mut else_seen)
+            else {
+                continue;
+            };
+
+            if then_used.is_empty() && else_used.is_empty() {
+                continue;
+            }
+
+            let mut used = then_used;
+            used.extend(else_used);
+            used.remove(&tail);
+            used.remove(&head);
+
+            if !self.is_closed_conditional_region(head, tail, &used) {
+                continue;
+            }
+
+            let new_id = self.next_id();
+            let header_node = self.nodes.remove(&head).unwrap();
+            for node in &used {
+                self.nodes.remove(node);
+            }
+
+            let if_node = build_if_node(cond, then_branch, else_branch)
+                .expect("empty conditional region was skipped");
+
+            self.nodes
+                .insert(new_id, CfgNode::merge([header_node, if_node]));
+
+            self.update_regionmap(|val| val == head || used.contains(&val), new_id);
+            self.transfer_predecessors(head, new_id);
+
+            for node in &used {
+                self.successors.remove(node);
+                self.predecessors.remove(node);
+            }
+            self.successors.remove(&head);
+
+            if let Some(tail_preds) = self.predecessors.get_mut(&tail) {
+                tail_preds.retain(|&p| p != head && !used.contains(&p));
+                tail_preds.push(new_id);
+            }
+            self.successors.insert(new_id, vec![tail]);
+
+            if head == self.entry_node {
+                self.entry_node = new_id;
+            }
+            self.invalidate_doms();
+
+            return true;
+        }
+
+        false
+    }
+
+    fn build_acyclic_branch(
+        &self,
+        node: usize,
+        tail: usize,
+        seen: &mut HashSet<usize>,
+    ) -> Option<(CfgNode, HashSet<usize>)> {
+        if node == tail {
+            return Some((CfgNode::Sequence { nodes: Vec::new() }, HashSet::new()));
+        }
+        if !seen.insert(node) {
+            return None;
+        }
+
+        let current = self.nodes.get(&node)?.clone();
+        let mut used = HashSet::from([node]);
+
+        match self.successors.get(&node).map(Vec::as_slice).unwrap_or(&[]) {
+            [] => Some((current, used)),
+            [next] => {
+                let (next_node, next_used) = self.build_acyclic_branch(*next, tail, seen)?;
+                used.extend(next_used);
+                Some((CfgNode::merge([current, next_node]), used))
+            }
+            [left, right] => {
+                let (mut cond, raw_then, raw_else) = self.extract_cond_jump(&current)?;
+                let active_then = self.region_for_block[&raw_then];
+                let active_else = self.region_for_block[&raw_else];
+
+                let (then_start, else_start) = if *left == active_then && *right == active_else {
+                    (*left, *right)
+                } else if *left == active_else && *right == active_then {
+                    cond = invert_condition(cond);
+                    (*right, *left)
+                } else {
+                    return None;
+                };
+
+                let mut then_seen = seen.clone();
+                let (then_branch, then_used) =
+                    self.build_acyclic_branch(then_start, tail, &mut then_seen)?;
+                let mut else_seen = seen.clone();
+                let (else_branch, else_used) =
+                    self.build_acyclic_branch(else_start, tail, &mut else_seen)?;
+
+                used.extend(then_used);
+                used.extend(else_used);
+
+                let Some(branch) = build_if_node(cond, then_branch, else_branch) else {
+                    return Some((current, used));
+                };
+
+                Some((CfgNode::merge([current, branch]), used))
+            }
+            _ => None,
+        }
+    }
+
+    fn is_closed_conditional_region(
+        &self,
+        head: usize,
+        tail: usize,
+        nodes: &HashSet<usize>,
+    ) -> bool {
+        nodes.iter().all(|node| {
+            self.predecessors
+                .get(node)
+                .into_iter()
+                .flatten()
+                .all(|pred| *pred == head || nodes.contains(pred))
+                && self
+                    .successors
+                    .get(node)
+                    .into_iter()
+                    .flatten()
+                    .all(|succ| *succ == tail || nodes.contains(succ))
+        })
+    }
+
     /// Returns the first found backedge from `node` if one exists, otherwise `None`.
     fn find_backedge(&mut self, node: usize) -> Option<usize> {
         for i in 0..self.predecessors.get(&node)?.len() {
@@ -1309,6 +1609,17 @@ impl<'a> FoldableGraph<'a> {
             let then_in_body = body_blocks.contains(&active_then) || active_then == tail;
             let else_in_body = body_blocks.contains(&active_else) || active_else == tail;
 
+            if let Some(guard) = self.build_loop_guard(head, tail, body_blocks)
+                && !guard.absorbed.is_empty()
+            {
+                return Some(Loop::While {
+                    cond: HilExpr::Bool(true),
+                    exit_block: guard.exit_block?,
+                    guard: Some(guard.tree),
+                    absorbed: guard.absorbed.into_iter().collect(),
+                });
+            }
+
             if then_in_body != else_in_body {
                 let (exit_block, invert) = if then_in_body {
                     (active_else, false)
@@ -1320,11 +1631,206 @@ impl<'a> FoldableGraph<'a> {
                 return Some(Loop::While {
                     cond: final_cond,
                     exit_block,
+                    guard: None,
+                    absorbed: Vec::new(),
+                });
+            }
+
+            if let Some(guard) = self.build_loop_guard(head, tail, body_blocks) {
+                return Some(Loop::While {
+                    cond: HilExpr::Bool(true),
+                    exit_block: guard.exit_block?,
+                    guard: Some(guard.tree),
+                    absorbed: guard.absorbed.into_iter().collect(),
                 });
             }
         }
 
         None
+    }
+
+    fn build_loop_guard(
+        &self,
+        head: usize,
+        tail: usize,
+        body_blocks: &HashSet<usize>,
+    ) -> Option<GuardBuild> {
+        let mut seen = HashSet::new();
+        let guard = self.build_guard_tree(head, head, tail, body_blocks, &mut seen)?;
+
+        if guard.has_body && guard.exit_block.is_some() {
+            Some(guard)
+        } else {
+            None
+        }
+    }
+
+    fn build_guard_tree(
+        &self,
+        node: usize,
+        head: usize,
+        tail: usize,
+        body_blocks: &HashSet<usize>,
+        seen: &mut HashSet<usize>,
+    ) -> Option<GuardBuild> {
+        if !seen.insert(node) || !self.is_guard_condition_node(node) {
+            return None;
+        }
+
+        let (condition, raw_then, raw_else) = self.extract_cond_jump(&self.nodes[&node])?;
+        let mut then_seen = seen.clone();
+        let mut else_seen = seen.clone();
+        let mut then_branch =
+            self.build_guard_successor(raw_then, head, tail, body_blocks, &mut then_seen);
+        let mut else_branch =
+            self.build_guard_successor(raw_else, head, tail, body_blocks, &mut else_seen);
+
+        if then_branch.exit_block.is_none()
+            && !then_branch.has_body
+            && else_branch.exit_block.is_none()
+            && !else_branch.has_body
+        {
+            return None;
+        }
+
+        let exit_block = match (then_branch.exit_block, else_branch.exit_block) {
+            (Some(left), Some(right)) if left == right => Some(left),
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (None, None) => None,
+            (Some(_), Some(_)) => return None,
+        };
+
+        let mut absorbed = HashSet::new();
+        absorbed.extend(then_branch.absorbed.drain());
+        absorbed.extend(else_branch.absorbed.drain());
+        if node != head {
+            absorbed.insert(node);
+        }
+
+        Some(GuardBuild {
+            tree: GuardTree::Branch {
+                node,
+                condition,
+                then_branch: Box::new(then_branch.tree),
+                else_branch: Box::new(else_branch.tree),
+            },
+            exit_block,
+            has_body: then_branch.has_body || else_branch.has_body,
+            absorbed,
+        })
+    }
+
+    fn build_guard_successor(
+        &self,
+        raw_target: usize,
+        head: usize,
+        tail: usize,
+        body_blocks: &HashSet<usize>,
+        seen: &mut HashSet<usize>,
+    ) -> GuardBuild {
+        let Some(&active) = self.region_for_block.get(&raw_target) else {
+            return GuardBuild::exit(raw_target);
+        };
+
+        if self.is_guard_condition_node(active)
+            && let Some(guard) = self.build_guard_tree(active, head, tail, body_blocks, seen)
+            && guard.exit_block.is_some()
+        {
+            return guard;
+        }
+
+        if active != raw_target
+            && self.nodes.contains_key(&raw_target)
+            && self.is_guard_condition_node(raw_target)
+            && let Some(guard) = self.build_guard_tree(raw_target, head, tail, body_blocks, seen)
+            && guard.exit_block.is_some()
+        {
+            return guard;
+        }
+
+        if active == tail || active == head {
+            return GuardBuild::body();
+        }
+
+        if !body_blocks.contains(&active) {
+            return GuardBuild::exit(active);
+        }
+
+        GuardBuild::body()
+    }
+
+    fn is_guard_condition_node(&self, node: usize) -> bool {
+        self.extract_cond_jump(&self.nodes[&node]).is_some()
+            && self.node_has_only_pure_assigns(&self.nodes[&node])
+    }
+
+    fn node_has_only_pure_assigns(&self, node: &CfgNode) -> bool {
+        match node {
+            CfgNode::BasicBlock { block } => self.cfg.blocks[*block].stmts.iter().all(|stmt| {
+                matches!(
+                    &stmt.inner,
+                    HilStmt::Assign { value, .. } if is_condition_prelude_value(value)
+                )
+            }),
+            CfgNode::Sequence { nodes } => nodes
+                .iter()
+                .all(|node| self.node_has_only_pure_assigns(node)),
+            _ => false,
+        }
+    }
+
+    fn build_guard_node(
+        &self,
+        guard: &GuardTree,
+        head: usize,
+        head_node: &CfgNode,
+        break_payload: &CfgNode,
+    ) -> Option<CfgNode> {
+        match guard {
+            GuardTree::Body => None,
+            GuardTree::Exit => Some(break_payload.clone()),
+            GuardTree::Branch {
+                node,
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let then_node = self.build_guard_node(then_branch, head, head_node, break_payload);
+                let else_node = self.build_guard_node(else_branch, head, head_node, break_payload);
+
+                let guard_if = match (then_node, else_node) {
+                    (Some(then_branch), Some(else_branch)) => CfgNode::If {
+                        condition: condition.clone(),
+                        then_branch: Box::new(then_branch),
+                        else_branch: Some(Box::new(else_branch)),
+                    },
+                    (Some(then_branch), None) => CfgNode::If {
+                        condition: condition.clone(),
+                        then_branch: Box::new(then_branch),
+                        else_branch: None,
+                    },
+                    (None, Some(else_branch)) => CfgNode::If {
+                        condition: invert_condition(condition.clone()),
+                        then_branch: Box::new(else_branch),
+                        else_branch: None,
+                    },
+                    (None, None) => return None,
+                };
+
+                let condition_node = if *node == head {
+                    head_node.clone()
+                } else {
+                    self.nodes[node].clone()
+                };
+
+                if self.node_emits_statements(&condition_node) {
+                    Some(CfgNode::merge([condition_node, guard_if]))
+                } else {
+                    Some(guard_if)
+                }
+            }
+        }
     }
 
     fn forward_jump_exit(&self, exit_block: usize, loop_head: usize) -> usize {
@@ -1365,7 +1871,12 @@ impl<'a> FoldableGraph<'a> {
                 // 1. while: the backedge is an unconditional jump, while the head either jumps to the body or the loop exit
                 // 2. repeat..until: the backedge is a conditional jump, the header can be any block
                 if let Some(kind) = self.identify_loop(head, tail, &body_blocks_used) {
-                    let body_blocks_used = self.get_loop_region(head, kind.exit_block());
+                    let mut body_blocks_used = self.get_loop_region(head, kind.exit_block());
+                    if let Loop::While { absorbed, .. } = &kind {
+                        for block in absorbed {
+                            body_blocks_used.remove(block);
+                        }
+                    }
 
                     let mut body_nodes: Vec<_> = self
                         .nodes
@@ -1388,12 +1899,15 @@ impl<'a> FoldableGraph<'a> {
                         Loop::While { .. } => (head, Some(tail)),
                         _ => (tail, None),
                     };
+                    let require_empty_continue_target =
+                        matches!(&kind, Loop::NumericFor { .. } | Loop::GenericFor { .. });
                     body_ast.resolve_escapes(
                         continue_tgt,
                         continue_tgt_alt,
                         kind.exit_block(),
                         self.cfg,
                         &self.region_for_block,
+                        require_empty_continue_target,
                     );
 
                     let loop_id = self.next_id();
@@ -1401,7 +1915,13 @@ impl<'a> FoldableGraph<'a> {
 
                     let mut absorbed_blocks = HashSet::new();
                     let (region_entry, loop_node, exit_block) = match kind {
-                        Loop::While { cond, exit_block } => {
+                        Loop::While {
+                            cond,
+                            exit_block,
+                            guard,
+                            absorbed,
+                        } => {
+                            absorbed_blocks.extend(absorbed);
                             let mut effective_exit = exit_block;
                             let mut break_payload = CfgNode::Break;
 
@@ -1419,10 +1939,22 @@ impl<'a> FoldableGraph<'a> {
                                 }
                             }
 
-                            let must_guard = self.node_emits_statements(&head_node)
-                                || !matches!(break_payload, CfgNode::Break);
+                            let loop_node = if let Some(guard) = guard {
+                                let guard_node = self
+                                    .build_guard_node(&guard, head, &head_node, &break_payload)
+                                    .unwrap_or_else(|| CfgNode::If {
+                                        condition: invert_condition(cond.clone()),
+                                        then_branch: Box::new(break_payload.clone()),
+                                        else_branch: None,
+                                    });
 
-                            let loop_node = if must_guard {
+                                CfgNode::While {
+                                    condition: HilExpr::Bool(true),
+                                    body: Box::new(CfgNode::merge([guard_node, body_ast])),
+                                }
+                            } else if self.node_emits_statements(&head_node)
+                                || !matches!(break_payload, CfgNode::Break)
+                            {
                                 let mut parts = Vec::with_capacity(3);
                                 if self.node_emits_statements(&head_node) {
                                     parts.push(head_node);
@@ -1613,6 +2145,10 @@ impl<'a> FoldableGraph<'a> {
                 continue;
             }
 
+            if self.collapse_acyclic_conditional() {
+                continue;
+            }
+
             if self.collapse_loops() {
                 continue;
             }
@@ -1677,6 +2213,19 @@ pub fn build_idoms_sparse(
     sparse_doms
 }
 
+fn is_condition_prelude_value(expr: &HilExpr) -> bool {
+    matches!(
+        expr,
+        HilExpr::Nil
+            | HilExpr::Number(_)
+            | HilExpr::String(_)
+            | HilExpr::Bool(_)
+            | HilExpr::Symbol(_)
+            | HilExpr::Import(_)
+            | HilExpr::Global(_)
+    )
+}
+
 fn flatten_regions(nodes: Vec<RegionNode>) -> Vec<RegionNode> {
     let mut out = Vec::new();
 
@@ -1690,6 +2239,35 @@ fn flatten_regions(nodes: Vec<RegionNode>) -> Vec<RegionNode> {
     }
 
     out
+}
+
+fn is_empty_node(node: &CfgNode) -> bool {
+    matches!(node, CfgNode::Sequence { nodes } if nodes.is_empty())
+}
+
+fn build_if_node(
+    condition: HilExpr,
+    then_branch: CfgNode,
+    else_branch: CfgNode,
+) -> Option<CfgNode> {
+    match (is_empty_node(&then_branch), is_empty_node(&else_branch)) {
+        (false, false) => Some(CfgNode::If {
+            condition,
+            then_branch: Box::new(then_branch),
+            else_branch: Some(Box::new(else_branch)),
+        }),
+        (false, true) => Some(CfgNode::If {
+            condition,
+            then_branch: Box::new(then_branch),
+            else_branch: None,
+        }),
+        (true, false) => Some(CfgNode::If {
+            condition: invert_condition(condition),
+            then_branch: Box::new(else_branch),
+            else_branch: None,
+        }),
+        (true, true) => None,
+    }
 }
 
 pub fn structure(cfg: &ControlFlowGraph) -> (RegionNode, bool) {
