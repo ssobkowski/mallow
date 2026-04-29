@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 
 use crate::{
     disasm::{DisasmError, Disassembly},
+    emitter::options::EmitterOptions,
     hil::StructuredFunction,
     logging::verbose,
 };
@@ -49,6 +50,10 @@ enum Commands {
         /// Output file path. Prints to stdout if omitted
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
+        #[arg(long)]
+        spill_locals: bool,
     },
     /// Compile a Luau source file and decompile the resulting bytecode
     Roundtrip {
@@ -59,6 +64,10 @@ enum Commands {
         /// Output file path. Prints to stdout if omitted
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
+        #[arg(long)]
+        spill_locals: bool,
     },
     /// Generate a control flow graph visualization for a bytecode file
     #[cfg(feature = "visualize")]
@@ -84,7 +93,7 @@ fn disassemble_bytecode(bytecode: &[u8]) -> Result<Disassembly, DisasmError> {
     Ok(d)
 }
 
-fn decompile_bytecode(bytecode: &[u8]) -> Result<String, DisasmError> {
+fn decompile_bytecode(bytecode: &[u8], options: EmitterOptions) -> Result<String, DisasmError> {
     let diasssembled = disassemble_bytecode(bytecode)?;
 
     let mut fns: Vec<_> = diasssembled
@@ -97,7 +106,7 @@ fn decompile_bytecode(bytecode: &[u8]) -> Result<String, DisasmError> {
     verbose!("running passes...");
     hil::passes::run(&mut fns);
 
-    let ast = emitter::emit_ast(fns, diasssembled.entry_proto as usize);
+    let ast = emitter::emit_ast(fns, diasssembled.entry_proto as usize, options);
 
     let mut comments = vec![format!(
         "Decompiled by mallow {}",
@@ -128,11 +137,15 @@ fn main() {
                 Err(e) => eprintln!("Error during disassembly: {}", e),
             }
         }
-        Commands::Decompile { input, output } => {
+        Commands::Decompile {
+            input,
+            output,
+            spill_locals,
+        } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
 
             verbose!("decompiling...");
-            let code = match decompile_bytecode(&bytecode) {
+            let code = match decompile_bytecode(&bytecode, EmitterOptions { spill_locals }) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Error during decompilation: {}", e);
@@ -144,7 +157,11 @@ fn main() {
                 eprintln!("Error writing decompilation output: {e}");
             }
         }
-        Commands::Roundtrip { input, output } => {
+        Commands::Roundtrip {
+            input,
+            output,
+            spill_locals,
+        } => {
             let compile_out = match Command::new("luau-compile")
                 .arg("--binary")
                 .arg(input)
@@ -162,13 +179,14 @@ fn main() {
                 return;
             }
 
-            let code = match decompile_bytecode(&compile_out.stdout) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error during decompilation: {}", e);
-                    return;
-                }
-            };
+            let code =
+                match decompile_bytecode(&compile_out.stdout, EmitterOptions { spill_locals }) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error during decompilation: {}", e);
+                        return;
+                    }
+                };
 
             if let Err(e) = write_output(output, &code) {
                 eprintln!("Error writing decompilation output: {e}");

@@ -49,6 +49,13 @@ impl<K: Hash + Eq, V> Scope<K, V> {
     pub fn contains(&self, name: &K) -> bool {
         self.variables.contains_key(name)
     }
+
+    /// Returns the number of variables in the scope.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.variables.len()
+    }
 }
 
 impl<K: Hash + Eq, V> Index<&K> for Scope<K, V> {
@@ -86,6 +93,12 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
         self.scopes.last_mut().expect("scope was just pushed")
     }
 
+    /// Returns the top scope, if it exists.
+    #[inline]
+    pub fn top_scope(&self) -> Option<&Scope<K, V>> {
+        self.scopes.last()
+    }
+
     /// Gets the current scope mutably, if it exists.
     #[inline]
     pub fn top_scope_mut(&mut self) -> Option<&mut Scope<K, V>> {
@@ -120,5 +133,12 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
     #[inline]
     pub fn contains(&self, name: &K) -> bool {
         self.iter().any(|s| s.contains(name))
+    }
+
+    /// Returns the value of the given name, if it is declared in the current
+    /// scope or any parent scopes.
+    #[inline]
+    pub fn get(&self, name: &K) -> Option<&V> {
+        self.iter().find_map(|s| s.get(name))
     }
 }

@@ -234,7 +234,7 @@ impl AstPrinter {
                 self.write("else");
                 self.newline();
                 self.indent += 1;
-                self.walk_block(&block);
+                self.walk_block(block);
                 self.indent -= 1;
             }
             None => {}
