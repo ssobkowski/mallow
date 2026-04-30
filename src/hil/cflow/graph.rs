@@ -736,6 +736,7 @@ impl ControlFlowGraph {
 
         let live_in_regs = compute_live_in_registers(&blocks, &raw_blocks, &successors, &ssa);
 
+        let mut loop_carried_versions = Vec::new();
         for (src, targets) in successors.iter().enumerate() {
             for &target in targets {
                 if target <= src {
@@ -771,8 +772,15 @@ impl ControlFlowGraph {
                     }
 
                     for reg in written_regs {
-                        if live_in_regs[target].contains(&reg) || loop_live_out.contains(&reg) {
-                            ssa.read_reg(target, reg);
+                        if live_in_regs[target].contains(&reg)
+                            || loop_live_out.contains(&reg)
+                            || (target == 0 && reg < proto.num_params)
+                        {
+                            let target_sym = ssa.read_reg(target, reg);
+                            let source_sym = ssa.read_reg(src, reg);
+                            if target_sym != source_sym {
+                                loop_carried_versions.push((target_sym, source_sym));
+                            }
                         }
                     }
                 }
@@ -783,6 +791,9 @@ impl ControlFlowGraph {
         ssa.finish(&mut blocks);
 
         let mut disjoint_set = UnionFind::new();
+        for (target, source) in loop_carried_versions {
+            disjoint_set.union(target, source);
+        }
         for (block_idx, block) in blocks.iter().enumerate() {
             for stmt in &block.stmts {
                 if let HilStmt::Phi(phi) = &stmt.inner {

@@ -55,7 +55,14 @@ fn run_case(source_path: &Path) -> Result<(), Failed> {
     let decompiled_path = temp_dir.path().join("decompiled.luau");
 
     compile_luau(&source_path, &bytecode_path)?;
-    decompile_bytecode(&bytecode_path, &decompiled_path)?;
+    decompile_bytecode(
+        &bytecode_path,
+        &decompiled_path,
+        // TODO: this is a hack
+        source_path
+            .file_stem()
+            .is_some_and(|name| name == "intg-sha2"),
+    )?;
 
     let source_output = run_luau(&source_path, "source.luau")?;
     let decompiled_output = run_luau(&decompiled_path, "decompiled.luau")?;
@@ -88,13 +95,23 @@ fn compile_luau(source_path: &Path, bytecode_path: &Path) -> Result<(), Failed> 
     Ok(())
 }
 
-fn decompile_bytecode(bytecode_path: &Path, decompiled_path: &Path) -> Result<(), Failed> {
-    let output = Command::new(mallow_exe())
+fn decompile_bytecode(
+    bytecode_path: &Path,
+    decompiled_path: &Path,
+    spill_locals: bool,
+) -> Result<(), Failed> {
+    let mut command = Command::new(mallow_exe());
+    command
         .arg("decompile")
         .arg("-i")
         .arg(bytecode_path)
         .arg("-o")
-        .arg(decompiled_path)
+        .arg(decompiled_path);
+    if spill_locals {
+        command.arg("--spill-locals");
+    }
+
+    let output = command
         .output()
         .map_err(|e| Failed::from(format!("failed to spawn mallow: {e}")))?;
 

@@ -389,18 +389,24 @@ impl CfgNode {
         }
     }
 
+    /// Returns the first raw basic block contained in this structured node.
+    ///
+    /// Post-structuring cleanup uses this to relate a structured loop body back to
+    /// the raw CFG edge that re-enters it.
+    fn first_block(&self) -> Option<usize> {
+        match self {
+            CfgNode::BasicBlock { block } => Some(*block),
+            CfgNode::Sequence { nodes } => nodes.first().and_then(|n| n.first_block()),
+            _ => None,
+        }
+    }
+
     /// Returns whether this node starts with the given raw CFG block.
     ///
     /// Sequence nodes recurse into their first child so merged wrappers do not
     /// hide the real leading block.
     fn starts_with_block(&self, block: usize) -> bool {
-        match self {
-            CfgNode::BasicBlock { block: id } => *id == block,
-            CfgNode::Sequence { nodes } => nodes
-                .first()
-                .is_some_and(|first| first.starts_with_block(block)),
-            _ => false,
-        }
+        self.first_block().is_some_and(|id| id == block)
     }
 
     /// Returns whether this node ends in an explicit terminal statement.
@@ -644,6 +650,30 @@ impl<'a> FoldableGraph<'a> {
         self.postidoms = None;
     }
 
+    /// Removes stale adjacency entries after region nodes have absorbed raw CFG nodes.
+    ///
+    /// Folding keeps the original block IDs inside `CfgNode::BasicBlock` leaves, but
+    /// the folded-away graph node IDs must disappear from `successors` and
+    /// `predecessors`. If they remain, later SESE checks see phantom edges and skip
+    /// otherwise valid conditional or loop folds.
+    fn prune_stale_edges(&mut self) {
+        let live: HashSet<_> = self.nodes.keys().copied().collect();
+
+        self.successors.retain(|node, _| live.contains(node));
+        for succs in self.successors.values_mut() {
+            let mut seen = HashSet::new();
+            succs.retain(|succ| live.contains(succ));
+            succs.retain(|succ| seen.insert(*succ));
+        }
+
+        self.predecessors.retain(|node, _| live.contains(node));
+        for preds in self.predecessors.values_mut() {
+            let mut seen = HashSet::new();
+            preds.retain(|pred| live.contains(pred));
+            preds.retain(|pred| seen.insert(*pred));
+        }
+    }
+
     /// Transfers all predecessors from `from` to `to`, updating the successor list of each predecessor.
     fn transfer_predecessors(&mut self, from: usize, to: usize) {
         let preds = self.predecessors.remove(&from).unwrap_or_default();
@@ -825,15 +855,164 @@ impl<'a> FoldableGraph<'a> {
         }
     }
 
-    /// Restructures a loop header's conditional branch into a structured if-then-else
-    /// or one-armed if guard, pulling the target branches out of the body sequence.
+    /// Returns the normalized `(start, end, step)` shape for a range that contains
+    /// exactly one structured numeric `for` loop.
     ///
-    /// When the loop header has a CondJump, this function identifies the branch targets
-    /// in the body sequence and restructures them. If both targets end with escape
-    /// (break/continue), they're pulled into an if-then-else at the top. If only one
-    /// target escapes, a one-armed guard is created. If neither escapes, both branches
-    /// are still restructured into an if-then-else since the conditional must be
-    /// represented in the output.
+    /// Flattened loop regions often look like:
+    ///
+    /// ```text
+    /// BasicBlock(assign loop bounds)
+    /// NumericFor(start = bound_symbol, end = bound_symbol, step = bound_symbol)
+    /// ```
+    ///
+    /// This helper treats those simple binding blocks as part of the loop range and
+    /// resolves the loop bounds through them, so two adjacent alternatives can be
+    /// compared by value rather than by temporary SSA symbol IDs.
+    fn numeric_for_range_shape(
+        &self,
+        nodes: &[CfgNode],
+        start: usize,
+        end: usize,
+    ) -> Option<(HilExpr, HilExpr, HilExpr)> {
+        let mut bindings = HashMap::new();
+        for node in &nodes[start..end] {
+            self.collect_simple_bindings(node, &mut bindings);
+        }
+
+        // There should be one real loop-emitting node in the range. Binding-only
+        // blocks are allowed because FORNPREP setup can remain as a sibling of the
+        // recovered `NumericFor` node until lowering.
+        let mut shape = None;
+
+        for node in &nodes[start..end] {
+            if let Some((start, end, step)) = self.node_numeric_for_shape(node) {
+                let normalized = (
+                    Self::resolve_simple_binding(start, &bindings),
+                    Self::resolve_simple_binding(end, &bindings),
+                    Self::resolve_simple_binding(step, &bindings),
+                );
+
+                if shape.replace(normalized).is_some() {
+                    return None;
+                }
+            } else if self.node_is_simple_binding_block(node) || !self.node_emits_statements(node) {
+                continue;
+            } else {
+                return None;
+            }
+        }
+
+        shape
+    }
+
+    /// Collects single-symbol assignments that can be used to normalize loop bounds.
+    ///
+    /// The bindings are intentionally shallow and local to the candidate branch
+    /// range. They are used only for shape comparison, not for rewriting the IR.
+    fn collect_simple_bindings(&self, node: &CfgNode, bindings: &mut HashMap<SymbolId, HilExpr>) {
+        match node {
+            CfgNode::BasicBlock { block } => {
+                for stmt in &self.cfg.blocks[*block].stmts {
+                    if let HilStmt::Assign {
+                        left: HilExpr::Symbol(symbol),
+                        value,
+                    } = &stmt.inner
+                    {
+                        bindings.insert(*symbol, value.clone());
+                    }
+                }
+            }
+            CfgNode::Sequence { nodes } => {
+                for node in nodes {
+                    self.collect_simple_bindings(node, bindings);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns true when a node only defines temporary values.
+    ///
+    /// Such blocks are safe to ignore while looking for the numeric-for shape,
+    /// because their statements are loop setup that will still be emitted wherever
+    /// the containing branch is moved.
+    fn node_is_simple_binding_block(&self, node: &CfgNode) -> bool {
+        match node {
+            CfgNode::BasicBlock { block } => self.cfg.blocks[*block].stmts.iter().all(|stmt| {
+                matches!(
+                    &stmt.inner,
+                    HilStmt::Assign {
+                        left: HilExpr::Symbol(_),
+                        ..
+                    } | HilStmt::Phi(_)
+                )
+            }),
+            CfgNode::Sequence { nodes } => nodes
+                .iter()
+                .all(|node| self.node_is_simple_binding_block(node)),
+            _ => false,
+        }
+    }
+
+    /// Replaces a symbol expression with a simple binding collected from the same range.
+    fn resolve_simple_binding(expr: HilExpr, bindings: &HashMap<SymbolId, HilExpr>) -> HilExpr {
+        match expr {
+            HilExpr::Symbol(symbol) => bindings
+                .get(&symbol)
+                .cloned()
+                .unwrap_or(HilExpr::Symbol(symbol)),
+            other => other,
+        }
+    }
+
+    /// Extracts the raw numeric-for bounds from a single structured loop node.
+    fn node_numeric_for_shape(&self, node: &CfgNode) -> Option<(HilExpr, HilExpr, HilExpr)> {
+        match node {
+            CfgNode::NumericFor {
+                start, end, step, ..
+            } => Some((start.clone(), end.clone(), step.clone())),
+            _ => None,
+        }
+    }
+
+    /// Extracts a normalized numeric-for shape from a branch node.
+    ///
+    /// Used by the cleanup pass that repairs one-armed `if` nodes followed by the
+    /// matching alternative loop.
+    fn branch_numeric_for_shape(&self, node: &CfgNode) -> Option<(HilExpr, HilExpr, HilExpr)> {
+        match node {
+            CfgNode::Sequence { nodes } => self.numeric_for_range_shape(nodes, 0, nodes.len()),
+            other => self.node_numeric_for_shape(other),
+        }
+    }
+
+    /// Checks whether two flattened branch ranges contain matching numeric loops.
+    ///
+    /// The comparison is deliberately narrow: both ranges must reduce to exactly one
+    /// numeric-for shape after ignoring simple loop-setup bindings. This prevents
+    /// broad if/else reconstruction in hash code where adjacent numeric loops may be
+    /// sequential work rather than alternatives.
+    fn ranges_are_matching_numeric_fors(
+        &self,
+        nodes: &[CfgNode],
+        then_idx: usize,
+        then_end: usize,
+        else_idx: usize,
+        else_end: usize,
+    ) -> bool {
+        let Some(then_shape) = self.numeric_for_range_shape(nodes, then_idx, then_end) else {
+            return false;
+        };
+        self.numeric_for_range_shape(nodes, else_idx, else_end)
+            .is_some_and(|else_shape| then_shape == else_shape)
+    }
+
+    /// Restructures a loop header's conditional branch inside a recovered loop body.
+    ///
+    /// Numeric and generic loop recovery can leave the header block and the two raw
+    /// conditional targets as siblings in the loop body. This pass recognizes those
+    /// target siblings and rebuilds the source-level `if`, either as an escape guard
+    /// (`if cond then break end`) or as a normal `if/else`.
     fn fold_head_escape_guard(&self, head_node: CfgNode, body_ast: CfgNode) -> CfgNode {
         let Some((mut cond, then_block, else_block)) = self.extract_cond_jump(&head_node) else {
             return CfgNode::merge([head_node, body_ast]);
@@ -843,6 +1022,9 @@ impl<'a> FoldableGraph<'a> {
             return CfgNode::merge([head_node, body_ast]);
         };
 
+        // Locate the current structured nodes that start with each raw conditional
+        // target. After earlier folds these are usually not bare blocks anymore:
+        // they can be sequences such as `prep block + NumericFor`.
         let then_idx = nodes
             .iter()
             .position(|node| node.starts_with_block(then_block));
@@ -859,6 +1041,9 @@ impl<'a> FoldableGraph<'a> {
             return CfgNode::merge([head_node, CfgNode::Sequence { nodes }]);
         };
 
+        // The simplest loop-header condition is a guard where one or both branches
+        // exit the current loop. Pull those targets next to the header so lowering
+        // emits a clear guard instead of leaving the raw jump shape in the sequence.
         let then_escape = self.node_ends_with_terminal(&nodes[then_idx]);
         let else_escape = self.node_ends_with_terminal(&nodes[else_idx]);
 
@@ -914,9 +1099,9 @@ impl<'a> FoldableGraph<'a> {
         }
 
         // Neither branch always escapes, but both targets are present in the body.
-        // Preserve the historical fall-through fold for ordinary guard shapes.
-        // The wider segment fold below is only for flattened loop regions, where
-        // the prep block and structured loop become adjacent siblings.
+        // Preserve the older single-node fold for ordinary branch shapes. The wider
+        // segment logic below is only for flattened loop regions where a branch is
+        // represented by multiple adjacent siblings.
         let has_flattened_loop_region = nodes.iter().any(|node| {
             matches!(
                 node,
@@ -954,28 +1139,144 @@ impl<'a> FoldableGraph<'a> {
             };
         }
 
-        // Loop nodes can be flattened into adjacent siblings here. The branch is
-        // the target prelude plus the immediately following structured loop, not
-        // the later shared continuation.
-        let branch_end = |start: usize| {
+        // For flattened loop branches, include the prep block plus the immediately
+        // following structured loop. When the opposite conditional target appears
+        // later, a one-armed branch may also include the intervening continuation
+        // nodes; this is the shape produced by some hash finalization loops.
+        let branch_end = |start: usize, other_start: usize| {
             let mut end = start + 1;
+            let mut saw_loop = false;
             if matches!(
                 nodes.get(end),
                 Some(CfgNode::NumericFor { .. } | CfgNode::GenericFor { .. })
             ) {
                 end += 1;
+                saw_loop = true;
             }
+
+            if saw_loop && start < other_start {
+                end = other_start;
+            }
+
             end
         };
 
-        let then_end = branch_end(then_idx);
-        let else_end = branch_end(else_idx);
+        let then_end = branch_end(then_idx, else_idx);
+        let else_end = branch_end(else_idx, then_idx);
+
+        let then_touches_else = then_end == else_idx && then_end > then_idx + 1;
+        let else_touches_then = else_end == then_idx && else_end > else_idx + 1;
+        if then_touches_else || else_touches_then {
+            // Adjacent branch ranges can be either real alternatives or a one-armed
+            // guard followed by continuation. Only rebuild an `if/else` here when
+            // both sides are matching numeric-for ranges; otherwise keep the safer
+            // one-armed interpretation.
+            if then_touches_else
+                && else_end > else_idx + 1
+                && self.ranges_are_matching_numeric_fors(
+                    &nodes, then_idx, then_end, else_idx, else_end,
+                )
+            {
+                let mut then_nodes = Vec::new();
+                let mut else_nodes = Vec::new();
+                let mut remaining = Vec::with_capacity(nodes.len());
+                for (idx, node) in nodes.into_iter().enumerate() {
+                    if (then_idx..then_end).contains(&idx) {
+                        then_nodes.push(node);
+                    } else if (else_idx..else_end).contains(&idx) {
+                        else_nodes.push(node);
+                    } else {
+                        remaining.push(node);
+                    }
+                }
+
+                let mut folded = Vec::with_capacity(remaining.len() + 2);
+                folded.push(head_node);
+                folded.push(CfgNode::If {
+                    condition: cond,
+                    then_branch: Box::new(CfgNode::Sequence { nodes: then_nodes }),
+                    else_branch: Some(Box::new(CfgNode::Sequence { nodes: else_nodes })),
+                });
+                folded.extend(remaining);
+
+                return CfgNode::Sequence { nodes: folded };
+            }
+
+            if else_touches_then
+                && then_end > then_idx + 1
+                && self.ranges_are_matching_numeric_fors(
+                    &nodes, then_idx, then_end, else_idx, else_end,
+                )
+            {
+                let mut then_nodes = Vec::new();
+                let mut else_nodes = Vec::new();
+                let mut remaining = Vec::with_capacity(nodes.len());
+                for (idx, node) in nodes.into_iter().enumerate() {
+                    if (then_idx..then_end).contains(&idx) {
+                        then_nodes.push(node);
+                    } else if (else_idx..else_end).contains(&idx) {
+                        else_nodes.push(node);
+                    } else {
+                        remaining.push(node);
+                    }
+                }
+
+                let mut folded = Vec::with_capacity(remaining.len() + 2);
+                folded.push(head_node);
+                folded.push(CfgNode::If {
+                    condition: cond,
+                    then_branch: Box::new(CfgNode::Sequence { nodes: then_nodes }),
+                    else_branch: Some(Box::new(CfgNode::Sequence { nodes: else_nodes })),
+                });
+                folded.extend(remaining);
+
+                return CfgNode::Sequence { nodes: folded };
+            }
+
+            // If the adjacent ranges do not prove to be matching alternatives, fold
+            // the range that touches the other target as a guard and leave the rest
+            // of the sequence in place. This avoids swallowing sequential work.
+            let (branch_idx, branch_end, invert) = if then_end == else_idx {
+                (then_idx, then_end, false)
+            } else {
+                (else_idx, else_end, true)
+            };
+
+            if invert {
+                cond = invert_condition(cond);
+            }
+
+            let mut branch_nodes = Vec::new();
+            let mut remaining = Vec::with_capacity(nodes.len());
+            for (idx, node) in nodes.into_iter().enumerate() {
+                if (branch_idx..branch_end).contains(&idx) {
+                    branch_nodes.push(node);
+                } else {
+                    remaining.push(node);
+                }
+            }
+
+            let mut folded = Vec::with_capacity(remaining.len() + 2);
+            folded.push(head_node);
+            folded.push(CfgNode::If {
+                condition: cond,
+                then_branch: Box::new(CfgNode::Sequence {
+                    nodes: branch_nodes,
+                }),
+                else_branch: None,
+            });
+            folded.extend(remaining);
+
+            return CfgNode::Sequence { nodes: folded };
+        }
 
         let ranges_overlap = then_idx < else_end && else_idx < then_end;
         if ranges_overlap || then_idx == then_end || else_idx == else_end {
             return CfgNode::merge([head_node, CfgNode::Sequence { nodes }]);
         }
 
+        // Non-adjacent flattened branches can be moved into a regular if/else while
+        // preserving all unrelated nodes after the conditional.
         let mut then_node_val = None;
         let mut else_node_val = None;
 
@@ -1128,6 +1429,280 @@ impl<'a> FoldableGraph<'a> {
             | CfgNode::NumericFor { body, .. }
             | CfgNode::GenericFor { body, .. } => self.normalize_escape_guards(body),
             _ => {}
+        }
+    }
+
+    /// Recursively pulls loop-reentering suffixes back into their infinite loop.
+    ///
+    /// Some irreducible-looking loop finalization shapes reduce to:
+    ///
+    /// ```text
+    /// while true do
+    ///     if done then return ... end
+    ///     ...
+    ///     if should_continue then break end
+    /// end
+    /// suffix_that_jumps_back_to_loop_head
+    /// ```
+    ///
+    /// The suffix is not really after the loop; it is the continuation payload for
+    /// the final guard. Moving it under that guard preserves the backedge and keeps
+    /// the loop body executable in source form.
+    fn absorb_reentering_loop_suffixes(&self, node: &mut CfgNode) {
+        match node {
+            CfgNode::Sequence { nodes } => {
+                for node in nodes.iter_mut() {
+                    self.absorb_reentering_loop_suffixes(node);
+                }
+
+                while self.absorb_reentering_loop_suffix(nodes) {}
+            }
+            CfgNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.absorb_reentering_loop_suffixes(then_branch);
+                if let Some(else_branch) = else_branch {
+                    self.absorb_reentering_loop_suffixes(else_branch);
+                }
+            }
+            CfgNode::While { body, .. }
+            | CfgNode::NumericFor { body, .. }
+            | CfgNode::GenericFor { body, .. } => {
+                self.absorb_reentering_loop_suffixes(body);
+            }
+            _ => {}
+        }
+    }
+
+    /// Repairs adjacent loop alternatives that were conservatively folded as a guard.
+    ///
+    /// `fold_head_escape_guard` prefers one-armed guards when adjacent branch ranges
+    /// could be sequential work. In the common nested-loop alternative shape, that
+    /// leaves:
+    ///
+    /// ```text
+    /// if not cond then
+    ///     else_loop
+    /// end
+    /// then_loop
+    /// ```
+    ///
+    /// If the following range is a matching numeric-for branch, this pass rewrites it
+    /// back into `if cond then then_loop else else_loop end`.
+    fn fold_adjacent_loop_branches(&self, node: &mut CfgNode) {
+        match node {
+            CfgNode::Sequence { nodes } => {
+                for node in nodes.iter_mut() {
+                    self.fold_adjacent_loop_branches(node);
+                }
+
+                let mut idx = 0;
+                while idx + 1 < nodes.len() {
+                    // Candidate right-hand branch is either the next node alone or a
+                    // loop setup block followed by a `NumericFor`.
+                    let next_end = if idx + 2 < nodes.len()
+                        && matches!(nodes[idx + 2], CfgNode::NumericFor { .. })
+                    {
+                        idx + 3
+                    } else {
+                        idx + 2
+                    };
+
+                    let should_fold = match &nodes[idx] {
+                        CfgNode::If {
+                            then_branch,
+                            else_branch: None,
+                            ..
+                        } => {
+                            // Require both sides to have the same normalized numeric
+                            // loop bounds. This keeps the pass from combining adjacent
+                            // loops that merely happen to sit next to each other.
+                            let then_shape = self.branch_numeric_for_shape(then_branch);
+                            let next_shape = self.numeric_for_range_shape(nodes, idx + 1, next_end);
+                            then_shape.is_some_and(|then_shape| {
+                                next_shape.is_some_and(|next_shape| then_shape == next_shape)
+                            })
+                        }
+                        _ => false,
+                    };
+
+                    if !should_fold {
+                        idx += 1;
+                        continue;
+                    }
+
+                    // Convert `if not C then A end; B` into
+                    // `if C then B else A end`. The condition inversion is paired
+                    // with swapping the old guarded branch into `else`.
+                    let next_nodes: Vec<_> = nodes.drain(idx + 1..next_end).collect();
+                    let next_branch = CfgNode::Sequence { nodes: next_nodes };
+                    let current =
+                        std::mem::replace(&mut nodes[idx], CfgNode::Sequence { nodes: Vec::new() });
+                    let CfgNode::If {
+                        condition,
+                        then_branch,
+                        else_branch: None,
+                    } = current
+                    else {
+                        unreachable!();
+                    };
+
+                    nodes[idx] = CfgNode::If {
+                        condition: invert_condition(condition),
+                        then_branch: Box::new(next_branch),
+                        else_branch: Some(then_branch),
+                    };
+                    idx += 1;
+                }
+            }
+            CfgNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.fold_adjacent_loop_branches(then_branch);
+                if let Some(else_branch) = else_branch {
+                    self.fold_adjacent_loop_branches(else_branch);
+                }
+            }
+            CfgNode::While { body, .. }
+            | CfgNode::NumericFor { body, .. }
+            | CfgNode::GenericFor { body, .. } => self.fold_adjacent_loop_branches(body),
+            _ => {}
+        }
+    }
+
+    /// Absorbs one suffix-after-loop pattern from a sequence.
+    ///
+    /// Returns true when it moved a suffix, allowing the caller to keep scanning the
+    /// same sequence until no more nested suffixes match.
+    fn absorb_reentering_loop_suffix(&self, nodes: &mut Vec<CfgNode>) -> bool {
+        let Some(loop_idx) = nodes.iter().enumerate().find_map(|(idx, node)| {
+            if idx + 1 >= nodes.len() {
+                return None;
+            }
+
+            let CfgNode::While {
+                condition: HilExpr::Bool(true),
+                body,
+            } = node
+            else {
+                return None;
+            };
+
+            let CfgNode::Sequence { nodes: body_nodes } = body.as_ref() else {
+                return None;
+            };
+
+            let Some(loop_head) = body.first_block() else {
+                return None;
+            };
+
+            // This pass is intentionally narrow. A return guard tells us the loop
+            // already has source-level exits, and the trailing break guard gives us a
+            // concrete place to attach the re-entering suffix.
+            let has_return_guard = body_nodes.iter().any(|node| match node {
+                CfgNode::If { then_branch, .. } => self.node_has_return_exit(then_branch),
+                _ => false,
+            });
+
+            let ends_with_break_guard = matches!(
+                body_nodes.last(),
+                Some(CfgNode::If {
+                    then_branch,
+                    else_branch: None,
+                    ..
+                }) if matches!(then_branch.as_ref(), CfgNode::Break)
+            );
+
+            // Only absorb suffixes that still contain a raw jump to the loop head;
+            // otherwise the nodes really are after the loop.
+            let suffix_reenters_loop = nodes[idx + 1..]
+                .iter()
+                .any(|node| self.node_jumps_to_block(node, loop_head));
+
+            (has_return_guard && ends_with_break_guard && suffix_reenters_loop).then_some(idx)
+        }) else {
+            return false;
+        };
+
+        // Everything after the loop becomes the payload of the final break guard.
+        // Later escape resolution turns the retained raw jumps into source-level
+        // control flow.
+        let suffix = nodes.split_off(loop_idx + 1);
+        let CfgNode::While { body, .. } = &mut nodes[loop_idx] else {
+            unreachable!();
+        };
+        let CfgNode::Sequence { nodes: body_nodes } = body.as_mut() else {
+            unreachable!();
+        };
+        let Some(CfgNode::If { then_branch, .. }) = body_nodes.last_mut() else {
+            unreachable!();
+        };
+
+        *then_branch = Box::new(CfgNode::Sequence { nodes: suffix });
+        true
+    }
+
+    /// Returns true when a structured node contains a raw or lowered return exit.
+    fn node_has_return_exit(&self, node: &CfgNode) -> bool {
+        match node {
+            CfgNode::Return { .. } => true,
+            CfgNode::BasicBlock { block } => {
+                matches!(self.cfg.blocks[*block].exit, BlockExit::Return(_))
+            }
+            CfgNode::Sequence { nodes } => nodes.iter().any(|node| self.node_has_return_exit(node)),
+            CfgNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.node_has_return_exit(then_branch)
+                    || else_branch
+                        .as_ref()
+                        .is_some_and(|branch| self.node_has_return_exit(branch))
+            }
+            CfgNode::While { body, .. }
+            | CfgNode::NumericFor { body, .. }
+            | CfgNode::GenericFor { body, .. } => self.node_has_return_exit(body),
+            _ => false,
+        }
+    }
+
+    /// Returns true when a structured node still contains a raw edge to `target`.
+    ///
+    /// This is used only by post-structuring cleanup passes that need to detect
+    /// whether a seemingly external suffix is actually part of a loop.
+    fn node_jumps_to_block(&self, node: &CfgNode, target: usize) -> bool {
+        match node {
+            CfgNode::BasicBlock { block } => match &self.cfg.blocks[*block].exit {
+                BlockExit::Jump(block) | BlockExit::Fallthrough(block) => *block == target,
+                BlockExit::CondJump {
+                    then_block,
+                    else_block,
+                    ..
+                } => *then_block == target || *else_block == target,
+                _ => false,
+            },
+            CfgNode::Sequence { nodes } => nodes
+                .iter()
+                .any(|node| self.node_jumps_to_block(node, target)),
+            CfgNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.node_jumps_to_block(then_branch, target)
+                    || else_branch
+                        .as_ref()
+                        .is_some_and(|branch| self.node_jumps_to_block(branch, target))
+            }
+            CfgNode::While { body, .. }
+            | CfgNode::NumericFor { body, .. }
+            | CfgNode::GenericFor { body, .. } => self.node_jumps_to_block(body, target),
+            _ => false,
         }
     }
 
@@ -1323,6 +1898,26 @@ impl<'a> FoldableGraph<'a> {
                 continue;
             };
 
+            if let Some((then_branch, then_used)) =
+                self.build_one_armed_branch(head, then_start, else_start)
+            {
+                self.collapse_one_armed_conditional(head, else_start, then_branch, then_used, cond);
+                return true;
+            }
+
+            if let Some((else_branch, else_used)) =
+                self.build_one_armed_branch(head, else_start, then_start)
+            {
+                self.collapse_one_armed_conditional(
+                    head,
+                    then_start,
+                    else_branch,
+                    else_used,
+                    invert_condition(cond),
+                );
+                return true;
+            }
+
             let mut then_seen = HashSet::new();
             let Some((then_branch, then_used)) =
                 self.build_acyclic_branch(then_start, tail, &mut then_seen)
@@ -1388,6 +1983,91 @@ impl<'a> FoldableGraph<'a> {
         false
     }
 
+    /// Builds a branch for a conditional where only one side should be folded.
+    ///
+    /// This is restricted to the current entry node and to branches that end in a
+    /// terminal escape. Without those guards, ordinary if/else regions can be
+    /// misread as `if cond then ... end; ...`, duplicating the fall-through side.
+    fn build_one_armed_branch(
+        &mut self,
+        head: usize,
+        branch_start: usize,
+        merge: usize,
+    ) -> Option<(CfgNode, HashSet<usize>)> {
+        // Keep this fold at the active graph entry. Deeper conditionals are handled
+        // by the normal two-arm fold or by the sequence cleanup passes after loops
+        // have been recovered.
+        if head != self.entry_node {
+            return None;
+        }
+
+        let mut seen = HashSet::new();
+        let (branch, mut used) = self.build_acyclic_branch(branch_start, merge, &mut seen)?;
+        if used.is_empty() {
+            return None;
+        }
+        // A one-armed fold is only valid when the branch cannot fall through into
+        // the merge path. Otherwise the missing branch would execute both sides.
+        if !self.node_ends_with_terminal(&branch) {
+            return None;
+        }
+        used.remove(&merge);
+        used.remove(&head);
+
+        if self.is_closed_conditional_region(head, merge, &used) {
+            Some((branch, used))
+        } else {
+            None
+        }
+    }
+
+    fn collapse_one_armed_conditional(
+        &mut self,
+        head: usize,
+        tail: usize,
+        branch: CfgNode,
+        used: HashSet<usize>,
+        condition: HilExpr,
+    ) {
+        let new_id = self.next_id();
+        let header_node = self.nodes.remove(&head).unwrap();
+        for node in &used {
+            self.nodes.remove(node);
+        }
+
+        self.nodes.insert(
+            new_id,
+            CfgNode::merge([
+                header_node,
+                CfgNode::If {
+                    condition,
+                    then_branch: Box::new(branch),
+                    else_branch: None,
+                },
+            ]),
+        );
+
+        self.update_regionmap(|val| val == head || used.contains(&val), new_id);
+        self.transfer_predecessors(head, new_id);
+
+        for node in &used {
+            self.successors.remove(node);
+            self.predecessors.remove(node);
+        }
+        self.successors.remove(&head);
+
+        if let Some(tail_preds) = self.predecessors.get_mut(&tail) {
+            tail_preds.retain(|&p| p != head && !used.contains(&p));
+            tail_preds.push(new_id);
+        }
+        self.successors.insert(new_id, vec![tail]);
+
+        if head == self.entry_node {
+            self.entry_node = new_id;
+        }
+        self.invalidate_doms();
+    }
+
     fn build_acyclic_branch(
         &self,
         node: usize,
@@ -1402,6 +2082,18 @@ impl<'a> FoldableGraph<'a> {
         }
 
         let current = self.nodes.get(&node)?.clone();
+        if matches!(
+            self.extract_exit(&current),
+            Some(
+                BlockExit::FornPrep { .. }
+                    | BlockExit::FornLoop { .. }
+                    | BlockExit::ForgPrep { .. }
+                    | BlockExit::ForgLoop { .. }
+            )
+        ) {
+            return None;
+        }
+
         let mut used = HashSet::from([node]);
 
         match self.successors.get(&node).map(Vec::as_slice).unwrap_or(&[]) {
@@ -1466,15 +2158,19 @@ impl<'a> FoldableGraph<'a> {
         })
     }
 
-    /// Returns the first found backedge from `node` if one exists, otherwise `None`.
-    fn find_backedge(&mut self, node: usize) -> Option<usize> {
-        for i in 0..self.predecessors.get(&node)?.len() {
-            let pred = self.predecessors[&node][i];
+    fn find_backedges(&mut self, node: usize) -> Vec<usize> {
+        let mut backedges = Vec::new();
+        let Some(preds) = self.predecessors.get(&node).cloned() else {
+            return backedges;
+        };
+
+        for pred in preds {
             if self.dominates(node, pred) {
-                return Some(pred);
+                backedges.push(pred);
             }
         }
-        None
+
+        backedges
     }
 
     /// Identifies all nodes belonging to a SESE loop region.
@@ -1864,241 +2560,241 @@ impl<'a> FoldableGraph<'a> {
         work.reverse();
 
         while let Some(head) = work.pop() {
-            if let Some(tail) = self.find_backedge(head) {
-                let body_blocks_used = self.get_natural_loop(head, tail);
+            let mut selected_loop = None;
+            for tail in self.find_backedges(head) {
+                let natural_body = self.get_natural_loop(head, tail);
 
                 // We can expect two types of a loop here:
                 // 1. while: the backedge is an unconditional jump, while the head either jumps to the body or the loop exit
                 // 2. repeat..until: the backedge is a conditional jump, the header can be any block
-                if let Some(kind) = self.identify_loop(head, tail, &body_blocks_used) {
-                    let mut body_blocks_used = self.get_loop_region(head, kind.exit_block());
-                    if let Loop::While { absorbed, .. } = &kind {
-                        for block in absorbed {
-                            body_blocks_used.remove(block);
-                        }
+                if let Some(kind) = self.identify_loop(head, tail, &natural_body) {
+                    selected_loop = Some((tail, kind));
+                    break;
+                }
+            }
+
+            if let Some((tail, kind)) = selected_loop {
+                let mut body_blocks_used = self.get_loop_region(head, kind.exit_block());
+                if let Loop::While { absorbed, .. } = &kind {
+                    for block in absorbed {
+                        body_blocks_used.remove(block);
                     }
+                }
 
-                    let mut body_nodes: Vec<_> = self
-                        .nodes
-                        .extract_if(|id, _| body_blocks_used.contains(id) && *id != head)
-                        .collect();
+                let mut body_nodes: Vec<_> = self
+                    .nodes
+                    .extract_if(|id, _| body_blocks_used.contains(id) && *id != head)
+                    .collect();
 
-                    let po_rank: HashMap<_, _> = self
-                        .post_order()
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, node)| (node, i))
-                        .collect();
+                let po_rank: HashMap<_, _> = self
+                    .post_order()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, node)| (node, i))
+                    .collect();
 
-                    body_nodes.sort_unstable_by_key(|(id, _)| std::cmp::Reverse(po_rank[id]));
+                body_nodes.sort_unstable_by_key(|(id, _)| std::cmp::Reverse(po_rank[id]));
 
-                    let mut body_ast = CfgNode::merge(body_nodes.into_iter().map(|(_, b)| b));
+                let mut body_ast = CfgNode::merge(body_nodes.into_iter().map(|(_, b)| b));
 
-                    // While loops jump to the head, repeat..until/for loops jump to the tail.
-                    let (continue_tgt, continue_tgt_alt) = match &kind {
-                        Loop::While { .. } => (head, Some(tail)),
-                        _ => (tail, None),
-                    };
-                    let require_empty_continue_target =
-                        matches!(&kind, Loop::NumericFor { .. } | Loop::GenericFor { .. });
-                    body_ast.resolve_escapes(
-                        continue_tgt,
-                        continue_tgt_alt,
-                        kind.exit_block(),
-                        self.cfg,
-                        &self.region_for_block,
-                        require_empty_continue_target,
-                    );
+                // While loops jump to the head, repeat..until/for loops jump to the tail.
+                let (continue_tgt, continue_tgt_alt) = match &kind {
+                    Loop::While { .. } => (head, Some(tail)),
+                    _ => (tail, None),
+                };
+                let require_empty_continue_target =
+                    matches!(&kind, Loop::NumericFor { .. } | Loop::GenericFor { .. });
+                body_ast.resolve_escapes(
+                    continue_tgt,
+                    continue_tgt_alt,
+                    kind.exit_block(),
+                    self.cfg,
+                    &self.region_for_block,
+                    require_empty_continue_target,
+                );
 
-                    let loop_id = self.next_id();
-                    let head_node = self.nodes.remove(&head).unwrap();
+                let loop_id = self.next_id();
+                let head_node = self.nodes.remove(&head).unwrap();
 
-                    let mut absorbed_blocks = HashSet::new();
-                    let (region_entry, loop_node, exit_block) = match kind {
-                        Loop::While {
-                            cond,
-                            exit_block,
-                            guard,
-                            absorbed,
-                        } => {
-                            absorbed_blocks.extend(absorbed);
-                            let mut effective_exit = exit_block;
-                            let mut break_payload = CfgNode::Break;
+                let mut absorbed_blocks = HashSet::new();
+                let (region_entry, loop_node, exit_block) = match kind {
+                    Loop::While {
+                        cond,
+                        exit_block,
+                        guard,
+                        absorbed,
+                    } => {
+                        absorbed_blocks.extend(absorbed);
+                        let mut effective_exit = exit_block;
+                        let mut break_payload = CfgNode::Break;
 
-                            if let Some(exit_node) = self.nodes.get(&exit_block)
-                                && let Some(BlockExit::Jump(next_raw)) =
-                                    self.extract_exit(exit_node)
-                                && let Some(&next_block) = self.region_for_block.get(next_raw)
-                                && next_block != head
-                            {
-                                effective_exit = next_block;
-                                absorbed_blocks.insert(exit_block);
-                                if self.node_emits_statements(exit_node) {
-                                    break_payload =
-                                        CfgNode::merge([exit_node.clone(), CfgNode::Break]);
-                                }
+                        if let Some(exit_node) = self.nodes.get(&exit_block)
+                            && let Some(BlockExit::Jump(next_raw)) = self.extract_exit(exit_node)
+                            && let Some(&next_block) = self.region_for_block.get(next_raw)
+                            && next_block != head
+                        {
+                            effective_exit = next_block;
+                            absorbed_blocks.insert(exit_block);
+                            if self.node_emits_statements(exit_node) {
+                                break_payload = CfgNode::merge([exit_node.clone(), CfgNode::Break]);
+                            }
+                        }
+
+                        let loop_node = if let Some(guard) = guard {
+                            let guard_node = self
+                                .build_guard_node(&guard, head, &head_node, &break_payload)
+                                .unwrap_or_else(|| CfgNode::If {
+                                    condition: invert_condition(cond.clone()),
+                                    then_branch: Box::new(break_payload.clone()),
+                                    else_branch: None,
+                                });
+
+                            CfgNode::While {
+                                condition: HilExpr::Bool(true),
+                                body: Box::new(CfgNode::merge([guard_node, body_ast])),
+                            }
+                        } else if self.node_emits_statements(&head_node)
+                            || !matches!(break_payload, CfgNode::Break)
+                        {
+                            let mut parts = Vec::with_capacity(3);
+                            if self.node_emits_statements(&head_node) {
+                                parts.push(head_node);
                             }
 
-                            let loop_node = if let Some(guard) = guard {
-                                let guard_node = self
-                                    .build_guard_node(&guard, head, &head_node, &break_payload)
-                                    .unwrap_or_else(|| CfgNode::If {
-                                        condition: invert_condition(cond.clone()),
-                                        then_branch: Box::new(break_payload.clone()),
-                                        else_branch: None,
-                                    });
-
-                                CfgNode::While {
-                                    condition: HilExpr::Bool(true),
-                                    body: Box::new(CfgNode::merge([guard_node, body_ast])),
-                                }
-                            } else if self.node_emits_statements(&head_node)
-                                || !matches!(break_payload, CfgNode::Break)
-                            {
-                                let mut parts = Vec::with_capacity(3);
-                                if self.node_emits_statements(&head_node) {
-                                    parts.push(head_node);
-                                }
-
-                                let break_guard = CfgNode::If {
-                                    condition: invert_condition(cond),
-                                    then_branch: Box::new(break_payload),
-                                    else_branch: None,
-                                };
-                                parts.push(break_guard);
-                                parts.push(body_ast);
-
-                                CfgNode::While {
-                                    condition: HilExpr::Bool(true),
-                                    body: Box::new(CfgNode::merge(parts)),
-                                }
-                            } else {
-                                CfgNode::While {
-                                    condition: cond,
-                                    body: Box::new(body_ast),
-                                }
+                            let break_guard = CfgNode::If {
+                                condition: invert_condition(cond),
+                                then_branch: Box::new(break_payload),
+                                else_branch: None,
                             };
+                            parts.push(break_guard);
+                            parts.push(body_ast);
 
-                            (head, loop_node, effective_exit)
-                        }
-                        Loop::RepeatUntil { exit_block } => (
-                            head,
-                            {
-                                let mut body = self.fold_head_escape_guard(head_node, body_ast);
-                                self.normalize_escape_guards(&mut body);
+                            CfgNode::While {
+                                condition: HilExpr::Bool(true),
+                                body: Box::new(CfgNode::merge(parts)),
+                            }
+                        } else {
+                            CfgNode::While {
+                                condition: cond,
+                                body: Box::new(body_ast),
+                            }
+                        };
 
-                                CfgNode::While {
-                                    condition: HilExpr::Bool(true),
-                                    body: Box::new(body),
-                                }
-                            },
-                            exit_block,
-                        ),
-                        Loop::NumericFor {
+                        (head, loop_node, effective_exit)
+                    }
+                    Loop::RepeatUntil { exit_block } => (
+                        head,
+                        {
+                            let mut body = self.fold_head_escape_guard(head_node, body_ast);
+                            self.normalize_escape_guards(&mut body);
+
+                            CfgNode::While {
+                                condition: HilExpr::Bool(true),
+                                body: Box::new(body),
+                            }
+                        },
+                        exit_block,
+                    ),
+                    Loop::NumericFor {
+                        var,
+                        start,
+                        end,
+                        step,
+                        prep_block,
+                        exit_block,
+                    } => {
+                        let prep_node = self.nodes.remove(&prep_block).unwrap();
+                        let mut for_body = self.fold_head_escape_guard(head_node, body_ast);
+                        self.normalize_escape_guards(&mut for_body);
+                        let for_node = CfgNode::NumericFor {
                             var,
                             start,
                             end,
                             step,
+                            body: Box::new(for_body),
+                        };
+                        (
                             prep_block,
+                            CfgNode::merge([prep_node, for_node]),
                             exit_block,
-                        } => {
-                            let prep_node = self.nodes.remove(&prep_block).unwrap();
-                            let mut for_body = self.fold_head_escape_guard(head_node, body_ast);
-                            self.normalize_escape_guards(&mut for_body);
-                            let for_node = CfgNode::NumericFor {
-                                var,
-                                start,
-                                end,
-                                step,
-                                body: Box::new(for_body),
-                            };
-                            (
-                                prep_block,
-                                CfgNode::merge([prep_node, for_node]),
-                                exit_block,
-                            )
-                        }
-                        Loop::GenericFor {
+                        )
+                    }
+                    Loop::GenericFor {
+                        vars,
+                        exprs,
+                        prep_block,
+                        exit_block,
+                    } => {
+                        let prep_node = self.nodes.remove(&prep_block).unwrap();
+                        let mut for_body = self.fold_head_escape_guard(head_node, body_ast);
+                        self.normalize_escape_guards(&mut for_body);
+                        let for_node = CfgNode::GenericFor {
                             vars,
                             exprs,
+                            body: Box::new(for_body),
+                        };
+                        (
                             prep_block,
+                            CfgNode::merge([prep_node, for_node]),
                             exit_block,
-                        } => {
-                            let prep_node = self.nodes.remove(&prep_block).unwrap();
-                            let mut for_body = self.fold_head_escape_guard(head_node, body_ast);
-                            self.normalize_escape_guards(&mut for_body);
-                            let for_node = CfgNode::GenericFor {
-                                vars,
-                                exprs,
-                                body: Box::new(for_body),
-                            };
-                            (
-                                prep_block,
-                                CfgNode::merge([prep_node, for_node]),
-                                exit_block,
-                            )
-                        }
-                    };
+                        )
+                    }
+                };
 
-                    self.nodes.insert(loop_id, loop_node);
-                    self.update_regionmap(
-                        |val| {
-                            val == region_entry
-                                || val == head
-                                || body_blocks_used.contains(&val)
-                                || absorbed_blocks.contains(&val)
-                        },
-                        loop_id,
-                    );
+                self.nodes.insert(loop_id, loop_node);
+                self.update_regionmap(
+                    |val| {
+                        val == region_entry
+                            || val == head
+                            || body_blocks_used.contains(&val)
+                            || absorbed_blocks.contains(&val)
+                    },
+                    loop_id,
+                );
 
-                    self.transfer_predecessors(region_entry, loop_id);
-                    if let Some(preds) = self.predecessors.get_mut(&loop_id) {
-                        preds.retain(|&p| {
-                            !body_blocks_used.contains(&p)
-                                && !absorbed_blocks.contains(&p)
-                                && p != tail
-                                && p != loop_id
-                                && p != head
-                        });
-                    }
-
-                    self.successors.insert(loop_id, vec![exit_block]);
-                    if let Some(exit_preds) = self.predecessors.get_mut(&exit_block) {
-                        exit_preds.retain(|&p| {
-                            p != region_entry
-                                && p != head
-                                && p != tail
-                                && !absorbed_blocks.contains(&p)
-                                && !body_blocks_used.contains(&p)
-                        });
-                        exit_preds.push(loop_id);
-                    }
-
-                    for block in &body_blocks_used {
-                        self.successors.remove(block);
-                        self.predecessors.remove(block);
-                    }
-                    for block in &absorbed_blocks {
-                        self.nodes.remove(block);
-                        self.successors.remove(block);
-                        self.predecessors.remove(block);
-                    }
-                    self.successors.remove(&head);
-                    if region_entry != head {
-                        self.successors.remove(&region_entry);
-                    }
-
-                    if region_entry != head {
-                        self.successors.remove(&region_entry);
-                    }
-                    if region_entry == self.entry_node || head == self.entry_node {
-                        self.entry_node = loop_id;
-                    }
-                    self.invalidate_doms();
-
-                    work.push(loop_id);
-                    changed = true;
+                self.transfer_predecessors(region_entry, loop_id);
+                if let Some(preds) = self.predecessors.get_mut(&loop_id) {
+                    preds.retain(|&p| {
+                        !body_blocks_used.contains(&p)
+                            && !absorbed_blocks.contains(&p)
+                            && p != tail
+                            && p != loop_id
+                            && p != head
+                    });
                 }
+
+                self.successors.insert(loop_id, vec![exit_block]);
+                if let Some(exit_preds) = self.predecessors.get_mut(&exit_block) {
+                    exit_preds.retain(|&p| {
+                        p != region_entry
+                            && p != head
+                            && p != tail
+                            && !absorbed_blocks.contains(&p)
+                            && !body_blocks_used.contains(&p)
+                    });
+                    exit_preds.push(loop_id);
+                }
+
+                for block in &body_blocks_used {
+                    self.successors.remove(block);
+                    self.predecessors.remove(block);
+                }
+                for block in &absorbed_blocks {
+                    self.nodes.remove(block);
+                    self.successors.remove(block);
+                    self.predecessors.remove(block);
+                }
+                self.successors.remove(&head);
+                if region_entry != head {
+                    self.successors.remove(&region_entry);
+                }
+                if region_entry == self.entry_node || head == self.entry_node {
+                    self.entry_node = loop_id;
+                }
+                self.invalidate_doms();
+
+                work.push(loop_id);
+                changed = true;
             }
         }
 
@@ -2137,6 +2833,8 @@ impl<'a> FoldableGraph<'a> {
 
     fn structure(&mut self) {
         loop {
+            self.prune_stale_edges();
+
             if self.collapse_sequential() {
                 continue;
             }
@@ -2279,6 +2977,13 @@ pub fn structure(cfg: &ControlFlowGraph) -> (RegionNode, bool) {
 
     let mut root = fg.nodes.remove(&fg.entry_node).unwrap();
     root.strip_virtual_exits();
+
+    // These cleanup passes operate on the final tree rather than the foldable graph:
+    // they repair shapes that only become obvious after all graph-level regions have
+    // been collapsed.
+    fg.absorb_reentering_loop_suffixes(&mut root);
+    fg.fold_adjacent_loop_branches(&mut root);
+
     root.resolve_returns(cfg);
     (root.lower(cfg), reduced)
 }
