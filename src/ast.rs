@@ -301,6 +301,21 @@ impl BinOp {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
         )
     }
+
+    /// Inverts this binary operator, if it is a comparison operator.
+    ///
+    /// Returns `None` for non-comparison operators.
+    pub const fn invert(self) -> Option<BinOp> {
+        match self {
+            BinOp::Eq => Some(BinOp::Ne),
+            BinOp::Ne => Some(BinOp::Eq),
+            BinOp::Lt => Some(BinOp::Gte),
+            BinOp::Lte => Some(BinOp::Gt),
+            BinOp::Gt => Some(BinOp::Lte),
+            BinOp::Gte => Some(BinOp::Lt),
+            _ => None,
+        }
+    }
 }
 
 impl Display for BinOp {

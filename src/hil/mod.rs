@@ -2,7 +2,7 @@ use crate::{
     disasm::Proto,
     hil::{
         cflow::{
-            graph::ControlFlowGraph,
+            cfg::ControlFlowGraph,
             region::{self, RegionNode},
         },
         lifter::ssa::SymbolId,

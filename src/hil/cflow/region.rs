@@ -4,10 +4,7 @@ use either::Either;
 use smallvec::SmallVec;
 
 use crate::hil::{
-    cflow::{
-        common::invert_condition,
-        graph::{BlockExit, ControlFlowGraph, build_immediate_dominators},
-    },
+    cflow::cfg::{BlockExit, ControlFlowGraph, build_idoms},
     ir::{HilExpr, HilStmt},
     lifter::ssa::SymbolId,
 };
@@ -299,7 +296,7 @@ impl CfgNode {
                                 else_branch: None,
                             }),
                             (None, Some(terminal)) => Some(CfgNode::If {
-                                condition: invert_condition(cond.clone()),
+                                condition: cond.clone().invert(),
                                 then_branch: Box::new(terminal),
                                 else_branch: None,
                             }),
@@ -435,7 +432,7 @@ impl CfgNode {
                     .stmts
                     .iter()
                     .cloned()
-                    .map(|stmt| stmt.inner)
+                    .map(|stmt| stmt.node)
                     .collect(),
             },
             CfgNode::Sequence { nodes } => {
@@ -916,7 +913,7 @@ impl<'a> FoldableGraph<'a> {
                     if let HilStmt::Assign {
                         left: HilExpr::Symbol(symbol),
                         value,
-                    } = &stmt.inner
+                    } = &stmt.node
                     {
                         bindings.insert(*symbol, value.clone());
                     }
@@ -940,7 +937,7 @@ impl<'a> FoldableGraph<'a> {
         match node {
             CfgNode::BasicBlock { block } => self.cfg.blocks[*block].stmts.iter().all(|stmt| {
                 matches!(
-                    &stmt.inner,
+                    &stmt.node,
                     HilStmt::Assign {
                         left: HilExpr::Symbol(_),
                         ..
@@ -1081,7 +1078,7 @@ impl<'a> FoldableGraph<'a> {
             None
         } {
             if invert {
-                cond = invert_condition(cond);
+                cond = cond.invert();
             }
 
             let mut guarded = Vec::with_capacity(nodes.len() + 2);
@@ -1243,7 +1240,7 @@ impl<'a> FoldableGraph<'a> {
             };
 
             if invert {
-                cond = invert_condition(cond);
+                cond = cond.invert();
             }
 
             let mut branch_nodes = Vec::new();
@@ -1365,7 +1362,7 @@ impl<'a> FoldableGraph<'a> {
 
                 nodes.push(head);
                 nodes.push(CfgNode::If {
-                    condition: invert_condition(cond),
+                    condition: cond.invert(),
                     then_branch: Box::new(escape_node),
                     else_branch: None,
                 });
@@ -1550,7 +1547,7 @@ impl<'a> FoldableGraph<'a> {
                     };
 
                     nodes[idx] = CfgNode::If {
-                        condition: invert_condition(condition),
+                        condition: condition.invert(),
                         then_branch: Box::new(next_branch),
                         else_branch: Some(then_branch),
                     };
@@ -1596,9 +1593,7 @@ impl<'a> FoldableGraph<'a> {
                 return None;
             };
 
-            let Some(loop_head) = body.first_block() else {
-                return None;
-            };
+            let loop_head = body.first_block()?;
 
             // This pass is intentionally narrow. A return guard tells us the loop
             // already has source-level exits, and the trailing break guard gives us a
@@ -1642,7 +1637,7 @@ impl<'a> FoldableGraph<'a> {
             unreachable!();
         };
 
-        *then_branch = Box::new(CfgNode::Sequence { nodes: suffix });
+        **then_branch = CfgNode::Sequence { nodes: suffix };
         true
     }
 
@@ -1781,7 +1776,7 @@ impl<'a> FoldableGraph<'a> {
                 let (left, right) = if left == active_then && right == active_else {
                     (left, right)
                 } else if left == active_else && right == active_then {
-                    cond = invert_condition(cond);
+                    cond = cond.invert();
                     (right, left)
                 } else {
                     continue;
@@ -1800,7 +1795,7 @@ impl<'a> FoldableGraph<'a> {
                 if left == tail && is_strict_body(right, tail) {
                     // If-Then (The body is on the FALSE path)
                     then_node_id = Some(right);
-                    cond = invert_condition(cond);
+                    cond = cond.invert();
                 } else if right == tail && is_strict_body(left, tail) {
                     // If-Then (The body is on the TRUE path)
                     then_node_id = Some(left);
@@ -1892,7 +1887,7 @@ impl<'a> FoldableGraph<'a> {
             let (then_start, else_start) = if left == active_then && right == active_else {
                 (left, right)
             } else if left == active_else && right == active_then {
-                cond = invert_condition(cond);
+                cond = cond.invert();
                 (right, left)
             } else {
                 continue;
@@ -1913,7 +1908,7 @@ impl<'a> FoldableGraph<'a> {
                     then_start,
                     else_branch,
                     else_used,
-                    invert_condition(cond),
+                    cond.invert(),
                 );
                 return true;
             }
@@ -2111,7 +2106,7 @@ impl<'a> FoldableGraph<'a> {
                 let (then_start, else_start) = if *left == active_then && *right == active_else {
                     (*left, *right)
                 } else if *left == active_else && *right == active_then {
-                    cond = invert_condition(cond);
+                    cond = cond.invert();
                     (*right, *left)
                 } else {
                     return None;
@@ -2323,7 +2318,7 @@ impl<'a> FoldableGraph<'a> {
                     (active_then, true)
                 };
 
-                let final_cond = if invert { invert_condition(cond) } else { cond };
+                let final_cond = if invert { cond.invert() } else { cond };
                 return Some(Loop::While {
                     cond: final_cond,
                     exit_block,
@@ -2465,7 +2460,7 @@ impl<'a> FoldableGraph<'a> {
         match node {
             CfgNode::BasicBlock { block } => self.cfg.blocks[*block].stmts.iter().all(|stmt| {
                 matches!(
-                    &stmt.inner,
+                    &stmt.node,
                     HilStmt::Assign { value, .. } if is_condition_prelude_value(value)
                 )
             }),
@@ -2507,7 +2502,7 @@ impl<'a> FoldableGraph<'a> {
                         else_branch: None,
                     },
                     (None, Some(else_branch)) => CfgNode::If {
-                        condition: invert_condition(condition.clone()),
+                        condition: condition.clone().invert(),
                         then_branch: Box::new(else_branch),
                         else_branch: None,
                     },
@@ -2644,7 +2639,7 @@ impl<'a> FoldableGraph<'a> {
                             let guard_node = self
                                 .build_guard_node(&guard, head, &head_node, &break_payload)
                                 .unwrap_or_else(|| CfgNode::If {
-                                    condition: invert_condition(cond.clone()),
+                                    condition: cond.invert(),
                                     then_branch: Box::new(break_payload.clone()),
                                     else_branch: None,
                                 });
@@ -2662,7 +2657,7 @@ impl<'a> FoldableGraph<'a> {
                             }
 
                             let break_guard = CfgNode::If {
-                                condition: invert_condition(cond),
+                                condition: cond.invert(),
                                 then_branch: Box::new(break_payload),
                                 else_branch: None,
                             };
@@ -2900,7 +2895,7 @@ pub fn build_idoms_sparse(
         }
     }
 
-    let dense_doms = build_immediate_dominators(dense_entry, &dense_succs, &dense_preds);
+    let dense_doms = build_idoms(dense_entry, &dense_succs, &dense_preds);
     let mut sparse_doms = HashMap::new();
     for (dense, &sparse) in dense_to_sparse.iter().enumerate() {
         if let Some(dense_idom) = dense_doms[dense] {
@@ -2960,7 +2955,7 @@ fn build_if_node(
             else_branch: None,
         }),
         (true, false) => Some(CfgNode::If {
-            condition: invert_condition(condition),
+            condition: condition.invert(),
             then_branch: Box::new(else_branch),
             else_branch: None,
         }),

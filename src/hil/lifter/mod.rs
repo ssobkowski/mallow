@@ -5,11 +5,11 @@ use ssa::Ssa;
 
 use crate::{
     ast::{BinOp, UnOp},
-    common::{escape_string, is_valid_luau_identifier},
+    common::{Spanned, ToSpanned as _, escape_string, is_valid_luau_identifier},
     disasm::Proto,
     hil::{
-        common::{const_expr, decoded_count},
-        ir::{HilExpr, HilStmt, Spanned, ToSpanned},
+        common::{const_expr, decoded_count, reg_add, reg_range},
+        ir::{HilExpr, HilStmt},
         lifter::{
             common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL},
             ssa::{Symbol, SymbolId},
@@ -37,7 +37,7 @@ pub struct MultiRet {
 ///
 /// Luau can insert bookkeeping opcodes (e.g. `CLOSEUPVALS`) between a variadic
 /// call and the eventual `RETURN`, so we must not flush the pending source there.
-fn instr_preserves_multiret(instr: &Instr, pending_src_reg: u8) -> bool {
+fn instr_preserves_multiret(instr: Instr, pending_src_reg: u8) -> bool {
     match instr {
         Instr::FastCall1 { .. }
         | Instr::FastCall2 { .. }
@@ -48,7 +48,7 @@ fn instr_preserves_multiret(instr: &Instr, pending_src_reg: u8) -> bool {
         Instr::GetImport { dest, .. }
         | Instr::GetGlobal { dest, .. }
         | Instr::GetUpval { dest, .. }
-        | Instr::Move { dest, .. } => *dest < pending_src_reg,
+        | Instr::Move { dest, .. } => dest < pending_src_reg,
         _ => false,
     }
 }
@@ -77,7 +77,7 @@ fn unop_for_instr(instr: &Instr) -> UnOp {
 }
 
 pub struct LiftContext<'a, 'cfg> {
-    pub instrs: &'a [(Instr, usize)],
+    pub instrs: &'a [Spanned<Instr>],
     pub consts: &'a [Constant],
     pub parent_proto: &'a Proto,
     pub protos: &'a [Proto],
@@ -88,7 +88,7 @@ pub struct LiftContext<'a, 'cfg> {
 pub struct Lifter<'a, 'cfg> {
     ip: usize,
 
-    instrs: &'a [(Instr, usize)],
+    instrs: &'a [Spanned<Instr>],
     consts: &'a [Constant],
     parent_proto: &'a Proto,
     protos: &'a [Proto],
@@ -124,11 +124,11 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         let ip = self.ip.saturating_sub(1);
         debug_assert!(
             ip < self.instrs.len(),
-            "ip out of bounds: {ip} (instrs len: ${})",
+            "ip out of bounds: {ip} (instrs len: {})",
             self.instrs.len()
         );
 
-        self.instrs[ip].1
+        self.instrs[ip].pc
     }
 
     fn next(&mut self) -> Option<Instr> {
@@ -136,7 +136,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         if instr.is_some() {
             self.ip += 1;
         }
-        instr.map(|i| i.0)
+        instr.map(|i| i.node)
     }
 
     /// Pushes one statement tagged with the current instruction PC.
@@ -144,23 +144,23 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         self.stmts.push(Spanned::new(stmt, self.current_pc()));
     }
 
+    /// Reads the values of the given register range from the SSA table.
     fn read_regs(&mut self, start: u8, count: u8) -> Vec<HilExpr> {
-        (0..count)
-            .map(|i| HilExpr::Symbol(self.get_reg_symbol(start + i)))
+        reg_range(start, count)
+            .map(|reg| HilExpr::Symbol(self.get_reg_symbol(reg)))
             .collect()
     }
 
+    /// Allocates a range of registers and returns their symbolic expressions.
     fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<HilExpr> {
-        (0..count)
-            .map(|i| {
-                let reg = start + i;
-                HilExpr::Symbol(self.alloc_reg_symbol(reg))
-            })
+        reg_range(start, count)
+            .map(|reg| HilExpr::Symbol(self.alloc_reg_symbol(reg)))
             .collect()
     }
 
+    /// Returns a chained concatenated expression of the values of the given register range.
     fn concat_expr_range(&mut self, start: u8, end: u8) -> HilExpr {
-        debug_assert!(
+        assert!(
             start <= end,
             "invalid CONCAT register range: {start}..{end}"
         );
@@ -178,30 +178,17 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 
     /// Emits a plain assignment statement at the current PC span.
     fn assign(&mut self, left: HilExpr, value: HilExpr) {
-        let ip = self.ip.saturating_sub(1);
-        debug_assert!(ip < self.instrs.len());
-        let pc = self.instrs[ip].1;
-
-        self.stmts
-            .push(HilStmt::Assign { left, value }.to_spanned(pc));
+        self.push(HilStmt::Assign { left, value });
     }
 
     /// Emits a plain assignment statement at the current PC span, and allocates
     /// a new register symbol in the arena.
     fn assign_reg(&mut self, reg: u8, value: HilExpr) {
-        let ip = self.ip.saturating_sub(1);
-        debug_assert!(ip < self.instrs.len());
-        let pc = self.instrs[ip].1;
-
         let sym = self.alloc_reg_symbol(reg);
-
-        self.stmts.push(
-            HilStmt::Assign {
-                left: HilExpr::Symbol(sym),
-                value,
-            }
-            .to_spanned(pc),
-        );
+        self.push(HilStmt::Assign {
+            left: HilExpr::Symbol(sym),
+            value,
+        });
     }
 
     fn get_reg_symbol(&mut self, reg: u8) -> SymbolId {
@@ -221,7 +208,9 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 
     fn note_close_upvals(&mut self, from_reg: u8) {
         for generation in &mut self.reg_generations[from_reg as usize..] {
-            *generation = generation.saturating_add(1);
+            *generation = generation
+                .checked_add(1)
+                .expect("capture generation overflow");
         }
 
         for captured in &mut self.open_captured_ref[from_reg as usize..] {
@@ -238,9 +227,51 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         sym
     }
 
+    fn instr_consumes_pending_multiret(&self, instr: Instr) -> bool {
+        let Some(pending) = &self.pending_multiret else {
+            return false;
+        };
+
+        match instr {
+            Instr::Call {
+                func, arg_count, ..
+            } if decoded_count(arg_count) == Count::Variadic => {
+                pending.base >= func.saturating_add(1)
+            }
+
+            Instr::SetList { base, count, .. } if decoded_count(count) == Count::Variadic => {
+                pending.base >= base
+            }
+
+            // NAMECALL can consume through the following CALL, so this one needs
+            // special handling / lookahead.
+            Instr::NameCall { .. } => true,
+
+            _ => false,
+        }
+    }
+
+    fn flush_pending_before(&mut self, instr: Instr) {
+        let Some(pending) = &self.pending_multiret else {
+            return;
+        };
+
+        if self.instr_consumes_pending_multiret(instr) {
+            return;
+        }
+
+        if instr_preserves_multiret(instr, pending.base) {
+            return;
+        }
+
+        self.flush_multiret();
+    }
+
     /// Lifts all instructions into pc-spanned HIL statements in bytecode order.
     pub fn run(mut self) -> (Vec<Spanned<HilStmt>>, Option<MultiRet>) {
         while let Some(instr) = self.next() {
+            self.flush_pending_before(instr);
+
             match &instr {
                 Instr::Nop => {}
                 Instr::LoadNil { reg } => self.assign_reg(*reg, HilExpr::Nil),
@@ -536,14 +567,15 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                     "CAPTURE instructions should have been consumed by NEWCLOSURE/DUPCLOSURE handling"
                 ),
 
-                Instr::GetVarArgs { dest, count } => match *count {
-                    0 => {
+                Instr::GetVarArgs { dest, count } => match decoded_count(*count) {
+                    Count::Variadic => {
+                        debug_assert!(self.pending_multiret.is_none());
                         self.pending_multiret = Some(MultiRet {
                             base: *dest,
                             expr: HilExpr::VarArgs.to_spanned(self.current_pc()),
                         });
                     }
-                    n => {
+                    Count::Number(n) => {
                         let left = self.alloc_regs(*dest, n);
                         self.push(HilStmt::AssignMany {
                             left,
@@ -560,7 +592,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
     }
 
     fn lift_call(&mut self, func: u8, arg_count: u8, ret_count: u8) {
-        let first_arg = func + 1;
+        let first_arg = reg_add(func, 1);
         let args = match decoded_count(arg_count) {
             Count::Number(argc) => {
                 if argc > 0 {
@@ -569,7 +601,10 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                     Vec::new()
                 }
             }
-            Count::Variadic => self.take_variadic_from(first_arg).unwrap_or_default(),
+            Count::Variadic => self.take_variadic_from(first_arg).unwrap_or_else(|| {
+                debug_assert!(false, "variadic CALL without pending multiret");
+                Vec::new()
+            }),
         };
         let call = HilExpr::Call {
             fun: Box::new(HilExpr::Symbol(self.get_reg_symbol(func))),
@@ -591,14 +626,14 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
             }
         };
 
-        debug_assert_eq!(
+        assert_eq!(
             func, dest,
             "CALL func reg {func} does not match NAMECALL dest reg {dest}"
         );
 
         let method = self.const_string(method as usize);
 
-        let first_arg = func + 2; // receiver is at func+1, user args start at func+2
+        let first_arg = reg_add(func, 2); // receiver is at func+1, user args start at func+2
         let variadic_args = match decoded_count(arg_count) {
             Count::Variadic => self.take_variadic_from(first_arg),
             Count::Number(_) => None,
@@ -607,7 +642,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         if variadic_args.is_none() {
             let should_flush = self.pending_multiret.as_ref().is_some_and(|m| {
                 !instr_preserves_multiret(
-                    &Instr::Call {
+                    Instr::Call {
                         func,
                         arg_count,
                         ret_count,
@@ -638,8 +673,10 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         let (values, has_variadic_tail) = match decoded_count(count) {
             Count::Number(n) => (self.read_regs(base, n), false),
             Count::Variadic => (
-                self.take_variadic_from(base)
-                    .unwrap_or_else(|| vec![HilExpr::Symbol(self.get_reg_symbol(base))]),
+                self.take_variadic_from(base).unwrap_or_else(|| {
+                    debug_assert!(false, "variadic call without pending multiret");
+                    Vec::new()
+                }),
                 true,
             ),
         };
@@ -663,6 +700,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
                 self.push(HilStmt::AssignMany { left, value: expr });
             }
             Count::Variadic => {
+                debug_assert!(self.pending_multiret.is_none());
                 self.pending_multiret = Some(MultiRet {
                     base: dest,
                     expr: expr.to_spanned(self.current_pc()),
@@ -684,7 +722,7 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         }
         let MultiRet { base, expr } = self.pending_multiret.take().unwrap();
         let mut args = self.read_regs(first, base - first);
-        args.push(expr.inner);
+        args.push(expr.strip());
         Some(args)
     }
 
@@ -719,30 +757,17 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 
     /// Flush the pending multiret to `self.stmts` as a standalone call-stmt or
     /// a plain `local = ...` assignment.
-    pub fn flush_multiret(&mut self) {
-        let Some(MultiRet { base, expr }) = self.pending_multiret.take() else {
+    fn flush_multiret(&mut self) {
+        let Some(multiret) = self.pending_multiret.take() else {
             return;
         };
-        match expr.inner {
-            HilExpr::Call { .. } | HilExpr::MethodCall { .. } => self
-                .stmts
-                .push(HilStmt::Call(expr.inner).to_spanned(expr.pc)),
-            HilExpr::VarArgs => {
-                let sym = self.alloc_reg_symbol(base);
 
-                self.stmts.push(
-                    HilStmt::Assign {
-                        left: HilExpr::Symbol(sym),
-                        value: HilExpr::VarArgs,
-                    }
-                    .to_spanned(expr.pc),
-                );
-            }
-            _ => unreachable!("unexpected deferred variadic source"),
-        }
+        flush_multiret(multiret, self.block_idx, self.ssa, &mut self.stmts);
     }
 
     /// See: [const_expr](crate::hil::common::const_expr)
+    #[inline]
+    #[must_use]
     fn const_expr(&self, index: usize) -> HilExpr {
         const_expr(self.consts, index)
     }
@@ -751,6 +776,8 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
     ///
     /// # Panics
     /// Panics if the constant at the given index is not a string.
+    #[inline]
+    #[must_use]
     fn const_string(&self, index: usize) -> String {
         match self.consts.get(index) {
             Some(Constant::String(s)) => s.clone(),
@@ -795,6 +822,39 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
         }
 
         Some(out)
+    }
+}
+
+/// Flushes a deferred variadic source into the given statement stream.
+///
+/// A pending call-like multiret becomes a standalone call statement. A pending
+/// vararg splice must materialize into its base register because later code can
+/// reference that register by symbol.
+pub fn flush_multiret(
+    multiret: MultiRet,
+    block_idx: usize,
+    ssa: &mut Ssa<'_>,
+    stmts: &mut Vec<Spanned<HilStmt>>,
+) {
+    let MultiRet { base, expr } = multiret;
+
+    match expr.node {
+        HilExpr::Call { .. } | HilExpr::MethodCall { .. } => {
+            stmts.push(expr.map(HilStmt::Call));
+        }
+        HilExpr::VarArgs => {
+            let sym = ssa.alloc_symbol(Symbol::reg(base));
+            ssa.write_reg(block_idx, base, sym);
+
+            stmts.push(
+                HilStmt::Assign {
+                    left: HilExpr::Symbol(sym),
+                    value: HilExpr::VarArgs,
+                }
+                .to_spanned(expr.pc), // this is probably not correct
+            );
+        }
+        _ => unreachable!("unexpected deferred variadic source"),
     }
 }
 

@@ -3,7 +3,7 @@ use smol_str::SmolStr;
 use crate::hil::{
     StructuredFunction,
     cflow::region::RegionNode,
-    ir::{HilExpr, HilStmt, HilTableItem},
+    ir::{HilExpr, HilStmt, HilTableItem, PhiNode},
     lifter::ssa::SymbolId,
 };
 
@@ -35,6 +35,8 @@ pub trait Visitor {
     fn visit_table_item(&mut self, item: &HilTableItem) {
         walk_table_item(self, item);
     }
+
+    fn visit_phi(&mut self, _phi: &PhiNode) {}
 
     fn visit_capture(&mut self, _index: usize, _sym: SymbolId) {}
 
@@ -79,6 +81,8 @@ pub trait VisitorMut {
     fn visit_table_item(&mut self, item: &mut HilTableItem) {
         walk_table_item_mut(self, item);
     }
+
+    fn visit_phi(&mut self, _phi: &mut PhiNode) {}
 
     fn visit_capture(&mut self, _index: usize, _sym: &mut SymbolId) {}
 
@@ -180,7 +184,7 @@ pub fn walk_stmt<V: Visitor + ?Sized>(visitor: &mut V, stmt: &HilStmt) {
             }
         }
         HilStmt::Call(expr) => visitor.visit_expr(expr),
-        HilStmt::Phi(_) => {}
+        HilStmt::Phi(phi) => visitor.visit_phi(phi),
     }
 }
 
@@ -336,7 +340,7 @@ pub fn walk_stmt_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmt: &mut HilStmt
             }
         }
         HilStmt::Call(expr) => visitor.visit_expr(expr),
-        HilStmt::Phi(_) => {}
+        HilStmt::Phi(phi) => visitor.visit_phi(phi),
     }
 }
 

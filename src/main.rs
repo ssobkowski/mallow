@@ -194,7 +194,7 @@ fn main() {
         }
         #[cfg(feature = "visualize")]
         Commands::Visualize { input, output } => {
-            use crate::hil::cflow::{graph::ControlFlowGraph, visualize::dump_cfgs};
+            use crate::hil::cflow::{cfg::ControlFlowGraph, visualize::dump_cfgs};
 
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
             let disasm = disassemble_bytecode(&bytecode).expect("failed to disassemble");

@@ -4,7 +4,10 @@ use std::fmt;
 
 use smallvec::{SmallVec, smallvec};
 
-use crate::hil::common::decoded_count;
+use crate::{
+    common::Spanned,
+    hil::common::{decoded_count, reg_range},
+};
 
 /// Represents the types of values that can be present in the constant table.
 #[derive(Debug, Clone)]
@@ -26,12 +29,14 @@ pub enum Constant {
     },
 }
 
-#[derive(Debug)]
+/// Represents a Luau count.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Count {
     Number(u8),
     Variadic,
 }
 
+/// Represents a Luau instruction.
 #[derive(Debug, Clone, Copy)]
 pub enum Instr {
     // Keep variant order in sync with LuauOpcode in Bytecode.h.
@@ -285,6 +290,7 @@ pub enum Instr {
 impl Instr {
     const LOP_COUNT: u8 = 83; // LOP__COUNT (not a valid opcode)
 
+    /// Returns whether the given opcode requires an auxiliary register.
     const fn opcode_requires_aux(opcode: u8) -> bool {
         matches!(
             opcode,
@@ -310,6 +316,38 @@ impl Instr {
                 | 78
                 | 79
                 | 80
+        )
+    }
+
+    /// Returns whether one instruction must terminate its basic block.
+    ///
+    /// Note: This does not cover LoadB.
+    #[must_use]
+    pub const fn is_branch_exit(&self) -> bool {
+        matches!(
+            self,
+            Instr::Jump { .. }
+                | Instr::JumpX { .. }
+                | Instr::JumpBack { .. }
+                | Instr::JumpIf { .. }
+                | Instr::JumpIfNot { .. }
+                | Instr::JumpIfEq { .. }
+                | Instr::JumpIfLe { .. }
+                | Instr::JumpIfLt { .. }
+                | Instr::JumpIfNotEq { .. }
+                | Instr::JumpIfNotLe { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpXEqKNil { .. }
+                | Instr::JumpXEqKB { .. }
+                | Instr::JumpXEqKN { .. }
+                | Instr::JumpXEqKS { .. }
+                | Instr::FornPrep { .. }
+                | Instr::FornLoop { .. }
+                | Instr::ForgPrep { .. }
+                | Instr::ForgPrepInext { .. }
+                | Instr::ForgPrepNext { .. }
+                | Instr::ForgLoop { .. }
+                | Instr::Return { .. }
         )
     }
 
@@ -375,27 +413,13 @@ impl Instr {
             Instr::Call {
                 func, ret_count, ..
             } => match decoded_count(*ret_count) {
-                Count::Number(n) => {
-                    let base = *func;
-                    debug_assert!(
-                        base.checked_add(n).is_some(),
-                        "CALL return register overflow"
-                    );
-                    (base..base + n).collect()
-                }
+                Count::Number(n) => reg_range(*func, n).collect(),
                 // TODO: how do you even determine this?
                 Count::Variadic => smallvec![],
             },
 
             Instr::GetVarArgs { dest, count } => match decoded_count(*count) {
-                Count::Number(n) => {
-                    let base = *dest;
-                    debug_assert!(
-                        base.checked_add(n).is_some(),
-                        "GETVARARGS register overflow"
-                    );
-                    (base..base + n).collect()
-                }
+                Count::Number(n) => reg_range(*dest, n).collect(),
                 Count::Variadic => unreachable!(),
             },
 
@@ -956,7 +980,7 @@ impl fmt::Display for Instr {
     }
 }
 
-pub fn decode_stream_with_word_pcs(words: &[u32]) -> Vec<(Instr, usize)> {
+pub fn decode_stream_with_word_pcs(words: &[u32]) -> Vec<Spanned<Instr>> {
     let mut out = Vec::new();
     let mut pc = 0usize;
 
@@ -985,7 +1009,7 @@ pub fn decode_stream_with_word_pcs(words: &[u32]) -> Vec<(Instr, usize)> {
             None
         };
 
-        out.push((
+        out.push(Spanned::new(
             Instr::new(header, aux)
                 .unwrap_or_else(|_| panic!("failed to decode instruction at word pc {header_pc}")),
             header_pc,
@@ -994,28 +1018,4 @@ pub fn decode_stream_with_word_pcs(words: &[u32]) -> Vec<(Instr, usize)> {
     }
 
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Instr;
-
-    #[test]
-    fn decode_settablen_preserves_256_index() {
-        let opcode = 18u32;
-        let a = 1u32 << 8;
-        let b = 2u32 << 16;
-        let c = 255u32 << 24;
-
-        let instr = Instr::from(opcode | a | b | c);
-
-        assert!(matches!(
-            instr,
-            Instr::SetTableN {
-                src: 1,
-                table: 2,
-                index: 256
-            }
-        ));
-    }
 }

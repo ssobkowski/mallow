@@ -5,7 +5,10 @@ use std::{
 
 use thiserror::Error;
 
-use crate::il::{Constant, Instr, decode_stream_with_word_pcs};
+use crate::{
+    common::Spanned,
+    il::{Constant, Instr, decode_stream_with_word_pcs},
+};
 
 const CONST_NIL: u8 = 0;
 const CONST_BOOL: u8 = 1;
@@ -82,7 +85,7 @@ pub struct Proto {
     pub is_vararg: bool,
     pub flags: u8,
     pub type_info: Vec<u8>,
-    pub instrs: Vec<(Instr, usize)>,
+    pub instrs: Vec<Spanned<Instr>>,
     pub consts: Vec<Constant>,
     pub protos: Vec<usize>,
     pub locals: Vec<LocalDebug>,
@@ -334,8 +337,8 @@ impl fmt::Display for Disassembly {
                 proto.index, proto.num_params, proto.num_upvals
             )?;
 
-            for (instr, pc) in &proto.instrs {
-                writeln!(f, "{pc}: {instr}")?;
+            for sd in &proto.instrs {
+                writeln!(f, "{}: {}", sd.pc, sd.node)?;
             }
 
             writeln!(f)?;

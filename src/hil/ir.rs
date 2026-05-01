@@ -3,20 +3,8 @@ use std::fmt::Display;
 use smol_str::SmolStr;
 
 use crate::ast::{BinOp, UnOp};
+use crate::common::ToSpanned;
 use crate::hil::lifter::ssa::SymbolId;
-
-/// A wrapper that attaches a bytecode PC to any IR node.
-#[derive(Debug, Clone)]
-pub struct Spanned<T> {
-    pub inner: T,
-    pub pc: usize,
-}
-
-impl<T> Spanned<T> {
-    pub fn new(inner: T, pc: usize) -> Self {
-        Self { inner, pc }
-    }
-}
 
 /// An expression in the high-level intermediate representation.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +61,7 @@ pub enum HilExpr {
 }
 
 impl HilExpr {
+    /// Returns whether this expressions reads a given symbol.
     pub fn reads_symbol(&self, sym: &SymbolId) -> bool {
         match self {
             HilExpr::Symbol(s) => s == sym,
@@ -94,6 +83,7 @@ impl HilExpr {
         }
     }
 
+    /// Returns whether this expression is pure, i.e. it does not have any side effects.
     pub const fn is_pure(&self) -> bool {
         match self {
             HilExpr::Nil
@@ -115,6 +105,10 @@ impl HilExpr {
         }
     }
 
+    /// Returns whether this expression is truthy.
+    ///
+    /// Returns `Some(true)` for truthy values, `Some(false)` for falsy values,
+    /// and `None` for values that are not determinable at compile time.
     pub const fn truthiness(&self) -> Option<bool> {
         match self {
             HilExpr::Nil => Some(false),
@@ -122,10 +116,30 @@ impl HilExpr {
             HilExpr::Number(_)
             | HilExpr::String(_)
             | HilExpr::Closure { .. }
-            | HilExpr::Global(_)
-            | HilExpr::Import(_)
             | HilExpr::Table { .. } => Some(true),
             _ => None,
+        }
+    }
+
+    /// Returns the inverted expression, i.e. `!expr`.
+    pub fn invert(self) -> HilExpr {
+        match self {
+            HilExpr::Bool(b) => HilExpr::Bool(!b),
+            HilExpr::Binary { lhs, op, rhs } if let Some(inverted) = op.invert() => {
+                HilExpr::Binary {
+                    lhs: Box::new(*lhs),
+                    op: inverted,
+                    rhs: Box::new(*rhs),
+                }
+            }
+            HilExpr::Unary {
+                op: UnOp::Not,
+                expr: inner,
+            } => *inner,
+            other => HilExpr::Unary {
+                op: UnOp::Not,
+                expr: Box::new(other),
+            },
         }
     }
 }
@@ -262,15 +276,6 @@ impl Display for HilStmt {
             HilStmt::Call(expr) => write!(f, "{}", expr),
             HilStmt::Phi(_) => Ok(()),
         }
-    }
-}
-
-pub trait ToSpanned {
-    fn to_spanned(self, pc: usize) -> Spanned<Self>
-    where
-        Self: Sized,
-    {
-        Spanned::new(self, pc)
     }
 }
 

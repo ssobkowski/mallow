@@ -1,5 +1,6 @@
+pub mod cfg;
 mod common;
-pub mod graph;
+mod graph;
 pub mod region;
 mod union_find;
 

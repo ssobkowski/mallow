@@ -2,9 +2,12 @@ use std::collections::{BTreeSet, HashMap};
 
 use id_arena::{Arena, Id};
 
-use crate::hil::{
-    cflow::graph::Block,
-    ir::{HilStmt, PhiNode, ToSpanned as _},
+use crate::{
+    common::ToSpanned as _,
+    hil::{
+        cflow::cfg::Block,
+        ir::{HilStmt, PhiNode},
+    },
 };
 
 pub type SymbolId = Id<Symbol>;
@@ -29,35 +32,35 @@ pub enum SsaVar {
     Upval(u8),
 }
 
-impl SsaVar {
-    const fn to_index(self) -> usize {
-        match self {
-            SsaVar::Reg(r) => r as usize,
-            SsaVar::Upval(u) => 256 + u as usize,
+impl From<SsaVar> for Symbol {
+    fn from(var: SsaVar) -> Self {
+        match var {
+            SsaVar::Reg(r) => Symbol::reg(r),
+            SsaVar::Upval(u) => Symbol::upval(u),
         }
     }
 }
 
 impl Symbol {
-    pub fn reg(reg: u8) -> Self {
+    pub const fn reg(reg: u8) -> Self {
         Self {
             kind: SymbolKind::Register(reg),
         }
     }
 
-    pub fn upval(index: u8) -> Self {
+    pub const fn upval(index: u8) -> Self {
         Self {
             kind: SymbolKind::Upvalue(index),
         }
     }
 
-    pub fn captured_reg(reg: u8, generation: u16) -> Self {
+    pub const fn captured_reg(reg: u8, generation: u16) -> Self {
         Self {
             kind: SymbolKind::CapturedRegister { reg, generation },
         }
     }
 
-    pub fn param(index: u8) -> Self {
+    pub const fn param(index: u8) -> Self {
         Self {
             kind: SymbolKind::Param(index),
         }
@@ -65,11 +68,12 @@ impl Symbol {
 }
 
 pub struct Ssa<'a> {
-    // 0-255: normal registers
-    // 256-511: upvalue registers
-    defs: Vec<[Option<SymbolId>; 512]>,
-    predecessors: &'a [Vec<usize>],
-    arena: &'a mut Arena<Symbol>,
+    registers: Vec<[Option<SymbolId>; 256]>,
+    upvalues: Vec<[Option<SymbolId>; 256]>,
+
+    predecessors: &'a [Vec<usize>], // TODO: hold a GraphView instead?
+    arena: Arena<Symbol>,
+
     aliases: HashMap<SymbolId, SymbolId>,
     phi_uses: HashMap<SymbolId, BTreeSet<SymbolId>>,
     phi_to_block: HashMap<SymbolId, usize>,
@@ -80,12 +84,13 @@ pub struct Ssa<'a> {
 }
 
 impl<'a> Ssa<'a> {
-    pub fn new(predecessors: &'a [Vec<usize>], arena: &'a mut Arena<Symbol>) -> Self {
+    pub fn new(predecessors: &'a [Vec<usize>]) -> Self {
         let blocks_count = predecessors.len();
         Self {
-            defs: vec![[None; 512]; blocks_count],
+            registers: vec![[None; 256]; blocks_count],
+            upvalues: vec![[None; 256]; blocks_count],
             predecessors,
-            arena,
+            arena: Arena::new(),
             aliases: HashMap::new(),
             phi_uses: HashMap::new(),
             phi_to_block: HashMap::new(),
@@ -95,24 +100,40 @@ impl<'a> Ssa<'a> {
         }
     }
 
-    pub fn alloc_symbol(&mut self, symbol: Symbol) -> SymbolId {
-        self.arena.alloc(symbol)
+    fn write_var(&mut self, block: usize, var: SsaVar, symbol: SymbolId) {
+        match var {
+            SsaVar::Reg(reg) => self.registers[block][reg as usize] = Some(symbol),
+            SsaVar::Upval(index) => self.upvalues[block][index as usize] = Some(symbol),
+        }
     }
 
     pub fn promote_to_captured_reg(&mut self, symbol: SymbolId, reg: u8, generation: u16) {
         self.arena[symbol].kind = SymbolKind::CapturedRegister { reg, generation };
     }
 
-    pub fn arena_iter(&self) -> impl Iterator<Item = (SymbolId, &Symbol)> {
-        self.arena.iter()
+    pub fn alloc_symbol(&mut self, sym: Symbol) -> SymbolId {
+        self.arena.alloc(sym)
+    }
+
+    pub fn arena(&self) -> &Arena<Symbol> {
+        &self.arena
     }
 
     pub fn write_reg(&mut self, block: usize, reg: u8, symbol: SymbolId) {
-        self.defs[block][SsaVar::Reg(reg).to_index()] = Some(symbol);
+        self.write_var(block, SsaVar::Reg(reg), symbol);
     }
 
+    #[must_use]
+    pub fn read_var(&mut self, block: usize, var: SsaVar) -> SymbolId {
+        match var {
+            SsaVar::Reg(reg) => self.read_reg(block, reg),
+            SsaVar::Upval(index) => self.read_upval(block, index),
+        }
+    }
+
+    #[must_use]
     pub fn read_reg(&mut self, block: usize, reg: u8) -> SymbolId {
-        if let Some(sym) = self.defs[block][SsaVar::Reg(reg).to_index()] {
+        if let Some(sym) = self.registers[block][reg as usize] {
             sym
         } else {
             self.read_var_recursive(block, SsaVar::Reg(reg))
@@ -120,17 +141,19 @@ impl<'a> Ssa<'a> {
     }
 
     pub fn write_upval(&mut self, block: usize, index: u8, symbol: SymbolId) {
-        self.defs[block][SsaVar::Upval(index).to_index()] = Some(symbol);
+        self.write_var(block, SsaVar::Upval(index), symbol);
     }
 
+    #[must_use]
     pub fn read_upval(&mut self, block: usize, index: u8) -> SymbolId {
-        if let Some(sym) = self.defs[block][SsaVar::Upval(index).to_index()] {
+        if let Some(sym) = self.upvalues[block][index as usize] {
             sym
         } else {
             self.read_var_recursive(block, SsaVar::Upval(index))
         }
     }
 
+    #[must_use]
     pub fn resolve(&self, mut sym: SymbolId) -> SymbolId {
         while let Some(&alias) = self.aliases.get(&sym) {
             sym = alias;
@@ -138,24 +161,28 @@ impl<'a> Ssa<'a> {
         sym
     }
 
+    #[must_use]
+    fn read_operands_from(&mut self, preds: &[usize], var: SsaVar) -> Vec<(usize, SymbolId)> {
+        preds
+            .iter()
+            .map(|&p| {
+                let sym = self.read_var(p, var);
+                (p, sym)
+            })
+            .collect()
+    }
+
     fn read_var_recursive(&mut self, block: usize, var: SsaVar) -> SymbolId {
         let preds = &self.predecessors[block];
         if preds.is_empty() {
-            let symbol = match var {
-                SsaVar::Reg(r) => Symbol::reg(r),
-                SsaVar::Upval(u) => Symbol::upval(u),
-            };
-            return self.arena.alloc(symbol);
+            return self.arena.alloc(Symbol::from(var));
         }
 
         let is_incomplete = preds.iter().any(|&p| !self.filled_blocks[p]);
         if is_incomplete {
-            let symbol = match var {
-                SsaVar::Reg(r) => Symbol::reg(r),
-                SsaVar::Upval(u) => Symbol::upval(u),
-            };
-            let phi_sym = self.arena.alloc(symbol);
-            self.defs[block][var.to_index()] = Some(phi_sym);
+            let phi_sym = self.arena.alloc(Symbol::from(var));
+            self.write_var(block, var, phi_sym);
+
             self.phi_to_block.insert(phi_sym, block);
 
             self.incomplete_phis
@@ -166,32 +193,16 @@ impl<'a> Ssa<'a> {
         }
 
         if preds.len() == 1 {
-            let sym = match var {
-                SsaVar::Reg(r) => self.read_reg(preds[0], r),
-                SsaVar::Upval(u) => self.read_upval(preds[0], u),
-            };
-            self.defs[block][var.to_index()] = Some(sym);
+            let sym = self.read_var(preds[0], var);
+            self.write_var(block, var, sym);
             return sym;
         }
 
-        let symbol = match var {
-            SsaVar::Reg(r) => Symbol::reg(r),
-            SsaVar::Upval(u) => Symbol::upval(u),
-        };
-        let phi_sym = self.arena.alloc(symbol);
-        self.defs[block][var.to_index()] = Some(phi_sym);
+        let phi_sym = self.arena.alloc(Symbol::from(var));
+        self.write_var(block, var, phi_sym);
         self.phi_to_block.insert(phi_sym, block);
 
-        let operands: Vec<_> = preds
-            .iter()
-            .map(|&p| {
-                let sym = match var {
-                    SsaVar::Reg(r) => self.read_reg(p, r),
-                    SsaVar::Upval(u) => self.read_upval(p, u),
-                };
-                (p, sym)
-            })
-            .collect();
+        let operands = self.read_operands_from(preds, var);
         for (_, op_sym) in &operands {
             self.phi_uses.entry(*op_sym).or_default().insert(phi_sym);
         }
@@ -249,19 +260,11 @@ impl<'a> Ssa<'a> {
         for (block, phis) in incomplete {
             for (var, phi_sym) in phis {
                 let preds = &self.predecessors[block];
-                let operands: Vec<_> = preds
-                    .iter()
-                    .map(|&p| {
-                        let sym = match var {
-                            SsaVar::Reg(r) => self.read_reg(p, r),
-                            SsaVar::Upval(u) => self.read_upval(p, u),
-                        };
-                        (p, sym)
-                    })
-                    .collect();
+                let operands = self.read_operands_from(preds, var);
                 for (_, op_sym) in &operands {
                     self.phi_uses.entry(*op_sym).or_default().insert(phi_sym);
                 }
+
                 self.phi_to_operands.insert(phi_sym, operands);
                 self.try_remove_trivial_phis(phi_sym);
             }

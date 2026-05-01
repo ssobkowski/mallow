@@ -1,3 +1,41 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spanned<T> {
+    pub node: T,
+    pub pc: usize,
+}
+
+impl<T> Spanned<T> {
+    #[inline]
+    #[must_use]
+    pub const fn new(node: T, pc: usize) -> Self {
+        Self { node, pc }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn strip(self) -> T {
+        self.node
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Spanned<U> {
+        Spanned {
+            node: f(self.node),
+            pc: self.pc,
+        }
+    }
+}
+
+pub trait ToSpanned {
+    fn to_spanned(self, pc: usize) -> Spanned<Self>
+    where
+        Self: Sized,
+    {
+        Spanned::new(self, pc)
+    }
+}
+
 /// Escapes a string for use in Lua string literals.
 pub fn escape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);

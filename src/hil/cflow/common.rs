@@ -1,59 +1,55 @@
-use crate::{
-    ast::{BinOp, UnOp},
-    hil::ir::HilExpr,
-};
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RegSet([u64; 4]);
 
-#[must_use]
-pub fn invert_condition(expr: HilExpr) -> HilExpr {
-    match expr {
-        HilExpr::Bool(b) => HilExpr::Bool(!b),
-        // TODO: https://github.com/rust-lang/rust/issues/51114
-        // will be stable in two tweeks from now
-        HilExpr::Binary { lhs, op, rhs } => {
-            if let Some(inverted) = invert_binop(op) {
-                HilExpr::Binary {
-                    lhs: Box::new(*lhs),
-                    op: inverted,
-                    rhs: Box::new(*rhs),
+impl RegSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn set(&mut self, reg: u8) {
+        self.0[reg as usize / 64] |= 1u64 << (reg % 64);
+    }
+
+    #[inline]
+    pub fn contains(&self, reg: u8) -> bool {
+        self.0[reg as usize / 64] & (1u64 << (reg % 64)) != 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        self.0.iter().enumerate().flat_map(|(i, &word)| {
+            let base = i * 64;
+            let mut w = word;
+            std::iter::from_fn(move || {
+                if w == 0 {
+                    return None;
                 }
-            } else {
-                HilExpr::Unary {
-                    op: UnOp::Not,
-                    expr: Box::new(HilExpr::Binary { lhs, op, rhs }),
-                }
-            }
+                let bit = w.trailing_zeros() as usize;
+                w &= w - 1; // clear lowest set bit
+                Some((base + bit) as u8)
+            })
+        })
+    }
+
+    pub fn extend<I: IntoIterator<Item = u8>>(&mut self, other: I) {
+        for reg in other {
+            self.set(reg);
         }
-        HilExpr::Unary {
-            op: UnOp::Not,
-            expr: inner,
-        } => *inner,
-        _ => HilExpr::Unary {
-            op: UnOp::Not,
-            expr: Box::new(expr),
-        },
     }
 }
 
-fn invert_binop(op: BinOp) -> Option<BinOp> {
-    match op {
-        BinOp::Eq => Some(BinOp::Ne),
-        BinOp::Ne => Some(BinOp::Eq),
-        BinOp::Lt => Some(BinOp::Gte),
-        BinOp::Lte => Some(BinOp::Gt),
-        BinOp::Gt => Some(BinOp::Lte),
-        BinOp::Gte => Some(BinOp::Lt),
-        _ => None,
+impl std::ops::BitOrAssign<&RegSet> for RegSet {
+    fn bitor_assign(&mut self, rhs: &RegSet) {
+        for (a, b) in self.0.iter_mut().zip(rhs.0.iter()) {
+            *a |= b;
+        }
     }
 }
 
-// pub trait GraphView {
-//     fn successors(&self, node: usize) -> &[usize];
-//     fn predecessors(&self, node: usize) -> &[usize];
-//     fn contains_node(&self, node: usize) -> bool;
-// }
-
-// pub trait GraphRewrite: GraphView {
-//     fn redirect_predecessors(&mut self, from: usize, to: usize);
-//     fn redirect_successors(&mut self, from: usize, to: usize);
-//     fn remove_node(&mut self, node: usize);
-// }
+impl std::ops::BitAndAssign<&RegSet> for RegSet {
+    fn bitand_assign(&mut self, rhs: &RegSet) {
+        for (a, b) in self.0.iter_mut().zip(rhs.0.iter()) {
+            *a &= b;
+        }
+    }
+}

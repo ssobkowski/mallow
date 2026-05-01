@@ -16,9 +16,18 @@ pub fn const_expr(consts: &[Constant], index: usize) -> HilExpr {
 }
 
 /// Decodes a Luau call/return sentinel count field into a [`Count`](crate::il::Count).
-pub fn decoded_count(encoded: u8) -> Count {
+pub const fn decoded_count(encoded: u8) -> Count {
     match encoded {
         0 => Count::Variadic,
         n => Count::Number(n - 1),
     }
+}
+
+pub const fn reg_add(reg: u8, offset: u8) -> u8 {
+    reg.checked_add(offset).expect("register overflow")
+}
+
+pub const fn reg_range(start: u8, count: u8) -> impl Iterator<Item = u8> {
+    let end = start.checked_add(count).expect("register range overflow");
+    start..end
 }

@@ -11,6 +11,7 @@ impl<T: Copy + Hash + Eq> UnionFind<T> {
         }
     }
 
+    #[must_use]
     pub fn find(&mut self, item: T) -> T {
         let p = *self.parent.entry(item).or_insert(item);
         if p == item {
