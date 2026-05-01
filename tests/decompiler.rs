@@ -1,13 +1,19 @@
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use tempfile::TempDir;
 
 fn main() {
     let args = Arguments::from_args();
+    let decompile_timeout = parse_timeout_env("MALLOW_TEST_DECOMPILE_TIMEOUT", 5);
+    let runtime_timeout = parse_timeout_env("MALLOW_TEST_RUNTIME_TIMEOUT", 10);
+
     let trials = discover_cases()
         .into_iter()
         .map(|case| {
@@ -16,12 +22,23 @@ fn main() {
                     .and_then(|n| n.to_str())
                     .unwrap_or("<invalid utf8>")
                     .to_string(),
-                move || run_case(&case),
+                move || run_case(&case, decompile_timeout, runtime_timeout),
             )
         })
         .collect();
 
     libtest_mimic::run(&args, trials).exit();
+}
+
+fn parse_timeout_env(name: &str, default_secs: u64) -> Duration {
+    let default = Duration::from_secs(default_secs);
+
+    std::env::var(name)
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(default)
 }
 
 #[derive(Debug)]
@@ -48,13 +65,17 @@ impl std::fmt::Display for CaseError {
     }
 }
 
-fn run_case(source_path: &Path) -> Result<(), Failed> {
+fn run_case(
+    source_path: &Path,
+    decompile_timeout: Duration,
+    runtime_timeout: Duration,
+) -> Result<(), Failed> {
     let temp_dir =
         TempDir::new().map_err(|e| Failed::from(format!("failed to create temp dir: {e}")))?;
     let bytecode_path = temp_dir.path().join("compiled.out");
     let decompiled_path = temp_dir.path().join("decompiled.luau");
 
-    compile_luau(&source_path, &bytecode_path)?;
+    compile_luau(source_path, &bytecode_path, decompile_timeout)?;
     decompile_bytecode(
         &bytecode_path,
         &decompiled_path,
@@ -62,10 +83,11 @@ fn run_case(source_path: &Path) -> Result<(), Failed> {
         source_path
             .file_stem()
             .is_some_and(|name| name == "intg-sha2"),
+        decompile_timeout,
     )?;
 
-    let source_output = run_luau(&source_path, "source.luau")?;
-    let decompiled_output = run_luau(&decompiled_path, "decompiled.luau")?;
+    let source_output = run_luau(source_path, "source.luau", runtime_timeout)?;
+    let decompiled_output = run_luau(&decompiled_path, "decompiled.luau", runtime_timeout)?;
 
     if source_output != decompiled_output {
         return Err(CaseError::OutputMismatch {
@@ -78,12 +100,75 @@ fn run_case(source_path: &Path) -> Result<(), Failed> {
     Ok(())
 }
 
-fn compile_luau(source_path: &Path, bytecode_path: &Path) -> Result<(), Failed> {
-    let output = Command::new(luau_compile_exe())
-        .arg("--binary")
-        .arg(source_path)
-        .output()
-        .map_err(|e| Failed::from(format!("failed to spawn luau-compile: {e}")))?;
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, Failed> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Failed::from(format!("failed to spawn {label}: {e}")))?;
+
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout_pipe.read_to_end(&mut buf).map(|_| buf)
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = Vec::new();
+        stderr_pipe.read_to_end(&mut buf).map(|_| buf)
+    });
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_thread
+                    .join()
+                    .unwrap_or_else(|_| Ok(Vec::new()))
+                    .unwrap_or_default();
+                let stderr = stderr_thread
+                    .join()
+                    .unwrap_or_else(|_| Ok(Vec::new()))
+                    .unwrap_or_default();
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(Failed::from(format!(
+                        "{label} timed out after {}s",
+                        timeout.as_secs()
+                    )));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(Failed::from(format!("failed to wait for {label}: {e}")));
+            }
+        }
+    }
+}
+
+fn compile_luau(source_path: &Path, bytecode_path: &Path, timeout: Duration) -> Result<(), Failed> {
+    let mut cmd = Command::new(luau_compile_exe());
+    cmd.arg("--binary").arg(source_path);
+    let output = run_command_with_timeout(cmd, timeout, "luau-compile")?;
 
     if !output.status.success() {
         return Err(CaseError::CompileError(format_output(&output)).into());
@@ -99,6 +184,7 @@ fn decompile_bytecode(
     bytecode_path: &Path,
     decompiled_path: &Path,
     spill_locals: bool,
+    timeout: Duration,
 ) -> Result<(), Failed> {
     let mut command = Command::new(mallow_exe());
     command
@@ -111,9 +197,7 @@ fn decompile_bytecode(
         command.arg("--spill-locals");
     }
 
-    let output = command
-        .output()
-        .map_err(|e| Failed::from(format!("failed to spawn mallow: {e}")))?;
+    let output = run_command_with_timeout(command, timeout, "mallow decompile")?;
 
     if !output.status.success() {
         return Err(CaseError::DecompileError(format_output(&output)).into());
@@ -122,11 +206,10 @@ fn decompile_bytecode(
     Ok(())
 }
 
-fn run_luau(script_path: &Path, label: &str) -> Result<String, Failed> {
-    let output = Command::new(luau_exe())
-        .arg(script_path)
-        .output()
-        .map_err(|e| Failed::from(format!("failed to spawn luau for {label}: {e}")))?;
+fn run_luau(script_path: &Path, label: &str, timeout: Duration) -> Result<String, Failed> {
+    let mut cmd = Command::new(luau_exe());
+    cmd.arg(script_path);
+    let output = run_command_with_timeout(cmd, timeout, &format!("luau ({label})"))?;
 
     if !output.status.success() {
         let err = if label == "source.luau" {
