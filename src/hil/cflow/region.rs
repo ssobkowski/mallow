@@ -726,6 +726,18 @@ impl<'a> FoldableGraph<'a> {
         }
     }
 
+    fn refresh_entry_node(&mut self) {
+        if self.nodes.contains_key(&self.entry_node) {
+            return;
+        }
+
+        if let Some(&entry_node) = self.region_for_block.get(&self.cfg.entry_block)
+            && self.nodes.contains_key(&entry_node)
+        {
+            self.entry_node = entry_node;
+        }
+    }
+
     /// Returns the exact successors of a node, if the successor count matches `N`.
     fn exact_successors<const N: usize>(&self, node: usize) -> Option<[usize; N]> {
         self.successors
@@ -2854,7 +2866,9 @@ impl<'a> FoldableGraph<'a> {
 
     fn structure(&mut self) {
         loop {
+            self.refresh_entry_node();
             self.prune_stale_edges();
+            self.refresh_entry_node();
 
             if self.collapse_sequential() {
                 continue;
@@ -2938,10 +2952,14 @@ pub fn structure(cfg: &ControlFlowGraph) -> (RegionNode, bool) {
     let mut fg = FoldableGraph::new(cfg);
 
     fg.structure();
+    fg.refresh_entry_node();
 
     let reduced = fg.nodes.iter().len() == 1;
 
-    let mut root = fg.nodes.remove(&fg.entry_node).unwrap();
+    let mut root = fg
+        .nodes
+        .remove(&fg.entry_node)
+        .expect("entry node should be present after refreshing from the region map");
     root.strip_virtual_exits();
 
     // These cleanup passes operate on the final tree rather than the foldable graph:
