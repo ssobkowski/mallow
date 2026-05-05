@@ -16,7 +16,7 @@ use crate::hil::{
 enum Loop {
     While {
         cond: HilExpr,
-        exit_block: usize,
+        exit_block: Option<usize>,
         guard: Option<GuardTree>,
         absorbed: Vec<usize>,
     },
@@ -83,12 +83,12 @@ impl GuardBuild {
 }
 
 impl Loop {
-    fn exit_block(&self) -> usize {
+    fn exit_block(&self) -> Option<usize> {
         match self {
-            Loop::While { exit_block, .. }
-            | Loop::RepeatUntil { exit_block, .. }
+            Loop::While { exit_block, .. } => *exit_block,
+            Loop::RepeatUntil { exit_block, .. }
             | Loop::NumericFor { exit_block, .. }
-            | Loop::GenericFor { exit_block, .. } => *exit_block,
+            | Loop::GenericFor { exit_block, .. } => Some(*exit_block),
         }
     }
 }
@@ -197,7 +197,7 @@ impl CfgNode {
         &mut self,
         continue_target: usize,
         continue_target_alt: Option<usize>,
-        exit: usize,
+        exit: Option<usize>,
         cfg: &ControlFlowGraph,
         region_map: &HashMap<usize, usize>,
         require_empty_continue_target: bool,
@@ -253,7 +253,7 @@ impl CfgNode {
                         let active = region_map[raw_target];
                         if is_continue_target(*raw_target, active) {
                             Some(CfgNode::Continue)
-                        } else if active == exit {
+                        } else if exit.is_some_and(|exit| active == exit) {
                             Some(CfgNode::Break)
                         } else {
                             None
@@ -261,7 +261,7 @@ impl CfgNode {
                     }
                     BlockExit::Fallthrough(raw_target) => {
                         let active = region_map[raw_target];
-                        if active == exit {
+                        if exit.is_some_and(|exit| active == exit) {
                             Some(CfgNode::Break)
                         } else {
                             None
@@ -277,7 +277,7 @@ impl CfgNode {
 
                         let then_terminal = if is_continue_target(*then_block, active_then) {
                             Some(CfgNode::Continue)
-                        } else if active_then == exit {
+                        } else if exit.is_some_and(|exit| active_then == exit) {
                             Some(CfgNode::Break)
                         } else {
                             None
@@ -285,7 +285,7 @@ impl CfgNode {
 
                         let else_terminal = if is_continue_target(*else_block, active_else) {
                             Some(CfgNode::Continue)
-                        } else if active_else == exit {
+                        } else if exit.is_some_and(|exit| active_else == exit) {
                             Some(CfgNode::Break)
                         } else {
                             None
@@ -2177,10 +2177,12 @@ impl<'a> FoldableGraph<'a> {
 
     /// Identifies all nodes belonging to a SESE loop region.
     #[must_use]
-    fn get_loop_region(&mut self, head: usize, exit: usize) -> HashSet<usize> {
+    fn get_loop_region(&mut self, head: usize, exit: Option<usize>) -> HashSet<usize> {
         self.post_order()
             .into_iter()
-            .filter(|&node| self.dominates(head, node) && !self.dominates(exit, node))
+            .filter(|&node| {
+                self.dominates(head, node) && exit.is_none_or(|exit| !self.dominates(exit, node))
+            })
             .collect()
     }
 
@@ -2213,6 +2215,17 @@ impl<'a> FoldableGraph<'a> {
     ) -> Option<Loop> {
         if let Some(tail_exit) = self.extract_exit(&self.nodes[&tail]) {
             match tail_exit {
+                BlockExit::Jump(raw_target)
+                    if self.region_for_block[raw_target] == head
+                        && self.extract_cond_jump(&self.nodes[&head]).is_none() =>
+                {
+                    return Some(Loop::While {
+                        cond: HilExpr::Bool(true),
+                        exit_block: None,
+                        guard: None,
+                        absorbed: Vec::new(),
+                    });
+                }
                 BlockExit::FornLoop {
                     base, exit_block, ..
                 } => {
@@ -2312,7 +2325,7 @@ impl<'a> FoldableGraph<'a> {
             {
                 return Some(Loop::While {
                     cond: HilExpr::Bool(true),
-                    exit_block: guard.exit_block?,
+                    exit_block: guard.exit_block,
                     guard: Some(guard.tree),
                     absorbed: guard.absorbed.into_iter().collect(),
                 });
@@ -2328,7 +2341,7 @@ impl<'a> FoldableGraph<'a> {
                 let final_cond = if invert { cond.invert() } else { cond };
                 return Some(Loop::While {
                     cond: final_cond,
-                    exit_block,
+                    exit_block: self.nodes.contains_key(&exit_block).then_some(exit_block),
                     guard: None,
                     absorbed: Vec::new(),
                 });
@@ -2337,7 +2350,7 @@ impl<'a> FoldableGraph<'a> {
             if let Some(guard) = self.build_loop_guard(head, tail, body_blocks) {
                 return Some(Loop::While {
                     cond: HilExpr::Bool(true),
-                    exit_block: guard.exit_block?,
+                    exit_block: guard.exit_block,
                     guard: Some(guard.tree),
                     absorbed: guard.absorbed.into_iter().collect(),
                 });
@@ -2576,7 +2589,8 @@ impl<'a> FoldableGraph<'a> {
             }
 
             if let Some((tail, kind)) = selected_loop {
-                let mut body_blocks_used = self.get_loop_region(head, kind.exit_block());
+                let loop_exit = kind.exit_block();
+                let mut body_blocks_used = self.get_loop_region(head, loop_exit);
                 if let Loop::While { absorbed, .. } = &kind {
                     for block in absorbed {
                         body_blocks_used.remove(block);
@@ -2609,7 +2623,7 @@ impl<'a> FoldableGraph<'a> {
                 body_ast.resolve_escapes(
                     continue_tgt,
                     continue_tgt_alt,
-                    kind.exit_block(),
+                    loop_exit,
                     self.cfg,
                     &self.region_for_block,
                     require_empty_continue_target,
@@ -2630,12 +2644,13 @@ impl<'a> FoldableGraph<'a> {
                         let mut effective_exit = exit_block;
                         let mut break_payload = CfgNode::Break;
 
-                        if let Some(exit_node) = self.nodes.get(&exit_block)
+                        if let Some(exit_block) = exit_block
+                            && let Some(exit_node) = self.nodes.get(&exit_block)
                             && let Some(BlockExit::Jump(next_raw)) = self.extract_exit(exit_node)
                             && let Some(&next_block) = self.region_for_block.get(next_raw)
                             && next_block != head
                         {
-                            effective_exit = next_block;
+                            effective_exit = Some(next_block);
                             absorbed_blocks.insert(exit_block);
                             if self.node_emits_statements(exit_node) {
                                 break_payload = CfgNode::merge([exit_node.clone(), CfgNode::Break]);
@@ -2695,7 +2710,7 @@ impl<'a> FoldableGraph<'a> {
                                 body: Box::new(body),
                             }
                         },
-                        exit_block,
+                        Some(exit_block),
                     ),
                     Loop::NumericFor {
                         var,
@@ -2718,7 +2733,7 @@ impl<'a> FoldableGraph<'a> {
                         (
                             prep_block,
                             CfgNode::merge([prep_node, for_node]),
-                            exit_block,
+                            Some(exit_block),
                         )
                     }
                     Loop::GenericFor {
@@ -2738,7 +2753,7 @@ impl<'a> FoldableGraph<'a> {
                         (
                             prep_block,
                             CfgNode::merge([prep_node, for_node]),
-                            exit_block,
+                            Some(exit_block),
                         )
                     }
                 };
@@ -2765,16 +2780,20 @@ impl<'a> FoldableGraph<'a> {
                     });
                 }
 
-                self.successors.insert(loop_id, vec![exit_block]);
-                if let Some(exit_preds) = self.predecessors.get_mut(&exit_block) {
-                    exit_preds.retain(|&p| {
-                        p != region_entry
-                            && p != head
-                            && p != tail
-                            && !absorbed_blocks.contains(&p)
-                            && !body_blocks_used.contains(&p)
-                    });
-                    exit_preds.push(loop_id);
+                if let Some(exit_block) = exit_block {
+                    self.successors.insert(loop_id, vec![exit_block]);
+                    if let Some(exit_preds) = self.predecessors.get_mut(&exit_block) {
+                        exit_preds.retain(|&p| {
+                            p != region_entry
+                                && p != head
+                                && p != tail
+                                && !absorbed_blocks.contains(&p)
+                                && !body_blocks_used.contains(&p)
+                        });
+                        exit_preds.push(loop_id);
+                    }
+                } else {
+                    self.successors.insert(loop_id, Vec::new());
                 }
 
                 for block in &body_blocks_used {
@@ -2933,4 +2952,56 @@ pub fn structure(cfg: &ControlFlowGraph) -> (RegionNode, bool) {
 
     root.resolve_returns(cfg);
     (root.lower(cfg), reduced)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::hil::{
+        cflow::{
+            cfg::{Block, BlockExit, ControlFlowGraph},
+            graph::{AdjGraph, GraphView as _},
+        },
+        ir::HilExpr,
+    };
+
+    use super::{RegionNode, structure};
+
+    fn cfg_from_blocks(blocks: Vec<Block>) -> ControlFlowGraph {
+        let (successors, predecessors) =
+            crate::hil::cflow::graph::build_graph(blocks.iter().map(Block::exit_targets));
+        let idoms = AdjGraph::new(0, &successors, &predecessors).build_idoms();
+
+        ControlFlowGraph {
+            blocks,
+            entry_block: 0,
+            successors,
+            predecessors,
+            idoms,
+            params: Vec::new(),
+            upvalues: Vec::new(),
+        }
+    }
+
+    // This is an exception to the rule of verifying by integration testing over unit testing, as naturally
+    // this would not only force a timeout but put a lot of work on the CPU. Resolving the shape of the loop
+    // is still tested extensively in the integration tests, but this "edge case" is here only because it's
+    // simpler to manually build and check it over testing it in the test suite.
+    #[test]
+    fn structures_exitless_self_loop() {
+        let cfg = cfg_from_blocks(vec![Block {
+            stmts: Vec::new(),
+            exit: BlockExit::Jump(0),
+        }]);
+
+        let (root, reduced) = structure(&cfg);
+
+        assert!(reduced);
+        assert!(matches!(
+            root,
+            RegionNode::While {
+                condition: HilExpr::Bool(true),
+                ..
+            }
+        ));
+    }
 }
