@@ -2,7 +2,10 @@ use std::{fmt::Display, path::PathBuf};
 
 use serde_json::{Value, json};
 
-use super::graph::{Block, BlockExit, ControlFlowGraph};
+use crate::hil::cflow::{
+    cfg::{Block, BlockExit, ControlFlowGraph},
+    graph::{DominatorTree, GraphView},
+};
 
 const CHAR_W: f64 = 7.2;
 const LINE_H: f64 = 16.0;
@@ -39,7 +42,7 @@ fn build_label(idx: usize, block: &Block, is_entry: bool) -> NodeLabel {
     let mut lines: Vec<_> = block
         .stmts
         .iter()
-        .map(|s| (format!("{}", s.inner), false))
+        .map(|s| (format!("{}", s.node), false))
         .collect();
 
     match &block.exit {
@@ -87,8 +90,8 @@ fn node_size(label: &NodeLabel) -> (f64, f64) {
     (w, h)
 }
 
-fn dom_depths(idoms: &[Option<usize>], entry: usize) -> Vec<usize> {
-    let n = idoms.len();
+fn dom_depths(idoms: &DominatorTree, entry: usize, node_count: usize) -> Vec<usize> {
+    let n = node_count;
     let mut depth = vec![usize::MAX; n];
     depth[entry] = 0;
 
@@ -99,11 +102,12 @@ fn dom_depths(idoms: &[Option<usize>], entry: usize) -> Vec<usize> {
             if depth[i] != usize::MAX {
                 continue;
             }
-            if let Some(idom) = idoms[i] {
-                if depth[idom] != usize::MAX {
-                    depth[i] = depth[idom] + 1;
-                    changed = true;
-                }
+            if let Some(idom) = idoms.idom(i)
+                && idom < n
+                && depth[idom] != usize::MAX
+            {
+                depth[i] = depth[idom] + 1;
+                changed = true;
             }
         }
     }
@@ -134,14 +138,10 @@ struct GraphPayload {
 }
 
 impl ControlFlowGraph {
-    fn is_reachable(&self, block: usize) -> bool {
-        block == self.entry_block || !self.predecessors(block).is_empty()
-    }
-
     fn graph_payload(&self, tag: &str) -> GraphPayload {
         let n = self.blocks.len();
 
-        let depths = dom_depths(&self.immediate_dominators, self.entry_block);
+        let depths = dom_depths(&self.idoms, self.entry_block, n);
         let labels: Vec<Option<NodeLabel>> = self
             .blocks
             .iter()
@@ -167,7 +167,7 @@ impl ControlFlowGraph {
                     }
 
                     edge_counter += 1;
-                    let is_back = self.dominates(src, dst);
+                    let is_back = self.idoms.dominates(src, dst);
                     edges.push(Edge {
                         id: format!("e{edge_counter}"),
                         src,
@@ -350,7 +350,7 @@ fn build_label_json(labels: &[Option<NodeLabel>], n: usize) -> Value {
     (0..n)
         .filter_map(|i| {
             let label = labels[i].as_ref()?;
-            let lines: Vec<Value> = label
+            let lines: Vec<_> = label
                 .lines
                 .iter()
                 .map(|(text, bold)| json!({ "text": text, "bold": bold }))

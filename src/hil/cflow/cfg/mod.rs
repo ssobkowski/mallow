@@ -12,7 +12,7 @@ use crate::{
     common::{Spanned, ToSpanned as _},
     disasm::Proto,
     hil::{
-        cflow::graph::build_graph,
+        cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
         ir::{HilExpr, HilStmt, PhiNode},
         lifter::ssa::SymbolId,
     },
@@ -225,7 +225,7 @@ pub struct ControlFlowGraph {
 
     pub successors: Vec<Vec<usize>>,
     pub predecessors: Vec<Vec<usize>>,
-    pub idoms: Vec<Option<usize>>,
+    pub idoms: DominatorTree,
 
     pub params: Vec<SymbolId>,
     pub upvalues: Vec<SymbolId>,
@@ -271,7 +271,7 @@ impl ControlFlowGraph {
 
         // Rebuild after folding
         let (successors, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
-        let idoms = build_idoms(0, &successors, &predecessors);
+        let idoms = AdjGraph::new(0, &successors, &predecessors).build_idoms();
 
         let mut graph = Self {
             blocks,
@@ -288,35 +288,11 @@ impl ControlFlowGraph {
         graph
     }
 
-    /// Returns whether `dom` dominates `node`.
-    #[must_use]
-    #[cfg(feature = "visualize")]
-    pub fn dominates(&self, dom: usize, node: usize) -> bool {
-        if dom == node {
-            return true;
-        }
-        let mut current = node;
-        loop {
-            match self.idom(current) {
-                Some(idom) if idom == dom => return true,
-                Some(idom) => current = idom,
-                None => return false,
-            }
-        }
-    }
-
-    /// Returns the immediate dominator of `block`.
-    #[inline]
-    #[must_use]
-    pub fn idom(&self, block: usize) -> Option<usize> {
-        self.idoms.get(block).copied().flatten()
-    }
-
     /// Unfolds Phi Nodes into assign statements inserted at appropriate locations.
     ///
     /// This should be ran after the graph metadata has been computed.
     fn unfold_phis(&mut self, block_idx: usize) {
-        let Some(idom) = self.idom(block_idx) else {
+        let Some(idom) = self.idoms.idom(block_idx) else {
             // This block has no immediate dominator, we can't emit the phi node
             // target declaration anywhere.
             return;
@@ -386,6 +362,24 @@ impl ControlFlowGraph {
                 );
             }
         }
+    }
+}
+
+impl GraphView for ControlFlowGraph {
+    fn entry(&self) -> usize {
+        self.entry_block
+    }
+
+    fn successors(&self, node: usize) -> &[usize] {
+        &self.successors[node]
+    }
+
+    fn predecessors(&self, node: usize) -> &[usize] {
+        &self.predecessors[node]
+    }
+
+    fn contains_node(&self, node: usize) -> bool {
+        node < self.blocks.len()
     }
 }
 
@@ -709,95 +703,6 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
     }
 
     raw_blocks
-}
-
-fn compute_rpo(entry_block: usize, successors: &[Vec<usize>]) -> Vec<usize> {
-    let len = successors.len();
-    let mut visited = vec![false; len];
-    let mut post_order = Vec::with_capacity(len);
-
-    fn dfs(
-        block: usize,
-        successors: &[Vec<usize>],
-        visited: &mut [bool],
-        post_order: &mut Vec<usize>,
-    ) {
-        visited[block] = true;
-        for &succ in &successors[block] {
-            if !visited[succ] {
-                dfs(succ, successors, visited, post_order);
-            }
-        }
-        post_order.push(block);
-    }
-
-    dfs(entry_block, successors, &mut visited, &mut post_order);
-
-    post_order.reverse();
-    post_order
-}
-
-/// Computes immediate dominators for all reachable blocks using the
-/// Cooper-Harvey-Kennedy algorithm.
-pub fn build_idoms(
-    entry_block: usize,
-    successors: &[Vec<usize>],
-    predecessors: &[Vec<usize>],
-) -> Vec<Option<usize>> {
-    let rpo_nodes = compute_rpo(entry_block, successors);
-
-    let len = successors.len();
-    let mut doms = vec![None; len];
-    doms[entry_block] = Some(entry_block);
-
-    let mut rpo_number = vec![usize::MAX; len];
-    for (index, &block) in rpo_nodes.iter().enumerate() {
-        rpo_number[block] = index;
-    }
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &block in &rpo_nodes {
-            if block == entry_block {
-                continue;
-            }
-
-            let Some(mut new_idom) = predecessors[block]
-                .iter()
-                .copied()
-                .find(|&p| doms[p].is_some())
-            else {
-                continue;
-            };
-
-            for &p in &predecessors[block] {
-                if p != new_idom && doms[p].is_some() {
-                    new_idom = intersect(p, new_idom, &doms, &rpo_number);
-                }
-            }
-
-            if doms[block] != Some(new_idom) {
-                doms[block] = Some(new_idom);
-                changed = true;
-            }
-        }
-    }
-    doms[entry_block] = None;
-
-    doms
-}
-
-fn intersect(mut b1: usize, mut b2: usize, doms: &[Option<usize>], rpo_number: &[usize]) -> usize {
-    while b1 != b2 {
-        while rpo_number[b1] > rpo_number[b2] {
-            b1 = doms[b1].unwrap();
-        }
-        while rpo_number[b2] > rpo_number[b1] {
-            b2 = doms[b2].unwrap();
-        }
-    }
-    b1
 }
 
 /// Resolves a relative branch target from an instruction index.

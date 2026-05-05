@@ -4,7 +4,10 @@ use either::Either;
 use smallvec::SmallVec;
 
 use crate::hil::{
-    cflow::cfg::{BlockExit, ControlFlowGraph, build_idoms},
+    cflow::{
+        cfg::{BlockExit, ControlFlowGraph},
+        graph::{DominatorTree, GraphView, Reversed, SeseGraphView},
+    },
     ir::{HilExpr, HilStmt},
     lifter::ssa::SymbolId,
 };
@@ -516,10 +519,34 @@ pub struct FoldableGraph<'a> {
     successors: HashMap<usize, Vec<usize>>,
     predecessors: HashMap<usize, Vec<usize>>,
 
-    idoms: Option<HashMap<usize, usize>>,
-    postidoms: Option<HashMap<usize, usize>>,
+    idoms: Option<DominatorTree>,
+    postidoms: Option<DominatorTree>,
 
     id_counter: usize,
+}
+
+impl GraphView for FoldableGraph<'_> {
+    fn entry(&self) -> usize {
+        self.entry_node
+    }
+
+    fn successors(&self, node: usize) -> &[usize] {
+        self.successors.get(&node).map_or(&[], Vec::as_slice)
+    }
+
+    fn predecessors(&self, node: usize) -> &[usize] {
+        self.predecessors.get(&node).map_or(&[], Vec::as_slice)
+    }
+
+    fn contains_node(&self, node: usize) -> bool {
+        self.nodes.contains_key(&node)
+    }
+}
+
+impl SeseGraphView for FoldableGraph<'_> {
+    fn exit(&self) -> usize {
+        self.exit_node
+    }
 }
 
 impl<'a> FoldableGraph<'a> {
@@ -609,35 +636,25 @@ impl<'a> FoldableGraph<'a> {
     }
 
     /// Lazily recalculates the immediate dominators for each node in the graph.
-    fn get_or_calc_idoms(&mut self) -> &HashMap<usize, usize> {
-        match self.idoms {
-            Some(ref idoms) => idoms,
-            None => {
-                self.idoms = Some(build_idoms_sparse(
-                    self.entry_node,
-                    self.nodes.keys().copied(),
-                    &self.successors,
-                    &self.predecessors,
-                ));
-                self.idoms.as_ref().unwrap()
-            }
+    fn get_or_calc_idoms(&mut self) -> &DominatorTree {
+        if self.idoms.is_none() {
+            self.idoms = Some(self.build_idoms());
         }
+
+        self.idoms
+            .as_ref()
+            .expect("immediate dominators should be cached")
     }
 
     /// Lazily recalculates the post-dominators for each node in the graph.
-    fn get_or_calc_postidoms(&mut self) -> &HashMap<usize, usize> {
-        match self.postidoms {
-            Some(ref doms) => doms,
-            None => {
-                self.postidoms = Some(build_idoms_sparse(
-                    self.exit_node,
-                    self.nodes.keys().copied(),
-                    &self.predecessors,
-                    &self.successors,
-                ));
-                self.postidoms.as_ref().unwrap()
-            }
+    fn get_or_calc_postidoms(&mut self) -> &DominatorTree {
+        if self.postidoms.is_none() {
+            self.postidoms = Some(Reversed::new(&*self).build_idoms());
         }
+
+        self.postidoms
+            .as_ref()
+            .expect("post-dominators should be cached")
     }
 
     /// Invalidates the cached immediate dominators and post-dominators,
@@ -1705,17 +1722,7 @@ impl<'a> FoldableGraph<'a> {
     #[must_use]
     pub fn dominates(&mut self, dom: usize, node: usize) -> bool {
         let idoms = self.get_or_calc_idoms();
-        if dom == node {
-            return true;
-        }
-        let mut current = node;
-        loop {
-            match idoms.get(&current).copied() {
-                Some(idom) if idom == dom => return true,
-                Some(idom) => current = idom,
-                None => return false,
-            }
-        }
+        idoms.dominates(dom, node)
     }
 
     /// Collapses conditionally executed blocks into a `If` node.
@@ -1760,7 +1767,7 @@ impl<'a> FoldableGraph<'a> {
             }
 
             if let Some([left, right]) = self.exact_successors(head) {
-                let Some(tail) = self.get_or_calc_postidoms().get(&head).copied() else {
+                let Some(tail) = self.get_or_calc_postidoms().idom(head) else {
                     continue;
                 };
 
@@ -1869,7 +1876,7 @@ impl<'a> FoldableGraph<'a> {
                 continue;
             }
 
-            let Some(tail) = self.get_or_calc_postidoms().get(&head).copied() else {
+            let Some(tail) = self.get_or_calc_postidoms().idom(head) else {
                 continue;
             };
 
@@ -2849,61 +2856,6 @@ impl<'a> FoldableGraph<'a> {
             break;
         }
     }
-}
-
-/// A wrapper around `build_immediate_dominators` that handles sparse/non-continuous node IDs.
-pub fn build_idoms_sparse(
-    entry_node: usize,
-    active_nodes: impl Iterator<Item = usize>,
-    successors_map: &HashMap<usize, Vec<usize>>,
-    predecessors_map: &HashMap<usize, Vec<usize>>,
-) -> HashMap<usize, usize> {
-    let mut sparse_to_dense = HashMap::new();
-    let mut dense_to_sparse = Vec::new();
-
-    for (dense, sparse) in active_nodes.enumerate() {
-        sparse_to_dense.insert(sparse, dense);
-        dense_to_sparse.push(sparse);
-    }
-
-    let num_nodes = dense_to_sparse.len();
-
-    // Safety check: if the entry node was folded or deleted, we can't compute
-    let Some(&dense_entry) = sparse_to_dense.get(&entry_node) else {
-        return HashMap::new();
-    };
-
-    let mut dense_succs = vec![Vec::new(); num_nodes];
-    let mut dense_preds = vec![Vec::new(); num_nodes];
-
-    for &sparse in &dense_to_sparse {
-        let dense = sparse_to_dense[&sparse];
-
-        if let Some(succs) = successors_map.get(&sparse) {
-            // Only include edges to nodes that still exist in the graph
-            dense_succs[dense] = succs
-                .iter()
-                .filter_map(|s| sparse_to_dense.get(s).copied())
-                .collect();
-        }
-
-        if let Some(preds) = predecessors_map.get(&sparse) {
-            dense_preds[dense] = preds
-                .iter()
-                .filter_map(|p| sparse_to_dense.get(p).copied())
-                .collect();
-        }
-    }
-
-    let dense_doms = build_idoms(dense_entry, &dense_succs, &dense_preds);
-    let mut sparse_doms = HashMap::new();
-    for (dense, &sparse) in dense_to_sparse.iter().enumerate() {
-        if let Some(dense_idom) = dense_doms[dense] {
-            sparse_doms.insert(sparse, dense_to_sparse[dense_idom]);
-        }
-    }
-
-    sparse_doms
 }
 
 fn is_condition_prelude_value(expr: &HilExpr) -> bool {

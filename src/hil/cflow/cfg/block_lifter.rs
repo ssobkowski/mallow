@@ -8,7 +8,7 @@ use crate::{
     hil::{
         cflow::{
             common::RegSet,
-            graph::{GraphView, compute_rpo},
+            graph::{AdjGraph, GraphView},
             union_find::UnionFind,
         },
         common::{const_expr, decoded_count, reg_add, reg_range},
@@ -114,11 +114,9 @@ impl<'a> BlockBuilder<'a> {
 
     /// Lifts reachable raw blocks in reverse postorder.
     fn lift_blocks(&mut self) {
-        let graph = SsaGraph {
-            successors: self.successors,
-        };
+        let graph = AdjGraph::new(0, self.successors, self.predecessors);
 
-        for block_id in compute_rpo(&graph) {
+        for block_id in graph.compute_rpo() {
             self.lift_block(block_id);
         }
     }
@@ -502,37 +500,6 @@ impl<'a> BlockBuilder<'a> {
             let sym = self.ssa.alloc_symbol(Symbol::reg(reg));
             self.ssa.write_reg(block_id, reg, sym);
         }
-    }
-}
-
-/// Minimal graph adapter so SSA construction can use generic graph utilities.
-struct SsaGraph<'a> {
-    successors: &'a [Vec<usize>],
-}
-
-impl GraphView for SsaGraph<'_> {
-    fn entry(&self) -> usize {
-        0
-    }
-
-    fn exit(&self) -> usize {
-        unimplemented!("not a SESE") // and it doesn't need to be SESE
-    }
-
-    fn len(&self) -> usize {
-        self.successors.len()
-    }
-
-    fn successors(&self, node: usize) -> &[usize] {
-        &self.successors[node]
-    }
-
-    fn predecessors(&self, _: usize) -> &[usize] {
-        unimplemented!("RPO does not need predecessor access")
-    }
-
-    fn contains_node(&self, node: usize) -> bool {
-        node < self.len()
     }
 }
 
