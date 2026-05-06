@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use smol_str::SmolStr;
 
 use crate::{
-    ast::{Block, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt, TableItem, UnOp},
+    ast::{
+        BinOp, Block, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt, TableItem, UnOp,
+    },
     common::is_valid_luau_identifier,
     emitter::{name::NameAllocator, options::EmitterOptions},
     hil::{
@@ -347,10 +349,36 @@ impl Emitter {
                 //
                 // we can emit it as a Luau `if` expression
                 if let Some(else_branch) = else_branch.as_ref()
-                    && let Some(ifelse) =
-                        self.emit_as_ifelse_expr(&hoisted, condition, then_branch, else_branch)
+                    && let [sym] = hoisted.as_slice()
+                    && let Some((then_value, else_value)) =
+                        Self::match_if_assign(*sym, then_branch, else_branch)
                 {
-                    buf.push(ifelse);
+                    let value =
+                        match Self::try_simplify_bool_ifelse(condition, then_value, else_value) {
+                            Some(e) => self.visit_expr(&e),
+                            None => Expr::IfElse {
+                                condition: Box::new(self.visit_expr(condition)),
+                                then_expr: Box::new(self.visit_expr(then_value)),
+                                else_expr: Box::new(self.visit_expr(else_value)),
+                            },
+                        };
+
+                    self.declare_symbol(*sym);
+                    buf.push(
+                        match self
+                            .symbol_storage(*sym)
+                            .expect("if-expression target was just declared")
+                        {
+                            SymbolStorage::Named(name) => Stmt::LocalDeclaration {
+                                names: vec![name],
+                                values: vec![value],
+                            },
+                            SymbolStorage::Spilled(_) => Stmt::Assignment {
+                                lhs: vec![self.symbol_expr(*sym)],
+                                rhs: vec![value],
+                            },
+                        },
+                    );
                     return;
                 }
 
@@ -852,54 +880,53 @@ impl Emitter {
         Expr::AnonymousFunction { params, body }
     }
 
-    fn emit_as_ifelse_expr(
-        &mut self,
-        hoisted: &[SymbolId],
+    /// Returns the values assigned to `sym` in the then/else branches, if both branches
+    /// consist of exactly one assignment to `sym` in a basic block.
+    ///
+    /// Returns `None` if either branch is not a basic block, contains more than one statement,
+    /// or does not assign to `sym`.
+    fn match_if_assign<'a>(
+        sym: SymbolId,
+        then_branch: &'a RegionNode,
+        else_branch: &'a RegionNode,
+    ) -> Option<(&'a HilExpr, &'a HilExpr)> {
+        let single_value = |node: &'a RegionNode| {
+            let RegionNode::BasicBlock { stmts } = node else {
+                return None;
+            };
+            let [HilStmt::Assign { left, value }] = stmts.as_slice() else {
+                return None;
+            };
+            (left == &HilExpr::Symbol(sym)).then_some(value)
+        };
+
+        Some((single_value(then_branch)?, single_value(else_branch)?))
+    }
+
+    /// Attempts to build a boolean-like expression from an if/else branch pair.
+    fn try_simplify_bool_ifelse(
         condition: &HilExpr,
-        then_branch: &RegionNode,
-        else_branch: &RegionNode,
-    ) -> Option<Stmt> {
-        // if-else expr cannot assign to tuples, only a single symbol
-        let [sym] = hoisted else { return None };
-
-        let single_assign_value = |node: &RegionNode| {
-            if let RegionNode::BasicBlock { stmts } = node {
-                let [stmt] = stmts.as_slice() else {
-                    return None;
-                };
-                match stmt {
-                    HilStmt::Assign { left, value } if left == &HilExpr::Symbol(*sym) => {
-                        Some(value.clone())
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        };
-
-        let value_if_true = single_assign_value(then_branch)?;
-        let value_if_false = single_assign_value(else_branch)?;
-
-        self.declare_symbol(*sym);
-        let value = Expr::IfElse {
-            condition: Box::new(self.visit_expr(condition)),
-            then_expr: Box::new(self.visit_expr(&value_if_true)),
-            else_expr: Box::new(self.visit_expr(&value_if_false)),
-        };
-
-        match self
-            .symbol_storage(*sym)
-            .expect("if-expression target was just declared")
-        {
-            SymbolStorage::Named(name) => Some(Stmt::LocalDeclaration {
-                names: vec![name],
-                values: vec![value],
-            }),
-            SymbolStorage::Spilled(_) => Some(Stmt::Assignment {
-                lhs: vec![self.symbol_expr(*sym)],
-                rhs: vec![value],
-            }),
+        then_value: &HilExpr,
+        else_value: &HilExpr,
+    ) -> Option<HilExpr> {
+        match (then_value, else_value) {
+            (HilExpr::Bool(true), HilExpr::Bool(false)) => match condition {
+                HilExpr::Binary {
+                    op: BinOp::Eq | BinOp::Ne,
+                    ..
+                } => Some(condition.clone()),
+                _ => None,
+            },
+            (HilExpr::Bool(false), HilExpr::Bool(true)) => match condition {
+                HilExpr::Binary {
+                    op: BinOp::Eq | BinOp::Ne,
+                    ..
+                } => Some(condition.clone().invert()),
+                // not (x < y) != x >= y when x or y is NaN, so only use comparison
+                // inversion for equality operators and otherwise keep the if-expression.
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
