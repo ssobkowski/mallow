@@ -558,11 +558,11 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
                         lhs: reg,
-                        op: BinOp::Gt,
+                        op: BinOp::Lte,
                         rhs: CondRhs::Reg(aux),
                     },
-                    then_block: pc_to_block_idx(entries, target),
-                    else_block: block_idx + 1,
+                    then_block: block_idx + 1,
+                    else_block: pc_to_block_idx(entries, target),
                 }
             }
             Some(Instr::JumpIfLt { reg, aux, offset }) => {
