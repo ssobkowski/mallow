@@ -68,6 +68,7 @@ impl FromLeBytes for String {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub struct LocalDebug {
     pub name: String,
@@ -79,15 +80,19 @@ pub struct LocalDebug {
 #[derive(Debug, Default, Clone)]
 pub struct Proto {
     pub index: u64,
+    #[allow(dead_code)]
     pub max_stack_size: u8,
     pub num_params: u8,
     pub num_upvals: u8,
     pub is_vararg: bool,
+    #[allow(dead_code)]
     pub flags: u8,
+    #[allow(dead_code)]
     pub type_info: Vec<u8>,
     pub instrs: Vec<Spanned<Instr>>,
     pub consts: Vec<Constant>,
     pub protos: Vec<usize>,
+    #[allow(dead_code)]
     pub locals: Vec<LocalDebug>,
 }
 

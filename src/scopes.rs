@@ -49,13 +49,6 @@ impl<K: Hash + Eq, V> Scope<K, V> {
     pub fn contains(&self, name: &K) -> bool {
         self.variables.contains_key(name)
     }
-
-    /// Returns the number of variables in the scope.
-    #[inline]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.variables.len()
-    }
 }
 
 impl<K: Hash + Eq, V> Index<&K> for Scope<K, V> {
@@ -87,16 +80,7 @@ impl<K: Hash + Eq, V> Scopes<K, V> {
     /// Pushes a new scope onto the stack.
     #[inline]
     pub fn push_scope(&mut self) -> &mut Scope<K, V> {
-        // TODO: https://github.com/rust-lang/rust/issues/151252
-        // perhaps it will get introduced with rust 1.95?
-        self.scopes.push(Scope::new());
-        self.scopes.last_mut().expect("scope was just pushed")
-    }
-
-    /// Returns the top scope, if it exists.
-    #[inline]
-    pub fn top_scope(&self) -> Option<&Scope<K, V>> {
-        self.scopes.last()
+        self.scopes.push_mut(Scope::new())
     }
 
     /// Gets the current scope mutably, if it exists.
