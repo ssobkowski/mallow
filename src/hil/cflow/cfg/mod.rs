@@ -258,12 +258,7 @@ impl ControlFlowGraph {
             let (_, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
             let (changed_cond, new_blocks) = fold_condition_chains(blocks, &predecessors);
 
-            let (successors, predecessors) =
-                build_graph(new_blocks.iter().map(|b| b.exit_targets()));
-            let (changed_dup, new_blocks) =
-                duplicate_shared_falsy_fallbacks(new_blocks, &successors, &predecessors);
-
-            if !changed_cond && !changed_dup {
+            if !changed_cond {
                 break new_blocks;
             }
             blocks = new_blocks;
@@ -791,112 +786,6 @@ fn fold_truthy_cond_jumps(blocks: &mut [Block]) -> bool {
     was_changed
 }
 
-/// Duplicates simple fallback blocks shared by multiple falsy short-circuit edges.
-///
-/// The bytecode for nested `and/or` expressions often has several failed truthiness
-/// checks converge on the same fallback assignment block. That block is semantically
-/// just "run this fallback for this failed edge", but the shared predecessor set is
-/// not a single-entry region and prevents structured `if not value then ... end`
-/// output. Tail-duplicating the fallback preserves the CFG semantics while making
-/// each falsy edge own a normal branch body.
-fn duplicate_shared_falsy_fallbacks(
-    mut blocks: Vec<Block>,
-    successors: &[Vec<usize>],
-    predecessors: &[Vec<usize>],
-) -> (bool, Vec<Block>) {
-    let mut rewrites = Vec::new();
-
-    for (target, preds) in predecessors.iter().enumerate() {
-        if preds.len() <= 1 || !is_duplicateable_fallback(&blocks[target]) {
-            continue;
-        }
-
-        if preds
-            .iter()
-            .any(|&pred| is_reachable(&successors, target, pred))
-        {
-            continue;
-        }
-
-        if !preds.iter().all(|&pred| {
-            matches!(
-                blocks[pred].exit,
-                BlockExit::CondJump {
-                    then_block,
-                    else_block,
-                    ..
-                } if then_block == target || else_block == target
-            )
-        }) {
-            continue;
-        }
-
-        rewrites.extend(preds.iter().skip(1).map(|&pred| (pred, target)));
-    }
-
-    if rewrites.is_empty() {
-        return (false, blocks);
-    }
-
-    for (pred, target) in rewrites {
-        let clone_target = blocks.len();
-        blocks.push(blocks[target].clone());
-        replace_exit_target(&mut blocks[pred].exit, target, clone_target);
-    }
-
-    (true, blocks)
-}
-
-fn is_reachable(successors: &[Vec<usize>], start: usize, target: usize) -> bool {
-    let mut stack = vec![start];
-    let mut seen = vec![false; successors.len()];
-
-    while let Some(node) = stack.pop() {
-        if node == target {
-            return true;
-        }
-
-        if std::mem::replace(&mut seen[node], true) {
-            continue;
-        }
-
-        stack.extend(successors[node].iter().copied());
-    }
-
-    false
-}
-
-fn is_duplicateable_fallback(block: &Block) -> bool {
-    if block.stmts.is_empty() {
-        return matches!(block.exit, BlockExit::CondJump { .. });
-    }
-
-    if !block
-        .stmts
-        .iter()
-        .all(|stmt| matches!(stmt.node, HilStmt::Assign { .. }))
-    {
-        return false;
-    }
-
-    match block.exit {
-        BlockExit::Jump(_) | BlockExit::Fallthrough(_) => true,
-        BlockExit::CondJump {
-            cond: HilExpr::Symbol(cond),
-            ..
-        } => block.stmts.iter().any(|stmt| {
-            matches!(
-                stmt.node,
-                HilStmt::Assign {
-                    left: HilExpr::Symbol(symbol),
-                    ..
-                } if symbol == cond
-            )
-        }),
-        _ => false,
-    }
-}
-
 /// Folds condition chains into the block exit, replacing them with a direct
 /// jump to the target block.
 fn fold_condition_chains(
@@ -916,18 +805,14 @@ fn fold_condition_chains(
         };
 
         if predecessors[then_a].len() == 1
-            && is_safe_to_hoist_across_condition(&blocks[then_a], &cond_a)
+            && blocks[then_a].stmts.is_empty()
             && let BlockExit::CondJump {
                 cond: cond_b,
                 then_block: then_b,
                 else_block: else_b,
             } = blocks[then_a].exit.clone()
-            && !block_assigns_condition_symbol(&blocks[then_a], &cond_b)
             && else_a == else_b
         {
-            let mut stmts = std::mem::take(&mut blocks[then_a].stmts);
-            blocks[i].stmts.append(&mut stmts);
-
             blocks[i].exit = BlockExit::CondJump {
                 cond: HilExpr::Binary {
                     lhs: Box::new(cond_a),
@@ -942,18 +827,14 @@ fn fold_condition_chains(
         }
 
         if predecessors[else_a].len() == 1
-            && is_safe_to_hoist_across_condition(&blocks[else_a], &cond_a)
+            && blocks[else_a].stmts.is_empty()
             && let BlockExit::CondJump {
                 cond: cond_b,
                 then_block: then_b,
                 else_block: else_b,
             } = blocks[else_a].exit.clone()
-            && !block_assigns_condition_symbol(&blocks[else_a], &cond_b)
             && then_a == then_b
         {
-            let mut stmts = std::mem::take(&mut blocks[else_a].stmts);
-            blocks[i].stmts.append(&mut stmts);
-
             blocks[i].exit = BlockExit::CondJump {
                 cond: HilExpr::Binary {
                     lhs: Box::new(cond_a),
@@ -968,78 +849,6 @@ fn fold_condition_chains(
     }
 
     (was_changed, blocks)
-}
-
-/// Returns whether a block contains an assignment to the condition symbol, ie.
-///
-/// ```
-/// [symbol] = [cond]
-/// ```
-/// where `[cond]` is the condition of our CondJump of interest
-fn block_assigns_condition_symbol(block: &Block, condition: &HilExpr) -> bool {
-    let HilExpr::Symbol(cond_symbol) = condition else {
-        return false;
-    };
-
-    block.stmts.iter().any(|stmt| {
-        matches!(
-            stmt.node,
-            HilStmt::Assign {
-                left: HilExpr::Symbol(symbol),
-                ..
-            } if symbol == *cond_symbol
-        )
-    })
-}
-
-fn replace_exit_target(exit: &mut BlockExit, old_target: usize, new_target: usize) {
-    match exit {
-        BlockExit::Jump(target)
-        | BlockExit::Fallthrough(target)
-        | BlockExit::FornLoop {
-            body_block: target, ..
-        }
-        | BlockExit::ForgLoop {
-            body_block: target, ..
-        } if *target == old_target => {
-            *target = new_target;
-        }
-        BlockExit::CondJump {
-            then_block,
-            else_block,
-            ..
-        } => {
-            if *then_block == old_target {
-                *then_block = new_target;
-            }
-            if *else_block == old_target {
-                *else_block = new_target;
-            }
-        }
-        BlockExit::FornPrep {
-            body_block,
-            exit_block,
-            ..
-        }
-        | BlockExit::ForgPrep {
-            body_block,
-            exit_block,
-            ..
-        } => {
-            if *body_block == old_target {
-                *body_block = new_target;
-            }
-            if *exit_block == old_target {
-                *exit_block = new_target;
-            }
-        }
-        BlockExit::FornLoop { exit_block, .. } | BlockExit::ForgLoop { exit_block, .. } => {
-            if *exit_block == old_target {
-                *exit_block = new_target;
-            }
-        }
-        BlockExit::Return(_) | BlockExit::Jump(_) | BlockExit::Fallthrough(_) => {}
-    }
 }
 
 /// Folds blocks with no statements and single jump exits.
@@ -1099,42 +908,4 @@ fn thread_jumps(blocks: &mut [Block]) -> bool {
         }
     }
     was_changed
-}
-
-fn is_safe_to_hoist_across_condition(block: &Block, condition: &HilExpr) -> bool {
-    if !block.stmts.is_empty()
-        && block.stmts.iter().all(|stmt| {
-            matches!(
-                &stmt.node,
-                HilStmt::Assign { value, .. } if is_condition_prelude_value(value)
-            )
-        })
-    {
-        return false;
-    }
-
-    block.stmts.iter().all(|stmt| {
-        let HilStmt::Assign { left, value } = &stmt.node else {
-            return false;
-        };
-
-        value.is_pure()
-            && !matches!(
-                (left, condition),
-                (HilExpr::Symbol(assigned), HilExpr::Symbol(cond)) if assigned == cond
-            )
-    })
-}
-
-fn is_condition_prelude_value(expr: &HilExpr) -> bool {
-    matches!(
-        expr,
-        HilExpr::Nil
-            | HilExpr::Number(_)
-            | HilExpr::String(_)
-            | HilExpr::Bool(_)
-            | HilExpr::Symbol(_)
-            | HilExpr::Import(_)
-            | HilExpr::Global(_)
-    )
 }
