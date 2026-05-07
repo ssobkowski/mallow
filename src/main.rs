@@ -94,19 +94,19 @@ fn disassemble_bytecode(bytecode: &[u8]) -> Result<Disassembly, DisasmError> {
 }
 
 fn decompile_bytecode(bytecode: &[u8], options: EmitterOptions) -> Result<String, DisasmError> {
-    let diasssembled = disassemble_bytecode(bytecode)?;
+    let disasssembled = disassemble_bytecode(bytecode)?;
 
-    let mut fns: Vec<_> = diasssembled
+    let mut fns: Vec<_> = disasssembled
         .protos
         .iter()
-        .map(|proto| StructuredFunction::from_proto(proto, &diasssembled.protos))
+        .map(|proto| StructuredFunction::from_proto(proto, &disasssembled.protos))
         .collect();
     let error = fns.iter().any(|f| !f.was_reduced);
 
     verbose!("running passes...");
     hil::passes::run(&mut fns);
 
-    let ast = emitter::emit_ast(fns, diasssembled.entry_proto as usize, options);
+    let ast = emitter::emit_ast(fns, disasssembled.entry_proto as usize, options);
 
     let mut comments = vec![format!(
         "Decompiled by mallow {}",
