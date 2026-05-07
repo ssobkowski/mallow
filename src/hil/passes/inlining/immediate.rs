@@ -318,8 +318,8 @@ impl Inliner {
             }
             RegionNode::GenericFor { exprs, .. } => {
                 if let HilStmt::AssignMany { left, value } = decl
-                    && self.can_inline_tuple_binding(left, value)
                     && left.as_slice() == exprs.as_slice()
+                    && self.can_inline_generic_for(left, value)
                 {
                     exprs.clear();
                     exprs.push(value.clone());
@@ -332,6 +332,22 @@ impl Inliner {
         }
 
         applied
+    }
+
+    fn can_inline_generic_for(&self, left: &[HilExpr], value: &HilExpr) -> bool {
+        if !self.can_inline_tuple_binding(left, value) {
+            return false;
+        }
+        // Generic for truncates to 3 values, so it's safe to inline
+        // a tuple of unknown arity as long as exactly 3 locals bind it.
+        left.len() == 3
+            && left.iter().all(|lvalue| match lvalue {
+                HilExpr::Symbol(sym) => self
+                    .vars
+                    .get(sym)
+                    .is_some_and(|v| v.read_count == 1 && v.write_count == 1),
+                _ => true,
+            })
     }
 }
 
