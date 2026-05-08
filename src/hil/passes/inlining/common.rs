@@ -115,19 +115,17 @@ impl Visitor for Analyzer {
     fn visit_region(&mut self, node: &RegionNode) {
         match node {
             RegionNode::NumericFor { var, .. } => {
-                if let Some(existing) = self.vars.get_mut(var) {
-                    existing.write_count += 1;
-                } else {
-                    self.vars.declare(*var, Var::new(HilExpr::Symbol(*var)));
-                }
+                self.vars
+                    .entry(*var)
+                    .or_insert_with(|| Var::new(HilExpr::Symbol(*var)))
+                    .write_count += 1;
             }
             RegionNode::GenericFor { vars, .. } => {
                 for var in vars {
-                    if let Some(existing) = self.vars.get_mut(var) {
-                        existing.write_count += 1;
-                    } else {
-                        self.vars.declare(*var, Var::new(HilExpr::Symbol(*var)));
-                    }
+                    self.vars
+                        .entry(*var)
+                        .or_insert_with(|| Var::new(HilExpr::Symbol(*var)))
+                        .write_count += 1;
                 }
             }
             _ => {}

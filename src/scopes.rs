@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::ops::Index;
 
@@ -48,6 +49,12 @@ impl<K: Hash + Eq, V> Scope<K, V> {
     #[must_use]
     pub fn contains(&self, name: &K) -> bool {
         self.variables.contains_key(name)
+    }
+
+    /// Returns an [Entry] for the given name.
+    #[inline]
+    pub fn entry(&mut self, name: K) -> Entry<'_, K, V> {
+        self.variables.entry(name)
     }
 }
 
