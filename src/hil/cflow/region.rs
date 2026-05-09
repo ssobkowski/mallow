@@ -3,13 +3,16 @@ use std::collections::{HashMap, HashSet};
 use either::Either;
 use smallvec::SmallVec;
 
-use crate::hil::{
-    cflow::{
-        cfg::{BlockExit, ControlFlowGraph},
-        graph::{DominatorTree, GraphView, Reversed, SeseGraphView},
+use crate::{
+    ast::BinOp,
+    hil::{
+        cflow::{
+            cfg::{BlockExit, ControlFlowGraph},
+            graph::{DominatorTree, GraphView, Reversed, SeseGraphView},
+        },
+        ir::{HilExpr, HilStmt},
+        lifter::ssa::SymbolId,
     },
-    ir::{HilExpr, HilStmt},
-    lifter::ssa::SymbolId,
 };
 
 #[derive(Debug)]
@@ -47,11 +50,106 @@ enum GuardTree {
     Body,
     Exit,
     Branch {
-        node: usize,
         condition: HilExpr,
         then_branch: Box<GuardTree>,
         else_branch: Box<GuardTree>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum BoolExpr {
+    True,
+    False,
+    Atom(HilExpr),
+    Not(Box<BoolExpr>),
+    And(Box<BoolExpr>, Box<BoolExpr>),
+    Or(Box<BoolExpr>, Box<BoolExpr>),
+}
+
+impl BoolExpr {
+    fn atom(expr: HilExpr) -> Self {
+        match expr {
+            HilExpr::Bool(true) => Self::True,
+            HilExpr::Bool(false) => Self::False,
+            other => Self::Atom(other),
+        }
+    }
+
+    fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Atom(expr) => Self::atom(expr.invert()),
+            Self::Not(inner) => *inner,
+            other => Self::Not(Box::new(other)),
+        }
+    }
+
+    fn and(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, rhs) => rhs,
+            (lhs, Self::True) => lhs,
+            (lhs, rhs) => Self::And(Box::new(lhs), Box::new(rhs)),
+        }
+    }
+
+    fn or(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, rhs) => rhs,
+            (lhs, Self::False) => lhs,
+            (lhs, Self::And(and_lhs, and_rhs)) if lhs == and_lhs.as_ref().clone().not() => {
+                lhs.or(*and_rhs)
+            }
+            (Self::And(and_lhs, and_rhs), rhs) if rhs == and_lhs.as_ref().clone().not() => {
+                rhs.or(*and_rhs)
+            }
+            (lhs, rhs) => Self::Or(Box::new(lhs), Box::new(rhs)),
+        }
+    }
+
+    fn into_hil(self) -> HilExpr {
+        match self {
+            Self::True => HilExpr::Bool(true),
+            Self::False => HilExpr::Bool(false),
+            Self::Atom(expr) => expr,
+            Self::Not(expr) => expr.into_hil().invert(),
+            Self::And(lhs, rhs) => HilExpr::Binary {
+                lhs: Box::new(lhs.into_hil()),
+                op: BinOp::And,
+                rhs: Box::new(rhs.into_hil()),
+            },
+            Self::Or(lhs, rhs) => HilExpr::Binary {
+                lhs: Box::new(lhs.into_hil()),
+                op: BinOp::Or,
+                rhs: Box::new(rhs.into_hil()),
+            },
+        }
+    }
+}
+
+impl From<GuardTree> for BoolExpr {
+    fn from(guard: GuardTree) -> Self {
+        match guard {
+            GuardTree::Body => BoolExpr::True,
+            GuardTree::Exit => BoolExpr::False,
+            GuardTree::Branch {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let cond_expr = BoolExpr::atom(condition);
+                let then_condition = BoolExpr::from(*then_branch);
+                let else_condition = BoolExpr::from(*else_branch);
+
+                cond_expr
+                    .clone()
+                    .and(then_condition)
+                    .or(cond_expr.not().and(else_condition))
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -135,6 +233,12 @@ pub enum CfgNode {
     /// A temporary scaffolding node used to merge multiple physical exits
     /// into a Single-Entry, Single-Exit (SESE) graph.
     VirtualExit,
+}
+
+impl CfgNode {
+    pub const fn is_empty(&self) -> bool {
+        matches!(self, CfgNode::Sequence { nodes } if nodes.is_empty())
+    }
 }
 
 /// A region node in the structured control flow graph.
@@ -1136,6 +1240,38 @@ impl<'a> FoldableGraph<'a> {
         });
 
         if !has_flattened_loop_region {
+            if let Some((then_branch, fallback_node, remaining)) =
+                self.build_shared_fallback_chain(&nodes, then_block, else_block)
+            {
+                let mut folded = Vec::with_capacity(remaining.len() + 3);
+                folded.push(head_node);
+                folded.push(CfgNode::If {
+                    condition: cond,
+                    then_branch: Box::new(then_branch),
+                    else_branch: None,
+                });
+                folded.push(fallback_node);
+                folded.extend(remaining);
+
+                return CfgNode::Sequence { nodes: folded };
+            }
+
+            if let Some((else_branch, fallback_node, remaining)) =
+                self.build_shared_fallback_chain(&nodes, else_block, then_block)
+            {
+                let mut folded = Vec::with_capacity(remaining.len() + 3);
+                folded.push(head_node);
+                folded.push(CfgNode::If {
+                    condition: cond.invert(),
+                    then_branch: Box::new(else_branch),
+                    else_branch: None,
+                });
+                folded.push(fallback_node);
+                folded.extend(remaining);
+
+                return CfgNode::Sequence { nodes: folded };
+            }
+
             let mut then_node_val = None;
             let mut else_node_val = None;
             let mut remove_order = [then_idx, else_idx];
@@ -1333,6 +1469,78 @@ impl<'a> FoldableGraph<'a> {
         folded.extend(remaining);
 
         CfgNode::Sequence { nodes: folded }
+    }
+
+    fn build_shared_fallback_chain(
+        &self,
+        nodes: &[CfgNode],
+        start_block: usize,
+        fallback_block: usize,
+    ) -> Option<(CfgNode, CfgNode, Vec<CfgNode>)> {
+        let mut guards = Vec::new();
+        let mut used_blocks = HashSet::new();
+        let mut current = start_block;
+
+        loop {
+            if !used_blocks.insert(current) {
+                return None;
+            }
+
+            let current_node = nodes
+                .iter()
+                .find(|node| node.starts_with_block(current))?
+                .clone();
+            let BlockExit::CondJump {
+                cond,
+                then_block,
+                else_block,
+            } = &self.cfg.blocks[current].exit
+            else {
+                let success_node = current_node;
+                if !self.node_ends_with_terminal(&success_node) || guards.is_empty() {
+                    return None;
+                }
+
+                let fallback_node = nodes
+                    .iter()
+                    .find(|node| node.starts_with_block(fallback_block))?
+                    .clone();
+                used_blocks.insert(fallback_block);
+
+                let mut branch = success_node;
+                for (guard_node, condition) in guards.into_iter().rev() {
+                    branch = CfgNode::merge([
+                        guard_node,
+                        CfgNode::If {
+                            condition,
+                            then_branch: Box::new(branch),
+                            else_branch: None,
+                        },
+                    ]);
+                }
+
+                let remaining = nodes
+                    .iter()
+                    .filter(|node| {
+                        node.first_block()
+                            .is_none_or(|block| !used_blocks.contains(&block))
+                    })
+                    .cloned()
+                    .collect();
+
+                return Some((branch, fallback_node, remaining));
+            };
+
+            if *else_block == fallback_block {
+                guards.push((current_node, cond.clone()));
+                current = *then_block;
+            } else if *then_block == fallback_block {
+                guards.push((current_node, cond.clone().invert()));
+                current = *else_block;
+            } else {
+                return None;
+            }
+        }
     }
 
     /// Folds one conditional in a sequence into an explicit escape guard.
@@ -2396,11 +2604,11 @@ impl<'a> FoldableGraph<'a> {
         body_blocks: &HashSet<usize>,
         seen: &mut HashSet<usize>,
     ) -> Option<GuardBuild> {
-        if !seen.insert(node) || !self.is_guard_condition_node(node) {
+        if !seen.insert(node) || self.extract_cond_jump(&self.nodes[&node]).is_none() {
             return None;
         }
 
-        let (condition, raw_then, raw_else) = self.extract_cond_jump(&self.nodes[&node])?;
+        let (_, raw_then, raw_else) = self.extract_cond_jump(&self.nodes[&node])?;
         let mut then_seen = seen.clone();
         let mut else_seen = seen.clone();
         let mut then_branch =
@@ -2424,6 +2632,10 @@ impl<'a> FoldableGraph<'a> {
             (Some(_), Some(_)) => return None,
         };
 
+        let condition_can_duplicate =
+            guard_condition_can_duplicate(&then_branch.tree, &else_branch.tree);
+        let condition = self.guard_node_condition(node, !condition_can_duplicate)?;
+
         let mut absorbed = HashSet::new();
         absorbed.extend(then_branch.absorbed.drain());
         absorbed.extend(else_branch.absorbed.drain());
@@ -2433,7 +2645,6 @@ impl<'a> FoldableGraph<'a> {
 
         Some(GuardBuild {
             tree: GuardTree::Branch {
-                node,
                 condition,
                 then_branch: Box::new(then_branch.tree),
                 else_branch: Box::new(else_branch.tree),
@@ -2456,22 +2667,6 @@ impl<'a> FoldableGraph<'a> {
             return GuardBuild::exit(raw_target);
         };
 
-        if self.is_guard_condition_node(active)
-            && let Some(guard) = self.build_guard_tree(active, head, tail, body_blocks, seen)
-            && guard.exit_block.is_some()
-        {
-            return guard;
-        }
-
-        if active != raw_target
-            && self.nodes.contains_key(&raw_target)
-            && self.is_guard_condition_node(raw_target)
-            && let Some(guard) = self.build_guard_tree(raw_target, head, tail, body_blocks, seen)
-            && guard.exit_block.is_some()
-        {
-            return guard;
-        }
-
         if active == tail || active == head {
             return GuardBuild::body();
         }
@@ -2480,47 +2675,53 @@ impl<'a> FoldableGraph<'a> {
             return GuardBuild::exit(active);
         }
 
+        if self.extract_cond_jump(&self.nodes[&active]).is_some()
+            && let Some(guard) = self.build_guard_tree(active, head, tail, body_blocks, seen)
+            && guard.exit_block.is_some()
+        {
+            return guard;
+        }
+
+        if active != raw_target
+            && self.nodes.contains_key(&raw_target)
+            && self.extract_cond_jump(&self.nodes[&raw_target]).is_some()
+            && let Some(guard) = self.build_guard_tree(raw_target, head, tail, body_blocks, seen)
+            && guard.exit_block.is_some()
+        {
+            return guard;
+        }
+
         GuardBuild::body()
     }
 
-    fn is_guard_condition_node(&self, node: usize) -> bool {
-        self.extract_cond_jump(&self.nodes[&node]).is_some()
-            && self.node_has_only_pure_assigns(&self.nodes[&node])
+    fn guard_node_condition(&self, node: usize, _allow_impure_prelude: bool) -> Option<HilExpr> {
+        let (condition, _, _) = self.extract_cond_jump(&self.nodes[&node])?;
+        if self.node_has_prelude(&self.nodes[&node]) {
+            return None;
+        }
+
+        Some(condition)
     }
 
-    fn node_has_only_pure_assigns(&self, node: &CfgNode) -> bool {
+    fn node_has_prelude(&self, node: &CfgNode) -> bool {
         match node {
-            CfgNode::BasicBlock { block } => self.cfg.blocks[*block].stmts.iter().all(|stmt| {
-                matches!(
-                    &stmt.node,
-                    HilStmt::Assign { value, .. } if is_condition_prelude_value(value)
-                )
-            }),
-            CfgNode::Sequence { nodes } => nodes
-                .iter()
-                .all(|node| self.node_has_only_pure_assigns(node)),
+            CfgNode::BasicBlock { block } => !self.cfg.blocks[*block].stmts.is_empty(),
+            CfgNode::Sequence { nodes } => nodes.iter().any(|node| self.node_has_prelude(node)),
             _ => false,
         }
     }
 
-    fn build_guard_node(
-        &self,
-        guard: &GuardTree,
-        head: usize,
-        head_node: &CfgNode,
-        break_payload: &CfgNode,
-    ) -> Option<CfgNode> {
+    fn build_guard_node(&self, guard: &GuardTree, break_payload: &CfgNode) -> Option<CfgNode> {
         match guard {
             GuardTree::Body => None,
             GuardTree::Exit => Some(break_payload.clone()),
             GuardTree::Branch {
-                node,
                 condition,
                 then_branch,
                 else_branch,
             } => {
-                let then_node = self.build_guard_node(then_branch, head, head_node, break_payload);
-                let else_node = self.build_guard_node(else_branch, head, head_node, break_payload);
+                let then_node = self.build_guard_node(then_branch, break_payload);
+                let else_node = self.build_guard_node(else_branch, break_payload);
 
                 let guard_if = match (then_node, else_node) {
                     (Some(then_branch), Some(else_branch)) => CfgNode::If {
@@ -2541,17 +2742,7 @@ impl<'a> FoldableGraph<'a> {
                     (None, None) => return None,
                 };
 
-                let condition_node = if *node == head {
-                    head_node.clone()
-                } else {
-                    self.nodes[node].clone()
-                };
-
-                if self.node_emits_statements(&condition_node) {
-                    Some(CfgNode::merge([condition_node, guard_if]))
-                } else {
-                    Some(guard_if)
-                }
+                Some(guard_if)
             }
         }
     }
@@ -2670,17 +2861,24 @@ impl<'a> FoldableGraph<'a> {
                         }
 
                         let loop_node = if let Some(guard) = guard {
-                            let guard_node = self
-                                .build_guard_node(&guard, head, &head_node, &break_payload)
-                                .unwrap_or_else(|| CfgNode::If {
-                                    condition: cond.invert(),
-                                    then_branch: Box::new(break_payload.clone()),
-                                    else_branch: None,
-                                });
+                            if matches!(break_payload, CfgNode::Break) {
+                                CfgNode::While {
+                                    condition: BoolExpr::from(guard).into_hil(),
+                                    body: Box::new(body_ast),
+                                }
+                            } else {
+                                let guard_node = self
+                                    .build_guard_node(&guard, &break_payload)
+                                    .unwrap_or_else(|| CfgNode::If {
+                                        condition: cond.invert(),
+                                        then_branch: Box::new(break_payload.clone()),
+                                        else_branch: None,
+                                    });
 
-                            CfgNode::While {
-                                condition: HilExpr::Bool(true),
-                                body: Box::new(CfgNode::merge([guard_node, body_ast])),
+                                CfgNode::While {
+                                    condition: HilExpr::Bool(true),
+                                    body: Box::new(CfgNode::merge([guard_node, body_ast])),
+                                }
                             }
                         } else if self.node_emits_statements(&head_node)
                             || !matches!(break_payload, CfgNode::Break)
@@ -2891,17 +3089,9 @@ impl<'a> FoldableGraph<'a> {
     }
 }
 
-fn is_condition_prelude_value(expr: &HilExpr) -> bool {
-    matches!(
-        expr,
-        HilExpr::Nil
-            | HilExpr::Number(_)
-            | HilExpr::String(_)
-            | HilExpr::Bool(_)
-            | HilExpr::Symbol(_)
-            | HilExpr::Import(_)
-            | HilExpr::Global(_)
-    )
+fn guard_condition_can_duplicate(then_branch: &GuardTree, else_branch: &GuardTree) -> bool {
+    !matches!(then_branch, GuardTree::Body | GuardTree::Exit)
+        && !matches!(else_branch, GuardTree::Body | GuardTree::Exit)
 }
 
 fn flatten_regions(nodes: Vec<RegionNode>) -> Vec<RegionNode> {
@@ -2919,16 +3109,12 @@ fn flatten_regions(nodes: Vec<RegionNode>) -> Vec<RegionNode> {
     out
 }
 
-fn is_empty_node(node: &CfgNode) -> bool {
-    matches!(node, CfgNode::Sequence { nodes } if nodes.is_empty())
-}
-
 fn build_if_node(
     condition: HilExpr,
     then_branch: CfgNode,
     else_branch: CfgNode,
 ) -> Option<CfgNode> {
-    match (is_empty_node(&then_branch), is_empty_node(&else_branch)) {
+    match (then_branch.is_empty(), else_branch.is_empty()) {
         (false, false) => Some(CfgNode::If {
             condition,
             then_branch: Box::new(then_branch),
@@ -2974,15 +3160,20 @@ pub fn structure(cfg: &ControlFlowGraph) -> (RegionNode, bool) {
 
 #[cfg(test)]
 mod tests {
+    use id_arena::Arena;
+    use smallvec::SmallVec;
+
+    use crate::common::ToSpanned as _;
     use crate::hil::{
         cflow::{
             cfg::{Block, BlockExit, ControlFlowGraph},
             graph::{AdjGraph, GraphView as _},
         },
-        ir::HilExpr,
+        ir::{HilExpr, HilStmt},
+        lifter::ssa::Symbol,
     };
 
-    use super::{RegionNode, structure};
+    use super::{CfgNode, FoldableGraph, RegionNode, structure};
 
     fn cfg_from_blocks(blocks: Vec<Block>) -> ControlFlowGraph {
         let (successors, predecessors) =
@@ -3021,5 +3212,67 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn guard_prelude_rejects_impure_single_read() {
+        let mut symbols: Arena<_> = Arena::new();
+        let tmp = symbols.alloc(Symbol::reg(0));
+
+        let cfg = cfg_from_blocks(vec![
+            Block {
+                stmts: vec![
+                    HilStmt::Assign {
+                        left: HilExpr::Symbol(tmp),
+                        value: HilExpr::Call {
+                            fun: Box::new(HilExpr::Global("make".into())),
+                            args: Vec::new(),
+                        },
+                    }
+                    .to_spanned(0),
+                ],
+                exit: BlockExit::CondJump {
+                    cond: HilExpr::Symbol(tmp),
+                    then_block: 1,
+                    else_block: 2,
+                },
+            },
+            Block {
+                stmts: Vec::new(),
+                exit: BlockExit::Return(SmallVec::new()),
+            },
+            Block {
+                stmts: Vec::new(),
+                exit: BlockExit::Return(SmallVec::new()),
+            },
+        ]);
+        let graph = FoldableGraph::new(&cfg);
+
+        assert_eq!(graph.guard_node_condition(0, false), None);
+    }
+
+    #[test]
+    fn shared_fallback_chain_rejects_cycles() {
+        let cfg = cfg_from_blocks(vec![
+            Block {
+                stmts: Vec::new(),
+                exit: BlockExit::CondJump {
+                    cond: HilExpr::Bool(true),
+                    then_block: 0,
+                    else_block: 1,
+                },
+            },
+            Block {
+                stmts: Vec::new(),
+                exit: BlockExit::Return(SmallVec::new()),
+            },
+        ]);
+        let graph = FoldableGraph::new(&cfg);
+        let nodes = vec![
+            CfgNode::BasicBlock { block: 0 },
+            CfgNode::BasicBlock { block: 1 },
+        ];
+
+        assert!(graph.build_shared_fallback_chain(&nodes, 0, 1).is_none());
     }
 }

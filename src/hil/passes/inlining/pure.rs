@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use crate::{
     common::Spanned,
     hil::{
-        cflow::cfg::{BlockExit, ControlFlowGraph},
+        cflow::cfg::{Block, BlockExit, ControlFlowGraph},
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
         passes::inlining::common::{Analyzer, Var},
@@ -16,6 +16,26 @@ struct Inliner {
     vars: Scope<SymbolId, Var>,
     inlined_symbols: HashSet<SymbolId>,
     was_changed: bool,
+}
+
+struct SymbolSubstituter<'a> {
+    sym: SymbolId,
+    replacement: &'a HilExpr,
+    change_count: usize,
+}
+
+impl VisitorMut for SymbolSubstituter<'_> {
+    fn visit_expr(&mut self, expr: &mut HilExpr) {
+        if let HilExpr::Symbol(sym) = expr
+            && *sym == self.sym
+        {
+            *expr = self.replacement.clone();
+            self.change_count += 1;
+            return;
+        }
+
+        walk_expr_mut(self, expr);
+    }
 }
 
 impl Inliner {
@@ -36,7 +56,6 @@ impl Inliner {
     }
 
     fn is_inlinable_rhs(&self, expr: &HilExpr) -> bool {
-        // TODO: Check the todo in `hil::common::invert_condition`. This can be applied here (i think)
         match expr {
             // A symbol can be inlined only when its value is stable for the whole function.
             // Otherwise a copied temporary can capture an old value and become wrong after
@@ -62,13 +81,131 @@ impl Inliner {
     }
 
     fn visit_cfg(&mut self, cfg: &mut ControlFlowGraph) {
-        for block in &mut cfg.blocks {
-            self.visit_cfg_exit(&mut block.exit);
+        let guard_blocks = self.loop_guard_blocks(cfg);
+
+        for (block_idx, block) in cfg.blocks.iter_mut().enumerate() {
+            if guard_blocks.contains(&block_idx) {
+                self.visit_cfg_guard_block(block);
+            } else {
+                self.visit_cfg_exit(&mut block.exit);
+            }
         }
 
         for block in &mut cfg.blocks {
             self.remove_inlined_cfg_assigns(&mut block.stmts);
         }
+    }
+
+    fn visit_cfg_guard_block(&mut self, block: &mut Block) {
+        self.visit_cfg_exit(&mut block.exit);
+
+        let Some((inlined, inlined_symbols)) = self.inline_condition_prelude(block) else {
+            return;
+        };
+
+        if let BlockExit::CondJump { cond, .. } = &mut block.exit
+            && *cond != inlined
+        {
+            *cond = inlined;
+            self.inlined_symbols.extend(inlined_symbols);
+            self.was_changed = true;
+        }
+    }
+
+    fn loop_guard_blocks(&self, cfg: &ControlFlowGraph) -> HashSet<usize> {
+        let mut guard_blocks = HashSet::new();
+        let mut queue = VecDeque::new();
+
+        for (pred, successors) in cfg.successors.iter().enumerate() {
+            for &succ in successors {
+                if cfg.idoms.dominates(succ, pred) && self.starts_condition_chain(cfg, succ) {
+                    queue.push_back(succ);
+                }
+            }
+        }
+
+        while let Some(block_idx) = queue.pop_front() {
+            if !guard_blocks.insert(block_idx) {
+                continue;
+            }
+
+            let block = &cfg.blocks[block_idx];
+            let BlockExit::CondJump { .. } = block.exit else {
+                continue;
+            };
+
+            if self.inline_condition_prelude(block).is_none() {
+                continue;
+            }
+
+            for target in block.exit.targets().into_iter().flatten() {
+                queue.push_back(target);
+            }
+        }
+
+        guard_blocks
+    }
+
+    fn starts_condition_chain(&self, cfg: &ControlFlowGraph, block_idx: usize) -> bool {
+        let block = &cfg.blocks[block_idx];
+        let BlockExit::CondJump { .. } = block.exit else {
+            return false;
+        };
+
+        block.exit.targets().into_iter().flatten().any(|target| {
+            let target_block = &cfg.blocks[target];
+            matches!(target_block.exit, BlockExit::CondJump { .. })
+                && self.inline_condition_prelude(target_block).is_some()
+        })
+    }
+
+    fn inline_condition_prelude(&self, block: &Block) -> Option<(HilExpr, Vec<SymbolId>)> {
+        let BlockExit::CondJump { cond, .. } = &block.exit else {
+            return None;
+        };
+
+        let mut condition = cond.clone();
+        let mut inlined_symbols = Vec::new();
+
+        for stmt in block.stmts.iter().rev() {
+            let HilStmt::Assign {
+                left: HilExpr::Symbol(symbol),
+                value,
+            } = &stmt.node
+            else {
+                return None;
+            };
+
+            if value.reads_symbol(symbol) {
+                return None;
+            }
+
+            let mut inlined = condition;
+            let mut substituter = SymbolSubstituter {
+                sym: *symbol,
+                replacement: value,
+                change_count: 0,
+            };
+            substituter.visit_expr(&mut inlined);
+            if substituter.change_count == 0 {
+                return None;
+            }
+            if !value.is_pure() && substituter.change_count > 1 {
+                return None;
+            }
+            if !self.vars.get(symbol).is_some_and(|var| {
+                !var.disqualified
+                    && var.write_count == 1
+                    && var.read_count == substituter.change_count
+            }) {
+                return None;
+            }
+
+            inlined_symbols.push(*symbol);
+            condition = inlined;
+        }
+
+        Some((condition, inlined_symbols))
     }
 
     fn remove_inlined_cfg_assigns(&mut self, stmts: &mut Vec<Spanned<HilStmt>>) {
