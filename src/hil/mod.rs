@@ -56,7 +56,12 @@ impl StructuredFunction {
         );
 
         verbose!(indent: 1, "building cfg...");
-        let cfg = ControlFlowGraph::from_proto(proto, all_protos);
+        let mut cfg = ControlFlowGraph::from_proto(proto, all_protos);
+
+        verbose!(indent: 1, "running pre-region passes...");
+        if passes::run_pre_region(&mut cfg) {
+            cfg.simplify_conditions();
+        }
 
         verbose!(indent: 1, "structuring region...");
         let (root, was_reduced) = region::structure(&cfg);

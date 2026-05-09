@@ -1,6 +1,9 @@
+use std::collections::HashSet;
+
 use crate::{
+    common::Spanned,
     hil::{
-        StructuredFunction,
+        cflow::cfg::{BlockExit, ControlFlowGraph},
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
         passes::inlining::common::{Analyzer, Var},
@@ -11,6 +14,7 @@ use crate::{
 
 struct Inliner {
     vars: Scope<SymbolId, Var>,
+    inlined_symbols: HashSet<SymbolId>,
     was_changed: bool,
 }
 
@@ -18,6 +22,7 @@ impl Inliner {
     fn with_vars(vars: Scope<SymbolId, Var>) -> Self {
         Self {
             vars,
+            inlined_symbols: HashSet::new(),
             was_changed: false,
         }
     }
@@ -27,6 +32,7 @@ impl Inliner {
             && var.write_count == 1
             && var.read_count == 1
             && self.is_inlinable_rhs(&var.expr)
+            && var.expr.truthiness().is_none()
     }
 
     fn is_inlinable_rhs(&self, expr: &HilExpr) -> bool {
@@ -52,6 +58,47 @@ impl Inliner {
             }
             HilExpr::Unary { expr, .. } if self.is_inlinable_rhs(expr) => true,
             _ => false,
+        }
+    }
+
+    fn visit_cfg(&mut self, cfg: &mut ControlFlowGraph) {
+        for block in &mut cfg.blocks {
+            self.visit_cfg_exit(&mut block.exit);
+        }
+
+        for block in &mut cfg.blocks {
+            self.remove_inlined_cfg_assigns(&mut block.stmts);
+        }
+    }
+
+    fn remove_inlined_cfg_assigns(&mut self, stmts: &mut Vec<Spanned<HilStmt>>) {
+        stmts.retain(|stmt| {
+            if let HilStmt::Assign {
+                left: HilExpr::Symbol(sym),
+                ..
+            } = &stmt.node
+                && self.inlined_symbols.contains(sym)
+            {
+                return false;
+            }
+
+            true
+        });
+    }
+
+    fn visit_cfg_exit(&mut self, exit: &mut BlockExit) {
+        match exit {
+            BlockExit::CondJump { cond, .. } => self.visit_expr(cond),
+            // Pre-region pure inlining is deliberately limited to conditional
+            // exits. Rewriting loop prep or return exits before structuring can
+            // erase shapes the region reducer still relies on.
+            BlockExit::Jump(_)
+            | BlockExit::Fallthrough(_)
+            | BlockExit::FornPrep { .. }
+            | BlockExit::FornLoop { .. }
+            | BlockExit::ForgPrep { .. }
+            | BlockExit::ForgLoop { .. } => {}
+            BlockExit::Return(_) => {}
         }
     }
 }
@@ -84,6 +131,7 @@ impl VisitorMut for Inliner {
             && !v.expr.reads_symbol(sym)
         {
             self.was_changed = true;
+            self.inlined_symbols.insert(*sym);
             *expr = v.expr.clone();
 
             self.visit_expr(expr);
@@ -94,13 +142,13 @@ impl VisitorMut for Inliner {
     }
 }
 
-pub fn run(fun: &mut StructuredFunction) -> bool {
+pub fn run_cfg(cfg: &mut ControlFlowGraph) -> bool {
     let mut changed = false;
     loop {
-        let vars = Analyzer::analyze_function(fun);
+        let vars = Analyzer::analyze_cfg(cfg);
 
         let mut inliner = Inliner::with_vars(vars);
-        inliner.visit_function(fun);
+        inliner.visit_cfg(cfg);
 
         if !inliner.was_changed {
             break;

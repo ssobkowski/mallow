@@ -283,6 +283,38 @@ impl ControlFlowGraph {
         graph
     }
 
+    /// Re-runs CFG-level simplifications that depend on block bodies being empty.
+    ///
+    /// Pre-region passes can remove temporary condition assignments, which exposes
+    /// short-circuit condition chains that were not foldable during initial lifting.
+    pub fn simplify_conditions(&mut self) {
+        loop {
+            let changed_cond = fold_truthy_cond_jumps(&mut self.blocks);
+            let changed_jump = thread_jumps(&mut self.blocks);
+            if !changed_cond && !changed_jump {
+                break;
+            }
+        }
+
+        loop {
+            let (_, predecessors) = build_graph(self.blocks.iter().map(|b| b.exit_targets()));
+            let blocks = std::mem::take(&mut self.blocks);
+            let (changed_cond, new_blocks) = fold_condition_chains(blocks, &predecessors);
+            self.blocks = new_blocks;
+
+            if !changed_cond {
+                break;
+            }
+        }
+
+        let (successors, predecessors) = build_graph(self.blocks.iter().map(|b| b.exit_targets()));
+        let idoms = self.build_idoms();
+
+        self.successors = successors;
+        self.predecessors = predecessors;
+        self.idoms = idoms;
+    }
+
     /// Unfolds Phi Nodes into assign statements inserted at appropriate locations.
     ///
     /// This should be ran after the graph metadata has been computed.

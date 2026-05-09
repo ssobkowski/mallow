@@ -1,4 +1,4 @@
-use crate::hil::{ReturnArity, StructuredFunction};
+use crate::hil::{ReturnArity, StructuredFunction, cflow::cfg::ControlFlowGraph};
 
 mod fold_tables;
 mod inlining;
@@ -27,4 +27,8 @@ pub fn run(fns: &mut [StructuredFunction]) {
             }
         }
     }
+}
+
+pub(crate) fn run_pre_region(cfg: &mut ControlFlowGraph) -> bool {
+    inlining::run_pre_region(cfg)
 }

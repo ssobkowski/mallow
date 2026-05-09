@@ -1,7 +1,10 @@
 use crate::{
     hil::{
         StructuredFunction,
-        cflow::region::RegionNode,
+        cflow::{
+            cfg::{BlockExit, ControlFlowGraph},
+            region::RegionNode,
+        },
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
         visitor::{Visitor, walk_expr, walk_function, walk_region},
@@ -21,7 +24,7 @@ pub struct Var {
 }
 
 impl Var {
-    fn new(expr: HilExpr) -> Self {
+    pub(in crate::hil::passes::inlining) fn new(expr: HilExpr) -> Self {
         Self {
             write_count: 1,
             read_count: 0,
@@ -36,21 +39,68 @@ pub struct Analyzer {
     vars: Scope<SymbolId, Var>,
 }
 
-impl Visitor for Analyzer {
-    fn visit_function(&mut self, fun: &StructuredFunction) {
+impl Analyzer {
+    fn seed_symbols(&mut self, params: &[SymbolId], upvalues: &[SymbolId]) {
         // Parameters are inlined into themselves - essentially they need to be present
         // in the vars array (see `is_inlinable_rhs`) and because they have no underlying
         // value this just allows us to skip bindings like `v{N} = p{N}`.
-        for param in &fun.cfg.params {
+        for param in params {
             self.vars.declare(*param, Var::new(HilExpr::Symbol(*param)));
         }
 
-        for upvalue in &fun.upvalues {
+        for upvalue in upvalues {
             // This can be inserted as a dummy expression, because upvalues are NEVER to be inlined.
             let mut var = Var::new(HilExpr::Nil);
             var.disqualified = true;
             self.vars.declare(*upvalue, var);
         }
+    }
+
+    fn note_loop_write(&mut self, sym: SymbolId) {
+        self.vars
+            .entry(sym)
+            .or_insert_with(|| Var::new(HilExpr::Symbol(sym)))
+            .write_count += 1;
+    }
+
+    fn visit_cfg_exit(&mut self, exit: &BlockExit) {
+        match exit {
+            BlockExit::CondJump { cond, .. } => self.visit_expr(cond),
+            BlockExit::FornPrep {
+                var,
+                start,
+                end,
+                step,
+                ..
+            } => {
+                self.note_loop_write(*var);
+                self.visit_expr(start);
+                self.visit_expr(end);
+                self.visit_expr(step);
+            }
+            BlockExit::ForgPrep { exprs, .. } => {
+                for expr in exprs {
+                    self.visit_expr(expr);
+                }
+            }
+            BlockExit::ForgLoop { vars, .. } => {
+                for var in vars {
+                    self.note_loop_write(*var);
+                }
+            }
+            BlockExit::Return(values) => {
+                for value in values {
+                    self.visit_expr(value);
+                }
+            }
+            BlockExit::Jump(_) | BlockExit::Fallthrough(_) | BlockExit::FornLoop { .. } => {}
+        }
+    }
+}
+
+impl Visitor for Analyzer {
+    fn visit_function(&mut self, fun: &StructuredFunction) {
+        self.seed_symbols(&fun.cfg.params, &fun.upvalues);
 
         walk_function(self, fun);
     }
@@ -115,17 +165,11 @@ impl Visitor for Analyzer {
     fn visit_region(&mut self, node: &RegionNode) {
         match node {
             RegionNode::NumericFor { var, .. } => {
-                self.vars
-                    .entry(*var)
-                    .or_insert_with(|| Var::new(HilExpr::Symbol(*var)))
-                    .write_count += 1;
+                self.note_loop_write(*var);
             }
             RegionNode::GenericFor { vars, .. } => {
                 for var in vars {
-                    self.vars
-                        .entry(*var)
-                        .or_insert_with(|| Var::new(HilExpr::Symbol(*var)))
-                        .write_count += 1;
+                    self.note_loop_write(*var);
                 }
             }
             _ => {}
@@ -156,6 +200,24 @@ impl Analyzer {
     pub fn analyze_function(fun: &StructuredFunction) -> Scope<SymbolId, Var> {
         let mut analyzer = Analyzer::default();
         analyzer.visit_function(fun);
+        analyzer.vars
+    }
+
+    pub fn analyze_cfg(cfg: &ControlFlowGraph) -> Scope<SymbolId, Var> {
+        let mut analyzer = Analyzer::default();
+        analyzer.seed_symbols(&cfg.params, &cfg.upvalues);
+
+        for block in &cfg.blocks {
+            analyzer.visit_block(
+                &block
+                    .stmts
+                    .iter()
+                    .map(|stmt| stmt.node.clone())
+                    .collect::<Vec<_>>(),
+            );
+            analyzer.visit_cfg_exit(&block.exit);
+        }
+
         analyzer.vars
     }
 }
