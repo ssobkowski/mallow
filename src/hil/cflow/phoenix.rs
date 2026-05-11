@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use crate::{
+    ast::UnOp,
     hil::{
         cflow::{
             cfg::{BlockExit, ControlFlowGraph},
@@ -48,8 +49,15 @@ struct LoopCtx {
     exits: HashSet<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct LoopId {
+    header: usize,
+    latch: usize,
+}
+
 #[derive(Debug, Clone)]
 struct LoopShape {
+    id: LoopId,
     header: usize,
     kind: LoopKind,
     body: Box<Shape>,
@@ -77,6 +85,7 @@ enum LoopKind {
 
 #[derive(Debug, Clone)]
 struct LoopBodyPlan {
+    loop_id: LoopId,
     entry: usize,
     nodes: HashSet<usize>,
     exits: HashSet<usize>,
@@ -114,78 +123,73 @@ struct ConditionalShape {
 
 #[derive(Debug, Clone)]
 struct LoopInfo {
+    id: LoopId,
     header: usize,
-    latches: Vec<usize>,
+    latch: usize,
     body: HashSet<usize>,
     exits: HashSet<usize>,
-    parent: Option<usize>,
-    children: Vec<usize>,
+    parent: Option<LoopId>,
+    children: Vec<LoopId>,
 }
 
 #[derive(Debug, Clone)]
 struct LoopForest {
-    loops: HashMap<usize, LoopInfo>,
-    /// Headers sorted so that an inner loop always appears before its parent.
-    innermost_first: Vec<usize>,
-    /// For each block, the innermost loop header that contains it.
-    innermost_loop_for_block: HashMap<usize, usize>,
+    loops: HashMap<LoopId, LoopInfo>,
+    by_header: HashMap<usize, Vec<LoopId>>,
 }
 
 impl LoopForest {
     fn build(cfg: &ControlFlowGraph, idoms: &DominatorTree) -> Self {
-        let mut latches_by_header: HashMap<_, Vec<_>> = HashMap::new();
+        let mut loops = HashMap::new();
+        let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::new();
+        let reachable: HashSet<_> = cfg.reverse_post_order().into_iter().collect();
+
         for latch in cfg.iter() {
-            for &succ in cfg.successors(latch) {
-                if idoms.dominates(succ, latch) {
-                    latches_by_header.entry(succ).or_default().push(latch);
+            if !reachable.contains(&latch) {
+                continue;
+            }
+
+            for &header in cfg.successors(latch) {
+                if reachable.contains(&header) && idoms.dominates(header, latch) {
+                    let id = LoopId { header, latch };
+                    let body = natural_loop_body(cfg, header, latch, &reachable);
+                    let exits = body
+                        .iter()
+                        .flat_map(|&block| cfg.successors(block).iter().copied())
+                        .filter(|target| !body.contains(target))
+                        .collect();
+
+                    loops.insert(
+                        id,
+                        LoopInfo {
+                            id,
+                            header,
+                            latch,
+                            body,
+                            exits,
+                            parent: None,
+                            children: Vec::new(),
+                        },
+                    );
+                    by_header.entry(header).or_default().push(id);
                 }
             }
         }
 
-        let mut loops: HashMap<_, _> = latches_by_header
-            .into_iter()
-            .map(|(header, mut latches)| {
-                latches.sort_unstable();
-                latches.dedup();
+        for ids in by_header.values_mut() {
+            ids.sort_unstable_by_key(|id| (loops[id].body.len(), *id));
+        }
 
-                let body = latches
-                    .iter()
-                    .copied()
-                    .fold(HashSet::new(), |mut body, latch| {
-                        body.extend(natural_loop_body(cfg, header, latch));
-                        body
-                    });
-
-                let exits = body
-                    .iter()
-                    .flat_map(|&block| cfg.successors(block).iter().copied())
-                    .filter(|target| !body.contains(target))
-                    .collect();
-
-                (
-                    header,
-                    LoopInfo {
-                        header,
-                        latches,
-                        body,
-                        exits,
-                        parent: None,
-                        children: Vec::new(),
-                    },
-                )
-            })
-            .collect();
-
-        let headers: Vec<_> = loops.keys().copied().collect();
-        let parents: Vec<_> = headers
+        let ids: Vec<_> = loops.keys().copied().collect();
+        let parents: Vec<_> = ids
             .iter()
             .copied()
-            .filter_map(|header| {
-                let loop_body = &loops.get(&header)?.body;
-                let parent = headers
+            .filter_map(|id| {
+                let loop_body = &loops.get(&id)?.body;
+                let parent = ids
                     .iter()
                     .copied()
-                    .filter(|&candidate| candidate != header)
+                    .filter(|&candidate| candidate != id)
                     .filter(|&candidate| {
                         let candidate_body = &loops[&candidate].body;
                         loop_body.len() < candidate_body.len()
@@ -193,67 +197,124 @@ impl LoopForest {
                     })
                     .min_by_key(|candidate| (loops[candidate].body.len(), *candidate))?;
 
-                Some((header, parent))
+                Some((id, parent))
             })
             .collect();
 
-        for (header, parent) in parents {
-            loops
-                .get_mut(&header)
-                .expect("child loop should exist")
-                .parent = Some(parent);
+        for (id, parent) in parents {
+            loops.get_mut(&id).expect("child loop should exist").parent = Some(parent);
             loops
                 .get_mut(&parent)
                 .expect("parent loop should exist")
                 .children
-                .push(header);
+                .push(id);
+        }
+
+        let same_header_parents: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| loops[id].parent.is_none())
+            .filter_map(|id| {
+                let child = &loops[&id];
+                ids.iter()
+                    .copied()
+                    .filter(|&candidate| candidate != id)
+                    .filter(|candidate| loops[candidate].header == child.header)
+                    .filter(|candidate| {
+                        child
+                            .exits
+                            .iter()
+                            .all(|exit| loops[candidate].body.contains(exit))
+                    })
+                    .min_by_key(|candidate| (loops[candidate].body.len(), *candidate))
+                    .map(|parent| (id, parent))
+            })
+            .collect();
+
+        for (id, parent) in same_header_parents {
+            loops.get_mut(&id).expect("child loop should exist").parent = Some(parent);
+            loops
+                .get_mut(&parent)
+                .expect("parent loop should exist")
+                .children
+                .push(id);
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let ids: Vec<_> = loops.keys().copied().collect();
+
+            for id in ids {
+                let children = loops[&id].children.clone();
+                let mut child_body = HashSet::new();
+                for child in children {
+                    child_body.extend(loops[&child].body.iter().copied());
+                }
+
+                let info = loops.get_mut(&id).expect("loop should exist");
+                let old_len = info.body.len();
+                info.body.extend(child_body);
+                changed |= info.body.len() != old_len;
+            }
+        }
+
+        for info in loops.values_mut() {
+            info.exits = info
+                .body
+                .iter()
+                .flat_map(|&block| cfg.successors(block).iter().copied())
+                .filter(|target| !info.body.contains(target))
+                .collect();
         }
 
         for info in loops.values_mut() {
             info.children.sort_unstable();
+            info.children.dedup();
         }
 
-        let mut innermost_first: Vec<_> = loops.keys().copied().collect();
-        innermost_first.sort_by_key(|header| (loops[header].body.len(), *header));
-
-        let mut innermost_loop_for_block = HashMap::new();
-        for &header in innermost_first.iter().rev() {
-            for &block in &loops[&header].body {
-                innermost_loop_for_block.insert(block, header);
-            }
-        }
-
-        Self {
-            loops,
-            innermost_first,
-            innermost_loop_for_block,
-        }
+        Self { loops, by_header }
     }
 
-    fn get(&self, header: usize) -> Option<&LoopInfo> {
-        self.loops.get(&header)
+    fn get(&self, id: LoopId) -> Option<&LoopInfo> {
+        self.loops.get(&id)
     }
 
-    fn is_nested_in(&self, inner_header: usize, outer_header: usize) -> bool {
-        let mut current = self.get(inner_header).and_then(|info| info.parent);
+    fn candidate_in_scope(
+        &self,
+        header: usize,
+        scope: &Scope,
+        blocked_loop: Option<LoopId>,
+    ) -> Option<&LoopInfo> {
+        self.by_header
+            .get(&header)?
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != blocked_loop)
+            .filter_map(|id| self.loops.get(&id))
+            .filter(|info| info.body.iter().all(|node| scope.nodes.contains(node)))
+            .max_by_key(|info| (info.body.len(), info.id))
+    }
 
-        while let Some(header) = current {
-            if header == outer_header {
+    fn is_nested_in(&self, inner: LoopId, outer: LoopId) -> bool {
+        let mut current = self.get(inner).and_then(|info| info.parent);
+
+        while let Some(id) = current {
+            if id == outer {
                 return true;
             }
-            current = self.get(header).and_then(|info| info.parent);
+            current = self.get(id).and_then(|info| info.parent);
         }
 
         false
     }
 
-    fn direct_children(&self, header: usize) -> &[usize] {
-        self.get(header)
-            .map_or(&[], |info| info.children.as_slice())
+    fn direct_children(&self, id: LoopId) -> &[LoopId] {
+        self.get(id).map_or(&[], |info| info.children.as_slice())
     }
 
     fn is_loop_header(&self, node: usize) -> bool {
-        self.loops.contains_key(&node)
+        self.by_header.contains_key(&node)
     }
 }
 
@@ -364,7 +425,7 @@ impl<'cfg> Structurer<'cfg> {
             exits,
         };
 
-        self.structure_scope(&scope, None, &TerminalPolicy::Normal)
+        self.structure_scope(&scope, None, &TerminalPolicy::Normal, None)
     }
 
     fn structure_scope(
@@ -372,6 +433,7 @@ impl<'cfg> Structurer<'cfg> {
         scope: &Scope,
         loop_ctx: Option<&LoopCtx>,
         terminal_policy: &TerminalPolicy,
+        blocked_loop: Option<LoopId>,
     ) -> Shape {
         let mut nodes = Vec::new();
         let mut visited = HashSet::new();
@@ -386,7 +448,7 @@ impl<'cfg> Structurer<'cfg> {
                 break;
             }
 
-            if let Some(loop_shape) = self.recognize_loop(current, scope) {
+            if let Some(loop_shape) = self.recognize_loop(current, scope, blocked_loop) {
                 let next = single_target(&loop_shape.exits);
                 nodes.push(Shape::Loop(loop_shape));
 
@@ -404,7 +466,13 @@ impl<'cfg> Structurer<'cfg> {
                     nodes.push(Shape::Block(current));
                 }
 
-                nodes.push(self.structure_conditional(conditional, scope, loop_ctx));
+                nodes.push(self.structure_conditional(
+                    conditional,
+                    scope,
+                    loop_ctx,
+                    terminal_policy,
+                    blocked_loop,
+                ));
 
                 let Some(merge) = merge else {
                     break;
@@ -436,30 +504,30 @@ impl<'cfg> Structurer<'cfg> {
         Shape::sequence(nodes)
     }
 
-    fn recognize_loop(&self, header: usize, scope: &Scope) -> Option<LoopShape> {
-        let loop_info = self.loops.get(header)?;
-        if !loop_info.body.iter().all(|node| scope.nodes.contains(node)) {
-            return None;
-        }
-
+    fn recognize_loop(
+        &self,
+        header: usize,
+        scope: &Scope,
+        blocked_loop: Option<LoopId>,
+    ) -> Option<LoopShape> {
+        let loop_info = self.loops.candidate_in_scope(header, scope, blocked_loop)?;
         let kind = self.classify_loop(loop_info);
         let body_plan = self.plan_loop_body(loop_info, &kind);
 
         let loop_ctx = LoopCtx {
             header,
-            continue_targets: [header]
-                .into_iter()
-                .chain(loop_info.latches.iter().copied())
-                .collect(),
+            continue_targets: self.continue_targets(loop_info, &kind),
             exits: loop_info.exits.clone(),
         };
 
         verbose!("loop:");
+        verbose!(indent: 1, "id = {:?}", loop_info.id);
         verbose!(indent: 1, "header = {}", header);
         verbose!(indent: 1, "body = {:?}", body_plan.nodes);
         verbose!(indent: 1, "exits = {:?}", loop_info.exits);
 
         Some(LoopShape {
+            id: loop_info.id,
             header,
             kind,
             body: Box::new(self.structure_loop_body(&body_plan, &loop_ctx)),
@@ -474,6 +542,7 @@ impl<'cfg> Structurer<'cfg> {
                 nodes.remove(&loop_info.header);
 
                 LoopBodyPlan {
+                    loop_id: loop_info.id,
                     entry: *body,
                     nodes,
                     exits: [loop_info.header]
@@ -484,6 +553,7 @@ impl<'cfg> Structurer<'cfg> {
                 }
             }
             LoopKind::RepeatUntil { latch, body, .. } => LoopBodyPlan {
+                loop_id: loop_info.id,
                 entry: *body,
                 nodes: loop_info.body.clone(),
                 exits: loop_info.exits.clone(),
@@ -499,7 +569,21 @@ impl<'cfg> Structurer<'cfg> {
             exits: plan.exits.clone(),
         };
 
-        self.structure_scope(&scope, Some(loop_ctx), &plan.terminal_policy)
+        self.structure_scope(
+            &scope,
+            Some(loop_ctx),
+            &plan.terminal_policy,
+            Some(plan.loop_id),
+        )
+    }
+
+    fn continue_targets(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+        match kind {
+            LoopKind::While { .. } | LoopKind::Infinite { .. } => {
+                [loop_info.header, loop_info.latch].into_iter().collect()
+            }
+            LoopKind::RepeatUntil { .. } => HashSet::new(),
+        }
     }
 
     fn recognize_conditional(&self, head: usize, scope: &Scope) -> Option<ConditionalShape> {
@@ -526,10 +610,15 @@ impl<'cfg> Structurer<'cfg> {
         shape: ConditionalShape,
         scope: &Scope,
         loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+        blocked_loop: Option<LoopId>,
     ) -> Shape {
         let mut branch_exits = scope.exits.clone();
         if let Some(merge) = shape.merge {
             branch_exits.insert(merge);
+        }
+        if let TerminalPolicy::SuppressExitOf { block } = terminal_policy {
+            branch_exits.insert(*block);
         }
 
         let then_nodes = self.collect_reachable_until(shape.then_entry, scope, &branch_exits);
@@ -539,6 +628,9 @@ impl<'cfg> Structurer<'cfg> {
             if nodes.is_empty() {
                 // If the branch naturally falls through to the merge point, it's just empty.
                 if Some(entry) == shape.merge {
+                    return Shape::sequence(Vec::new());
+                }
+                if terminal_policy.suppresses(entry) {
                     return Shape::sequence(Vec::new());
                 }
 
@@ -567,7 +659,7 @@ impl<'cfg> Structurer<'cfg> {
                 nodes,
                 exits: branch_exits.clone(),
             };
-            self.structure_scope(&branch_scope, loop_ctx, &TerminalPolicy::Normal)
+            self.structure_scope(&branch_scope, loop_ctx, terminal_policy, blocked_loop)
         };
 
         let then_shape = build_branch(shape.then_entry, then_nodes);
@@ -585,20 +677,29 @@ impl<'cfg> Structurer<'cfg> {
     fn classify_loop(&self, loop_info: &LoopInfo) -> LoopKind {
         verbose!("classify_loop: loop_info = {:?}", loop_info);
 
-        // if loop header is also a latch, and the header's CondJump has one edge back to itself and one edge out, this is a post-test loop
-        if loop_info.latches.contains(&loop_info.header)
-            && let BlockExit::CondJump {
-                cond,
-                then_block,
-                else_block,
-            } = self.cfg.get(loop_info.header).exit()
+        // If the latch condition has one edge back to the header and one edge out,
+        // this is a post-test loop. The latch owns the condition.
+        if let BlockExit::CondJump {
+            cond,
+            then_block,
+            else_block,
+        } = self.cfg.get(loop_info.latch).exit()
             && (*then_block == loop_info.header) ^ (*else_block == loop_info.header)
         {
+            let condition = if *then_block == loop_info.header {
+                HilExpr::Unary {
+                    op: UnOp::Not,
+                    expr: Box::new(cond.clone()),
+                }
+            } else {
+                cond.clone()
+            };
+
             verbose!(indent:1, "kind = RepeatUntil");
-            verbose!(indent:1, "condition = ({})", cond);
+            verbose!(indent:1, "condition = ({})", condition);
             return LoopKind::RepeatUntil {
-                condition: cond.clone(),
-                latch: loop_info.header,
+                condition,
+                latch: loop_info.latch,
                 body: loop_info.header,
             };
         }
@@ -735,15 +836,26 @@ impl Shape {
 
 /// Collect the natural loop body by walking predecessors back from `latch`
 /// until `header` is reached. Returns the full set including header.
-fn natural_loop_body(cfg: &ControlFlowGraph, header: usize, latch: usize) -> HashSet<usize> {
+fn natural_loop_body(
+    cfg: &ControlFlowGraph,
+    header: usize,
+    latch: usize,
+    reachable: &HashSet<usize>,
+) -> HashSet<usize> {
     let mut body = HashSet::new();
     body.insert(header);
 
     let mut stack = vec![latch];
     while let Some(node) = stack.pop() {
+        if !reachable.contains(&node) {
+            continue;
+        }
+
         if body.insert(node) && node != header {
             for &pred in cfg.predecessors(node) {
-                stack.push(pred);
+                if reachable.contains(&pred) {
+                    stack.push(pred);
+                }
             }
         }
     }
