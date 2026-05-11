@@ -35,17 +35,17 @@ fn build_label(idx: usize, block: &Block, is_entry: bool) -> NodeLabel {
     if is_entry {
         header.push_str(" (Entry)");
     }
-    if matches!(block.exit, BlockExit::Return(_)) {
+    if matches!(block.exit(), BlockExit::Return(_)) {
         header.push_str(" (Exit)");
     }
 
     let mut lines: Vec<_> = block
-        .stmts
+        .stmts()
         .iter()
         .map(|s| (format!("{}", s.node), false))
         .collect();
 
-    match &block.exit {
+    match block.exit() {
         BlockExit::CondJump { cond, .. } => lines.push((format!("if ({})", cond), true)),
         BlockExit::FornPrep {
             var,
@@ -139,23 +139,23 @@ struct GraphPayload {
 
 impl ControlFlowGraph {
     fn graph_payload(&self, tag: &str) -> GraphPayload {
-        let n = self.blocks.len();
+        let n = self.blocks().count();
 
-        let depths = dom_depths(&self.idoms, self.entry_block, n);
+        let idoms = self.build_idoms();
+        let depths = dom_depths(&idoms, self.entry(), n);
         let labels: Vec<Option<NodeLabel>> = self
-            .blocks
-            .iter()
+            .blocks()
             .enumerate()
             .map(|(i, b)| {
                 self.is_reachable(i)
-                    .then(|| build_label(i, b, i == self.entry_block))
+                    .then(|| build_label(i, b, i == self.entry()))
             })
             .collect();
 
         let mut edge_counter = 0usize;
         let mut edges: Vec<Edge> = Vec::new();
 
-        for (src, block) in self.blocks.iter().enumerate() {
+        for (src, block) in self.blocks().enumerate() {
             if !self.is_reachable(src) {
                 continue;
             }
@@ -167,7 +167,7 @@ impl ControlFlowGraph {
                     }
 
                     edge_counter += 1;
-                    let is_back = self.idoms.dominates(src, dst);
+                    let is_back = idoms.dominates(src, dst);
                     edges.push(Edge {
                         id: format!("e{edge_counter}"),
                         src,
@@ -178,7 +178,7 @@ impl ControlFlowGraph {
                     });
                 };
 
-            match &block.exit {
+            match block.exit() {
                 BlockExit::Jump(t) | BlockExit::Fallthrough(t) => {
                     push(&mut edges, *t, "#2196F3", 0)
                 }

@@ -40,6 +40,7 @@ pub struct StructuredFunction {
     pub cfg: ControlFlowGraph,
     pub root: RegionNode,
 
+    pub params: Vec<SymbolId>,
     pub upvalues: Vec<SymbolId>,
     pub is_vararg: bool,
     pub return_arity: Option<ReturnArity>,
@@ -80,12 +81,14 @@ impl StructuredFunction {
             )
         }
 
-        let upvalues = cfg.upvalues.clone();
+        let params = cfg.params().to_vec();
+        let upvalues = cfg.upvalues().to_vec();
 
         Self {
             proto: proto.index as usize,
             cfg,
             root,
+            params,
             upvalues,
             is_vararg: proto.is_vararg,
             return_arity: None,

@@ -69,23 +69,23 @@ impl Inliner {
     }
 
     fn visit_cfg(&mut self, cfg: &mut ControlFlowGraph) {
-        for block in &mut cfg.blocks {
+        for block in cfg.blocks_mut() {
             self.visit_cfg_cond_block(block);
         }
 
-        for block in &mut cfg.blocks {
-            self.remove_inlined_cfg_assigns(&mut block.stmts);
+        for block in cfg.blocks_mut() {
+            self.remove_inlined_cfg_assigns(block.stmts_mut());
         }
     }
 
     fn visit_cfg_cond_block(&mut self, block: &mut Block) {
-        self.visit_cfg_exit(&mut block.exit);
+        self.visit_cfg_exit(block.exit_mut());
 
         let Some((inlined, inlined_symbols)) = self.inline_condition_prelude(block) else {
             return;
         };
 
-        if let BlockExit::CondJump { cond, .. } = &mut block.exit
+        if let BlockExit::CondJump { cond, .. } = block.exit_mut()
             && *cond != inlined
         {
             *cond = inlined;
@@ -95,14 +95,14 @@ impl Inliner {
     }
 
     fn inline_condition_prelude(&self, block: &Block) -> Option<(HilExpr, Vec<SymbolId>)> {
-        let BlockExit::CondJump { cond, .. } = &block.exit else {
+        let BlockExit::CondJump { cond, .. } = block.exit() else {
             return None;
         };
 
         let mut condition = cond.clone();
         let mut inlined_symbols = Vec::new();
 
-        for stmt in block.stmts.iter().rev() {
+        for stmt in block.stmts().iter().rev() {
             let HilStmt::Assign {
                 left: HilExpr::Symbol(symbol),
                 value,

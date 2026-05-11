@@ -60,11 +60,39 @@ struct LoopShape {
 #[derive(Debug, Clone)]
 enum LoopKind {
     /// `while cond do`; condition is owned by the loop header.
-    While { condition: HilExpr },
+    While {
+        condition: HilExpr,
+        guard: usize,
+        body: usize,
+    },
     /// `repeat ... until cond`; condition is owned by the loop latch.
-    RepeatUntil { condition: HilExpr },
+    RepeatUntil {
+        condition: HilExpr,
+        latch: usize,
+        body: usize,
+    },
     /// `while true do`; loop exits are represented by `break`.
-    Infinite,
+    Infinite { body: usize },
+}
+
+#[derive(Debug, Clone)]
+struct LoopBodyPlan {
+    entry: usize,
+    nodes: HashSet<usize>,
+    exits: HashSet<usize>,
+    terminal_policy: TerminalPolicy,
+}
+
+#[derive(Debug, Clone)]
+enum TerminalPolicy {
+    Normal,
+    SuppressExitOf { block: usize },
+}
+
+impl TerminalPolicy {
+    fn suppresses(&self, block: usize) -> bool {
+        matches!(self, TerminalPolicy::SuppressExitOf { block: suppressed } if *suppressed == block)
+    }
 }
 
 /// The CFG boundary currently being structured.
@@ -294,7 +322,7 @@ impl RegionGraph {
         successors.insert(virtual_exit, Vec::new());
 
         Self {
-            entry: cfg.entry_block,
+            entry: cfg.entry(),
             exit: virtual_exit,
             nodes,
             successors,
@@ -336,10 +364,15 @@ impl<'cfg> Structurer<'cfg> {
             exits,
         };
 
-        self.structure_scope(&scope, None)
+        self.structure_scope(&scope, None, &TerminalPolicy::Normal)
     }
 
-    fn structure_scope(&self, scope: &Scope, loop_ctx: Option<&LoopCtx>) -> Shape {
+    fn structure_scope(
+        &self,
+        scope: &Scope,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+    ) -> Shape {
         let mut nodes = Vec::new();
         let mut visited = HashSet::new();
         let mut current = scope.entry;
@@ -348,6 +381,11 @@ impl<'cfg> Structurer<'cfg> {
             && !scope.exits.contains(&current)
             && visited.insert(current)
         {
+            if terminal_policy.suppresses(current) {
+                nodes.push(Shape::Block(current));
+                break;
+            }
+
             if let Some(loop_shape) = self.recognize_loop(current, scope) {
                 let next = single_target(&loop_shape.exits);
                 nodes.push(Shape::Loop(loop_shape));
@@ -362,7 +400,7 @@ impl<'cfg> Structurer<'cfg> {
             if let Some(conditional) = self.recognize_conditional(current, scope) {
                 let merge = conditional.merge;
 
-                if !self.cfg.blocks[current].stmts.is_empty() {
+                if !self.cfg.get(current).stmts().is_empty() {
                     nodes.push(Shape::Block(current));
                 }
 
@@ -404,30 +442,8 @@ impl<'cfg> Structurer<'cfg> {
             return None;
         }
 
-        let body_entry = self
-            .graph
-            .successors(header)
-            .iter()
-            .copied()
-            .find(|succ| loop_info.body.contains(succ) && *succ != header)
-            .unwrap_or(header);
-
-        let mut body_nodes = loop_info.body.clone();
-
-        // the header of a repeat/until is a normal block; only while discards it
         let kind = self.classify_loop(loop_info);
-        if matches!(kind, LoopKind::While { .. }) {
-            body_nodes.remove(&header);
-        }
-
-        let body_scope = Scope {
-            entry: body_entry,
-            nodes: body_nodes.clone(),
-            exits: [header]
-                .into_iter()
-                .chain(loop_info.exits.iter().copied())
-                .collect(),
-        };
+        let body_plan = self.plan_loop_body(loop_info, &kind);
 
         let loop_ctx = LoopCtx {
             header,
@@ -440,15 +456,50 @@ impl<'cfg> Structurer<'cfg> {
 
         verbose!("loop:");
         verbose!(indent: 1, "header = {}", header);
-        verbose!(indent: 1, "body = {:?}", body_nodes);
+        verbose!(indent: 1, "body = {:?}", body_plan.nodes);
         verbose!(indent: 1, "exits = {:?}", loop_info.exits);
 
         Some(LoopShape {
             header,
             kind,
-            body: Box::new(self.structure_scope(&body_scope, Some(&loop_ctx))),
+            body: Box::new(self.structure_loop_body(&body_plan, &loop_ctx)),
             exits: loop_info.exits.clone(),
         })
+    }
+
+    fn plan_loop_body(&self, loop_info: &LoopInfo, kind: &LoopKind) -> LoopBodyPlan {
+        match kind {
+            LoopKind::While { body, .. } | LoopKind::Infinite { body } => {
+                let mut nodes = loop_info.body.clone();
+                nodes.remove(&loop_info.header);
+
+                LoopBodyPlan {
+                    entry: *body,
+                    nodes,
+                    exits: [loop_info.header]
+                        .into_iter()
+                        .chain(loop_info.exits.iter().copied())
+                        .collect(),
+                    terminal_policy: TerminalPolicy::Normal,
+                }
+            }
+            LoopKind::RepeatUntil { latch, body, .. } => LoopBodyPlan {
+                entry: *body,
+                nodes: loop_info.body.clone(),
+                exits: loop_info.exits.clone(),
+                terminal_policy: TerminalPolicy::SuppressExitOf { block: *latch },
+            },
+        }
+    }
+
+    fn structure_loop_body(&self, plan: &LoopBodyPlan, loop_ctx: &LoopCtx) -> Shape {
+        let scope = Scope {
+            entry: plan.entry,
+            nodes: plan.nodes.clone(),
+            exits: plan.exits.clone(),
+        };
+
+        self.structure_scope(&scope, Some(loop_ctx), &plan.terminal_policy)
     }
 
     fn recognize_conditional(&self, head: usize, scope: &Scope) -> Option<ConditionalShape> {
@@ -456,7 +507,7 @@ impl<'cfg> Structurer<'cfg> {
             cond,
             then_block,
             else_block,
-        } = &self.cfg.blocks.get(head)?.exit
+        } = self.cfg.get(head).exit()
         else {
             return None;
         };
@@ -502,7 +553,7 @@ impl<'cfg> Structurer<'cfg> {
                 }
 
                 // Catch edge cases where an empty branch is a direct return
-                if let BlockExit::Return(values) = &self.cfg.blocks[entry].exit {
+                if let BlockExit::Return(values) = self.cfg.get(entry).exit() {
                     return Shape::Return {
                         values: values.clone(),
                     };
@@ -516,7 +567,7 @@ impl<'cfg> Structurer<'cfg> {
                 nodes,
                 exits: branch_exits.clone(),
             };
-            self.structure_scope(&branch_scope, loop_ctx)
+            self.structure_scope(&branch_scope, loop_ctx, &TerminalPolicy::Normal)
         };
 
         let then_shape = build_branch(shape.then_entry, then_nodes);
@@ -540,26 +591,38 @@ impl<'cfg> Structurer<'cfg> {
                 cond,
                 then_block,
                 else_block,
-            } = &self.cfg.blocks[loop_info.header].exit
+            } = self.cfg.get(loop_info.header).exit()
             && (*then_block == loop_info.header) ^ (*else_block == loop_info.header)
         {
             verbose!(indent:1, "kind = RepeatUntil");
             verbose!(indent:1, "condition = ({})", cond);
             return LoopKind::RepeatUntil {
                 condition: cond.clone(),
+                latch: loop_info.header,
+                body: loop_info.header,
             };
         }
 
-        if let BlockExit::CondJump { cond, .. } = &self.cfg.blocks[loop_info.header].exit {
+        let body = self
+            .graph
+            .successors(loop_info.header)
+            .iter()
+            .copied()
+            .find(|succ| loop_info.body.contains(succ) && *succ != loop_info.header)
+            .unwrap_or(loop_info.header);
+
+        if let BlockExit::CondJump { cond, .. } = self.cfg.get(loop_info.header).exit() {
             verbose!(indent:1, "kind = While");
             verbose!(indent:1, "condition = ({})", cond);
             return LoopKind::While {
                 condition: cond.clone(),
+                guard: loop_info.header,
+                body,
             };
         }
 
         verbose!(indent:1, "kind=Infinite");
-        LoopKind::Infinite
+        LoopKind::Infinite { body }
     }
 
     fn find_merge_point(&self, node: usize, scope: &Scope) -> Option<usize> {
@@ -570,7 +633,7 @@ impl<'cfg> Structurer<'cfg> {
     fn shape_for_block(&self, block: usize, loop_ctx: Option<&LoopCtx>) -> Shape {
         let block_shape = Shape::Block(block);
 
-        match &self.cfg.blocks[block].exit {
+        match self.cfg.get(block).exit() {
             BlockExit::Jump(target) | BlockExit::Fallthrough(target)
                 if loop_ctx.is_some_and(|ctx| ctx.continue_targets.contains(target)) =>
             {
@@ -633,8 +696,9 @@ impl Shape {
     fn lower(self, cfg: &ControlFlowGraph) -> RegionNode {
         match self {
             Shape::Block(block) => RegionNode::BasicBlock {
-                stmts: cfg.blocks[block]
-                    .stmts
+                stmts: cfg
+                    .get(block)
+                    .stmts()
                     .iter()
                     .map(|stmt| stmt.node.clone())
                     .collect(),
@@ -648,15 +712,15 @@ impl Shape {
                 else_branch: shape.else_branch.map(|branch| Box::new(branch.lower(cfg))),
             },
             Shape::Loop(shape) => match shape.kind {
-                LoopKind::While { condition } => RegionNode::While {
+                LoopKind::While { condition, .. } => RegionNode::While {
                     condition,
                     body: Box::new(shape.body.lower(cfg)),
                 },
-                LoopKind::RepeatUntil { condition } => RegionNode::RepeatUntil {
+                LoopKind::RepeatUntil { condition, .. } => RegionNode::RepeatUntil {
                     condition,
                     body: Box::new(shape.body.lower(cfg)),
                 },
-                LoopKind::Infinite => RegionNode::While {
+                LoopKind::Infinite { .. } => RegionNode::While {
                     condition: HilExpr::Bool(true),
                     body: Box::new(shape.body.lower(cfg)),
                 },

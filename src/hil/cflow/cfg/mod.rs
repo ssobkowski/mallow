@@ -101,8 +101,8 @@ impl RawBlockExit {
 /// Represents a lifted block
 #[derive(Debug, Clone)]
 pub struct Block {
-    pub stmts: Vec<Spanned<HilStmt>>,
-    pub exit: BlockExit,
+    stmts: Vec<Spanned<HilStmt>>,
+    exit: BlockExit,
 }
 
 impl Block {
@@ -117,6 +117,26 @@ impl Block {
     /// Returns the exit targets of this block.
     pub fn exit_targets(&self) -> [Option<usize>; 2] {
         self.exit.targets()
+    }
+
+    /// Returns an iterator over the statements of this block.
+    pub fn stmts(&self) -> &[Spanned<HilStmt>] {
+        &self.stmts
+    }
+
+    /// Returns a mutable reference to the statements of this block.
+    pub fn stmts_mut(&mut self) -> &mut Vec<Spanned<HilStmt>> {
+        &mut self.stmts
+    }
+
+    /// Returns the exit of this block.
+    pub fn exit(&self) -> &BlockExit {
+        &self.exit
+    }
+
+    /// Returns a mutable reference to the exit of this block.
+    pub fn exit_mut(&mut self) -> &mut BlockExit {
+        &mut self.exit
     }
 }
 
@@ -220,15 +240,15 @@ pub enum Cond {
 
 #[derive(Debug, Clone)]
 pub struct ControlFlowGraph {
-    pub blocks: Vec<Block>,
-    pub entry_block: usize,
+    blocks: Vec<Block>,
+    entry_block: usize,
 
-    pub successors: Vec<Vec<usize>>,
-    pub predecessors: Vec<Vec<usize>>,
-    pub idoms: DominatorTree,
+    successors: Vec<Vec<usize>>,
+    predecessors: Vec<Vec<usize>>,
+    idoms: DominatorTree,
 
-    pub params: Vec<SymbolId>,
-    pub upvalues: Vec<SymbolId>,
+    params: Vec<SymbolId>,
+    upvalues: Vec<SymbolId>,
 }
 
 impl ControlFlowGraph {
@@ -389,6 +409,32 @@ impl ControlFlowGraph {
                 );
             }
         }
+    }
+
+    /// Returns the list of parameters of the function.
+    pub fn params(&self) -> &[SymbolId] {
+        &self.params
+    }
+
+    /// Returns the list of upvalues of the function.
+    pub fn upvalues(&self) -> &[SymbolId] {
+        &self.upvalues
+    }
+
+    /// Returns a block by its index.
+    pub fn get(&self, idx: usize) -> &Block {
+        debug_assert!(self.contains_node(idx));
+        &self.blocks[idx]
+    }
+
+    /// Returns an iterator over all blocks in the CFG.
+    pub fn blocks(&self) -> impl Iterator<Item = &Block> + '_ {
+        self.blocks.iter()
+    }
+
+    /// Returns a mutable iterator over all blocks in the CFG.
+    pub fn blocks_mut(&mut self) -> impl Iterator<Item = &mut Block> + '_ {
+        self.blocks.iter_mut()
     }
 }
 

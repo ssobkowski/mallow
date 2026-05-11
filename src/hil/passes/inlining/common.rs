@@ -100,7 +100,7 @@ impl Analyzer {
 
 impl Visitor for Analyzer {
     fn visit_function(&mut self, fun: &StructuredFunction) {
-        self.seed_symbols(&fun.cfg.params, &fun.upvalues);
+        self.seed_symbols(fun.cfg.params(), &fun.upvalues);
 
         walk_function(self, fun);
     }
@@ -205,17 +205,17 @@ impl Analyzer {
 
     pub fn analyze_cfg(cfg: &ControlFlowGraph) -> Scope<SymbolId, Var> {
         let mut analyzer = Analyzer::default();
-        analyzer.seed_symbols(&cfg.params, &cfg.upvalues);
+        analyzer.seed_symbols(cfg.params(), cfg.upvalues());
 
-        for block in &cfg.blocks {
+        for block in cfg.blocks() {
             analyzer.visit_block(
                 &block
-                    .stmts
+                    .stmts()
                     .iter()
                     .map(|stmt| stmt.node.clone())
                     .collect::<Vec<_>>(),
             );
-            analyzer.visit_cfg_exit(&block.exit);
+            analyzer.visit_cfg_exit(block.exit());
         }
 
         analyzer.vars

@@ -287,7 +287,7 @@ impl<'a> Ssa<'a> {
             };
 
             blocks[block_idx]
-                .stmts
+                .stmts_mut()
                 .insert(0, HilStmt::Phi(phi_node).to_spanned(0));
         }
     }

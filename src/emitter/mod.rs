@@ -139,12 +139,12 @@ impl Emitter {
         let fun = self.functions[proto_idx].clone();
 
         let scope = self.scopes.push_scope();
-        for &sym in &fun.cfg.params {
+        for &sym in fun.cfg.params() {
             let slot = self.contexts[self.current_ctx].next_local_slot;
             self.contexts[self.current_ctx].next_local_slot += 1;
             scope.declare(sym, slot);
         }
-        for &sym in &fun.cfg.upvalues {
+        for &sym in fun.cfg.upvalues() {
             let slot = self.contexts[self.current_ctx].next_local_slot;
             self.contexts[self.current_ctx].next_local_slot += 1;
             scope.declare(sym, slot);
@@ -227,7 +227,7 @@ impl Emitter {
         }
 
         let proto_idx = self.contexts[ctx_idx].proto_idx;
-        let is_param = self.functions[proto_idx].cfg.params.contains(&sym);
+        let is_param = self.functions[proto_idx].params.contains(&sym);
         self.reserve_symbol_name_fresh(ctx_idx, sym, is_param)
     }
 
@@ -266,9 +266,9 @@ impl Emitter {
         }
 
         let proto_idx = self.current_context().proto_idx;
-        let cfg = &self.functions[proto_idx].cfg;
-        if cfg.params.contains(&sym)
-            || cfg.upvalues.contains(&sym)
+        let fun = &self.functions[proto_idx];
+        if fun.params.contains(&sym)
+            || fun.upvalues.contains(&sym)
             || self.current_context().forced_named_symbols.contains(&sym)
         {
             return Some(SymbolStorage::Named(self.get_symbol_name(&sym)));
@@ -853,7 +853,7 @@ impl Emitter {
             .collect();
 
         let child_ctx = self.create_context(proto_idx);
-        let child_upvalues = self.functions[proto_idx].cfg.upvalues.clone();
+        let child_upvalues = self.functions[proto_idx].upvalues.clone();
         for (i, binding) in parent_bindings.into_iter().enumerate() {
             if let Some(&child_upval_sym) = child_upvalues.get(i) {
                 match binding {
@@ -874,7 +874,7 @@ impl Emitter {
 
         let old_scopes = std::mem::take(&mut self.scopes);
 
-        let param_symbols = self.functions[proto_idx].cfg.params.clone();
+        let param_symbols = self.functions[proto_idx].params.clone();
         let is_vararg = self.functions[proto_idx].is_vararg;
         let mut params: Vec<_> = param_symbols
             .into_iter()
