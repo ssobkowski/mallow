@@ -408,6 +408,10 @@ impl GraphView for ControlFlowGraph {
     fn contains_node(&self, node: usize) -> bool {
         node < self.blocks.len()
     }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        0..self.blocks.len()
+    }
 }
 
 /// Returns the list of instruction indices which are block entries.

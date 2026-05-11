@@ -3,6 +3,7 @@ use crate::{
     hil::{
         cflow::{
             cfg::ControlFlowGraph,
+            phoenix,
             region::{self, RegionNode},
         },
         lifter::ssa::SymbolId,
@@ -63,8 +64,14 @@ impl StructuredFunction {
             cfg.simplify_conditions();
         }
 
+        eprintln!("{:#?}", cfg);
+
         verbose!(indent: 1, "structuring region...");
-        let (root, was_reduced) = region::structure(&cfg);
+        let (root, was_reduced) = if std::env::var("MALLOW_PHOENIX").is_ok_and(|f| f == "1") {
+            phoenix::structure(&cfg)
+        } else {
+            region::structure(&cfg)
+        };
 
         if !was_reduced {
             eprintln!(

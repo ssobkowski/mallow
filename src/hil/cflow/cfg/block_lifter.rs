@@ -116,7 +116,7 @@ impl<'a> BlockBuilder<'a> {
     fn lift_blocks(&mut self) {
         let graph = AdjGraph::new(0, self.successors, self.predecessors);
 
-        for block_id in graph.compute_rpo() {
+        for block_id in graph.reverse_post_order() {
             self.lift_block(block_id);
         }
     }

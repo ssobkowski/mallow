@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// A read-only view of a directed graph.
 pub trait GraphView {
@@ -6,43 +6,52 @@ pub trait GraphView {
     fn successors(&self, node: usize) -> &[usize];
     fn predecessors(&self, node: usize) -> &[usize];
     fn contains_node(&self, node: usize) -> bool;
+    fn iter(&self) -> impl Iterator<Item = usize> + '_;
 
     fn is_reachable(&self, node: usize) -> bool {
         self.contains_node(node) && (node == self.entry() || !self.predecessors(node).is_empty())
     }
 
-    fn compute_rpo(&self) -> Vec<usize> {
-        let mut visited = HashSet::new();
-        let mut post_order = Vec::new();
-
-        self.compute_rpo_dfs(self.entry(), &mut visited, &mut post_order);
-
-        post_order.reverse();
-        post_order
-    }
-
-    #[doc(hidden)]
-    fn compute_rpo_dfs(
-        &self,
-        block: usize,
-        visited: &mut HashSet<usize>,
-        post_order: &mut Vec<usize>,
-    ) {
-        visited.insert(block);
-
-        for &succ in self.successors(block) {
-            if self.contains_node(succ) && !visited.contains(&succ) {
-                self.compute_rpo_dfs(succ, visited, post_order);
+    fn post_order(&self) -> Vec<usize> {
+        fn dfs<G: GraphView + ?Sized>(
+            graph: &G,
+            node: usize,
+            visited: &mut HashSet<usize>,
+            order: &mut Vec<usize>,
+        ) {
+            if !graph.contains_node(node) {
+                return;
             }
+
+            if !visited.insert(node) {
+                return;
+            }
+
+            for &succ in graph.successors(node) {
+                dfs(graph, succ, visited, order);
+            }
+
+            order.push(node);
         }
 
-        post_order.push(block);
+        let mut visited = HashSet::new();
+        let mut order = Vec::new();
+
+        dfs(self, self.entry(), &mut visited, &mut order);
+
+        order
+    }
+
+    fn reverse_post_order(&self) -> Vec<usize> {
+        let mut order = self.post_order();
+        order.reverse();
+        order
     }
 
     /// Computes immediate dominators for all reachable blocks using the
     /// Cooper-Harvey-Kennedy algorithm.
     fn build_idoms(&self) -> DominatorTree {
-        let rpo_nodes = self.compute_rpo();
+        let rpo_nodes = self.reverse_post_order();
 
         let mut idoms = HashMap::new();
         idoms.insert(self.entry(), self.entry());
@@ -106,6 +115,10 @@ impl<G: GraphView + ?Sized> GraphView for &G {
     fn contains_node(&self, node: usize) -> bool {
         (**self).contains_node(node)
     }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (**self).iter()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +149,35 @@ impl DominatorTree {
                 None => return false,
             }
         }
+    }
+
+    pub fn post_order(&self) -> Vec<usize> {
+        let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        children.insert(self.entry, Vec::new());
+
+        for (&node, &idom) in &self.idoms {
+            children.entry(idom).or_default().push(node);
+            children.entry(node).or_default();
+        }
+
+        for children in children.values_mut() {
+            children.sort_unstable();
+        }
+
+        let mut order = Vec::with_capacity(children.len());
+        fn visit(node: usize, children: &BTreeMap<usize, Vec<usize>>, order: &mut Vec<usize>) {
+            if let Some(child_nodes) = children.get(&node) {
+                for &child in child_nodes {
+                    visit(child, children, order);
+                }
+            }
+
+            order.push(node);
+        }
+
+        visit(self.entry, &children, &mut order);
+
+        order
     }
 
     fn intersect(
@@ -207,6 +249,10 @@ impl<G: SeseGraphView> GraphView for Reversed<G> {
     fn contains_node(&self, node: usize) -> bool {
         self.0.contains_node(node)
     }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter()
+    }
 }
 
 impl<G: SeseGraphView> SeseGraphView for Reversed<G> {
@@ -246,6 +292,10 @@ impl GraphView for AdjGraph<'_> {
 
     fn contains_node(&self, node: usize) -> bool {
         node < self.successors.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        0..self.successors.len()
     }
 }
 
@@ -299,6 +349,10 @@ mod tests {
         fn contains_node(&self, node: usize) -> bool {
             self.nodes.contains_key(&node)
         }
+
+        fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+            self.nodes.keys().copied()
+        }
     }
 
     impl SeseGraphView for SparseGraph {
@@ -313,7 +367,7 @@ mod tests {
         let predecessors = vec![vec![], vec![0], vec![0], vec![1, 2]];
         let graph = AdjGraph::new(0, &successors, &predecessors);
 
-        assert_eq!(graph.compute_rpo(), vec![0, 2, 1, 3]);
+        assert_eq!(graph.reverse_post_order(), vec![0, 2, 1, 3]);
 
         let idoms = graph.build_idoms();
         assert_eq!(idoms.entry(), 0);
@@ -329,7 +383,7 @@ mod tests {
     fn sparse_node_ids_keep_original_ids() {
         let graph = SparseGraph::new(10, 30, &[(10, 20), (20, 30)], &[10, 20, 30]);
 
-        assert_eq!(graph.compute_rpo(), vec![10, 20, 30]);
+        assert_eq!(graph.reverse_post_order(), vec![10, 20, 30]);
 
         let idoms = graph.build_idoms();
         assert_eq!(idoms.entry(), 10);

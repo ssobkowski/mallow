@@ -645,6 +645,10 @@ impl GraphView for FoldableGraph<'_> {
     fn contains_node(&self, node: usize) -> bool {
         self.nodes.contains_key(&node)
     }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.nodes.keys().copied()
+    }
 }
 
 impl SeseGraphView for FoldableGraph<'_> {
