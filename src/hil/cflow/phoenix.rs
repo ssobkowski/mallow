@@ -280,24 +280,19 @@ impl RegionGraph {
             .filter(|&id| successors.get(&id).is_none_or(|s| s.is_empty()))
             .collect();
 
-        let exit_node = if terminal_nodes.len() == 1 {
-            terminal_nodes[0]
-        } else {
-            let virtual_exit = usize::MAX;
-            nodes.insert(virtual_exit, Shape::VirtualExit);
+        let virtual_exit = usize::MAX;
+        nodes.insert(virtual_exit, Shape::VirtualExit);
 
-            for node in terminal_nodes {
-                successors.entry(node).or_default().push(virtual_exit);
-                predecessors.entry(virtual_exit).or_default().push(node);
-            }
+        for node in terminal_nodes {
+            successors.entry(node).or_default().push(virtual_exit);
+            predecessors.entry(virtual_exit).or_default().push(node);
+        }
 
-            successors.insert(virtual_exit, Vec::new());
-            virtual_exit
-        };
+        successors.insert(virtual_exit, Vec::new());
 
         Self {
             entry: cfg.entry_block,
-            exit: exit_node,
+            exit: virtual_exit,
             nodes,
             successors,
             predecessors,
