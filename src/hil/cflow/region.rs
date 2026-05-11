@@ -259,6 +259,11 @@ pub enum RegionNode {
         condition: HilExpr,
         body: Box<RegionNode>,
     },
+    /// A structured `repeat ... until ...` loop recovered from backedges.
+    RepeatUntil {
+        condition: HilExpr,
+        body: Box<RegionNode>,
+    },
     /// A structured numeric `for` loop recovered from `FORNPREP/FORNLOOP`.
     NumericFor {
         var: SymbolId,

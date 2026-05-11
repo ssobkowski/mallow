@@ -127,6 +127,13 @@ pub enum Stmt {
         /// Loop body.
         body: Block,
     },
+    /// `repeat ... until ...` loop.
+    RepeatUntil {
+        /// Loop condition.
+        condition: Expr,
+        /// Loop body.
+        body: Block,
+    },
 }
 
 /// An if statement.

@@ -437,6 +437,17 @@ impl Emitter {
 
                 self.scopes.pop_scope();
             }
+            RegionNode::RepeatUntil { condition, body } => {
+                self.scopes.push_scope();
+
+                let body = self.visit_region(body);
+                buf.push(Stmt::RepeatUntil {
+                    condition: self.visit_expr(condition),
+                    body,
+                });
+
+                self.scopes.pop_scope();
+            }
             RegionNode::NumericFor {
                 body,
                 var,

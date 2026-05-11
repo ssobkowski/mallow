@@ -214,6 +214,16 @@ impl AstPrinter {
                 self.write("end");
                 self.newline();
             }
+            Stmt::RepeatUntil { condition, body } => {
+                self.write("repeat");
+                self.newline();
+                self.indent += 1;
+                self.walk_block(body);
+                self.indent -= 1;
+                self.write("until ");
+                self.walk_expr(condition, 0, Side::None);
+                self.newline();
+            }
         }
     }
 

@@ -4,13 +4,16 @@ use std::collections::{HashMap, HashSet};
 
 use smallvec::SmallVec;
 
-use crate::hil::{
-    cflow::{
-        cfg::{BlockExit, ControlFlowGraph},
-        graph::{DominatorTree, GraphView, Reversed, SeseGraphView},
-        region::RegionNode,
+use crate::{
+    hil::{
+        cflow::{
+            cfg::{BlockExit, ControlFlowGraph},
+            graph::{DominatorTree, GraphView, Reversed, SeseGraphView},
+            region::RegionNode,
+        },
+        ir::HilExpr,
     },
-    ir::HilExpr,
+    logging::verbose,
 };
 
 /// The lexical control-flow shape recognized from CFG facts.
@@ -408,15 +411,18 @@ impl<'cfg> Structurer<'cfg> {
             .copied()
             .find(|succ| loop_info.body.contains(succ) && *succ != header)
             .unwrap_or(header);
-        let body_nodes = loop_info
-            .body
-            .iter()
-            .copied()
-            .filter(|node| *node != header)
-            .collect();
+
+        let mut body_nodes = loop_info.body.clone();
+
+        // the header of a repeat/until is a normal block; only while discards it
+        let kind = self.classify_loop(loop_info);
+        if matches!(kind, LoopKind::While { .. }) {
+            body_nodes.remove(&header);
+        }
+
         let body_scope = Scope {
             entry: body_entry,
-            nodes: body_nodes,
+            nodes: body_nodes.clone(),
             exits: [header]
                 .into_iter()
                 .chain(loop_info.exits.iter().copied())
@@ -432,9 +438,14 @@ impl<'cfg> Structurer<'cfg> {
             exits: loop_info.exits.clone(),
         };
 
+        verbose!("loop:");
+        verbose!(indent: 1, "header = {}", header);
+        verbose!(indent: 1, "body = {:?}", body_nodes);
+        verbose!(indent: 1, "exits = {:?}", loop_info.exits);
+
         Some(LoopShape {
             header,
-            kind: self.classify_loop(loop_info),
+            kind,
             body: Box::new(self.structure_scope(&body_scope, Some(&loop_ctx))),
             exits: loop_info.exits.clone(),
         })
@@ -521,12 +532,34 @@ impl<'cfg> Structurer<'cfg> {
     }
 
     fn classify_loop(&self, loop_info: &LoopInfo) -> LoopKind {
-        match &self.cfg.blocks[loop_info.header].exit {
-            BlockExit::CondJump { cond, .. } => LoopKind::While {
+        verbose!("classify_loop: loop_info = {:?}", loop_info);
+
+        // if loop header is also a latch, and the header's CondJump has one edge back to itself and one edge out, this is a post-test loop
+        if loop_info.latches.contains(&loop_info.header)
+            && let BlockExit::CondJump {
+                cond,
+                then_block,
+                else_block,
+            } = &self.cfg.blocks[loop_info.header].exit
+            && (*then_block == loop_info.header) ^ (*else_block == loop_info.header)
+        {
+            verbose!(indent:1, "kind = RepeatUntil");
+            verbose!(indent:1, "condition = ({})", cond);
+            return LoopKind::RepeatUntil {
                 condition: cond.clone(),
-            },
-            _ => LoopKind::Infinite,
+            };
         }
+
+        if let BlockExit::CondJump { cond, .. } = &self.cfg.blocks[loop_info.header].exit {
+            verbose!(indent:1, "kind = While");
+            verbose!(indent:1, "condition = ({})", cond);
+            return LoopKind::While {
+                condition: cond.clone(),
+            };
+        }
+
+        verbose!(indent:1, "kind=Infinite");
+        LoopKind::Infinite
     }
 
     fn find_merge_point(&self, node: usize, scope: &Scope) -> Option<usize> {
@@ -619,9 +652,10 @@ impl Shape {
                     condition,
                     body: Box::new(shape.body.lower(cfg)),
                 },
-                LoopKind::RepeatUntil { .. } => {
-                    todo!("lower repeat-until Phoenix shape")
-                }
+                LoopKind::RepeatUntil { condition } => RegionNode::RepeatUntil {
+                    condition,
+                    body: Box::new(shape.body.lower(cfg)),
+                },
                 LoopKind::Infinite => RegionNode::While {
                     condition: HilExpr::Bool(true),
                     body: Box::new(shape.body.lower(cfg)),
