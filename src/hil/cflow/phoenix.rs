@@ -363,6 +363,11 @@ impl<'cfg> Structurer<'cfg> {
 
             if let Some(conditional) = self.recognize_conditional(current, scope) {
                 let merge = conditional.merge;
+
+                if !self.cfg.blocks[current].stmts.is_empty() {
+                    nodes.push(Shape::Block(current));
+                }
+
                 nodes.push(self.structure_conditional(conditional, scope, loop_ctx));
 
                 let Some(merge) = merge else {
@@ -473,19 +478,43 @@ impl<'cfg> Structurer<'cfg> {
         let then_nodes = self.collect_reachable_until(shape.then_entry, scope, &branch_exits);
         let else_nodes = self.collect_reachable_until(shape.else_entry, scope, &branch_exits);
 
-        let then_branch = Scope {
-            entry: shape.then_entry,
-            nodes: then_nodes,
-            exits: branch_exits.clone(),
-        };
-        let else_branch = Scope {
-            entry: shape.else_entry,
-            nodes: else_nodes,
-            exits: branch_exits,
+        let build_branch = |entry: usize, nodes: HashSet<usize>| {
+            if nodes.is_empty() {
+                // If the branch naturally falls through to the merge point, it's just empty.
+                if Some(entry) == shape.merge {
+                    return Shape::sequence(Vec::new());
+                }
+
+                // If the branch jumps out of the region entirely, map it to the correct exit instruction.
+                if let Some(ctx) = loop_ctx {
+                    if ctx.exits.contains(&entry) {
+                        return Shape::Break;
+                    }
+                    if ctx.continue_targets.contains(&entry) {
+                        return Shape::Continue;
+                    }
+                }
+
+                // Catch edge cases where an empty branch is a direct return
+                if let BlockExit::Return(values) = &self.cfg.blocks[entry].exit {
+                    return Shape::Return {
+                        values: values.clone(),
+                    };
+                }
+
+                return Shape::sequence(Vec::new());
+            }
+
+            let branch_scope = Scope {
+                entry,
+                nodes,
+                exits: branch_exits.clone(),
+            };
+            self.structure_scope(&branch_scope, loop_ctx)
         };
 
-        let then_shape = self.structure_scope(&then_branch, loop_ctx);
-        let else_shape = self.structure_scope(&else_branch, loop_ctx);
+        let then_shape = build_branch(shape.then_entry, then_nodes);
+        let else_shape = build_branch(shape.else_entry, else_nodes);
 
         Shape::If(IfShape {
             head: shape.head,
