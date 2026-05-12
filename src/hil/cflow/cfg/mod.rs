@@ -114,6 +114,11 @@ impl Block {
         }
     }
 
+    /// Returns whether the block is empty.
+    pub fn is_empty(&self) -> bool {
+        self.stmts.is_empty()
+    }
+
     /// Returns the exit targets of this block.
     pub fn exit_targets(&self) -> [Option<usize>; 2] {
         self.exit.targets()

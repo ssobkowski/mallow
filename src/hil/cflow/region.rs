@@ -313,7 +313,7 @@ impl CfgNode {
     ) {
         let is_continue_target = |raw_target: usize, active_target: usize| {
             if active_target == continue_target {
-                !require_empty_continue_target || cfg.get(raw_target).stmts().is_empty()
+                !require_empty_continue_target || cfg.get(raw_target).is_empty()
             } else {
                 continue_target_alt.is_some_and(|target| raw_target == target)
             }
@@ -960,7 +960,7 @@ impl<'a> FoldableGraph<'a> {
 
     fn node_emits_statements(&self, node: &CfgNode) -> bool {
         match node {
-            CfgNode::BasicBlock { block } => !self.cfg.get(*block).stmts().is_empty(),
+            CfgNode::BasicBlock { block } => !self.cfg.get(*block).is_empty(),
             CfgNode::Sequence { nodes } => {
                 nodes.iter().any(|node| self.node_emits_statements(node))
             }
@@ -2717,7 +2717,7 @@ impl<'a> FoldableGraph<'a> {
 
     fn node_has_prelude(&self, node: &CfgNode) -> bool {
         match node {
-            CfgNode::BasicBlock { block } => !self.cfg.get(*block).stmts().is_empty(),
+            CfgNode::BasicBlock { block } => !self.cfg.get(*block).is_empty(),
             CfgNode::Sequence { nodes } => nodes.iter().any(|node| self.node_has_prelude(node)),
             _ => false,
         }
