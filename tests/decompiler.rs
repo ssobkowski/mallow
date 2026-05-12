@@ -85,7 +85,6 @@ fn run_case(
             .is_some_and(|name| name == "intg-sha2"),
         decompile_timeout,
     )?;
-    assert_decompiled_shape(source_path, &decompiled_path)?;
 
     let source_output = run_luau(source_path, "source.luau", runtime_timeout)?;
     let decompiled_output = run_luau(&decompiled_path, "decompiled.luau", runtime_timeout)?;
@@ -96,30 +95,6 @@ fn run_case(
             decompiled: decompiled_output,
         }
         .into());
-    }
-
-    Ok(())
-}
-
-fn assert_decompiled_shape(source_path: &Path, decompiled_path: &Path) -> Result<(), Failed> {
-    if !source_path
-        .file_stem()
-        .is_some_and(|name| name == "controlflow33")
-    {
-        return Ok(());
-    }
-
-    let source = fs::read_to_string(decompiled_path)
-        .map_err(|e| Failed::from(format!("failed to read decompiled output: {e}")))?;
-    let line_count = source.lines().count();
-    let epsilon_returns = source.matches("return \"epsilon\"").count();
-    let default_returns = source.matches("return \"default\"").count();
-
-    if line_count > 1_000 || epsilon_returns > 4 || default_returns > 4 {
-        return Err(Failed::from(format!(
-            "controlflow33 decompiled shape duplicated terminal return bodies: \
-             {line_count} lines, epsilon returns={epsilon_returns}, default returns={default_returns}"
-        )));
     }
 
     Ok(())

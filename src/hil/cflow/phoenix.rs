@@ -57,6 +57,10 @@ struct LoopCtx {
     /// loops this includes the header/latch; for Luau numeric and generic
     /// loops this is the loop instruction latch.
     continue_targets: HashSet<usize>,
+    /// Blocks whose edge to a continue target is the loop's ordinary tail edge.
+    /// That edge is represented by the surrounding loop syntax and must not be
+    /// lowered as an explicit `continue`.
+    implicit_continue_sources: HashSet<usize>,
     /// Continue targets that still carry loop-body payload before completing
     /// the iteration.
     continue_payload_entries: HashSet<usize>,
@@ -169,6 +173,9 @@ struct Scope {
     /// Boundary targets for this scope. These are stop points for sequencing,
     /// not a claim that the target blocks have no statements.
     exits: HashSet<usize>,
+    /// Exit targets that represent ordinary fallthrough for this scope, such as
+    /// the merge block of a structured conditional branch.
+    implicit_exits: HashSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +501,7 @@ impl<'cfg> Structurer<'cfg> {
             entry: self.graph.entry(),
             nodes,
             exits,
+            implicit_exits: HashSet::new(),
         };
 
         self.structure_scope(&scope, None, &TerminalPolicy::Normal, None)
@@ -510,6 +518,11 @@ impl<'cfg> Structurer<'cfg> {
         verbose!(indent: 1, "entry = {}", scope.entry);
         verbose!(indent: 1, "nodes = {:?}", sorted_nodes(&scope.nodes));
         verbose!(indent: 1, "exits = {:?}", sorted_nodes(&scope.exits));
+        verbose!(
+            indent: 1,
+            "implicit_exits = {:?}",
+            sorted_nodes(&scope.implicit_exits)
+        );
         verbose!(indent: 1, "terminal_policy = {:?}", terminal_policy);
         verbose!(indent: 1, "blocked_loop = {:?}", blocked_loop);
         if let Some(ctx) = loop_ctx {
@@ -519,12 +532,19 @@ impl<'cfg> Structurer<'cfg> {
                 "loop_ctx.continue_targets = {:?}",
                 sorted_nodes(&ctx.continue_targets)
             );
+            verbose!(
+                indent: 1,
+                "loop_ctx.implicit_continue_sources = {:?}",
+                sorted_nodes(&ctx.implicit_continue_sources)
+            );
             verbose!(indent: 1, "loop_ctx.exits = {:?}", sorted_nodes(&ctx.exits));
         }
 
         let mut nodes = Vec::new();
         let mut visited = HashSet::new();
         let mut current = scope.entry;
+
+        visited.insert(usize::MAX); // virtual exit
 
         while scope.nodes.contains(&current)
             && !scope.exits.contains(&current)
@@ -580,7 +600,7 @@ impl<'cfg> Structurer<'cfg> {
                 continue;
             }
 
-            nodes.push(self.shape_for_block(current, loop_ctx));
+            nodes.push(self.shape_for_block(current, scope, loop_ctx));
 
             let next = self
                 .graph
@@ -631,6 +651,7 @@ impl<'cfg> Structurer<'cfg> {
         let loop_ctx = LoopCtx {
             header,
             continue_targets: self.continue_targets(loop_info, &kind),
+            implicit_continue_sources: self.implicit_continue_sources(loop_info, &kind),
             continue_payload_entries: self.continue_payload_entries(loop_info, &kind),
             exits: lexical_exits.clone(),
             exit_payload_entries: self.exit_payload_entries(loop_info, &lexical_exits),
@@ -655,6 +676,11 @@ impl<'cfg> Structurer<'cfg> {
             indent: 1,
             "continue_targets = {:?}",
             sorted_nodes(&loop_ctx.continue_targets)
+        );
+        verbose!(
+            indent: 1,
+            "implicit_continue_sources = {:?}",
+            sorted_nodes(&loop_ctx.implicit_continue_sources)
         );
         verbose!(
             indent: 1,
@@ -685,7 +711,7 @@ impl<'cfg> Structurer<'cfg> {
         lexical_exits: HashSet<usize>,
     ) -> LoopBodyPlan {
         match kind {
-            LoopKind::While { body, .. } | LoopKind::Infinite { body } => {
+            LoopKind::While { body, .. } => {
                 let mut nodes = lexical_body;
                 nodes.remove(&loop_info.header);
 
@@ -700,6 +726,13 @@ impl<'cfg> Structurer<'cfg> {
                     terminal_policy: TerminalPolicy::Normal,
                 }
             }
+            LoopKind::Infinite { body } => LoopBodyPlan {
+                loop_id: loop_info.id,
+                entry: *body,
+                nodes: lexical_body,
+                exits: lexical_exits,
+                terminal_policy: TerminalPolicy::Normal,
+            },
             LoopKind::RepeatUntil { latch, body, .. } => LoopBodyPlan {
                 loop_id: loop_info.id,
                 entry: *body,
@@ -766,7 +799,10 @@ impl<'cfg> Structurer<'cfg> {
                 .copied()
                 .filter(|target| *target != *body)
                 .collect(),
-            LoopKind::Infinite { .. } => loop_info.exits.clone(),
+            LoopKind::Infinite { .. } => self.common_loop_follow(loop_info).map_or_else(
+                || loop_info.exits.clone(),
+                |follow| [follow].into_iter().collect(),
+            ),
         }
     }
 
@@ -775,6 +811,7 @@ impl<'cfg> Structurer<'cfg> {
             entry: plan.entry,
             nodes: plan.nodes.clone(),
             exits: plan.exits.clone(),
+            implicit_exits: HashSet::new(),
         };
 
         self.structure_scope(
@@ -793,6 +830,17 @@ impl<'cfg> Structurer<'cfg> {
             LoopKind::RepeatUntil { .. }
             | LoopKind::NumericFor { .. }
             | LoopKind::GenericFor { .. } => [loop_info.latch].into_iter().collect(),
+        }
+    }
+
+    fn implicit_continue_sources(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+        match kind {
+            LoopKind::While { .. } | LoopKind::Infinite { .. }
+                if loop_info.latch != loop_info.header =>
+            {
+                [loop_info.latch].into_iter().collect()
+            }
+            _ => HashSet::new(),
         }
     }
 
@@ -942,6 +990,7 @@ impl<'cfg> Structurer<'cfg> {
                     .copied()
                     .filter(|exit| *exit != entry)
                     .collect(),
+                implicit_exits: shape.merge.into_iter().collect(),
             };
             self.structure_scope(&branch_scope, loop_ctx, terminal_policy, blocked_loop)
         };
@@ -1045,24 +1094,34 @@ impl<'cfg> Structurer<'cfg> {
                 cond.clone()
             };
 
-            verbose!(indent: 1, "kind = RepeatUntil");
-            verbose!(indent: 1, "condition = ({})", condition);
-            return LoopKind::RepeatUntil {
-                condition,
-                latch: loop_info.latch,
-                body: loop_info.header,
+            let loop_exit = if *then_block == loop_info.header {
+                *else_block
+            } else {
+                *then_block
             };
+
+            if self.can_represent_as_repeat_until(loop_info, loop_exit) {
+                verbose!(indent: 1, "kind = RepeatUntil");
+                verbose!(indent: 1, "condition = ({})", condition);
+                return LoopKind::RepeatUntil {
+                    condition,
+                    latch: loop_info.latch,
+                    body: loop_info.header,
+                };
+            }
         }
 
-        let body = self
-            .graph
-            .successors(loop_info.header)
-            .iter()
-            .copied()
-            .find(|succ| loop_info.body.contains(succ) && *succ != loop_info.header)
-            .unwrap_or(loop_info.header);
+        if let BlockExit::CondJump { cond, .. } = self.cfg.get(loop_info.header).exit()
+            && self.cfg.get(loop_info.header).is_empty()
+        {
+            let body = self
+                .graph
+                .successors(loop_info.header)
+                .iter()
+                .copied()
+                .find(|succ| loop_info.body.contains(succ) && *succ != loop_info.header)
+                .unwrap_or(loop_info.header);
 
-        if let BlockExit::CondJump { cond, .. } = self.cfg.get(loop_info.header).exit() {
             verbose!(indent: 1, "kind = While");
             verbose!(indent: 1, "condition = ({})", cond);
             return LoopKind::While {
@@ -1073,7 +1132,22 @@ impl<'cfg> Structurer<'cfg> {
         }
 
         verbose!(indent: 1, "kind=Infinite");
-        LoopKind::Infinite { body }
+        LoopKind::Infinite {
+            body: loop_info.header,
+        }
+    }
+
+    fn can_represent_as_repeat_until(&self, loop_info: &LoopInfo, loop_exit: usize) -> bool {
+        if loop_info.exits.len() == 1 {
+            return true;
+        }
+
+        self.cfg.get(loop_exit).is_empty()
+    }
+
+    fn common_loop_follow(&self, loop_info: &LoopInfo) -> Option<usize> {
+        let follow = self.ipdoms.idom(loop_info.header)?;
+        (!loop_info.body.contains(&follow)).then_some(follow)
     }
 
     fn find_merge_point(&self, node: usize, scope: &Scope) -> Option<usize> {
@@ -1081,13 +1155,29 @@ impl<'cfg> Structurer<'cfg> {
         (scope.nodes.contains(&merge) && !scope.exits.contains(&merge)).then_some(merge)
     }
 
-    fn shape_for_block(&self, block: usize, loop_ctx: Option<&LoopCtx>) -> Shape {
+    fn shape_for_block(&self, block: usize, scope: &Scope, loop_ctx: Option<&LoopCtx>) -> Shape {
         let block_shape = Shape::Block(block);
 
         match self.cfg.get(block).exit() {
             BlockExit::Jump(target) | BlockExit::Fallthrough(target)
+                if scope.implicit_exits.contains(target) =>
+            {
+                verbose!(indent: 2, "block {} exits to implicit target {}", block, target);
+                block_shape
+            }
+            BlockExit::Jump(target) | BlockExit::Fallthrough(target)
                 if loop_ctx.is_some_and(|ctx| ctx.continue_targets.contains(target)) =>
             {
+                if loop_ctx.is_some_and(|ctx| ctx.implicit_continue_sources.contains(&block)) {
+                    verbose!(
+                        indent: 2,
+                        "block {} exits through implicit loop tail to {}",
+                        block,
+                        target
+                    );
+                    return block_shape;
+                }
+
                 verbose!(indent: 2, "block {} exits to continue target {}", block, target);
                 Shape::sequence([block_shape, Shape::Continue])
             }
