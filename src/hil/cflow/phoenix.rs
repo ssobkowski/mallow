@@ -105,6 +105,7 @@ enum LoopKind {
         latch: usize,
         body: usize,
     },
+    /// for var = start, step, end
     NumericFor {
         var: SymbolId,
         start: HilExpr,
@@ -114,12 +115,13 @@ enum LoopKind {
         body: usize,
         exit: usize,
     },
+    /// for [vars] in [exprs]
     GenericFor {
         vars: SmallVec<[SymbolId; 3]>,
         exprs: [HilExpr; 3],
-        prep_block: usize,
+        prep: usize,
         body: usize,
-        exit_block: usize,
+        exit: usize,
     },
     /// `while true do`; loop exits are represented by `break`.
     Infinite { body: usize },
@@ -187,10 +189,10 @@ struct LoopInfo {
     header: usize,
     latch: usize,
     /// Natural loop body collected by walking predecessors from latch to
-    /// header. This is a graph-theoretic body, not necessarily the final
-    /// lexical source body.
+    /// header. This identifies the cycle that proves the loop exists; Phoenix
+    /// expands it into a lexical body after classifying the loop kind.
     body: HashSet<usize>,
-    /// Successor targets reached by edges leaving `body`.
+    /// Successor targets reached by edges leaving the natural cycle body.
     exits: HashSet<usize>,
     /// Smallest containing loop, when loop bodies are nested by containment.
     parent: Option<LoopId>,
@@ -618,21 +620,32 @@ impl<'cfg> Structurer<'cfg> {
     ) -> Option<LoopShape> {
         let loop_info = self.loops.candidate_in_scope(header, scope, blocked_loop)?;
         let kind = self.classify_loop(loop_info);
-        let body_plan = self.plan_loop_body(loop_info, &kind);
+        let (lexical_body, lexical_exits) = self.lexical_loop_body(loop_info, &kind);
+        let body_plan = self.plan_loop_body(
+            loop_info,
+            &kind,
+            lexical_body.clone(),
+            lexical_exits.clone(),
+        );
 
         let loop_ctx = LoopCtx {
             header,
             continue_targets: self.continue_targets(loop_info, &kind),
             continue_payload_entries: self.continue_payload_entries(loop_info, &kind),
-            exits: loop_info.exits.clone(),
-            exit_payload_entries: self.exit_payload_entries(loop_info, &kind),
+            exits: lexical_exits.clone(),
+            exit_payload_entries: self.exit_payload_entries(loop_info, &lexical_exits),
         };
 
         verbose!("loop:");
         verbose!(indent: 1, "id = {:?}", loop_info.id);
         verbose!(indent: 1, "header = {}", header);
+        verbose!(
+            indent: 1,
+            "natural_body = {:?}",
+            sorted_nodes(&loop_info.body)
+        );
         verbose!(indent: 1, "body = {:?}", sorted_nodes(&body_plan.nodes));
-        verbose!(indent: 1, "exits = {:?}", sorted_nodes(&loop_info.exits));
+        verbose!(indent: 1, "exits = {:?}", sorted_nodes(&lexical_exits));
         verbose!(
             indent: 1,
             "exit_payload_entries = {:?}",
@@ -660,14 +673,20 @@ impl<'cfg> Structurer<'cfg> {
             header,
             kind,
             body: Box::new(self.structure_loop_body(&body_plan, &loop_ctx)),
-            exits: loop_info.exits.clone(),
+            exits: lexical_exits,
         })
     }
 
-    fn plan_loop_body(&self, loop_info: &LoopInfo, kind: &LoopKind) -> LoopBodyPlan {
+    fn plan_loop_body(
+        &self,
+        loop_info: &LoopInfo,
+        kind: &LoopKind,
+        lexical_body: HashSet<usize>,
+        lexical_exits: HashSet<usize>,
+    ) -> LoopBodyPlan {
         match kind {
             LoopKind::While { body, .. } | LoopKind::Infinite { body } => {
-                let mut nodes = loop_info.body.clone();
+                let mut nodes = lexical_body;
                 nodes.remove(&loop_info.header);
 
                 LoopBodyPlan {
@@ -676,7 +695,7 @@ impl<'cfg> Structurer<'cfg> {
                     nodes,
                     exits: [loop_info.header]
                         .into_iter()
-                        .chain(loop_info.exits.iter().copied())
+                        .chain(lexical_exits.iter().copied())
                         .collect(),
                     terminal_policy: TerminalPolicy::Normal,
                 }
@@ -684,17 +703,70 @@ impl<'cfg> Structurer<'cfg> {
             LoopKind::RepeatUntil { latch, body, .. } => LoopBodyPlan {
                 loop_id: loop_info.id,
                 entry: *body,
-                nodes: loop_info.body.clone(),
-                exits: loop_info.exits.clone(),
+                nodes: lexical_body,
+                exits: lexical_exits,
                 terminal_policy: TerminalPolicy::SuppressExitOf { block: *latch },
             },
             LoopKind::NumericFor { body, .. } | LoopKind::GenericFor { body, .. } => LoopBodyPlan {
                 loop_id: loop_info.id,
                 entry: *body,
-                nodes: loop_info.body.clone(),
-                exits: loop_info.exits.clone(),
+                nodes: lexical_body,
+                exits: lexical_exits,
                 terminal_policy: TerminalPolicy::Normal,
             },
+        }
+    }
+
+    fn lexical_loop_body(
+        &self,
+        loop_info: &LoopInfo,
+        kind: &LoopKind,
+    ) -> (HashSet<usize>, HashSet<usize>) {
+        let exits = self.lexical_loop_exits(loop_info, kind);
+        let mut body = loop_info.body.clone();
+        let mut stack: Vec<_> = body
+            .iter()
+            .flat_map(|&block| self.graph.successors(block).iter().copied())
+            .filter(|target| !body.contains(target) && !exits.contains(target))
+            .collect();
+
+        while let Some(node) = stack.pop() {
+            if exits.contains(&node) || !body.insert(node) {
+                continue;
+            }
+
+            stack.extend(
+                self.graph
+                    .successors(node)
+                    .iter()
+                    .copied()
+                    .filter(|target| !body.contains(target) && !exits.contains(target)),
+            );
+        }
+
+        (body, exits)
+    }
+
+    fn lexical_loop_exits(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+        match kind {
+            LoopKind::NumericFor { exit, .. } | LoopKind::GenericFor { exit, .. } => {
+                [*exit].into_iter().collect()
+            }
+            LoopKind::RepeatUntil { latch, .. } => self
+                .graph
+                .successors(*latch)
+                .iter()
+                .copied()
+                .filter(|target| *target != loop_info.header)
+                .collect(),
+            LoopKind::While { guard, body, .. } => self
+                .graph
+                .successors(*guard)
+                .iter()
+                .copied()
+                .filter(|target| *target != *body)
+                .collect(),
+            LoopKind::Infinite { .. } => loop_info.exits.clone(),
         }
     }
 
@@ -724,36 +796,12 @@ impl<'cfg> Structurer<'cfg> {
         }
     }
 
-    fn exit_payload_entries(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
-        let canonical_exits = self.canonical_loop_exits(loop_info, kind);
-
-        loop_info
-            .exits
-            .difference(&canonical_exits)
-            .copied()
-            .collect()
-    }
-
-    fn canonical_loop_exits(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
-        match kind {
-            LoopKind::While { guard, .. } => self
-                .graph
-                .successors(*guard)
-                .iter()
-                .copied()
-                .filter(|succ| !loop_info.body.contains(succ))
-                .collect(),
-            LoopKind::RepeatUntil { latch, .. } => self
-                .graph
-                .successors(*latch)
-                .iter()
-                .copied()
-                .filter(|succ| !loop_info.body.contains(succ))
-                .collect(),
-            LoopKind::NumericFor { exit, .. } => [*exit].into_iter().collect(),
-            LoopKind::GenericFor { exit_block, .. } => [*exit_block].into_iter().collect(),
-            LoopKind::Infinite { .. } => HashSet::new(),
-        }
+    fn exit_payload_entries(
+        &self,
+        loop_info: &LoopInfo,
+        lexical_exits: &HashSet<usize>,
+    ) -> HashSet<usize> {
+        loop_info.exits.difference(lexical_exits).copied().collect()
     }
 
     fn continue_payload_entries(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
@@ -967,9 +1015,9 @@ impl<'cfg> Structurer<'cfg> {
                 return LoopKind::GenericFor {
                     vars: vars.clone(),
                     exprs: exprs.clone(),
-                    prep_block,
+                    prep: prep_block,
                     body: *body_block,
-                    exit_block: *exit_block,
+                    exit: *exit_block,
                 };
             }
         }
