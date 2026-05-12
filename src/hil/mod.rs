@@ -3,12 +3,13 @@ use crate::{
     hil::{
         cflow::{
             cfg::ControlFlowGraph,
+            graph::GraphView,
             phoenix,
             region::{self, RegionNode},
         },
         lifter::ssa::SymbolId,
     },
-    logging::verbose,
+    logging::{is_verbose, verbose},
 };
 
 pub mod cflow;
@@ -65,7 +66,33 @@ impl StructuredFunction {
             cfg.simplify_conditions();
         }
 
-        eprintln!("{:#?}", cfg);
+        if is_verbose() {
+            let idoms = cfg.build_idoms();
+
+            verbose!(indent: 1, "cfg {{");
+            for (i, block) in cfg.blocks().enumerate() {
+                verbose!(indent: 2, "block {} {{", i);
+
+                if block.stmts().is_empty() {
+                    verbose!(indent: 3, "stmts: [empty]");
+                } else {
+                    verbose!(indent: 3, "stmts: [");
+                    for stmt in block.stmts() {
+                        verbose!(indent: 3, "  {}", stmt.node);
+                    }
+                    verbose!(indent: 3, "]");
+                }
+
+                verbose!(indent: 3, "exit: {:?}", block.exit());
+
+                verbose!(indent: 3, "predecessors: {:?}", cfg.predecessors(i));
+                verbose!(indent: 3, "successors: {:?}", cfg.successors(i));
+                verbose!(indent: 3, "idom: {:?}", idoms.idom(i));
+
+                verbose!(indent: 2, "}}");
+            }
+            verbose!(indent: 1, "}}");
+        }
 
         verbose!(indent: 1, "structuring region...");
         let (root, was_reduced) = if std::env::var("MALLOW_PHOENIX").is_ok_and(|f| f == "1") {

@@ -1,6 +1,6 @@
 pub mod cfg;
 mod common;
-mod graph;
+pub mod graph;
 pub mod phoenix;
 pub mod region;
 mod union_find;
