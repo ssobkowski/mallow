@@ -811,6 +811,11 @@ impl<'cfg> Structurer<'cfg> {
             {
                 [loop_info.latch].into_iter().collect()
             }
+            LoopKind::NumericFor { .. } | LoopKind::GenericFor { .. }
+                if !self.cfg.get(loop_info.latch).is_empty() =>
+            {
+                [loop_info.latch].into_iter().collect()
+            }
             _ => HashSet::new(),
         }
     }
@@ -1113,9 +1118,14 @@ impl<'cfg> Structurer<'cfg> {
         let mut stack = vec![entry];
 
         while let Some(node) = stack.pop() {
-            if (!scope.nodes.contains(&node) && !(include_boundary_entry && node == entry))
-                || !nodes.insert(node)
-            {
+            let owns_boundary_entry = include_boundary_entry && node == entry;
+            if !scope.nodes.contains(&node) && !owns_boundary_entry {
+                continue;
+            }
+            if exits.contains(&node) && !owns_boundary_entry {
+                continue;
+            }
+            if !nodes.insert(node) {
                 continue;
             }
             if exits.contains(&node) {
