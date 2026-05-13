@@ -286,6 +286,16 @@ pub enum RegionNode {
     Return { values: SmallVec<[HilExpr; 3]> },
 }
 
+impl RegionNode {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            RegionNode::BasicBlock { stmts } => stmts.is_empty(),
+            RegionNode::Sequence { nodes } => nodes.is_empty(),
+            _ => false,
+        }
+    }
+}
+
 impl CfgNode {
     /// Merges nodes into a `Sequence` node, flattening nested sequences.
     fn merge(nodes: impl IntoIterator<Item = CfgNode>) -> CfgNode {

@@ -1,13 +1,14 @@
-use crate::hil::{ReturnArity, StructuredFunction, cflow::cfg::ControlFlowGraph};
+use crate::hil::{StructuredFunction, cflow::cfg::ControlFlowGraph};
 
 mod fold_tables;
 mod inlining;
+mod normalize_ifs;
 mod return_arity;
 mod tuple_assign;
 
 pub fn run(fns: &mut [StructuredFunction]) {
     return_arity::infer_all(fns);
-    let return_arities: Vec<ReturnArity> = fns
+    let return_arities: Vec<_> = fns
         .iter()
         .map(|f| {
             f.return_arity
@@ -18,9 +19,9 @@ pub fn run(fns: &mut [StructuredFunction]) {
     for fun in fns {
         loop {
             let mut changed = inlining::run(fun, &return_arities);
-            changed = changed || tuple_assign::run(fun);
-
-            changed = changed || fold_tables::run(fun);
+            changed |= tuple_assign::run(fun);
+            changed |= fold_tables::run(fun);
+            changed |= normalize_ifs::run(fun);
 
             if !changed {
                 break;
