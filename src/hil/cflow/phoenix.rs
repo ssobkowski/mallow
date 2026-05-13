@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use crate::{
-    ast::UnOp,
+    ast::{BinOp, UnOp},
     hil::{
         cflow::{
             cfg::{BlockExit, ControlFlowGraph},
@@ -99,9 +99,17 @@ struct LoopShape {
 enum LoopKind {
     /// `while cond do`; condition is owned by the loop header.
     While {
+        /// Source-level condition that reaches the loop body when truthy.
         condition: HilExpr,
+        /// First CFG block in the guard tree.
         guard: usize,
+        /// First payload block executed after the guard succeeds.
         body: usize,
+        /// Empty conditional blocks consumed into `condition`; these are loop
+        /// syntax, not body payload.
+        guard_nodes: HashSet<usize>,
+        /// Guard leaves reached when the while condition fails.
+        exits: HashSet<usize>,
     },
     /// `repeat ... until cond`; condition is owned by the loop latch.
     RepeatUntil {
@@ -205,6 +213,30 @@ struct LoopInfo {
     parent: Option<LoopId>,
     /// Loops directly nested inside this loop.
     children: Vec<LoopId>,
+}
+
+#[derive(Debug, Clone)]
+struct WhileGuard {
+    /// Combined truth condition for all guard paths that reach `body`.
+    condition: HilExpr,
+    /// Unique payload entry reached by the truthy guard paths.
+    body: usize,
+    /// Empty CFG blocks folded into `condition`.
+    guard_nodes: HashSet<usize>,
+    /// CFG targets reached by falsy guard paths.
+    exits: HashSet<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct GuardBranch {
+    /// Condition under which this branch reaches `body`.
+    condition: HilExpr,
+    /// Payload entry reached by this branch, or `None` for a loop exit branch.
+    body: Option<usize>,
+    /// Empty CFG blocks folded while following this branch.
+    guard_nodes: HashSet<usize>,
+    /// Exit targets discovered while following this branch.
+    exits: HashSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -711,9 +743,13 @@ impl<'cfg> Structurer<'cfg> {
         lexical_exits: HashSet<usize>,
     ) -> LoopBodyPlan {
         match kind {
-            LoopKind::While { body, .. } => {
+            LoopKind::While {
+                body, guard_nodes, ..
+            } => {
                 let mut nodes = lexical_body;
-                nodes.remove(&loop_info.header);
+                for guard in guard_nodes {
+                    nodes.remove(guard);
+                }
 
                 LoopBodyPlan {
                     loop_id: loop_info.id,
@@ -792,13 +828,7 @@ impl<'cfg> Structurer<'cfg> {
                 .copied()
                 .filter(|target| *target != loop_info.header)
                 .collect(),
-            LoopKind::While { guard, body, .. } => self
-                .graph
-                .successors(*guard)
-                .iter()
-                .copied()
-                .filter(|target| *target != *body)
-                .collect(),
+            LoopKind::While { exits, .. } => exits.clone(),
             LoopKind::Infinite { .. } => self.common_loop_follow(loop_info).map_or_else(
                 || loop_info.exits.clone(),
                 |follow| [follow].into_iter().collect(),
@@ -1111,28 +1141,15 @@ impl<'cfg> Structurer<'cfg> {
             }
         }
 
-        if let BlockExit::CondJump {
-            cond,
-            then_block,
-            else_block,
-        } = self.cfg.get(loop_info.header).exit()
-            && self.cfg.get(loop_info.header).is_empty()
-            && let Some(body) = [*then_block, *else_block]
-                .into_iter()
-                .find(|succ| loop_info.body.contains(succ) && *succ != loop_info.header)
-        {
-            let condition = if body == *then_block {
-                cond.clone()
-            } else {
-                cond.clone().invert()
-            };
-
+        if let Some(guard) = self.recognize_while_guard(loop_info) {
             verbose!(indent: 1, "kind = While");
-            verbose!(indent: 1, "condition = ({})", condition);
+            verbose!(indent: 1, "condition = ({})", guard.condition);
             return LoopKind::While {
-                condition,
+                condition: guard.condition,
                 guard: loop_info.header,
-                body,
+                body: guard.body,
+                guard_nodes: guard.guard_nodes,
+                exits: guard.exits,
             };
         }
 
@@ -1140,6 +1157,99 @@ impl<'cfg> Structurer<'cfg> {
         LoopKind::Infinite {
             body: loop_info.header,
         }
+    }
+
+    fn recognize_while_guard(&self, loop_info: &LoopInfo) -> Option<WhileGuard> {
+        let mut visiting = HashSet::new();
+        let guard = self.recognize_while_guard_node(loop_info, loop_info.header, &mut visiting)?;
+        let body = guard.body?;
+
+        Some(WhileGuard {
+            condition: guard.condition,
+            body,
+            guard_nodes: guard.guard_nodes,
+            exits: guard.exits,
+        })
+    }
+
+    fn recognize_while_guard_node(
+        &self,
+        loop_info: &LoopInfo,
+        node: usize,
+        visiting: &mut HashSet<usize>,
+    ) -> Option<GuardBranch> {
+        if !loop_info.body.contains(&node) || !self.cfg.get(node).is_empty() {
+            return None;
+        }
+        if !visiting.insert(node) {
+            return None;
+        }
+
+        let BlockExit::CondJump {
+            cond,
+            then_block,
+            else_block,
+        } = self.cfg.get(node).exit()
+        else {
+            visiting.remove(&node);
+            return None;
+        };
+
+        let then_branch = self.recognize_while_guard_branch(loop_info, *then_block, visiting);
+        let else_branch = self.recognize_while_guard_branch(loop_info, *else_block, visiting);
+
+        visiting.remove(&node);
+
+        let then_branch = then_branch?;
+        let else_branch = else_branch?;
+        let body = merge_optional_body(then_branch.body, else_branch.body)?;
+        let mut guard_nodes = then_branch.guard_nodes;
+        guard_nodes.extend(else_branch.guard_nodes);
+        guard_nodes.insert(node);
+
+        let mut exits = then_branch.exits;
+        exits.extend(else_branch.exits);
+
+        Some(GuardBranch {
+            condition: or_expr(
+                and_expr(cond.clone(), then_branch.condition),
+                and_expr(cond.clone().invert(), else_branch.condition),
+            ),
+            body,
+            guard_nodes,
+            exits,
+        })
+    }
+
+    fn recognize_while_guard_branch(
+        &self,
+        loop_info: &LoopInfo,
+        target: usize,
+        visiting: &mut HashSet<usize>,
+    ) -> Option<GuardBranch> {
+        if !loop_info.body.contains(&target) {
+            return Some(GuardBranch {
+                condition: HilExpr::Bool(false),
+                body: None,
+                guard_nodes: HashSet::new(),
+                exits: [target].into_iter().collect(),
+            });
+        }
+
+        if target != loop_info.latch
+            && self.cfg.get(target).is_empty()
+            && matches!(self.cfg.get(target).exit(), BlockExit::CondJump { .. })
+            && let Some(guard) = self.recognize_while_guard_node(loop_info, target, visiting)
+        {
+            return Some(guard);
+        }
+
+        Some(GuardBranch {
+            condition: HilExpr::Bool(true),
+            body: Some(target),
+            guard_nodes: HashSet::new(),
+            exits: HashSet::new(),
+        })
     }
 
     fn can_represent_as_repeat_until(&self, loop_info: &LoopInfo, loop_exit: usize) -> bool {
@@ -1349,6 +1459,46 @@ fn single_target(targets: &HashSet<usize>) -> Option<usize> {
     let mut targets = targets.iter().copied();
     let target = targets.next()?;
     targets.next().is_none().then_some(target)
+}
+
+fn merge_optional_body(lhs: Option<usize>, rhs: Option<usize>) -> Option<Option<usize>> {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) if lhs != rhs => None,
+        (Some(body), _) | (_, Some(body)) => Some(Some(body)),
+        (None, None) => Some(None),
+    }
+}
+
+fn and_expr(lhs: HilExpr, rhs: HilExpr) -> HilExpr {
+    match (lhs, rhs) {
+        (HilExpr::Bool(false), _) | (_, HilExpr::Bool(false)) => HilExpr::Bool(false),
+        (HilExpr::Bool(true), expr) | (expr, HilExpr::Bool(true)) => expr,
+        (lhs, rhs) => HilExpr::Binary {
+            lhs: Box::new(lhs),
+            op: BinOp::And,
+            rhs: Box::new(rhs),
+        },
+    }
+}
+
+fn or_expr(lhs: HilExpr, rhs: HilExpr) -> HilExpr {
+    match (lhs, rhs) {
+        (HilExpr::Bool(true), _) | (_, HilExpr::Bool(true)) => HilExpr::Bool(true),
+        (HilExpr::Bool(false), expr) | (expr, HilExpr::Bool(false)) => expr,
+        (
+            lhs,
+            HilExpr::Binary {
+                lhs: and_lhs,
+                op: BinOp::And,
+                rhs: and_rhs,
+            },
+        ) if lhs.clone().invert() == *and_lhs => or_expr(lhs, *and_rhs),
+        (lhs, rhs) => HilExpr::Binary {
+            lhs: Box::new(lhs),
+            op: BinOp::Or,
+            rhs: Box::new(rhs),
+        },
+    }
 }
 
 fn sorted_nodes(nodes: &HashSet<usize>) -> Vec<usize> {
