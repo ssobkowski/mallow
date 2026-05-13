@@ -1000,15 +1000,11 @@ impl<'cfg> Structurer<'cfg> {
                     }
                 }
 
-                // Catch edge cases where an empty branch is a direct return
-                if let BlockExit::Return(values) = self.cfg.get(entry).exit() {
-                    verbose!(indent: 2, "empty branch reaches return");
-                    return Shape::Return {
-                        values: values.clone(),
-                    };
-                }
-
-                verbose!(indent: 2, "empty branch has no structured terminal");
+                // Empty branch nodes mean the target is a boundary owned by an
+                // outer scope. Do not inspect that block's payload here: a
+                // shared continuation may itself end in Return, but the edge is
+                // still ordinary fallthrough from this branch.
+                verbose!(indent: 2, "empty branch reaches outer boundary");
                 return Shape::sequence(Vec::new());
             }
 
