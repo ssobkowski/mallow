@@ -1111,21 +1111,26 @@ impl<'cfg> Structurer<'cfg> {
             }
         }
 
-        if let BlockExit::CondJump { cond, .. } = self.cfg.get(loop_info.header).exit()
+        if let BlockExit::CondJump {
+            cond,
+            then_block,
+            else_block,
+        } = self.cfg.get(loop_info.header).exit()
             && self.cfg.get(loop_info.header).is_empty()
-        {
-            let body = self
-                .graph
-                .successors(loop_info.header)
-                .iter()
-                .copied()
+            && let Some(body) = [*then_block, *else_block]
+                .into_iter()
                 .find(|succ| loop_info.body.contains(succ) && *succ != loop_info.header)
-                .unwrap_or(loop_info.header);
+        {
+            let condition = if body == *then_block {
+                cond.clone()
+            } else {
+                cond.clone().invert()
+            };
 
             verbose!(indent: 1, "kind = While");
-            verbose!(indent: 1, "condition = ({})", cond);
+            verbose!(indent: 1, "condition = ({})", condition);
             return LoopKind::While {
-                condition: cond.clone(),
+                condition,
                 guard: loop_info.header,
                 body,
             };
