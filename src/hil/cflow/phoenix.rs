@@ -203,6 +203,10 @@ struct LoopInfo {
     id: LoopId,
     header: usize,
     latch: usize,
+    /// Backedge sources owned by this logical loop. Most loops have a single
+    /// latch, but source-level pre-test loops can have several body exits that
+    /// jump back to the same header.
+    latches: HashSet<usize>,
     /// Natural loop body collected by walking predecessors from latch to
     /// header. This identifies the cycle that proves the loop exists; Phoenix
     /// expands it into a lexical body after classifying the loop kind.
@@ -272,6 +276,7 @@ impl LoopForest {
                             id,
                             header,
                             latch,
+                            latches: [latch].into_iter().collect(),
                             body,
                             exits,
                             parent: None,
@@ -285,6 +290,81 @@ impl LoopForest {
 
         for ids in by_header.values_mut() {
             ids.sort_unstable_by_key(|id| (loops[id].body.len(), *id));
+        }
+
+        Self::recompute_exits(cfg, &mut loops);
+        Self::rebuild_tree(&mut loops);
+        Self::propagate_child_bodies(&mut loops);
+        Self::recompute_exits(cfg, &mut loops);
+
+        let aggregate_same_header_loops: Vec<_> = by_header
+            .iter()
+            .filter_map(|(&header, ids)| {
+                let root_ids: Vec<_> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| loops[id].parent.is_none())
+                    .collect();
+
+                if root_ids.len() < 2 {
+                    return None;
+                }
+
+                let representative = root_ids
+                    .iter()
+                    .copied()
+                    .max_by_key(|id| (loops[id].body.len(), *id))?;
+
+                let mut body = HashSet::new();
+                let mut latches = HashSet::new();
+                for id in root_ids.iter().copied() {
+                    body.extend(loops[&id].body.iter().copied());
+                    latches.extend(loops[&id].latches.iter().copied());
+                }
+
+                Some((header, representative, root_ids, body, latches))
+            })
+            .collect();
+
+        for (header, representative, merged_ids, body, latches) in aggregate_same_header_loops {
+            let info = loops
+                .get_mut(&representative)
+                .expect("representative loop should exist");
+            info.header = header;
+            info.latches = latches;
+            info.body = body;
+
+            for id in merged_ids {
+                if id != representative {
+                    loops.remove(&id);
+                }
+            }
+        }
+
+        Self::recompute_exits(cfg, &mut loops);
+        Self::rebuild_tree(&mut loops);
+        Self::propagate_child_bodies(&mut loops);
+        Self::recompute_exits(cfg, &mut loops);
+        let by_header = Self::rebuild_by_header(&loops);
+
+        Self { loops, by_header }
+    }
+
+    fn recompute_exits(cfg: &ControlFlowGraph, loops: &mut HashMap<LoopId, LoopInfo>) {
+        for info in loops.values_mut() {
+            info.exits = info
+                .body
+                .iter()
+                .flat_map(|&block| cfg.successors(block).iter().copied())
+                .filter(|target| !info.body.contains(target))
+                .collect();
+        }
+    }
+
+    fn rebuild_tree(loops: &mut HashMap<LoopId, LoopInfo>) {
+        for info in loops.values_mut() {
+            info.parent = None;
+            info.children.clear();
         }
 
         let ids: Vec<_> = loops.keys().copied().collect();
@@ -317,6 +397,7 @@ impl LoopForest {
                 .push(id);
         }
 
+        let ids: Vec<_> = loops.keys().copied().collect();
         let same_header_parents: Vec<_> = ids
             .iter()
             .copied()
@@ -347,6 +428,13 @@ impl LoopForest {
                 .push(id);
         }
 
+        for info in loops.values_mut() {
+            info.children.sort_unstable();
+            info.children.dedup();
+        }
+    }
+
+    fn propagate_child_bodies(loops: &mut HashMap<LoopId, LoopInfo>) {
         loop {
             let mut changed = false;
             let ids: Vec<_> = loops.keys().copied().collect();
@@ -368,22 +456,20 @@ impl LoopForest {
                 break;
             }
         }
+    }
 
-        for info in loops.values_mut() {
-            info.exits = info
-                .body
-                .iter()
-                .flat_map(|&block| cfg.successors(block).iter().copied())
-                .filter(|target| !info.body.contains(target))
-                .collect();
+    fn rebuild_by_header(loops: &HashMap<LoopId, LoopInfo>) -> HashMap<usize, Vec<LoopId>> {
+        let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::new();
+
+        for (&id, info) in loops {
+            by_header.entry(info.header).or_default().push(id);
         }
 
-        for info in loops.values_mut() {
-            info.children.sort_unstable();
-            info.children.dedup();
+        for ids in by_header.values_mut() {
+            ids.sort_unstable_by_key(|id| (loops[id].body.len(), *id));
         }
 
-        Self { loops, by_header }
+        by_header
     }
 
     fn get(&self, id: LoopId) -> Option<&LoopInfo> {
@@ -602,7 +688,9 @@ impl<'cfg> Structurer<'cfg> {
                 continue;
             }
 
-            if let Some(conditional) = self.recognize_conditional(current, scope) {
+            if let Some(conditional) =
+                self.recognize_conditional(current, scope, loop_ctx, terminal_policy)
+            {
                 let merge = conditional.merge;
                 verbose!(
                     indent: 2,
@@ -632,7 +720,7 @@ impl<'cfg> Structurer<'cfg> {
                 continue;
             }
 
-            nodes.push(self.shape_for_block(current, scope, loop_ctx));
+            nodes.push(self.shape_for_block(current, scope, loop_ctx, terminal_policy));
 
             let next = self
                 .graph
@@ -854,9 +942,10 @@ impl<'cfg> Structurer<'cfg> {
 
     fn continue_targets(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
         match kind {
-            LoopKind::While { .. } | LoopKind::Infinite { .. } => {
-                [loop_info.header, loop_info.latch].into_iter().collect()
-            }
+            LoopKind::While { .. } | LoopKind::Infinite { .. } => [loop_info.header]
+                .into_iter()
+                .chain(loop_info.latches.iter().copied())
+                .collect(),
             LoopKind::RepeatUntil { .. }
             | LoopKind::NumericFor { .. }
             | LoopKind::GenericFor { .. } => [loop_info.latch].into_iter().collect(),
@@ -865,11 +954,12 @@ impl<'cfg> Structurer<'cfg> {
 
     fn implicit_continue_sources(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
         match kind {
-            LoopKind::While { .. } | LoopKind::Infinite { .. }
-                if loop_info.latch != loop_info.header =>
-            {
-                [loop_info.latch].into_iter().collect()
-            }
+            LoopKind::While { .. } | LoopKind::Infinite { .. } => loop_info
+                .latches
+                .iter()
+                .copied()
+                .filter(|latch| *latch != loop_info.header)
+                .collect(),
             _ => HashSet::new(),
         }
     }
@@ -884,11 +974,12 @@ impl<'cfg> Structurer<'cfg> {
 
     fn continue_payload_entries(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
         match kind {
-            LoopKind::While { .. } | LoopKind::Infinite { .. }
-                if loop_info.latch != loop_info.header =>
-            {
-                [loop_info.latch].into_iter().collect()
-            }
+            LoopKind::While { .. } | LoopKind::Infinite { .. } => loop_info
+                .latches
+                .iter()
+                .copied()
+                .filter(|latch| *latch != loop_info.header)
+                .collect(),
             LoopKind::NumericFor { .. } | LoopKind::GenericFor { .. }
                 if !self.cfg.get(loop_info.latch).is_empty() =>
             {
@@ -898,7 +989,13 @@ impl<'cfg> Structurer<'cfg> {
         }
     }
 
-    fn recognize_conditional(&self, head: usize, scope: &Scope) -> Option<ConditionalShape> {
+    fn recognize_conditional(
+        &self,
+        head: usize,
+        scope: &Scope,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+    ) -> Option<ConditionalShape> {
         let BlockExit::CondJump {
             cond,
             then_block,
@@ -913,8 +1010,34 @@ impl<'cfg> Structurer<'cfg> {
             condition: cond.clone(),
             then_entry: *then_block,
             else_entry: *else_block,
-            merge: self.find_merge_point(head, scope),
+            merge: self.find_merge_point(head, scope).or_else(|| {
+                self.local_branch_merge(*then_block, *else_block, scope, loop_ctx, terminal_policy)
+            }),
         })
+    }
+
+    fn local_branch_merge(
+        &self,
+        then_entry: usize,
+        else_entry: usize,
+        scope: &Scope,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+    ) -> Option<usize> {
+        let then_target =
+            single_target(&self.graph.successors(then_entry).iter().copied().collect())?;
+        let else_target =
+            single_target(&self.graph.successors(else_entry).iter().copied().collect())?;
+
+        let is_loop_payload =
+            loop_ctx.is_some_and(|ctx| ctx.continue_payload_entries.contains(&then_target));
+
+        (then_target == else_target
+            && (scope.nodes.contains(&then_target) || is_loop_payload)
+            && (!scope.exits.contains(&then_target)
+                || terminal_policy.suppresses(then_target)
+                || is_loop_payload))
+            .then_some(then_target)
     }
 
     fn structure_conditional(
@@ -933,7 +1056,12 @@ impl<'cfg> Structurer<'cfg> {
             branch_exits.insert(*block);
         }
         if let Some(ctx) = loop_ctx {
-            branch_exits.extend(ctx.continue_targets.iter().copied());
+            branch_exits.extend(
+                ctx.continue_targets
+                    .iter()
+                    .copied()
+                    .filter(|target| !terminal_policy.suppresses(*target)),
+            );
             branch_exits.extend(ctx.exits.iter().copied());
         }
 
@@ -969,7 +1097,7 @@ impl<'cfg> Structurer<'cfg> {
         verbose!(indent: 1, "then_nodes = {:?}", sorted_nodes(&then_nodes));
         verbose!(indent: 1, "else_nodes = {:?}", sorted_nodes(&else_nodes));
 
-        let build_branch = |entry: usize, nodes: HashSet<usize>| {
+        let build_branch = |entry: usize, mut nodes: HashSet<usize>| {
             verbose!(
                 indent: 1,
                 "build_branch entry = {}, nodes = {:?}",
@@ -1008,15 +1136,33 @@ impl<'cfg> Structurer<'cfg> {
                 return Shape::sequence(Vec::new());
             }
 
+            let owned_payload_exit = loop_ctx.and_then(|ctx| {
+                ctx.continue_payload_entries
+                    .iter()
+                    .copied()
+                    .filter(|payload| {
+                        Some(*payload) != shape.merge || scope.exits.contains(payload)
+                    })
+                    .find(|payload| {
+                        entry == *payload
+                            || single_target(
+                                &self.graph.successors(entry).iter().copied().collect(),
+                            ) == Some(*payload)
+                    })
+            });
+            if let Some(payload) = owned_payload_exit {
+                nodes.insert(payload);
+            }
+
             let branch_scope = Scope {
                 entry,
                 nodes,
                 exits: branch_exits
                     .iter()
                     .copied()
-                    .filter(|exit| *exit != entry)
+                    .filter(|exit| *exit != entry && Some(*exit) != owned_payload_exit)
                     .collect(),
-                implicit_exits: shape.merge.into_iter().collect(),
+                implicit_exits: shape.merge.into_iter().chain(owned_payload_exit).collect(),
             };
             self.structure_scope(&branch_scope, loop_ctx, terminal_policy, blocked_loop)
         };
@@ -1036,7 +1182,11 @@ impl<'cfg> Structurer<'cfg> {
     fn classify_loop(&self, loop_info: &LoopInfo) -> LoopKind {
         verbose!("classify_loop: loop_info = {:?}", loop_info);
 
-        if let BlockExit::FornLoop { base, .. } = self.cfg.get(loop_info.latch).exit() {
+        let single_latch = (loop_info.latches.len() == 1).then_some(loop_info.latch);
+
+        if let Some(latch) = single_latch
+            && let BlockExit::FornLoop { base, .. } = self.cfg.get(latch).exit()
+        {
             let prep_block = self
                 .cfg
                 .predecessors(loop_info.header)
@@ -1071,12 +1221,13 @@ impl<'cfg> Structurer<'cfg> {
             }
         }
 
-        if let BlockExit::ForgLoop {
-            base,
-            vars,
-            body_block,
-            exit_block,
-        } = self.cfg.get(loop_info.latch).exit()
+        if let Some(latch) = single_latch
+            && let BlockExit::ForgLoop {
+                base,
+                vars,
+                body_block,
+                exit_block,
+            } = self.cfg.get(latch).exit()
         {
             let prep_block = self
                 .cfg
@@ -1104,11 +1255,12 @@ impl<'cfg> Structurer<'cfg> {
 
         // If the latch condition has one edge back to the header and one edge out,
         // this is a post-test loop. The latch owns the condition.
-        if let BlockExit::CondJump {
-            cond,
-            then_block,
-            else_block,
-        } = self.cfg.get(loop_info.latch).exit()
+        if let Some(latch) = single_latch
+            && let BlockExit::CondJump {
+                cond,
+                then_block,
+                else_block,
+            } = self.cfg.get(latch).exit()
             && (*then_block == loop_info.header) ^ (*else_block == loop_info.header)
         {
             let condition = if *then_block == loop_info.header {
@@ -1131,7 +1283,7 @@ impl<'cfg> Structurer<'cfg> {
                 verbose!(indent: 1, "condition = ({})", condition);
                 return LoopKind::RepeatUntil {
                     condition,
-                    latch: loop_info.latch,
+                    latch,
                     body: loop_info.header,
                 };
             }
@@ -1232,9 +1384,10 @@ impl<'cfg> Structurer<'cfg> {
             });
         }
 
-        if target != loop_info.latch
+        if !loop_info.latches.contains(&target)
             && self.cfg.get(target).is_empty()
             && matches!(self.cfg.get(target).exit(), BlockExit::CondJump { .. })
+            && self.conditional_has_loop_exit(loop_info, target)
             && let Some(guard) = self.recognize_while_guard_node(loop_info, target, visiting)
         {
             return Some(guard);
@@ -1248,7 +1401,34 @@ impl<'cfg> Structurer<'cfg> {
         })
     }
 
+    fn conditional_has_loop_exit(&self, loop_info: &LoopInfo, node: usize) -> bool {
+        let BlockExit::CondJump {
+            then_block,
+            else_block,
+            ..
+        } = self.cfg.get(node).exit()
+        else {
+            return false;
+        };
+
+        !loop_info.body.contains(then_block) || !loop_info.body.contains(else_block)
+    }
+
     fn can_represent_as_repeat_until(&self, loop_info: &LoopInfo, loop_exit: usize) -> bool {
+        let Some(latch) = (loop_info.latches.len() == 1).then_some(loop_info.latch) else {
+            return false;
+        };
+
+        if loop_info.header != latch
+            && self
+                .graph
+                .successors(loop_info.header)
+                .iter()
+                .any(|target| !loop_info.body.contains(target))
+        {
+            return false;
+        }
+
         if loop_info.exits.len() == 1 {
             return true;
         }
@@ -1266,7 +1446,13 @@ impl<'cfg> Structurer<'cfg> {
         (scope.nodes.contains(&merge) && !scope.exits.contains(&merge)).then_some(merge)
     }
 
-    fn shape_for_block(&self, block: usize, scope: &Scope, loop_ctx: Option<&LoopCtx>) -> Shape {
+    fn shape_for_block(
+        &self,
+        block: usize,
+        scope: &Scope,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+    ) -> Shape {
         let block_shape = Shape::Block(block);
 
         match self.cfg.get(block).exit() {
@@ -1279,6 +1465,16 @@ impl<'cfg> Structurer<'cfg> {
             BlockExit::Jump(target) | BlockExit::Fallthrough(target)
                 if loop_ctx.is_some_and(|ctx| ctx.continue_targets.contains(target)) =>
             {
+                if terminal_policy.suppresses(*target) && self.ipdoms.idom(block) == Some(*target) {
+                    verbose!(
+                        indent: 2,
+                        "block {} reaches suppressed loop terminal {}",
+                        block,
+                        target
+                    );
+                    return block_shape;
+                }
+
                 if loop_ctx.is_some_and(|ctx| ctx.implicit_continue_sources.contains(&block)) {
                     verbose!(
                         indent: 2,
