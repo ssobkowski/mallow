@@ -61,6 +61,42 @@ pub enum HilExpr {
 }
 
 impl HilExpr {
+    /// Returns a new [`HilExpr::Binary`] expression with the given operands,
+    /// and the [`BinOp::And`] operator.
+    pub fn and(lhs: HilExpr, rhs: HilExpr) -> Self {
+        match (lhs, rhs) {
+            (HilExpr::Bool(false), _) | (_, HilExpr::Bool(false)) => HilExpr::Bool(false),
+            (HilExpr::Bool(true), expr) | (expr, HilExpr::Bool(true)) => expr,
+            (lhs, rhs) => HilExpr::Binary {
+                lhs: Box::new(lhs),
+                op: BinOp::And,
+                rhs: Box::new(rhs),
+            },
+        }
+    }
+
+    /// Returns a new [`HilExpr::Binary`] expression with the given operands,
+    /// and the [`BinOp::Or`] operator.
+    pub fn or(lhs: HilExpr, rhs: HilExpr) -> Self {
+        match (lhs, rhs) {
+            (HilExpr::Bool(true), _) | (_, HilExpr::Bool(true)) => HilExpr::Bool(true),
+            (HilExpr::Bool(false), expr) | (expr, HilExpr::Bool(false)) => expr,
+            (
+                lhs,
+                HilExpr::Binary {
+                    lhs: and_lhs,
+                    op: BinOp::And,
+                    rhs: and_rhs,
+                },
+            ) if lhs.clone().invert() == *and_lhs => Self::or(lhs, *and_rhs),
+            (lhs, rhs) => HilExpr::Binary {
+                lhs: Box::new(lhs),
+                op: BinOp::Or,
+                rhs: Box::new(rhs),
+            },
+        }
+    }
+
     /// Returns whether this expressions reads a given symbol.
     pub fn reads_symbol(&self, sym: &SymbolId) -> bool {
         match self {

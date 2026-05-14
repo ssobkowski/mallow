@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use crate::{
-    ast::{BinOp, UnOp},
+    ast::UnOp,
     hil::{
         cflow::{
             cfg::{BlockExit, ControlFlowGraph},
@@ -1359,9 +1359,9 @@ impl<'cfg> Structurer<'cfg> {
         exits.extend(else_branch.exits);
 
         Some(GuardBranch {
-            condition: or_expr(
-                and_expr(cond.clone(), then_branch.condition),
-                and_expr(cond.clone().invert(), else_branch.condition),
+            condition: HilExpr::or(
+                HilExpr::and(cond.clone(), then_branch.condition),
+                HilExpr::and(cond.clone().invert(), else_branch.condition),
             ),
             body,
             guard_nodes,
@@ -1658,38 +1658,6 @@ fn merge_optional_body(lhs: Option<usize>, rhs: Option<usize>) -> Option<Option<
         (Some(lhs), Some(rhs)) if lhs != rhs => None,
         (Some(body), _) | (_, Some(body)) => Some(Some(body)),
         (None, None) => Some(None),
-    }
-}
-
-fn and_expr(lhs: HilExpr, rhs: HilExpr) -> HilExpr {
-    match (lhs, rhs) {
-        (HilExpr::Bool(false), _) | (_, HilExpr::Bool(false)) => HilExpr::Bool(false),
-        (HilExpr::Bool(true), expr) | (expr, HilExpr::Bool(true)) => expr,
-        (lhs, rhs) => HilExpr::Binary {
-            lhs: Box::new(lhs),
-            op: BinOp::And,
-            rhs: Box::new(rhs),
-        },
-    }
-}
-
-fn or_expr(lhs: HilExpr, rhs: HilExpr) -> HilExpr {
-    match (lhs, rhs) {
-        (HilExpr::Bool(true), _) | (_, HilExpr::Bool(true)) => HilExpr::Bool(true),
-        (HilExpr::Bool(false), expr) | (expr, HilExpr::Bool(false)) => expr,
-        (
-            lhs,
-            HilExpr::Binary {
-                lhs: and_lhs,
-                op: BinOp::And,
-                rhs: and_rhs,
-            },
-        ) if lhs.clone().invert() == *and_lhs => or_expr(lhs, *and_rhs),
-        (lhs, rhs) => HilExpr::Binary {
-            lhs: Box::new(lhs),
-            op: BinOp::Or,
-            rhs: Box::new(rhs),
-        },
     }
 }
 
