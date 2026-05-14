@@ -1,5 +1,6 @@
 use crate::hil::{StructuredFunction, cflow::cfg::ControlFlowGraph};
 
+mod fold_bool_assign;
 mod fold_tables;
 mod inlining;
 mod normalize;
@@ -23,6 +24,7 @@ pub fn run(fns: &mut [StructuredFunction]) {
             changed |= tuple_assign::run(fun);
             changed |= fold_tables::run(fun);
             changed |= short_circuit::run(fun);
+            changed |= fold_bool_assign::run(fun);
             changed |= normalize::run(fun);
 
             if !changed {

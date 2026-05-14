@@ -54,6 +54,12 @@ pub enum HilExpr {
     },
     /// An unary expression.
     Unary { op: UnOp, expr: Box<HilExpr> },
+    /// A Luau if-expression (`if cond then a else b`).
+    IfElse {
+        condition: Box<HilExpr>,
+        then_expr: Box<HilExpr>,
+        else_expr: Box<HilExpr>,
+    },
     /// A table constructor with a list of implicit values.
     Table { items: Vec<HilTableItem> },
     /// Vararg expression (`...`).
@@ -97,6 +103,15 @@ impl HilExpr {
         }
     }
 
+    /// Returns a new [`HilExpr::Unary`] expression with the given operand and the
+    /// [`UnOp::Not`] operator.
+    pub fn not(expr: HilExpr) -> Self {
+        HilExpr::Unary {
+            op: UnOp::Not,
+            expr: Box::new(expr),
+        }
+    }
+
     /// Returns whether this expressions reads a given symbol.
     pub fn reads_symbol(&self, sym: &SymbolId) -> bool {
         match self {
@@ -111,6 +126,15 @@ impl HilExpr {
             }
             HilExpr::Binary { lhs, rhs, .. } => lhs.reads_symbol(sym) || rhs.reads_symbol(sym),
             HilExpr::Unary { expr, .. } => expr.reads_symbol(sym),
+            HilExpr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                condition.reads_symbol(sym)
+                    || then_expr.reads_symbol(sym)
+                    || else_expr.reads_symbol(sym)
+            }
             HilExpr::Table { items } => items.iter().any(|item| match item {
                 HilTableItem::List(expr) => expr.reads_symbol(sym),
                 HilTableItem::Index(key, value) => key.reads_symbol(sym) || value.reads_symbol(sym),
@@ -133,6 +157,11 @@ impl HilExpr {
             HilExpr::GetIndex { obj, index } => obj.is_pure() && index.is_pure(),
             HilExpr::Unary { expr, .. } => expr.is_pure(),
             HilExpr::Binary { lhs, rhs, .. } => lhs.is_pure() && rhs.is_pure(),
+            HilExpr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => condition.is_pure() && then_expr.is_pure() && else_expr.is_pure(),
             HilExpr::Closure { .. }
             | HilExpr::Call { .. }
             | HilExpr::MethodCall { .. }
@@ -180,10 +209,7 @@ impl HilExpr {
                 op: UnOp::Not,
                 expr: inner,
             } => *inner,
-            other => HilExpr::Unary {
-                op: UnOp::Not,
-                expr: Box::new(other),
-            },
+            other => HilExpr::not(other),
         }
     }
 }
@@ -232,6 +258,13 @@ impl Display for HilExpr {
                 } else {
                     write!(f, "{}{}", op, expr)
                 }
+            }
+            HilExpr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                write!(f, "if {} then {} else {}", condition, then_expr, else_expr)
             }
             HilExpr::Table { items } => {
                 if items.is_empty() {

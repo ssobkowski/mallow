@@ -6,9 +6,7 @@ use std::collections::{HashMap, HashSet};
 use smol_str::SmolStr;
 
 use crate::{
-    ast::{
-        BinOp, Block, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt, TableItem, UnOp,
-    },
+    ast::{Block, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt, TableItem, UnOp},
     common::is_valid_luau_identifier,
     emitter::{name::NameAllocator, options::EmitterOptions},
     hil::{
@@ -342,46 +340,6 @@ impl Emitter {
                     .collect();
                 hoisted.sort_by_key(|sym| sym.index());
 
-                // Luau: if this `If` follows the structure of:
-                //
-                // hoisted = [var]
-                // if <cond> then var = var_if_true else var = var_if_false end
-                //
-                // we can emit it as a Luau `if` expression
-                if let Some(else_branch) = else_branch.as_ref()
-                    && let [sym] = hoisted.as_slice()
-                    && let Some((then_value, else_value)) =
-                        Self::match_if_assign(*sym, then_branch, else_branch)
-                {
-                    let value =
-                        match Self::try_simplify_bool_ifelse(condition, then_value, else_value) {
-                            Some(e) => self.visit_expr(&e),
-                            None => Expr::IfElse {
-                                condition: Box::new(self.visit_expr(condition)),
-                                then_expr: Box::new(self.visit_expr(then_value)),
-                                else_expr: Box::new(self.visit_expr(else_value)),
-                            },
-                        };
-
-                    self.declare_symbol(*sym);
-                    buf.push(
-                        match self
-                            .symbol_storage(*sym)
-                            .expect("if-expression target was just declared")
-                        {
-                            SymbolStorage::Named(name) => Stmt::LocalDeclaration {
-                                names: vec![name],
-                                values: vec![value],
-                            },
-                            SymbolStorage::Spilled(_) => Stmt::Assignment {
-                                lhs: vec![self.symbol_expr(*sym)],
-                                rhs: vec![value],
-                            },
-                        },
-                    );
-                    return;
-                }
-
                 if !hoisted.is_empty() {
                     for sym in &hoisted {
                         self.declare_symbol(*sym);
@@ -512,11 +470,7 @@ impl Emitter {
     fn maybe_predeclare_recursive_local(&mut self, stmt: &HilStmt, buf: &mut Vec<Stmt>) {
         let HilStmt::Assign {
             left: HilExpr::Symbol(sym),
-            value:
-                HilExpr::Closure {
-                    proto,
-                    captures,
-                },
+            value: HilExpr::Closure { proto, captures },
         } = stmt
         else {
             return;
@@ -553,8 +507,7 @@ impl Emitter {
                             // If value is a named closure, reserve its debug_name
                             // as the symbol name before declaring/symbol_expr.
                             if let HilExpr::Closure { proto, .. } = value {
-                                let debug_name =
-                                    self.functions[*proto].debug_name.clone();
+                                let debug_name = self.functions[*proto].debug_name.clone();
                                 if let Some(ref name) = debug_name {
                                     self.reserve_symbol_name_exact(
                                         self.current_ctx,
@@ -844,6 +797,15 @@ impl Emitter {
                 method: Identifier::new(method.clone()),
                 args: args.iter().map(|expr| self.visit_expr(expr)).collect(),
             },
+            HilExpr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => Expr::IfElse {
+                condition: Box::new(self.visit_expr(condition)),
+                then_expr: Box::new(self.visit_expr(then_expr)),
+                else_expr: Box::new(self.visit_expr(else_expr)),
+            },
             HilExpr::Table { items } => Expr::Table {
                 items: self.visit_table_items(items),
             },
@@ -924,56 +886,6 @@ impl Emitter {
         self.scopes = old_scopes;
 
         Expr::AnonymousFunction { params, body }
-    }
-
-    /// Returns the values assigned to `sym` in the then/else branches, if both branches
-    /// consist of exactly one assignment to `sym` in a basic block.
-    ///
-    /// Returns `None` if either branch is not a basic block, contains more than one statement,
-    /// or does not assign to `sym`.
-    fn match_if_assign<'a>(
-        sym: SymbolId,
-        then_branch: &'a RegionNode,
-        else_branch: &'a RegionNode,
-    ) -> Option<(&'a HilExpr, &'a HilExpr)> {
-        let single_value = |node: &'a RegionNode| {
-            let RegionNode::BasicBlock { stmts } = node else {
-                return None;
-            };
-            let [HilStmt::Assign { left, value }] = stmts.as_slice() else {
-                return None;
-            };
-            (left == &HilExpr::Symbol(sym)).then_some(value)
-        };
-
-        Some((single_value(then_branch)?, single_value(else_branch)?))
-    }
-
-    /// Attempts to build a boolean-like expression from an if/else branch pair.
-    fn try_simplify_bool_ifelse(
-        condition: &HilExpr,
-        then_value: &HilExpr,
-        else_value: &HilExpr,
-    ) -> Option<HilExpr> {
-        match (then_value, else_value) {
-            (HilExpr::Bool(true), HilExpr::Bool(false)) => match condition {
-                HilExpr::Binary {
-                    op: BinOp::Eq | BinOp::Ne,
-                    ..
-                } => Some(condition.clone()),
-                _ => None,
-            },
-            (HilExpr::Bool(false), HilExpr::Bool(true)) => match condition {
-                HilExpr::Binary {
-                    op: BinOp::Eq | BinOp::Ne,
-                    ..
-                } => Some(condition.clone().invert()),
-                // not (x < y) != x >= y when x or y is NaN, so only use comparison
-                // inversion for equality operators and otherwise keep the if-expression.
-                _ => None,
-            },
-            _ => None,
-        }
     }
 }
 
