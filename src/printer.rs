@@ -476,12 +476,44 @@ impl AstPrinter {
                 self.write(&rendered);
             }
             Literal::String(value) => {
+                if should_use_long_string(value) {
+                    if let Some(level) = long_string_level(value) {
+                        self.write_long_string(value, level);
+                        return;
+                    }
+                }
                 self.write("\"");
                 self.write(&escape_string(value));
                 self.write("\"");
             }
             Literal::Bool(value) => self.write(if *value { "true" } else { "false" }),
         }
+    }
+
+    /// Emits a Lua long string literal `[==[value]==]` at the given bracket level.
+    ///
+    /// Lua/Luau strips the very first newline that immediately follows the
+    /// opening bracket.  When the value itself starts with `\n` we emit an
+    /// extra one before the content so the round-trip is correct.
+    ///
+    /// The content and closing bracket are written directly to the output
+    /// buffer (bypassing the indent-injecting `write()`) because any
+    /// whitespace inside a long string is literal and must not be altered.
+    fn write_long_string(&mut self, value: &str, level: usize) {
+        let eq = "=".repeat(level);
+        // Opening bracket — goes through write() to pick up any pending indent.
+        self.write(&format!("[{eq}["));
+        // If the value starts with '\n', Lua would strip it on read, so we
+        // emit one extra to compensate.
+        if value.starts_with('\n') {
+            self.out.push('\n');
+        }
+        // Content goes verbatim; no indentation must be injected.
+        self.out.push_str(value);
+        // Closing bracket immediately after the last byte of content.
+        self.out.push_str(&format!("]{}]", eq));
+        // We are no longer at the start of a line.
+        self.line_start = false;
     }
 
     fn write_table(&mut self, items: &[TableItem]) {
@@ -602,13 +634,138 @@ const fn compound_binary_symbol(op: &CompoundBinOp) -> &'static str {
     }
 }
 
+/// Returns the length that `escape_string` would produce for `s`, without allocating.
+///
+/// This mirrors the escaping logic in [`escape_string`] exactly.
+fn escaped_len(s: &str) -> usize {
+    let mut len = 0;
+    for ch in s.chars() {
+        let code = u32::from(ch);
+        let byte = u8::try_from(code).unwrap_or(b'?');
+        len += match byte {
+            // Two-character escape sequences
+            b'\\' | b'\n' | b'\r' | b'\t' | b'\0' | b'"' => 2,
+            // Printable ASCII — emitted verbatim
+            0x20..=0x7E => 1,
+            // Numeric escapes: `\NNN` where NNN is the decimal byte value
+            b => {
+                1 + if b < 10 {
+                    1
+                } else if b < 100 {
+                    2
+                } else {
+                    3
+                }
+            }
+        };
+    }
+    len
+}
+
+/// Returns the minimum long-string bracket level needed to embed `s` as a Lua
+/// long string, or `None` if the string cannot be represented as one at all.
+fn long_string_level(s: &str) -> Option<usize> {
+    if s.contains('\r') || s.contains('\0') {
+        return None;
+    }
+
+    // probably not the best way to do this
+    for level in 0..=16 {
+        let closing = format!("]{}]", "=".repeat(level));
+        if !s.contains(&closing) {
+            return Some(level);
+        }
+    }
+
+    None
+}
+
+/// Returns `true` when emitting `s` as a Lua long string would produce
+/// cleaner output than a quoted string with escape sequences.
+fn should_use_long_string(s: &str) -> bool {
+    if s.contains('\r') || s.contains('\0') {
+        return false;
+    }
+    let has_newlines = s.contains('\n');
+    let escape_ratio = escaped_len(s) as f64 / s.len().max(1) as f64;
+    let long_and_escaped = s.len() > 80 && escape_ratio > 1.2;
+    has_newlines || long_and_escaped
+}
+
 #[cfg(test)]
 mod tests {
-    use super::escape_string;
+    use super::{escape_string, escaped_len, long_string_level, should_use_long_string};
 
     #[test]
     fn escape_preserves_high_byte_values() {
         let value: String = [b'A', 0x80, 0xFF].into_iter().map(char::from).collect();
         assert_eq!(escape_string(&value), "A\\128\\255");
+    }
+
+    #[test]
+    fn escaped_len_plain_ascii() {
+        assert_eq!(escaped_len("hello"), 5);
+    }
+
+    #[test]
+    fn escaped_len_special_chars() {
+        assert_eq!(escaped_len("\n"), 2);
+        assert_eq!(escaped_len("\\"), 2); // single backslash → "\\" (2 chars)
+        assert_eq!(escaped_len("\""), 2);
+    }
+
+    #[test]
+    fn escaped_len_high_bytes() {
+        // 0x80 (128) → \128 = 4 chars, 0xFF (255) → \255 = 4 chars.
+        let s: String = [0x80u8, 0xFF].into_iter().map(char::from).collect();
+        assert_eq!(escaped_len(&s), 8);
+    }
+
+    #[test]
+    fn long_string_level_plain() {
+        assert_eq!(long_string_level("hello world"), Some(0));
+    }
+
+    #[test]
+    fn long_string_level_contains_level0_close() {
+        // `]]` forces level 1; `]=]` is absent so level 1 is sufficient.
+        assert_eq!(long_string_level("a]]b"), Some(1));
+    }
+
+    #[test]
+    fn long_string_level_rejects_cr() {
+        assert_eq!(long_string_level("line1\r\nline2"), None);
+    }
+
+    #[test]
+    fn long_string_level_rejects_null() {
+        assert_eq!(long_string_level("has\0null"), None);
+    }
+
+    #[test]
+    fn should_use_long_string_with_newline() {
+        assert!(should_use_long_string("line1\nline2"));
+    }
+
+    #[test]
+    fn should_use_long_string_plain_short() {
+        assert!(!should_use_long_string("hello"));
+    }
+
+    #[test]
+    fn should_use_long_string_rejects_cr() {
+        assert!(!should_use_long_string("line1\r\nline2"));
+    }
+
+    #[test]
+    fn should_use_long_string_rejects_null() {
+        assert!(!should_use_long_string("has\0null"));
+    }
+
+    #[test]
+    fn should_use_long_string_long_escaped() {
+        // A string of 90 tab characters has an escape ratio of 2.0, well above 1.2.
+        let s: String = std::iter::repeat('\t').take(90).collect();
+        assert!(should_use_long_string(&s));
     }
 }
