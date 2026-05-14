@@ -297,6 +297,27 @@ pub enum BinOp {
 }
 
 impl BinOp {
+    /// Returns the string representation of this operator.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::Pow => "^",
+            BinOp::Eq => "==",
+            BinOp::Ne => "~=",
+            BinOp::Lt => "<",
+            BinOp::Lte => "<=",
+            BinOp::Gt => ">",
+            BinOp::Gte => ">=",
+            BinOp::And => "and",
+            BinOp::Or => "or",
+            BinOp::Concat => "..",
+        }
+    }
+
     /// Returns the precedence level of this binary operator.
     pub const fn precedence(&self) -> u8 {
         match self {
@@ -352,23 +373,7 @@ impl BinOp {
 
 impl Display for BinOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BinOp::Add => write!(f, "+"),
-            BinOp::Sub => write!(f, "-"),
-            BinOp::Mul => write!(f, "*"),
-            BinOp::Div => write!(f, "/"),
-            BinOp::Mod => write!(f, "%"),
-            BinOp::Pow => write!(f, "^"),
-            BinOp::Eq => write!(f, "=="),
-            BinOp::Ne => write!(f, "~="),
-            BinOp::Lt => write!(f, "<"),
-            BinOp::Lte => write!(f, "<="),
-            BinOp::Gt => write!(f, ">"),
-            BinOp::Gte => write!(f, ">="),
-            BinOp::And => write!(f, "and"),
-            BinOp::Or => write!(f, "or"),
-            BinOp::Concat => write!(f, ".."),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -382,6 +387,27 @@ pub enum CompoundBinOp {
     Mod,
     Pow,
     Concat,
+}
+
+impl CompoundBinOp {
+    /// Returns the string representation of this compound assignment operator.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            CompoundBinOp::Add => "+=",
+            CompoundBinOp::Sub => "-=",
+            CompoundBinOp::Mul => "*=",
+            CompoundBinOp::Div => "/=",
+            CompoundBinOp::Mod => "%=",
+            CompoundBinOp::Pow => "^=",
+            CompoundBinOp::Concat => "..=",
+        }
+    }
+}
+
+impl Display for CompoundBinOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }
 
 impl From<BinOp> for CompoundBinOp {
@@ -407,12 +433,19 @@ pub enum UnOp {
     Not,
 }
 
+impl UnOp {
+    /// Returns the string representation of this unary operator.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            UnOp::Minus => "-",
+            UnOp::Length => "#",
+            UnOp::Not => "not",
+        }
+    }
+}
+
 impl Display for UnOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UnOp::Minus => write!(f, "-"),
-            UnOp::Length => write!(f, "#"),
-            UnOp::Not => write!(f, "not"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }

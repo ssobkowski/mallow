@@ -1,8 +1,5 @@
 use crate::{
-    ast::{
-        BinOp, Block, CompoundBinOp, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem,
-        UnOp,
-    },
+    ast::{BinOp, Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, UnOp},
     common::escape_string,
 };
 
@@ -93,7 +90,7 @@ impl AstPrinter {
             Stmt::CompoundAssignment { lhs, op, rhs } => {
                 self.walk_expr(lhs, 0, Side::None);
                 self.write(" ");
-                self.write(compound_binary_symbol(op));
+                self.write(op.as_str());
                 self.write(" ");
                 self.walk_expr(rhs, 0, Side::None);
                 self.newline();
@@ -283,7 +280,7 @@ impl AstPrinter {
                 }
                 self.walk_expr(lhs, prec, Side::Left);
                 self.write(" ");
-                self.write(binary_symbol(op));
+                self.write(op.as_str());
                 self.write(" ");
                 self.walk_expr(rhs, prec, Side::Right);
                 if needs_parens {
@@ -296,7 +293,7 @@ impl AstPrinter {
                 if needs_parens {
                     self.write("(");
                 }
-                self.write(unary_symbol(op));
+                self.write(op.as_str());
                 if matches!(op, UnOp::Not) {
                     self.write(" ");
                 }
@@ -596,46 +593,6 @@ const fn binary_assoc(op: &BinOp) -> Assoc {
     }
 }
 
-const fn binary_symbol(op: &BinOp) -> &'static str {
-    match op {
-        BinOp::Add => "+",
-        BinOp::Sub => "-",
-        BinOp::Mul => "*",
-        BinOp::Div => "/",
-        BinOp::Mod => "%",
-        BinOp::Pow => "^",
-        BinOp::Eq => "==",
-        BinOp::Ne => "~=",
-        BinOp::Lt => "<",
-        BinOp::Lte => "<=",
-        BinOp::Gt => ">",
-        BinOp::Gte => ">=",
-        BinOp::And => "and",
-        BinOp::Or => "or",
-        BinOp::Concat => "..",
-    }
-}
-
-const fn unary_symbol(op: &UnOp) -> &'static str {
-    match op {
-        UnOp::Minus => "-",
-        UnOp::Length => "#",
-        UnOp::Not => "not",
-    }
-}
-
-const fn compound_binary_symbol(op: &CompoundBinOp) -> &'static str {
-    match op {
-        CompoundBinOp::Add => "+=",
-        CompoundBinOp::Sub => "-=",
-        CompoundBinOp::Mul => "*=",
-        CompoundBinOp::Div => "/=",
-        CompoundBinOp::Mod => "%=",
-        CompoundBinOp::Pow => "^=",
-        CompoundBinOp::Concat => "..=",
-    }
-}
-
 /// Returns the length that `escape_string` would produce for `s`, without allocating.
 ///
 /// This mirrors the escaping logic in [`escape_string`] exactly.
@@ -647,7 +604,7 @@ fn escaped_len(s: &str) -> usize {
         len += match byte {
             // Two-character escape sequences
             b'\\' | b'\n' | b'\r' | b'\t' | b'\0' | b'"' => 2,
-            // Printable ASCII — emitted verbatim
+            // Printable ASCII - emitted verbatim
             0x20..=0x7E => 1,
             // Numeric escapes: `\NNN` where NNN is the decimal byte value
             b => {
