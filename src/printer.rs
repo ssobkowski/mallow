@@ -146,6 +146,19 @@ impl AstPrinter {
             Stmt::If(if_stmt) => {
                 self.walk_if_stmt(if_stmt, true);
             }
+            Stmt::LocalFunction { name, params, body } => {
+                self.write("local function ");
+                self.write(name.as_str());
+                self.write("(");
+                self.write_params(params);
+                self.write(")");
+                self.newline();
+                self.indent += 1;
+                self.walk_block(body);
+                self.indent -= 1;
+                self.write("end");
+                self.newline();
+            }
             Stmt::LocalDeclaration { names, values } => {
                 self.write("local ");
                 for (i, name) in names.iter().enumerate() {

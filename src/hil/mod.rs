@@ -38,6 +38,7 @@ impl ReturnArity {
 #[derive(Debug, Clone)]
 pub struct StructuredFunction {
     pub proto: usize,
+    pub debug_name: Option<String>,
     pub cfg: ControlFlowGraph,
     pub root: RegionNode,
 
@@ -114,6 +115,7 @@ impl StructuredFunction {
 
         Self {
             proto: proto.index as usize,
+            debug_name: proto.debug_name.clone(),
             cfg,
             root,
             params,

@@ -512,13 +512,23 @@ impl Emitter {
     fn maybe_predeclare_recursive_local(&mut self, stmt: &HilStmt, buf: &mut Vec<Stmt>) {
         let HilStmt::Assign {
             left: HilExpr::Symbol(sym),
-            value: HilExpr::Closure { captures, .. },
+            value:
+                HilExpr::Closure {
+                    proto,
+                    captures,
+                },
         } = stmt
         else {
             return;
         };
 
         if self.scopes.contains(sym) || !captures.iter().any(|capture| capture == sym) {
+            return;
+        }
+
+        // If the closure has a debug_name, visit_stmt will emit a LocalFunction
+        // which natively handles recursion in Luau.
+        if self.functions[*proto].debug_name.is_some() {
             return;
         }
 
@@ -535,9 +545,25 @@ impl Emitter {
         match stmt {
             HilStmt::Assign { left, value } => {
                 let mut needs_declaration = false;
+                let mut named_closure = false;
+
                 let left_expr = match left {
                     HilExpr::Symbol(sym) => {
                         if !self.scopes.contains(sym) {
+                            // If value is a named closure, reserve its debug_name
+                            // as the symbol name before declaring/symbol_expr.
+                            if let HilExpr::Closure { proto, .. } = value {
+                                let debug_name =
+                                    self.functions[*proto].debug_name.clone();
+                                if let Some(ref name) = debug_name {
+                                    self.reserve_symbol_name_exact(
+                                        self.current_ctx,
+                                        *sym,
+                                        name.clone().into(),
+                                    );
+                                    named_closure = true;
+                                }
+                            }
                             self.declare_symbol(*sym);
                             needs_declaration = true;
                         }
@@ -551,6 +577,15 @@ impl Emitter {
                     let HilExpr::Symbol(sym) = left else {
                         unreachable!("non-symbol lvalues are never declarations");
                     };
+
+                    if named_closure {
+                        if let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
+                            && let Expr::AnonymousFunction { params, body } = right
+                        {
+                            buf.push(Stmt::LocalFunction { name, params, body });
+                            return;
+                        }
+                    }
 
                     match self
                         .symbol_storage(*sym)

@@ -95,6 +95,15 @@ pub enum Stmt {
     },
     /// `if ... then ... [else ...] end`.
     If(If),
+    /// `local function name(params) body end`.
+    LocalFunction {
+        /// Function name.
+        name: Identifier,
+        /// Function parameters.
+        params: Vec<Parameter>,
+        /// Function body.
+        body: Block,
+    },
     /// `local a, b = ...`.
     LocalDeclaration {
         /// Declared local names.
