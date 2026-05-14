@@ -312,7 +312,7 @@ impl BinOp {
     /// Inverts this binary operator, if it is a comparison operator.
     ///
     /// Returns `None` for non-comparison operators.
-    pub const fn invert(self) -> Option<BinOp> {
+    pub const fn invert(self) -> Option<Self> {
         match self {
             BinOp::Eq => Some(BinOp::Ne),
             BinOp::Ne => Some(BinOp::Eq),
@@ -320,6 +320,22 @@ impl BinOp {
             BinOp::Lte => Some(BinOp::Gt),
             BinOp::Gt => Some(BinOp::Lte),
             BinOp::Gte => Some(BinOp::Lt),
+            _ => None,
+        }
+    }
+
+    /// Returns the flipped comparison operator.
+    ///
+    /// Returns `None` if the operator is not a comparison operator.
+    /// For operators that cannot be flipped, returns `self`.
+    pub const fn flip(self) -> Option<Self> {
+        match self {
+            BinOp::Eq => Some(BinOp::Eq),
+            BinOp::Ne => Some(BinOp::Ne),
+            BinOp::Lt => Some(BinOp::Gt),
+            BinOp::Lte => Some(BinOp::Gte),
+            BinOp::Gt => Some(BinOp::Lt),
+            BinOp::Gte => Some(BinOp::Lte),
             _ => None,
         }
     }

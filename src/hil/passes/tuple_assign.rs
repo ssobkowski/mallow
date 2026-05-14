@@ -120,16 +120,7 @@ fn stmt_mentions_symbol(stmt: &HilStmt, sym: SymbolId) -> bool {
 }
 
 pub fn run(fun: &mut StructuredFunction) -> bool {
-    let mut changed = false;
-    loop {
-        let mut rewriter = Rewriter::default();
-        rewriter.visit_function(fun);
-
-        if !rewriter.changed {
-            break;
-        }
-
-        changed = true;
-    }
-    changed
+    let mut rewriter = Rewriter::default();
+    rewriter.visit_function(fun);
+    rewriter.changed
 }

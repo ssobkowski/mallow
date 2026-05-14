@@ -105,6 +105,14 @@ impl HilExpr {
         }
     }
 
+    /// Returns whether this expression is a literal expression.
+    pub const fn is_literal(&self) -> bool {
+        matches!(
+            self,
+            HilExpr::Nil | HilExpr::Number(_) | HilExpr::String(_) | HilExpr::Bool(_)
+        )
+    }
+
     /// Returns whether this expression is truthy.
     ///
     /// Returns `Some(true)` for truthy values, `Some(false)` for falsy values,
