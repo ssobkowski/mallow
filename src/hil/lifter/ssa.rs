@@ -5,7 +5,7 @@ use id_arena::{Arena, Id};
 use crate::{
     common::ToSpanned as _,
     hil::{
-        cflow::cfg::Block,
+        cflow::{cfg::Block, graph::GraphView},
         ir::{HilStmt, PhiNode},
     },
 };
@@ -67,11 +67,11 @@ impl Symbol {
     }
 }
 
-pub struct Ssa<'a> {
+pub struct Ssa<'a, G: GraphView> {
     registers: Vec<[Option<SymbolId>; 256]>,
     upvalues: Vec<[Option<SymbolId>; 256]>,
 
-    predecessors: &'a [Vec<usize>], // TODO: hold a GraphView instead?
+    graph: &'a G,
     arena: Arena<Symbol>,
 
     aliases: HashMap<SymbolId, SymbolId>,
@@ -83,13 +83,13 @@ pub struct Ssa<'a> {
     incomplete_phis: HashMap<usize, Vec<(SsaVar, SymbolId)>>,
 }
 
-impl<'a> Ssa<'a> {
-    pub fn new(predecessors: &'a [Vec<usize>]) -> Self {
-        let blocks_count = predecessors.len();
+impl<'a, G: GraphView> Ssa<'a, G> {
+    pub fn new(graph: &'a G) -> Self {
+        let blocks_count = graph.len();
         Self {
             registers: vec![[None; 256]; blocks_count],
             upvalues: vec![[None; 256]; blocks_count],
-            predecessors,
+            graph,
             arena: Arena::new(),
             aliases: HashMap::new(),
             phi_uses: HashMap::new(),
@@ -173,7 +173,7 @@ impl<'a> Ssa<'a> {
     }
 
     fn read_var_recursive(&mut self, block: usize, var: SsaVar) -> SymbolId {
-        let preds = &self.predecessors[block];
+        let preds = self.graph.predecessors(block);
         if preds.is_empty() {
             return self.arena.alloc(Symbol::from(var));
         }
@@ -259,7 +259,7 @@ impl<'a> Ssa<'a> {
 
         for (block, phis) in incomplete {
             for (var, phi_sym) in phis {
-                let preds = &self.predecessors[block];
+                let preds = self.graph.predecessors(block);
                 let operands = self.read_operands_from(preds, var);
                 for (_, op_sym) in &operands {
                     self.phi_uses.entry(*op_sym).or_default().insert(phi_sym);

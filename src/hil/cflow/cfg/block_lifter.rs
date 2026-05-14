@@ -6,11 +6,7 @@ use crate::{
     common::Spanned,
     disasm::Proto,
     hil::{
-        cflow::{
-            common::RegSet,
-            graph::{AdjGraph, GraphView},
-            union_find::UnionFind,
-        },
+        cflow::{common::RegSet, graph::GraphView, union_find::UnionFind},
         common::{const_expr, decoded_count, reg_add, reg_range},
         ir::{HilExpr, HilStmt, PhiNode},
         lifter::{
@@ -36,47 +32,43 @@ pub(super) struct BuildResult {
 /// This phase owns the mutable SSA algorithm because block lifting, synthetic
 /// terminator writes, loop-carried repairs, and final symbol canonicalization
 /// are tightly coupled.
-pub(super) fn build_blocks(
+pub(super) fn build_blocks<G: GraphView>(
     proto: &Proto,
     all_protos: &[Proto],
     raw_blocks: &[RawBlock],
-    successors: &[Vec<usize>],
-    predecessors: &[Vec<usize>],
+    graph: &G,
 ) -> BuildResult {
-    BlockBuilder::new(proto, all_protos, raw_blocks, successors, predecessors).build()
+    BlockBuilder::new(proto, all_protos, raw_blocks, graph).build()
 }
 
 /// Mutable state for the SSA-backed CFG block lifting phase.
-struct BlockBuilder<'a> {
+struct BlockBuilder<'a, G: GraphView> {
     proto: &'a Proto,
     all_protos: &'a [Proto],
     raw_blocks: &'a [RawBlock],
-    successors: &'a [Vec<usize>],
-    predecessors: &'a [Vec<usize>],
+    graph: &'a G,
     blocks: Vec<Block>,
-    ssa: LifterSsa<'a>,
+    ssa: LifterSsa<'a, G>,
     params: Vec<SymbolId>,
     upvalues: Vec<SymbolId>,
     loop_carried_versions: Vec<(SymbolId, SymbolId)>,
 }
 
-impl<'a> BlockBuilder<'a> {
+impl<'a, G: GraphView> BlockBuilder<'a, G> {
     /// Creates the phase state around immutable CFG inputs and fresh SSA state.
     fn new(
         proto: &'a Proto,
         all_protos: &'a [Proto],
         raw_blocks: &'a [RawBlock],
-        successors: &'a [Vec<usize>],
-        predecessors: &'a [Vec<usize>],
+        graph: &'a G,
     ) -> Self {
         Self {
             proto,
             all_protos,
             raw_blocks,
-            successors,
-            predecessors,
+            graph,
             blocks: vec![Block::dummy(); raw_blocks.len()],
-            ssa: LifterSsa::new(predecessors),
+            ssa: LifterSsa::new(graph),
             params: Vec::with_capacity(proto.num_params as usize),
             upvalues: Vec::with_capacity(proto.num_upvals as usize),
             loop_carried_versions: Vec::new(),
@@ -114,9 +106,7 @@ impl<'a> BlockBuilder<'a> {
 
     /// Lifts reachable raw blocks in reverse postorder.
     fn lift_blocks(&mut self) {
-        let graph = AdjGraph::new(0, self.successors, self.predecessors);
-
-        for block_id in graph.reverse_post_order() {
+        for block_id in self.graph.reverse_post_order() {
             self.lift_block(block_id);
         }
     }
@@ -360,9 +350,9 @@ impl<'a> BlockBuilder<'a> {
     /// Finds loop-carried register versions that should canonicalize together.
     fn collect_loop_carried_versions(&mut self) {
         let live_in_regs =
-            compute_live_in_registers(&self.blocks, self.raw_blocks, self.successors, &self.ssa);
+            compute_live_in_registers(&self.blocks, self.raw_blocks, self.graph, &self.ssa);
 
-        for (src, targets) in self.successors.iter().enumerate() {
+        for (src, targets) in self.graph.iter().map(|n| (n, self.graph.successors(n))) {
             for &target in targets {
                 // Luau bytecode is emitted in block order, so loop backedges target an
                 // earlier/equal block. Forward edges cannot introduce loop-carried versions.
@@ -380,7 +370,7 @@ impl<'a> BlockBuilder<'a> {
                 let loop_body = self.collect_loop_body(src, target);
                 let written_regs = self.collect_loop_written_regs(&loop_body);
                 let loop_live_out =
-                    compute_loop_live_out_regs(&loop_body, self.successors, &live_in_regs);
+                    compute_loop_live_out_regs(&loop_body, &self.graph, &live_in_regs);
 
                 for u in 0..self.proto.num_upvals {
                     let _ = self.ssa.read_upval(target, u);
@@ -409,7 +399,7 @@ impl<'a> BlockBuilder<'a> {
         let mut worklist = vec![src];
         while let Some(b) = worklist.pop() {
             if loop_body.insert(b) {
-                worklist.extend(&self.predecessors[b]);
+                worklist.extend(self.graph.predecessors(b));
             }
         }
         loop_body
@@ -520,7 +510,11 @@ where
 }
 
 /// Rewrites all SSA temporary symbols in lifted blocks to their canonical IDs.
-fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &LifterSsa<'_>, djs: &mut UnionFind<SymbolId>) {
+fn resolve_ssa_symbols<G: GraphView>(
+    blocks: &mut [Block],
+    ssa: &LifterSsa<'_, G>,
+    djs: &mut UnionFind<SymbolId>,
+) {
     let mut resolver = SymbolResolver { ssa, djs };
     for block in blocks {
         for stmt in &mut block.stmts {
@@ -531,12 +525,12 @@ fn resolve_ssa_symbols(blocks: &mut [Block], ssa: &LifterSsa<'_>, djs: &mut Unio
 }
 
 /// Visitor that canonicalizes every symbol reference it sees.
-struct SymbolResolver<'ssa, 'cfg, 'uf> {
-    ssa: &'ssa LifterSsa<'cfg>,
+struct SymbolResolver<'ssa, 'cfg, 'uf, G: GraphView> {
+    ssa: &'ssa LifterSsa<'cfg, G>,
     djs: &'uf mut UnionFind<SymbolId>,
 }
 
-impl VisitorMut for SymbolResolver<'_, '_, '_> {
+impl<G: GraphView> VisitorMut for SymbolResolver<'_, '_, '_, G> {
     fn visit_symbol(&mut self, sym: &mut SymbolId) {
         let resolved = self.ssa.resolve(*sym);
         *sym = self.djs.find(resolved);
@@ -593,7 +587,7 @@ fn visit_block_exit_symbols_mut<V: VisitorMut + ?Sized>(exit: &mut BlockExit, vi
 }
 
 /// Builds a lookup from SSA symbols to their original physical register.
-fn symbol_register_map(ssa: &LifterSsa<'_>) -> HashMap<SymbolId, u8> {
+fn symbol_register_map<G: GraphView>(ssa: &LifterSsa<'_, G>) -> HashMap<SymbolId, u8> {
     ssa.arena()
         .iter()
         .filter_map(|(id, sym)| match sym.kind {
@@ -751,11 +745,11 @@ fn collect_exit_reg_uses(
 }
 
 /// Computes the registers each lifted block needs on entry.
-fn compute_live_in_registers(
+fn compute_live_in_registers<G: GraphView>(
     blocks: &[Block],
     raw_blocks: &[RawBlock],
-    successors: &[Vec<usize>],
-    ssa: &LifterSsa<'_>,
+    graph: &G,
+    ssa: &LifterSsa<'_, G>,
 ) -> Vec<RegSet> {
     let reg_of = symbol_register_map(ssa);
 
@@ -789,7 +783,7 @@ fn compute_live_in_registers(
 
         for block_idx in (0..blocks.len()).rev() {
             let mut new_out = RegSet::new();
-            for &succ in &successors[block_idx] {
+            for &succ in graph.successors(block_idx) {
                 new_out |= &live_in[succ];
             }
 
@@ -811,15 +805,15 @@ fn compute_live_in_registers(
     live_in
 }
 
-fn compute_loop_live_out_regs(
+fn compute_loop_live_out_regs<G: GraphView>(
     loop_body: &HashSet<usize>,
-    successors: &[Vec<usize>],
+    graph: &G,
     live_in_regs: &[RegSet],
 ) -> RegSet {
     let mut live_out = RegSet::new();
 
     for &block_id in loop_body {
-        for &succ in &successors[block_id] {
+        for &succ in graph.successors(block_id) {
             if !loop_body.contains(&succ) {
                 live_out |= &live_in_regs[succ];
             }

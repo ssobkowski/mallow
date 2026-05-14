@@ -139,7 +139,7 @@ struct GraphPayload {
 
 impl ControlFlowGraph {
     fn graph_payload(&self, tag: &str) -> GraphPayload {
-        let n = self.blocks().count();
+        let n = self.len();
 
         let idoms = self.build_idoms();
         let depths = dom_depths(&idoms, self.entry(), n);

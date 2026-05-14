@@ -663,6 +663,10 @@ impl GraphView for FoldableGraph<'_> {
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.nodes.keys().copied()
     }
+
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
 }
 
 impl SeseGraphView for FoldableGraph<'_> {

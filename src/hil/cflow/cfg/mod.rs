@@ -264,12 +264,13 @@ impl ControlFlowGraph {
         let raw_blocks = build_raw_blocks(&entries, instrs);
 
         let (successors, predecessors) = build_graph(raw_blocks.iter().map(|b| b.exit.targets()));
+        let graph = AdjGraph::new(0, &successors, &predecessors);
 
         let block_lifter::BuildResult {
             mut blocks,
             params,
             upvalues,
-        } = block_lifter::build_blocks(proto, all_protos, &raw_blocks, &successors, &predecessors);
+        } = block_lifter::build_blocks(proto, all_protos, &raw_blocks, &graph);
 
         loop {
             let changed_cond = fold_truthy_cond_jumps(&mut blocks);
@@ -462,6 +463,10 @@ impl GraphView for ControlFlowGraph {
 
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         0..self.blocks.len()
+    }
+
+    fn len(&self) -> usize {
+        self.blocks.len()
     }
 }
 

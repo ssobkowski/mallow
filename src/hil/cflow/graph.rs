@@ -7,7 +7,9 @@ pub trait GraphView {
     fn predecessors(&self, node: usize) -> &[usize];
     fn contains_node(&self, node: usize) -> bool;
     fn iter(&self) -> impl Iterator<Item = usize> + '_;
+    fn len(&self) -> usize;
 
+    #[cfg(feature = "visualize")]
     fn is_reachable(&self, node: usize) -> bool {
         self.contains_node(node) && (node == self.entry() || !self.predecessors(node).is_empty())
     }
@@ -118,6 +120,10 @@ impl<G: GraphView + ?Sized> GraphView for &G {
 
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         (**self).iter()
+    }
+
+    fn len(&self) -> usize {
+        (**self).len()
     }
 }
 
@@ -253,6 +259,10 @@ impl<G: SeseGraphView> GraphView for Reversed<G> {
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.0.iter()
     }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 impl<G: SeseGraphView> SeseGraphView for Reversed<G> {
@@ -269,6 +279,8 @@ pub struct AdjGraph<'a> {
 
 impl<'a> AdjGraph<'a> {
     pub fn new(entry: usize, successors: &'a [Vec<usize>], predecessors: &'a [Vec<usize>]) -> Self {
+        assert_eq!(successors.len(), predecessors.len());
+
         Self {
             entry,
             successors,
@@ -296,6 +308,10 @@ impl GraphView for AdjGraph<'_> {
 
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         0..self.successors.len()
+    }
+
+    fn len(&self) -> usize {
+        self.successors.len()
     }
 }
 
@@ -352,6 +368,10 @@ mod tests {
 
         fn iter(&self) -> impl Iterator<Item = usize> + '_ {
             self.nodes.keys().copied()
+        }
+
+        fn len(&self) -> usize {
+            self.nodes.len()
         }
     }
 

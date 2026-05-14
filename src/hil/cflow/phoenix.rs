@@ -542,6 +542,10 @@ impl GraphView for RegionGraph {
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.nodes.keys().copied()
     }
+
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
 }
 
 impl SeseGraphView for RegionGraph {

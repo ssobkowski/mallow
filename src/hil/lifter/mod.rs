@@ -8,6 +8,7 @@ use crate::{
     common::{Spanned, ToSpanned as _, escape_string, is_valid_luau_identifier},
     disasm::Proto,
     hil::{
+        cflow::graph::GraphView,
         common::{const_expr, decoded_count, reg_add, reg_range},
         ir::{HilExpr, HilStmt},
         lifter::{
@@ -76,16 +77,16 @@ fn unop_for_instr(instr: &Instr) -> UnOp {
     }
 }
 
-pub struct LiftContext<'a, 'cfg> {
+pub struct LiftContext<'a, 'cfg, G: GraphView> {
     pub instrs: &'a [Spanned<Instr>],
     pub consts: &'a [Constant],
     pub parent_proto: &'a Proto,
     pub protos: &'a [Proto],
-    pub ssa: &'a mut Ssa<'cfg>,
+    pub ssa: &'a mut Ssa<'cfg, G>,
     pub block_idx: usize,
 }
 
-pub struct Lifter<'a, 'cfg> {
+pub struct Lifter<'a, 'cfg, G: GraphView> {
     ip: usize,
 
     instrs: &'a [Spanned<Instr>],
@@ -93,7 +94,7 @@ pub struct Lifter<'a, 'cfg> {
     parent_proto: &'a Proto,
     protos: &'a [Proto],
 
-    ssa: &'a mut Ssa<'cfg>,
+    ssa: &'a mut Ssa<'cfg, G>,
     block_idx: usize,
 
     stmts: Vec<Spanned<HilStmt>>,
@@ -103,8 +104,8 @@ pub struct Lifter<'a, 'cfg> {
     open_captured_ref: [Option<u16>; 256],
 }
 
-impl<'a, 'cfg> Lifter<'a, 'cfg> {
-    pub fn new(ctx: LiftContext<'a, 'cfg>) -> Self {
+impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
+    pub fn new(ctx: LiftContext<'a, 'cfg, G>) -> Self {
         Self {
             ip: 0,
             instrs: ctx.instrs,
@@ -830,10 +831,10 @@ impl<'a, 'cfg> Lifter<'a, 'cfg> {
 /// A pending call-like multiret becomes a standalone call statement. A pending
 /// vararg splice must materialize into its base register because later code can
 /// reference that register by symbol.
-pub fn flush_multiret(
+pub fn flush_multiret<G: GraphView>(
     multiret: MultiRet,
     block_idx: usize,
-    ssa: &mut Ssa<'_>,
+    ssa: &mut Ssa<'_, G>,
     stmts: &mut Vec<Spanned<HilStmt>>,
 ) {
     let MultiRet { base, expr } = multiret;
@@ -860,7 +861,9 @@ pub fn flush_multiret(
 
 /// Lifts one instruction slice into raw HIL statements.
 #[must_use]
-pub fn lift<'a, 'cfg>(ctx: LiftContext<'a, 'cfg>) -> (Vec<Spanned<HilStmt>>, Option<MultiRet>) {
+pub fn lift<'a, 'cfg, G: GraphView>(
+    ctx: LiftContext<'a, 'cfg, G>,
+) -> (Vec<Spanned<HilStmt>>, Option<MultiRet>) {
     let lifter = Lifter::new(ctx);
     lifter.run()
 }
