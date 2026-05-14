@@ -14,7 +14,7 @@ use crate::{
         cflow::region::RegionNode,
         ir::{HilExpr, HilStmt, HilTableItem},
         lifter::ssa::SymbolId,
-        visitor::Visitor,
+        visitor::{Visitor, walk_expr},
     },
     scopes::Scopes,
 };
@@ -22,19 +22,19 @@ use crate::{
 const MAX_LOCAL_COUNT: usize = 199;
 
 #[derive(Default)]
-struct Collector {
+struct AssignCollector {
     symbols: HashSet<SymbolId>,
 }
 
-impl Collector {
+impl AssignCollector {
     fn collect_assigned_symbols(node: &RegionNode) -> HashSet<SymbolId> {
-        let mut collector = Collector::default();
+        let mut collector = AssignCollector::default();
         collector.visit_region(node);
         collector.symbols
     }
 }
 
-impl Visitor for Collector {
+impl Visitor for AssignCollector {
     fn visit_stmt(&mut self, stmt: &HilStmt) {
         match stmt {
             HilStmt::Assign {
@@ -54,6 +54,45 @@ impl Visitor for Collector {
             }
             _ => {}
         }
+    }
+}
+
+#[derive(Default)]
+struct ReadCollector {
+    symbols: HashSet<SymbolId>,
+}
+
+impl ReadCollector {
+    fn collect_read_symbols(nodes: &[RegionNode]) -> HashSet<SymbolId> {
+        let mut collector = ReadCollector::default();
+        for node in nodes {
+            collector.visit_region(node);
+        }
+        collector.symbols
+    }
+}
+
+impl Visitor for ReadCollector {
+    /// Override lvalue traversal so that plain symbol write targets are *not* collected as reads.
+    /// Sub-expressions of compound lvalues (`t[k]`, `t.field`) are still traversed as reads.
+    fn visit_lvalue_expr(&mut self, expr: &HilExpr) {
+        match expr {
+            HilExpr::Symbol(_) => {}
+            HilExpr::GetField { obj, .. } => self.visit_expr(obj),
+            HilExpr::GetIndex { obj, index } => {
+                self.visit_expr(obj);
+                self.visit_expr(index);
+            }
+            other => walk_expr(self, other),
+        }
+    }
+
+    fn visit_symbol(&mut self, sym: SymbolId) {
+        self.symbols.insert(sym);
+    }
+
+    fn visit_capture(&mut self, _index: usize, sym: SymbolId) {
+        self.symbols.insert(sym);
     }
 }
 
@@ -312,75 +351,120 @@ impl Emitter {
         Block::with_stmts(stmts)
     }
 
+    /// Visits a flat sequence of region nodes, giving each `If` node access to its
+    /// continuation so that only symbols genuinely needed after the branch are hoisted.
+    fn visit_sequence(&mut self, nodes: &[RegionNode], buf: &mut Vec<Stmt>) {
+        for (i, node) in nodes.iter().enumerate() {
+            if let RegionNode::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } = node
+            {
+                let continuation = &nodes[i + 1..];
+                self.visit_if_node(
+                    condition,
+                    then_branch,
+                    else_branch.as_deref(),
+                    continuation,
+                    buf,
+                );
+            } else {
+                self.visit_node(node, buf);
+            }
+        }
+    }
+
+    /// Emits an `if`/`else` statement, hoisting symbols that are assigned in both
+    /// branches *and* actually read in `continuation` (the remaining nodes that follow
+    /// this `if` in the enclosing sequence).
+    fn visit_if_node(
+        &mut self,
+        condition: &HilExpr,
+        then_branch: &RegionNode,
+        else_branch: Option<&RegionNode>,
+        continuation: &[RegionNode],
+        buf: &mut Vec<Stmt>,
+    ) {
+        let then_assigned = AssignCollector::collect_assigned_symbols(then_branch);
+
+        let else_assigned = else_branch
+            .map(AssignCollector::collect_assigned_symbols)
+            .unwrap_or_default();
+
+        // A symbol needs to be hoisted only when it is assigned in *both* branches
+        // (so it is live on all paths after the if) *and* is actually read somewhere
+        // in the continuation.  Symbols that are dead after the if stay local to their
+        // branch, which gives downstream HIL passes more room to fold them.
+        let continuation_reads = ReadCollector::collect_read_symbols(continuation);
+
+        let mut hoisted: Vec<_> = then_assigned
+            .intersection(&else_assigned)
+            .copied()
+            .filter(|sym| !self.scopes.contains(sym))
+            .filter(|sym| continuation.is_empty() || continuation_reads.contains(sym))
+            .collect();
+        hoisted.sort_by_key(|sym| sym.index());
+
+        if !hoisted.is_empty() {
+            for sym in &hoisted {
+                self.declare_symbol(*sym);
+            }
+
+            let names: Vec<_> = hoisted
+                .iter()
+                .filter_map(|sym| match self.symbol_storage(*sym) {
+                    Some(SymbolStorage::Named(name)) => Some(name),
+                    Some(SymbolStorage::Spilled(_)) | None => None,
+                })
+                .collect();
+            if !names.is_empty() {
+                buf.push(Stmt::LocalDeclaration {
+                    names,
+                    values: Vec::new(),
+                });
+            }
+        }
+
+        self.scopes.push_scope();
+        let then_body = self.visit_region(then_branch);
+        self.scopes.pop_scope();
+
+        let else_clause = else_branch.map(|e| {
+            self.scopes.push_scope();
+            let region = self.visit_region(e);
+            self.scopes.pop_scope();
+
+            // if the region is only one If statement we can fold into an elseif
+            if let [Stmt::If(elseif)] = region.stmts.as_slice() {
+                return ElseClause::If(Box::new(elseif.clone()));
+            }
+
+            ElseClause::Else(region)
+        });
+
+        buf.push(Stmt::If(If {
+            condition: self.visit_expr(condition),
+            then_body,
+            else_clause,
+        }));
+    }
+
     fn visit_node(&mut self, node: &RegionNode, buf: &mut Vec<Stmt>) {
         match node {
             RegionNode::BasicBlock { stmts } => self.visit_block(stmts, buf),
-            RegionNode::Sequence { nodes } => {
-                for n in nodes {
-                    self.visit_node(n, buf);
-                }
-            }
+            RegionNode::Sequence { nodes } => self.visit_sequence(nodes, buf),
             RegionNode::If {
                 condition,
                 then_branch,
                 else_branch,
                 ..
             } => {
-                let then_assigned = Collector::collect_assigned_symbols(then_branch);
-
-                let else_assigned = else_branch
-                    .as_ref()
-                    .map(|node| Collector::collect_assigned_symbols(node))
-                    .unwrap_or_default();
-
-                let mut hoisted: Vec<_> = then_assigned
-                    .intersection(&else_assigned)
-                    .copied()
-                    .filter(|sym| !self.scopes.contains(sym))
-                    .collect();
-                hoisted.sort_by_key(|sym| sym.index());
-
-                if !hoisted.is_empty() {
-                    for sym in &hoisted {
-                        self.declare_symbol(*sym);
-                    }
-
-                    let names: Vec<_> = hoisted
-                        .iter()
-                        .filter_map(|sym| match self.symbol_storage(*sym) {
-                            Some(SymbolStorage::Named(name)) => Some(name),
-                            Some(SymbolStorage::Spilled(_)) | None => None,
-                        })
-                        .collect();
-                    if !names.is_empty() {
-                        buf.push(Stmt::LocalDeclaration {
-                            names,
-                            values: Vec::new(),
-                        });
-                    }
-                }
-
-                self.scopes.push_scope();
-
-                let then_body = self.visit_region(then_branch);
-                let else_clause = else_branch.as_ref().map(|e| {
-                    let region = self.visit_region(e);
-
-                    // if the region is only one If statement we can fold into an elseif
-                    if let [Stmt::If(elseif)] = region.stmts.as_slice() {
-                        return ElseClause::If(Box::new(elseif.clone()));
-                    }
-
-                    ElseClause::Else(region)
-                });
-
-                buf.push(Stmt::If(If {
-                    condition: self.visit_expr(condition),
-                    then_body,
-                    else_clause,
-                }));
-
-                self.scopes.pop_scope();
+                // No continuation is known when visiting a bare If node outside of a
+                // Sequence. Pass an empty slice so the hoist filter falls back to the
+                // conservative behaviour of hoisting anything assigned in both branches.
+                self.visit_if_node(condition, then_branch, else_branch.as_deref(), &[], buf);
             }
             RegionNode::While {
                 condition, body, ..
