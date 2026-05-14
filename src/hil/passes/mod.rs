@@ -4,6 +4,7 @@ mod fold_tables;
 mod inlining;
 mod normalize;
 mod return_arity;
+mod short_circuit;
 mod tuple_assign;
 
 pub fn run(fns: &mut [StructuredFunction]) {
@@ -21,6 +22,7 @@ pub fn run(fns: &mut [StructuredFunction]) {
             let mut changed = inlining::run(fun, &return_arities);
             changed |= tuple_assign::run(fun);
             changed |= fold_tables::run(fun);
+            changed |= short_circuit::run(fun);
             changed |= normalize::run(fun);
 
             if !changed {
