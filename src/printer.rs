@@ -67,19 +67,9 @@ impl AstPrinter {
         match stmt {
             Stmt::Assignment { lhs, rhs } => {
                 self.write("");
-                for (i, lv) in lhs.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.walk_expr(lv, 0, Side::None);
-                }
+                self.write_punctuated(lhs, ", ", |p, lv| p.walk_expr(lv, 0, Side::None));
                 self.write(" = ");
-                for (i, rv) in rhs.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.walk_expr(rv, 0, Side::None);
-                }
+                self.write_punctuated(rhs, ", ", |p, rv| p.walk_expr(rv, 0, Side::None));
                 self.newline();
             }
             Stmt::Comment { text } => {
@@ -119,19 +109,9 @@ impl AstPrinter {
             }
             Stmt::GenericFor { vars, exprs, body } => {
                 self.write("for ");
-                for (i, var) in vars.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.write(var.as_str());
-                }
+                self.write_punctuated(vars, ", ", |p, var| p.write(var.as_str()));
                 self.write(" in ");
-                for (i, expr) in exprs.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.walk_expr(expr, 0, Side::None);
-                }
+                self.write_punctuated(exprs, ", ", |p, expr| p.walk_expr(expr, 0, Side::None));
                 self.write(" do");
                 self.newline();
                 self.indent += 1;
@@ -158,20 +138,12 @@ impl AstPrinter {
             }
             Stmt::LocalDeclaration { names, values } => {
                 self.write("local ");
-                for (i, name) in names.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.write(name.as_str());
-                }
+                self.write_punctuated(names, ", ", |p, name| p.write(name.as_str()));
                 if !values.is_empty() {
                     self.write(" = ");
-                    for (i, value) in values.iter().enumerate() {
-                        if i > 0 {
-                            self.write(", ");
-                        }
-                        self.walk_expr(value, 0, Side::None);
-                    }
+                    self.write_punctuated(values, ", ", |p, value| {
+                        p.walk_expr(value, 0, Side::None)
+                    });
                 }
                 self.newline();
             }
@@ -206,12 +178,9 @@ impl AstPrinter {
                 self.write("return");
                 if !values.is_empty() {
                     self.write(" ");
-                    for (i, value) in values.iter().enumerate() {
-                        if i > 0 {
-                            self.write(", ");
-                        }
-                        self.walk_expr(value, 0, Side::None);
-                    }
+                    self.write_punctuated(values, ", ", |p, value| {
+                        p.walk_expr(value, 0, Side::None)
+                    });
                 }
                 self.newline();
             }
@@ -294,7 +263,7 @@ impl AstPrinter {
                     self.write("(");
                 }
                 self.write(op.as_str());
-                if matches!(op, UnOp::Not) {
+                if op == &UnOp::Not {
                     self.write(" ");
                 }
                 self.walk_expr(expr, prec, Side::Right);
@@ -317,12 +286,7 @@ impl AstPrinter {
                     self.write(")");
                 }
                 self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.walk_expr(arg, 0, Side::None);
-                }
+                self.write_punctuated(args, ", ", |p, arg| p.walk_expr(arg, 0, Side::None));
                 self.write(")");
                 if needs_parens {
                     self.write(")");
@@ -349,12 +313,7 @@ impl AstPrinter {
                 self.write(":");
                 self.write(method.as_str());
                 self.write("(");
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.write(", ");
-                    }
-                    self.walk_expr(arg, 0, Side::None);
-                }
+                self.write_punctuated(args, ", ", |p, arg| p.walk_expr(arg, 0, Side::None));
                 self.write(")");
                 if needs_parens {
                     self.write(")");
@@ -446,15 +405,10 @@ impl AstPrinter {
     }
 
     fn write_params(&mut self, params: &[Parameter]) {
-        for (i, param) in params.iter().enumerate() {
-            if i > 0 {
-                self.write(", ");
-            }
-            match param {
-                Parameter::Regular(name) => self.write(name.as_str()),
-                Parameter::Vararg => self.write("..."),
-            }
-        }
+        self.write_punctuated(params, ", ", |p, param| match param {
+            Parameter::Regular(name) => p.write(name.as_str()),
+            Parameter::Vararg => p.write("..."),
+        });
     }
 
     fn write_literal(&mut self, lit: &Literal) {
@@ -559,6 +513,15 @@ impl AstPrinter {
             self.line_start = false;
         }
         self.out.push_str(s);
+    }
+
+    fn write_punctuated<T>(&mut self, items: &[T], sep: &str, mut f: impl FnMut(&mut Self, &T)) {
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                self.write(sep);
+            }
+            f(self, item);
+        }
     }
 
     fn newline(&mut self) {
