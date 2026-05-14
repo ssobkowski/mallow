@@ -92,6 +92,7 @@ pub struct Proto {
     pub instrs: Vec<Spanned<Instr>>,
     pub consts: Vec<Constant>,
     pub protos: Vec<usize>,
+    pub debug_name: Option<String>,
     #[allow(dead_code)]
     pub locals: Vec<LocalDebug>,
 }
@@ -189,7 +190,7 @@ impl<'a> Disassembler<'a> {
         }
 
         self.read_varint()?; // line defined
-        self.read_varint()?; // source index (1-based string table index)
+        let debug_name = self.read_string(strings)?;
 
         // line info
         if self.read::<u8>()? == 1 {
@@ -253,6 +254,7 @@ impl<'a> Disassembler<'a> {
             instrs,
             consts,
             protos,
+            debug_name,
             locals,
         })
     }
@@ -304,6 +306,22 @@ impl<'a> Disassembler<'a> {
         }
     }
 
+    /// Read a varint-encoded 1-based string table index. Returns `None` for index 0 (null).
+    #[inline]
+    fn read_string(&mut self, strings: &[String]) -> Result<Option<String>, DisasmError> {
+        let idx = self.read_varint()?;
+        if idx == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            strings
+                .get(idx.saturating_sub(1) as usize)
+                .cloned()
+                .unwrap_or_default(),
+        ))
+    }
+
     #[inline]
     fn read_varint(&mut self) -> Result<u64, DisasmError> {
         let mut result = 0u64;
@@ -336,10 +354,15 @@ impl<'a> Disassembler<'a> {
 impl fmt::Display for Disassembly {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for proto in &self.protos {
+            let name_suffix = proto
+                .debug_name
+                .as_ref()
+                .map(|n| format!(" (\"{n}\")"))
+                .unwrap_or_default();
             writeln!(
                 f,
-                "Proto {} ({} params, {} upvalues)",
-                proto.index, proto.num_params, proto.num_upvals
+                "Proto {}{} ({} params, {} upvalues)",
+                proto.index, name_suffix, proto.num_params, proto.num_upvals
             )?;
 
             for sd in &proto.instrs {
