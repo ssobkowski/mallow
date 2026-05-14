@@ -1,7 +1,7 @@
 //! Normalizes the HIL tree using the following rules:
 //!
 //! 1. If the *then* branch is empty and the *else* branch is not, swap the branches and invert the condition.
-//! 2. Canonicalize binary comparison expressions of the form `[literal] op [symbol]` to `[symbol] op [literal]`.
+//! 2. Canonicalize binary comparison expressions of the form `[literal] op [expr]` to `[expr] op [literal]`.
 
 use crate::hil::{
     StructuredFunction,
@@ -37,7 +37,7 @@ impl VisitorMut for Normalizer {
         if let HilExpr::Binary { lhs, op, rhs } = expr
             && let Some(flipped) = op.flip()
             && lhs.is_literal()
-            && let HilExpr::Symbol(_) = rhs.as_ref()
+            && !rhs.is_literal()
         {
             *op = flipped;
             std::mem::swap(lhs, rhs);
