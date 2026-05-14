@@ -191,7 +191,9 @@ impl AstPrinter {
                 self.walk_expr(start, 0, Side::None);
                 self.write(", ");
                 self.walk_expr(end, 0, Side::None);
-                if let Some(step) = step {
+                if let Some(step) = step
+                    && !matches!(step, Expr::Literal(Literal::Number(1.0)))
+                {
                     self.write(", ");
                     self.walk_expr(step, 0, Side::None);
                 }
