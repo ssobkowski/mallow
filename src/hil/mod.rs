@@ -95,11 +95,12 @@ impl StructuredFunction {
         }
 
         verbose!(indent: 1, "structuring region...");
-        let (root, was_reduced) = if std::env::var("MALLOW_PHOENIX").is_ok_and(|f| f == "1") {
-            phoenix::structure(&cfg)
-        } else {
-            region::structure(&cfg)
-        };
+        let (root, was_reduced) =
+            if std::env::var("MALLOW_LEGACY_STRUCTURER").is_ok_and(|f| f == "1") {
+                region::structure(&cfg)
+            } else {
+                phoenix::structure(&cfg)
+            };
 
         if !was_reduced {
             eprintln!(
