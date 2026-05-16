@@ -13,6 +13,7 @@ use crate::{
     disasm::Proto,
     hil::{
         cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
+        common::{reg_add, reg_range},
         ir::{HilExpr, HilStmt, PhiNode},
         lifter::ssa::SymbolId,
     },
@@ -559,7 +560,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
             (end, None)
         };
 
-        let exit_writes = if last_instr.is_branch_exit() {
+        let mut exit_writes = if last_instr.is_branch_exit() {
             last_instr.written_registers()
         } else {
             SmallVec::new()
@@ -755,6 +756,19 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
             | Some(Instr::ForgPrepInext { base, offset })
             | Some(Instr::ForgPrepNext { base, offset }) => {
                 let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let exit_block = pc_to_block_idx(entries, target);
+
+                let end = entries.get(exit_block + 1).copied().unwrap_or(instrs.len());
+                let result_count = match instrs
+                    .get(end.saturating_sub(1))
+                    .map(|spanned| spanned.node)
+                {
+                    Some(Instr::ForgLoop { var_count, .. }) => var_count,
+                    other => panic!("FORGPREP target block must end in FORGLOOP, got {other:?}"),
+                };
+
+                exit_writes = reg_range(reg_add(base, 3), result_count).collect();
+
                 RawBlockExit::ForgPrep {
                     base,
                     body_block: block_idx + 1,
