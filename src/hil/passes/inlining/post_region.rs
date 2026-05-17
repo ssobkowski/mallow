@@ -11,6 +11,104 @@ use crate::hil::{
     visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut},
 };
 
+#[derive(Debug, Default)]
+struct BlockSummary {
+    stmt_reads: Vec<HashSet<SymbolId>>,
+}
+
+impl BlockSummary {
+    fn new(stmts: &[HilStmt]) -> Self {
+        let mut summary = Self::default();
+        for stmt in stmts {
+            let stmt_summary = StmtSummary::new(stmt);
+            summary.stmt_reads.push(stmt_summary.reads);
+        }
+        summary
+    }
+
+    fn reads_in_stmt(&self, idx: usize) -> impl Iterator<Item = SymbolId> + '_ {
+        self.stmt_reads[idx].iter().copied()
+    }
+}
+
+#[derive(Debug, Default)]
+struct StmtSummary {
+    reads: HashSet<SymbolId>,
+}
+
+impl StmtSummary {
+    fn new(stmt: &HilStmt) -> Self {
+        let mut summary = Self::default();
+        summary.visit_stmt(stmt);
+        summary
+    }
+}
+
+impl Visitor for StmtSummary {
+    fn visit_stmt(&mut self, stmt: &HilStmt) {
+        match stmt {
+            HilStmt::Assign { left, value } => {
+                if !matches!(left, HilExpr::Symbol(_)) {
+                    self.visit_expr(left);
+                }
+                self.visit_expr(value);
+            }
+            HilStmt::AssignMany { left, value } => {
+                for expr in left {
+                    if !matches!(expr, HilExpr::Symbol(_)) {
+                        self.visit_expr(expr);
+                    }
+                }
+                self.visit_expr(value);
+            }
+            HilStmt::SetList { values, .. } => {
+                for value in values {
+                    self.visit_expr(value);
+                }
+            }
+            HilStmt::Call(expr) => {
+                self.visit_expr(expr);
+            }
+            HilStmt::Phi(_) => {
+                unreachable!("phi nodes should have been unfolded at this point")
+            }
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &HilExpr) {
+        if let HilExpr::Symbol(sym) = expr {
+            self.reads.insert(*sym);
+            return;
+        }
+
+        walk_expr(self, expr);
+    }
+
+    fn visit_phi(&mut self, _: &PhiNode) {
+        unreachable!("phi nodes should have been unfolded at this point")
+    }
+}
+
+#[derive(Debug, Default)]
+struct RegionReadSet {
+    reads: HashSet<SymbolId>,
+}
+
+impl Visitor for RegionReadSet {
+    fn visit_expr(&mut self, expr: &HilExpr) {
+        if let HilExpr::Symbol(sym) = expr {
+            self.reads.insert(*sym);
+            return;
+        }
+
+        walk_expr(self, expr);
+    }
+
+    fn visit_phi(&mut self, _: &PhiNode) {
+        unreachable!("phi nodes should have been unfolded at this point")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TupleSource {
     targets: Vec<SymbolId>,
@@ -245,21 +343,36 @@ impl<'a> Inliner<'a> {
         }
     }
 
-    fn inline_block_inner(&mut self, stmts: &mut Vec<HilStmt>, tail: Option<&[RegionNode]>) {
+    fn inline_block_inner(
+        &mut self,
+        stmts: &mut Vec<HilStmt>,
+        tail_reads: Option<&HashSet<SymbolId>>,
+    ) {
+        let summary = BlockSummary::new(stmts);
+        let plain_sources: Vec<_> = stmts
+            .iter()
+            .map(|stmt| plain_assignment(stmt).map(|(sym, _)| sym))
+            .collect();
         let mut removable = HashSet::new();
         let mut idx = 0;
         while idx < stmts.len() {
+            let mut active_reads: HashSet<_> = summary.reads_in_stmt(idx).collect();
             for source_idx in 0..idx {
                 if removable.contains(&source_idx) {
                     continue;
                 }
-                let Some((sym, rhs)) =
-                    plain_assignment(&stmts[source_idx]).map(|(s, r)| (s, r.clone()))
-                else {
+                let Some(sym) = plain_sources[source_idx] else {
                     continue;
                 };
+                if !active_reads.contains(&sym) {
+                    continue;
+                }
+                let Some((_, rhs)) = plain_assignment(&stmts[source_idx]) else {
+                    continue;
+                };
+                let rhs = rhs.clone();
 
-                let inlineable = match tail {
+                let inlineable = match tail_reads {
                     None => {
                         self.can_inline_globally(sym, &rhs)
                             && can_substitute_in_stmt_context(
@@ -270,15 +383,16 @@ impl<'a> Inliner<'a> {
                                 idx,
                             )
                     }
-                    Some(tail) => {
+                    Some(tail_reads) => {
                         self.can_inline_locally(stmts, source_idx, idx, sym, &rhs)
-                            && !tail
-                                .iter()
-                                .any(|node| ReadCounter::new(sym).in_region(node) > 0)
+                            && !tail_reads.contains(&sym)
                     }
                 };
 
                 if inlineable && substitute_in_stmt(&mut stmts[idx], sym, &rhs) {
+                    let mut replacement_reads = RegionReadSet::default();
+                    replacement_reads.visit_expr(&rhs);
+                    active_reads.extend(replacement_reads.reads);
                     removable.insert(source_idx);
                 }
             }
@@ -291,8 +405,22 @@ impl<'a> Inliner<'a> {
         self.inline_block_inner(stmts, None);
     }
 
+    fn inline_block_with_tail_reads(
+        &mut self,
+        stmts: &mut Vec<HilStmt>,
+        tail_reads: &HashSet<SymbolId>,
+    ) {
+        self.inline_block_inner(stmts, Some(tail_reads));
+    }
+
     fn inline_block_with_tail(&mut self, stmts: &mut Vec<HilStmt>, tail: &[RegionNode]) {
-        self.inline_block_inner(stmts, Some(tail));
+        let mut reads = HashSet::new();
+        for node in tail {
+            let mut collector = RegionReadSet::default();
+            collector.visit_region(node);
+            reads.extend(collector.reads);
+        }
+        self.inline_block_with_tail_reads(stmts, &reads);
     }
 
     fn inline_sequence_edges(&mut self, nodes: &mut [RegionNode]) {
@@ -727,10 +855,7 @@ impl<'a> Inliner<'a> {
     }
 
     fn has_effect_between_positions(&self, write_pos: usize, read_pos: usize) -> bool {
-        self.analysis
-            .effect_positions
-            .iter()
-            .any(|pos| *pos > write_pos && *pos < read_pos)
+        positions_contain_in_range(&self.analysis.effect_positions, write_pos + 1, read_pos)
     }
 
     fn source_rewritten_between(&self, source: &SymbolFacts, target: &SymbolFacts) -> bool {
@@ -740,10 +865,7 @@ impl<'a> Inliner<'a> {
         let Some(read_pos) = target.read_positions.iter().copied().max() else {
             return true;
         };
-        source
-            .write_positions
-            .iter()
-            .any(|pos| *pos > write_pos && *pos < read_pos)
+        positions_contain_in_range(&source.write_positions, write_pos + 1, read_pos)
     }
 
     fn expr_arity(&self, expr: &HilExpr) -> ReturnArity {
@@ -973,11 +1095,6 @@ impl ReadCounter {
         self.visit_stmt(stmt);
         self.counter
     }
-
-    fn in_region(mut self, region: &RegionNode) -> usize {
-        self.visit_region(region);
-        self.counter
-    }
 }
 
 impl Visitor for ReadCounter {
@@ -1029,6 +1146,11 @@ impl VisitorMut for SymbolSubstituter<'_> {
 
         walk_expr_mut(self, expr);
     }
+}
+
+fn positions_contain_in_range(positions: &[usize], start: usize, end: usize) -> bool {
+    let idx = positions.partition_point(|pos| *pos < start);
+    positions.get(idx).is_some_and(|pos| *pos < end)
 }
 
 pub fn run(fun: &mut StructuredFunction, return_arities: &[ReturnArity]) -> bool {
