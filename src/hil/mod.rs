@@ -79,7 +79,7 @@ impl StructuredFunction {
                 } else {
                     verbose!(indent: 3, "stmts: [");
                     for stmt in block.stmts() {
-                        verbose!(indent: 3, "  {}", stmt.node);
+                        verbose!(indent: 3, "  {}", stmt);
                     }
                     verbose!(indent: 3, "]");
                 }

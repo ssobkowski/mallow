@@ -130,6 +130,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
             "non-variadic exit lowering must consume or flush pending multiret"
         );
 
+        let stmts = stmts.into_iter().map(|s| s.node).collect();
         self.blocks[block_id] = Block { stmts, exit };
         self.ssa.mark_filled(block_id);
     }
@@ -443,7 +444,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
     fn union_phi_versions(&self, disjoint_set: &mut UnionFind<SymbolId>) {
         for (block_idx, block) in self.blocks.iter().enumerate() {
             for stmt in &block.stmts {
-                if let HilStmt::Phi(phi) = &stmt.node {
+                if let HilStmt::Phi(phi) = &stmt {
                     for (pred_block, operand) in &phi.operands {
                         if is_loop_header_loop_var_operand(
                             &self.blocks,
@@ -518,7 +519,7 @@ fn resolve_ssa_symbols<G: GraphView>(
     let mut resolver = SymbolResolver { ssa, djs };
     for block in blocks {
         for stmt in &mut block.stmts {
-            resolver.visit_stmt(&mut stmt.node);
+            resolver.visit_stmt(stmt);
         }
         visit_block_exit_symbols_mut(&mut block.exit, &mut resolver);
     }
@@ -766,7 +767,7 @@ fn compute_live_in_registers<G: GraphView>(
                 defs: &mut block_defs[block_idx],
                 seen_defs: &mut seen_defs,
             }
-            .visit_stmt(&stmt.node);
+            .visit_stmt(&stmt);
         }
 
         collect_exit_reg_uses(&block.exit, &reg_of, &mut block_uses[block_idx], &seen_defs);

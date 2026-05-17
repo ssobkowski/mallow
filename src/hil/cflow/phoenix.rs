@@ -1567,12 +1567,7 @@ impl Shape {
     fn lower(self, cfg: &ControlFlowGraph) -> RegionNode {
         match self {
             Shape::Block(block) => RegionNode::BasicBlock {
-                stmts: cfg
-                    .get(block)
-                    .stmts()
-                    .iter()
-                    .map(|stmt| stmt.node.clone())
-                    .collect(),
+                stmts: cfg.get(block).stmts().to_vec(),
             },
             Shape::Sequence(nodes) => RegionNode::Sequence {
                 nodes: nodes.into_iter().map(|node| node.lower(cfg)).collect(),

@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ast::BinOp,
-    common::{Spanned, ToSpanned as _},
+    common::Spanned,
     disasm::Proto,
     hil::{
         cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
@@ -102,7 +102,7 @@ impl RawBlockExit {
 /// Represents a lifted block
 #[derive(Debug, Clone)]
 pub struct Block {
-    stmts: Vec<Spanned<HilStmt>>,
+    stmts: Vec<HilStmt>,
     exit: BlockExit,
 }
 
@@ -126,12 +126,12 @@ impl Block {
     }
 
     /// Returns an iterator over the statements of this block.
-    pub fn stmts(&self) -> &[Spanned<HilStmt>] {
+    pub fn stmts(&self) -> &[HilStmt] {
         &self.stmts
     }
 
     /// Returns a mutable reference to the statements of this block.
-    pub fn stmts_mut(&mut self) -> &mut Vec<Spanned<HilStmt>> {
+    pub fn stmts_mut(&mut self) -> &mut Vec<HilStmt> {
         &mut self.stmts
     }
 
@@ -371,9 +371,9 @@ impl ControlFlowGraph {
 
         let phis: Vec<_> = self.blocks[block_idx]
             .stmts
-            .extract_if(.., |stmt| matches!(stmt.node, HilStmt::Phi { .. }))
+            .extract_if(.., |stmt| matches!(stmt, HilStmt::Phi(_)))
             .map(|stmt| {
-                let HilStmt::Phi(PhiNode { target, operands }) = stmt.node else {
+                let HilStmt::Phi(PhiNode { target, operands }) = stmt else {
                     unreachable!();
                 };
 
@@ -394,26 +394,20 @@ impl ControlFlowGraph {
 
             // Emit the target declaration in the idom block. The structurer
             // will determine whether to make it a declaration or not.
-            self.blocks[idom].stmts.push(
-                HilStmt::Assign {
-                    left: HilExpr::Symbol(target),
-                    value: HilExpr::Nil,
-                }
-                .to_spanned(0),
-            );
+            self.blocks[idom].stmts.push(HilStmt::Assign {
+                left: HilExpr::Symbol(target),
+                value: HilExpr::Nil,
+            });
 
             // In each operand block insert the `target = operand` statement.
             for (op_block_idx, version) in operands {
                 if version == target {
                     continue;
                 }
-                self.blocks[op_block_idx].stmts.push(
-                    HilStmt::Assign {
-                        left: HilExpr::Symbol(target),
-                        value: HilExpr::Symbol(version),
-                    }
-                    .to_spanned(0),
-                );
+                self.blocks[op_block_idx].stmts.push(HilStmt::Assign {
+                    left: HilExpr::Symbol(target),
+                    value: HilExpr::Symbol(version),
+                });
             }
         }
     }
@@ -851,7 +845,7 @@ fn symbol_truthiness_in_block(block: &Block, symbol: SymbolId) -> Option<bool> {
         let HilStmt::Assign {
             left: HilExpr::Symbol(target),
             value,
-        } = &stmt.node
+        } = &stmt
         else {
             return None;
         };

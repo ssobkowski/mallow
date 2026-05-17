@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 
 use crate::{
-    common::Spanned,
     hil::{
         cflow::cfg::{Block, BlockExit, ControlFlowGraph},
         ir::{HilExpr, HilStmt},
@@ -106,7 +105,7 @@ impl Inliner {
             let HilStmt::Assign {
                 left: HilExpr::Symbol(symbol),
                 value,
-            } = &stmt.node
+            } = &stmt
             else {
                 return None;
             };
@@ -143,12 +142,12 @@ impl Inliner {
         Some((condition, inlined_symbols))
     }
 
-    fn remove_inlined_cfg_assigns(&mut self, stmts: &mut Vec<Spanned<HilStmt>>) {
+    fn remove_inlined_cfg_assigns(&mut self, stmts: &mut Vec<HilStmt>) {
         stmts.retain(|stmt| {
             if let HilStmt::Assign {
                 left: HilExpr::Symbol(sym),
                 ..
-            } = &stmt.node
+            } = stmt
                 && self.inlined_symbols.contains(sym)
             {
                 return false;

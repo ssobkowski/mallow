@@ -208,13 +208,7 @@ impl Analyzer {
         analyzer.seed_symbols(cfg.params(), cfg.upvalues());
 
         for block in cfg.blocks() {
-            analyzer.visit_block(
-                &block
-                    .stmts()
-                    .iter()
-                    .map(|stmt| stmt.node.clone())
-                    .collect::<Vec<_>>(),
-            );
+            analyzer.visit_block(block.stmts());
             analyzer.visit_cfg_exit(block.exit());
         }
 

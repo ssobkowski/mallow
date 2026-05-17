@@ -548,13 +548,7 @@ impl CfgNode {
         match self {
             CfgNode::BasicBlock { block } => RegionNode::BasicBlock {
                 // TODO: `std::mem::take` here to avoid cloning?
-                stmts: cfg
-                    .get(block)
-                    .stmts()
-                    .iter()
-                    .cloned()
-                    .map(|stmt| stmt.node)
-                    .collect(),
+                stmts: cfg.get(block).stmts().to_vec(),
             },
             CfgNode::Sequence { nodes } => {
                 // Because we now own the statements, we can flatten sequences of
@@ -1072,7 +1066,7 @@ impl<'a> FoldableGraph<'a> {
                     if let HilStmt::Assign {
                         left: HilExpr::Symbol(symbol),
                         value,
-                    } = &stmt.node
+                    } = &stmt
                     {
                         bindings.insert(*symbol, value.clone());
                     }
@@ -1096,7 +1090,7 @@ impl<'a> FoldableGraph<'a> {
         match node {
             CfgNode::BasicBlock { block } => self.cfg.get(*block).stmts().iter().all(|stmt| {
                 matches!(
-                    &stmt.node,
+                    &stmt,
                     HilStmt::Assign {
                         left: HilExpr::Symbol(_),
                         ..

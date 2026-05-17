@@ -42,7 +42,7 @@ fn build_label(idx: usize, block: &Block, is_entry: bool) -> NodeLabel {
     let mut lines: Vec<_> = block
         .stmts()
         .iter()
-        .map(|s| (format!("{}", s.node), false))
+        .map(|s| (format!("{}", s), false))
         .collect();
 
     match block.exit() {

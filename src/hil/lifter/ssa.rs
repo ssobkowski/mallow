@@ -2,12 +2,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use id_arena::{Arena, Id};
 
-use crate::{
-    common::ToSpanned as _,
-    hil::{
-        cflow::{cfg::Block, graph::GraphView},
-        ir::{HilStmt, PhiNode},
-    },
+use crate::hil::{
+    cflow::{cfg::Block, graph::GraphView},
+    ir::{HilStmt, PhiNode},
 };
 
 pub type SymbolId = Id<Symbol>;
@@ -288,7 +285,7 @@ impl<'a, G: GraphView> Ssa<'a, G> {
 
             blocks[block_idx]
                 .stmts_mut()
-                .insert(0, HilStmt::Phi(phi_node).to_spanned(0));
+                .insert(0, HilStmt::Phi(phi_node));
         }
     }
 }
