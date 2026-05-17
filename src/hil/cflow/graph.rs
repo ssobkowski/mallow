@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 /// A read-only view of a directed graph.
 pub trait GraphView {
@@ -94,10 +94,7 @@ pub trait GraphView {
         }
         idoms.remove(&self.entry());
 
-        DominatorTree {
-            entry: self.entry(),
-            idoms,
-        }
+        DominatorTree { idoms }
     }
 }
 
@@ -129,15 +126,10 @@ impl<G: GraphView + ?Sized> GraphView for &G {
 
 #[derive(Debug, Clone)]
 pub struct DominatorTree {
-    entry: usize,
     idoms: HashMap<usize, usize>,
 }
 
 impl DominatorTree {
-    pub fn entry(&self) -> usize {
-        self.entry
-    }
-
     pub fn idom(&self, node: usize) -> Option<usize> {
         self.idoms.get(&node).copied()
     }
@@ -155,35 +147,6 @@ impl DominatorTree {
                 None => return false,
             }
         }
-    }
-
-    pub fn post_order(&self) -> Vec<usize> {
-        let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        children.insert(self.entry, Vec::new());
-
-        for (&node, &idom) in &self.idoms {
-            children.entry(idom).or_default().push(node);
-            children.entry(node).or_default();
-        }
-
-        for children in children.values_mut() {
-            children.sort_unstable();
-        }
-
-        let mut order = Vec::with_capacity(children.len());
-        fn visit(node: usize, children: &BTreeMap<usize, Vec<usize>>, order: &mut Vec<usize>) {
-            if let Some(child_nodes) = children.get(&node) {
-                for &child in child_nodes {
-                    visit(child, children, order);
-                }
-            }
-
-            order.push(node);
-        }
-
-        visit(self.entry, &children, &mut order);
-
-        order
     }
 
     fn intersect(
@@ -390,7 +353,6 @@ mod tests {
         assert_eq!(graph.reverse_post_order(), vec![0, 2, 1, 3]);
 
         let idoms = graph.build_idoms();
-        assert_eq!(idoms.entry(), 0);
         assert_eq!(idoms.idom(0), None);
         assert_eq!(idoms.idom(1), Some(0));
         assert_eq!(idoms.idom(2), Some(0));
@@ -406,7 +368,6 @@ mod tests {
         assert_eq!(graph.reverse_post_order(), vec![10, 20, 30]);
 
         let idoms = graph.build_idoms();
-        assert_eq!(idoms.entry(), 10);
         assert_eq!(idoms.idom(10), None);
         assert_eq!(idoms.idom(20), Some(10));
         assert_eq!(idoms.idom(30), Some(20));
@@ -431,7 +392,6 @@ mod tests {
         );
 
         let postidoms = Reversed::new(&graph).build_idoms();
-        assert_eq!(postidoms.entry(), 40);
         assert_eq!(postidoms.idom(10), Some(40));
         assert_eq!(postidoms.idom(20), Some(40));
         assert_eq!(postidoms.idom(30), Some(40));
