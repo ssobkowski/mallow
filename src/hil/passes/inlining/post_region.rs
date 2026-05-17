@@ -375,13 +375,13 @@ impl<'a> Inliner<'a> {
                 let inlineable = match tail_reads {
                     None => {
                         self.can_inline_globally(sym, &rhs)
-                            && can_substitute_in_stmt_context(
-                                &stmts[idx],
-                                sym,
-                                &rhs,
-                                source_idx,
-                                idx,
-                            )
+                            && (can_substitute_in_stmt_context(&stmts[idx], sym, &rhs)
+                                || is_adjacent_assignment_consumer(
+                                    &stmts[idx],
+                                    sym,
+                                    source_idx,
+                                    idx,
+                                ))
                     }
                     Some(tail_reads) => {
                         self.can_inline_locally(stmts, source_idx, idx, sym, &rhs)
@@ -467,15 +467,16 @@ impl<'a> Inliner<'a> {
             if !self.can_inline_globally(sym, &rhs) {
                 continue;
             }
-            if !rhs.is_pure() && !matches!(rhs, HilExpr::Symbol(_)) {
-                continue;
-            }
-            let mut used = false;
             for stmt in next_stmts.iter_mut() {
-                used |= substitute_in_stmt(stmt, sym, &rhs);
-            }
-            if used {
-                removable.insert(source_idx);
+                if ReadCounter::new(sym).in_stmt(stmt) == 0 {
+                    continue;
+                }
+                if can_substitute_in_stmt_context(stmt, sym, &rhs)
+                    && substitute_in_stmt(stmt, sym, &rhs)
+                {
+                    removable.insert(source_idx);
+                }
+                break;
             }
         }
         self.remove_stmts(source_stmts, &removable);
@@ -715,18 +716,6 @@ impl<'a> Inliner<'a> {
         if fact.rhs.as_ref() != Some(rhs) {
             return false;
         }
-        if let HilExpr::Symbol(source) = rhs {
-            let Some(source_fact) = self.analysis.facts.get(source) else {
-                return false;
-            };
-            if self.source_rewritten_between(source_fact, fact) {
-                return false;
-            }
-            if source_fact.poisoned && self.has_effect_between(fact) {
-                return false;
-            }
-        }
-
         self.can_move_rhs(fact, rhs)
     }
 
@@ -772,22 +761,22 @@ impl<'a> Inliner<'a> {
         {
             return false;
         }
-        if let HilExpr::Symbol(source) = rhs {
-            if stmts[source_idx + 1..use_idx]
+        let rhs_reads = expr_read_symbols(rhs);
+        if rhs_reads.iter().any(|source| {
+            stmts[source_idx + 1..use_idx]
                 .iter()
                 .any(|stmt| stmt_writes_symbol(stmt, *source))
-            {
-                return false;
-            }
-            if self
-                .analysis
+        }) {
+            return false;
+        }
+        if rhs_reads.iter().any(|source| {
+            self.analysis
                 .facts
                 .get(source)
                 .is_some_and(|fact| fact.poisoned)
                 && stmts[source_idx + 1..use_idx].iter().any(stmt_has_effect)
-            {
-                return false;
-            }
+        }) {
+            return false;
         }
 
         true
@@ -827,40 +816,29 @@ impl<'a> Inliner<'a> {
     }
 
     fn can_move_rhs(&self, fact: &SymbolFacts, rhs: &HilExpr) -> bool {
-        if rhs.is_pure() {
-            return true;
+        let Some(write_pos) = fact.write_pos else {
+            return false;
+        };
+        let Some(read_pos) = fact.read_positions.iter().copied().max() else {
+            return false;
+        };
+        for source in expr_read_symbols(rhs) {
+            let Some(source_fact) = self.analysis.facts.get(&source) else {
+                return false;
+            };
+            if positions_contain_in_range(&source_fact.write_positions, write_pos + 1, read_pos) {
+                return false;
+            }
+            if source_fact.poisoned && self.has_effect_between_positions(write_pos, read_pos) {
+                return false;
+            }
         }
-        let Some(write_pos) = fact.write_pos else {
-            return false;
-        };
-        let Some(read_pos) = fact.read_positions.iter().copied().max() else {
-            return false;
-        };
-        !self.has_effect_between_positions(write_pos, read_pos)
-    }
 
-    fn has_effect_between(&self, fact: &SymbolFacts) -> bool {
-        let Some(write_pos) = fact.write_pos else {
-            return true;
-        };
-        let Some(read_pos) = fact.read_positions.iter().copied().max() else {
-            return true;
-        };
-        self.has_effect_between_positions(write_pos, read_pos)
+        rhs.is_pure() || !self.has_effect_between_positions(write_pos, read_pos)
     }
 
     fn has_effect_between_positions(&self, write_pos: usize, read_pos: usize) -> bool {
         positions_contain_in_range(&self.analysis.effect_positions, write_pos + 1, read_pos)
-    }
-
-    fn source_rewritten_between(&self, source: &SymbolFacts, target: &SymbolFacts) -> bool {
-        let Some(write_pos) = target.write_pos else {
-            return true;
-        };
-        let Some(read_pos) = target.read_positions.iter().copied().max() else {
-            return true;
-        };
-        positions_contain_in_range(&source.write_positions, write_pos + 1, read_pos)
     }
 
     fn expr_arity(&self, expr: &HilExpr) -> ReturnArity {
@@ -936,16 +914,20 @@ fn stmt_has_effect(stmt: &HilStmt) -> bool {
     }
 }
 
+fn expr_read_symbols(expr: &HilExpr) -> HashSet<SymbolId> {
+    let mut reads = RegionReadSet::default();
+    reads.visit_expr(expr);
+    reads.reads
+}
+
 fn can_substitute_in_stmt_context(
     stmt: &HilStmt,
     sym: SymbolId,
     rhs: &HilExpr,
-    source_idx: usize,
-    use_idx: usize,
 ) -> bool {
     rhs.is_pure()
         || matches!(rhs, HilExpr::Symbol(_))
-        || is_adjacent_assignment_consumer(stmt, sym, source_idx, use_idx)
+        || is_call_statement_consumer(stmt, sym, rhs)
 }
 
 fn can_substitute_in_expr_context(expr: &HilExpr, sym: SymbolId, rhs: &HilExpr) -> bool {
@@ -968,6 +950,10 @@ fn is_adjacent_assignment_consumer(
         && left.is_pure()
         && use_idx == source_idx + 1
         && can_inline_effectful_at_expr_occurrence(value, sym)
+}
+
+fn is_call_statement_consumer(stmt: &HilStmt, sym: SymbolId, rhs: &HilExpr) -> bool {
+    matches!(stmt, HilStmt::Call(expr) if can_substitute_in_expr_context(expr, sym, rhs))
 }
 
 fn can_inline_effectful_at_expr_occurrence(expr: &HilExpr, sym: SymbolId) -> bool {

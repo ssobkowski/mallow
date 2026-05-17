@@ -393,27 +393,36 @@ fn substitute_available_expr(
 }
 
 fn kill_lvalues(stmt: &HilStmt, available: &mut HashMap<SymbolId, HilExpr>) {
-    // A write invalidates only the block-local availability map. The global
-    // single-write/single-read safety gate still comes from `SymbolFacts`.
+    let written = written_symbols(stmt);
+    if written.is_empty() {
+        return;
+    }
+
+    // Available expressions capture the value of every symbol they read at the
+    // assignment point. Any later write to one of those inputs invalidates the
+    // expression, even when the expression itself is pure.
+    available.retain(|sym, replacement| {
+        !written.contains(sym) && !written.iter().any(|written| replacement.reads_symbol(written))
+    });
+}
+
+fn written_symbols(stmt: &HilStmt) -> Vec<SymbolId> {
     match stmt {
         HilStmt::Assign {
             left: HilExpr::Symbol(sym),
             ..
-        } => {
-            available.remove(sym);
-        }
-        HilStmt::Assign { .. } => {}
+        } => vec![*sym],
+        HilStmt::Assign { .. } => Vec::new(),
         HilStmt::AssignMany { left, .. } => {
-            for lvalue in left {
-                if let HilExpr::Symbol(sym) = lvalue {
-                    available.remove(sym);
-                }
-            }
+            left.iter()
+                .filter_map(|lvalue| match lvalue {
+                    HilExpr::Symbol(sym) => Some(*sym),
+                    _ => None,
+                })
+                .collect()
         }
-        HilStmt::SetList { table, .. } => {
-            available.remove(table);
-        }
-        HilStmt::Call(_) => {}
+        HilStmt::SetList { table, .. } => vec![*table],
+        HilStmt::Call(_) => Vec::new(),
         HilStmt::Phi(_) => {
             unreachable!("phi nodes should have been unfolded at this point")
         }
