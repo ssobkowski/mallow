@@ -193,9 +193,13 @@ impl Emitter {
             .map(|u| self.get_symbol_name(u).0)
             .collect::<Vec<_>>()
             .join(", ");
-        let mut block = Block::with_stmts(vec![Stmt::Comment {
-            text: format!("proto {}: upvalues = [{}]", proto_idx, upvalue_str),
-        }]);
+        let mut block = if self.entry != proto_idx {
+            Block::with_stmts(vec![Stmt::Comment {
+                text: format!("proto {}: upvalues = [{}]", proto_idx, upvalue_str),
+            }])
+        } else {
+            Block::with_stmts(Vec::new())
+        };
         block.stmts.extend(self.visit_region(&fun.root).stmts);
         for (idx, anomaly) in self.contexts[self.current_ctx].anomalies.iter().enumerate() {
             block.stmts.insert(
