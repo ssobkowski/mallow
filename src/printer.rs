@@ -605,7 +605,7 @@ fn long_string_level(s: &str) -> Option<usize> {
 /// Returns `true` when emitting `s` as a Lua long string would produce
 /// cleaner output than a quoted string with escape sequences.
 fn should_use_long_string(s: &str) -> bool {
-    if s.contains('\r') || s.contains('\0') {
+    if s.contains('\r') || s.contains('\0') || s == "\n" || s == "\t" {
         return false;
     }
     let has_newlines = s.contains('\n');
