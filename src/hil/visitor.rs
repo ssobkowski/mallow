@@ -7,6 +7,7 @@ use crate::hil::{
     lifter::ssa::SymbolId,
 };
 
+#[allow(dead_code, reason = "might be used in the future")]
 pub trait Visitor {
     fn visit_function(&mut self, fun: &StructuredFunction) {
         walk_function(self, fun);
@@ -53,6 +54,7 @@ pub trait Visitor {
     fn visit_import(&mut self, _path: &str) {}
 }
 
+#[allow(dead_code, reason = "might be used in the future")]
 pub trait VisitorMut {
     fn visit_function(&mut self, fun: &mut StructuredFunction) {
         walk_function_mut(self, fun);
@@ -124,9 +126,13 @@ pub fn walk_region<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode) {
                 visitor.visit_region(else_branch);
             }
         }
-        RegionNode::While { condition, body } | RegionNode::RepeatUntil { condition, body } => {
+        RegionNode::While { condition, body } => {
             visitor.visit_expr(condition);
             visitor.visit_region(body);
+        }
+        RegionNode::RepeatUntil { condition, body } => {
+            visitor.visit_region(body);
+            visitor.visit_expr(condition);
         }
         RegionNode::NumericFor {
             body,
@@ -289,9 +295,13 @@ pub fn walk_region_mut<V: VisitorMut + ?Sized>(visitor: &mut V, node: &mut Regio
                 visitor.visit_region(else_branch);
             }
         }
-        RegionNode::While { condition, body } | RegionNode::RepeatUntil { condition, body } => {
+        RegionNode::While { condition, body } => {
             visitor.visit_expr(condition);
             visitor.visit_region(body);
+        }
+        RegionNode::RepeatUntil { condition, body } => {
+            visitor.visit_region(body);
+            visitor.visit_expr(condition);
         }
         RegionNode::NumericFor {
             body,

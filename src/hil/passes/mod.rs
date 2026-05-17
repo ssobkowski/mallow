@@ -20,7 +20,7 @@ pub fn run(fns: &mut [StructuredFunction]) {
 
     for fun in fns {
         loop {
-            let mut changed = inlining::run(fun, &return_arities);
+            let mut changed = inlining::run_post_region(fun, &return_arities);
             changed |= tuple_assign::run(fun);
             changed |= fold_tables::run(fun);
             changed |= short_circuit::run(fun);
