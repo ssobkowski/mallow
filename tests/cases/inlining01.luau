@@ -139,6 +139,22 @@ local function noinline_tuple_assign()
     return a, b
 end
 
+local function noinline_loop_condition()
+    local counter = 0
+    local function side_effect()
+        counter += 1
+        return true
+    end
+
+    local i = 0
+    local x = side_effect()
+    while x and i < 3 do
+        i += 1
+    end
+
+    return counter
+end
+
 print(noinline_eval_order())
 print(noinline_duplicate_exec())
 print(noinline_nested_call())
@@ -154,3 +170,4 @@ print(may_inline_ipairs())
 print(noinline_many_reads())
 print(noinline_cond_jump())
 print(noinline_tuple_assign())
+print(noinline_loop_condition())

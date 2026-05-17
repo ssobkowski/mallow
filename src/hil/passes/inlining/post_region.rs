@@ -5,7 +5,7 @@ use smallvec::{SmallVec, smallvec};
 use crate::hil::{
     ReturnArity, StructuredFunction,
     cflow::region::RegionNode,
-    ir::{HilExpr, HilStmt},
+    ir::{HilExpr, HilStmt, HilTableItem, PhiNode},
     lifter::ssa::SymbolId,
     passes::return_arity::luau_global_arity,
     visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut},
@@ -179,8 +179,8 @@ impl Visitor for Analyzer {
     }
 
     fn visit_expr(&mut self, expr: &HilExpr) {
-        let pos = self.alloc_pos();
         if let HilExpr::Symbol(sym) = expr {
+            let pos = self.alloc_pos();
             self.facts.entry(*sym).or_default().note_read(pos);
             return;
         }
@@ -245,32 +245,40 @@ impl<'a> Inliner<'a> {
         }
     }
 
-    fn inline_block(&mut self, stmts: &mut Vec<HilStmt>) {
+    fn inline_block_inner(&mut self, stmts: &mut Vec<HilStmt>, tail: Option<&[RegionNode]>) {
         let mut removable = HashSet::new();
-        let mut idx = 0usize;
+        let mut idx = 0;
         while idx < stmts.len() {
             for source_idx in 0..idx {
                 if removable.contains(&source_idx) {
                     continue;
                 }
                 let Some((sym, rhs)) =
-                    plain_assignment(&stmts[source_idx]).map(|(sym, rhs)| (sym, rhs.clone()))
+                    plain_assignment(&stmts[source_idx]).map(|(s, r)| (s, r.clone()))
                 else {
                     continue;
                 };
-                if !self.can_inline_plain(sym, &rhs) {
-                    continue;
-                }
-                if !can_substitute_in_stmt_context(&stmts[idx], sym, &rhs, source_idx, idx) {
-                    continue;
-                }
-                if stmts[idx + 1..]
-                    .iter()
-                    .any(|stmt| stmt_mentions_symbol(stmt, sym))
-                {
-                    continue;
-                }
-                if substitute_stmt_rvalues(&mut stmts[idx], sym, &rhs) {
+
+                let inlineable = match tail {
+                    None => {
+                        self.can_inline_globally(sym, &rhs)
+                            && can_substitute_in_stmt_context(
+                                &stmts[idx],
+                                sym,
+                                &rhs,
+                                source_idx,
+                                idx,
+                            )
+                    }
+                    Some(tail) => {
+                        self.can_inline_locally(stmts, source_idx, idx, sym, &rhs)
+                            && !tail
+                                .iter()
+                                .any(|node| ReadCounter::new(sym).in_region(node) > 0)
+                    }
+                };
+
+                if inlineable && substitute_in_stmt(&mut stmts[idx], sym, &rhs) {
                     removable.insert(source_idx);
                 }
             }
@@ -279,32 +287,12 @@ impl<'a> Inliner<'a> {
         self.remove_stmts(stmts, &removable);
     }
 
+    fn inline_block(&mut self, stmts: &mut Vec<HilStmt>) {
+        self.inline_block_inner(stmts, None);
+    }
+
     fn inline_block_with_tail(&mut self, stmts: &mut Vec<HilStmt>, tail: &[RegionNode]) {
-        let mut removable = HashSet::new();
-        let mut idx = 0usize;
-        while idx < stmts.len() {
-            for source_idx in 0..idx {
-                if removable.contains(&source_idx) {
-                    continue;
-                }
-                let Some((sym, rhs)) =
-                    plain_assignment(&stmts[source_idx]).map(|(sym, rhs)| (sym, rhs.clone()))
-                else {
-                    continue;
-                };
-                if !self.can_inline_plain_in_block(stmts, source_idx, idx, sym, &rhs) {
-                    continue;
-                }
-                if tail.iter().any(|node| region_mentions_symbol(node, sym)) {
-                    continue;
-                }
-                if substitute_stmt_rvalues(&mut stmts[idx], sym, &rhs) {
-                    removable.insert(source_idx);
-                }
-            }
-            idx += 1;
-        }
-        self.remove_stmts(stmts, &removable);
+        self.inline_block_inner(stmts, Some(tail));
     }
 
     fn inline_sequence_edges(&mut self, nodes: &mut [RegionNode]) {
@@ -326,9 +314,7 @@ impl<'a> Inliner<'a> {
                     self.inline_next_block(stmts, next_stmts);
                 }
                 RegionNode::Return { values } => self.inline_return(stmts, values),
-                RegionNode::If { condition, .. }
-                | RegionNode::While { condition, .. }
-                | RegionNode::RepeatUntil { condition, .. } => {
+                RegionNode::If { condition, .. } => {
                     self.inline_expr_from_block(stmts, condition);
                 }
                 RegionNode::GenericFor { exprs, .. } => self.inline_generic_for(stmts, exprs),
@@ -351,7 +337,7 @@ impl<'a> Inliner<'a> {
             else {
                 continue;
             };
-            if !self.can_inline_plain(sym, &rhs) {
+            if !self.can_inline_globally(sym, &rhs) {
                 continue;
             }
             if !rhs.is_pure() && !matches!(rhs, HilExpr::Symbol(_)) {
@@ -359,7 +345,7 @@ impl<'a> Inliner<'a> {
             }
             let mut used = false;
             for stmt in next_stmts.iter_mut() {
-                used |= substitute_stmt_rvalues(stmt, sym, &rhs);
+                used |= substitute_in_stmt(stmt, sym, &rhs);
             }
             if used {
                 removable.insert(source_idx);
@@ -391,7 +377,7 @@ impl<'a> Inliner<'a> {
             let Some((idx, rhs)) = self.find_plain_source(stmts, *sym) else {
                 continue;
             };
-            if self.can_inline_plain(*sym, &rhs) {
+            if self.can_inline_globally(*sym, &rhs) {
                 *value = rhs;
                 removable.insert(idx);
             }
@@ -410,7 +396,7 @@ impl<'a> Inliner<'a> {
             else {
                 continue;
             };
-            if !self.can_inline_plain(sym, &rhs) {
+            if !self.can_inline_globally(sym, &rhs) {
                 continue;
             }
             if !can_substitute_in_expr_context(expr, sym, &rhs) {
@@ -509,7 +495,7 @@ impl<'a> Inliner<'a> {
             let Some((idx, rhs)) = self.find_plain_source(stmts, *sym) else {
                 continue;
             };
-            if self.can_inline_plain(*sym, &rhs) {
+            if self.can_inline_globally(*sym, &rhs) {
                 *expr = rhs;
                 removable.insert(idx);
             }
@@ -534,7 +520,7 @@ impl<'a> Inliner<'a> {
             let Some((idx, rhs)) = self.find_plain_source(stmts, *sym) else {
                 continue;
             };
-            if self.can_inline_plain(*sym, &rhs) {
+            if self.can_inline_globally(*sym, &rhs) {
                 *bound = rhs;
                 removable.insert(idx);
             }
@@ -571,17 +557,21 @@ impl<'a> Inliner<'a> {
                     })
                     .collect();
                 if source_targets == targets {
+                    let Some(write_pos) = self
+                        .analysis
+                        .facts
+                        .get(&targets[0])
+                        .and_then(|fact| fact.write_pos)
+                    else {
+                        return None;
+                    };
+
                     Some((
                         idx,
                         TupleSource {
                             targets: source_targets,
                             value: value.clone(),
-                            write_pos: self
-                                .analysis
-                                .facts
-                                .get(&targets[0])
-                                .and_then(|fact| fact.write_pos)
-                                .unwrap_or(0),
+                            write_pos,
                         },
                     ))
                 } else {
@@ -592,7 +582,7 @@ impl<'a> Inliner<'a> {
         })
     }
 
-    fn can_inline_plain(&self, sym: SymbolId, rhs: &HilExpr) -> bool {
+    fn can_inline_globally(&self, sym: SymbolId, rhs: &HilExpr) -> bool {
         let Some(fact) = self.analysis.facts.get(&sym) else {
             return false;
         };
@@ -617,7 +607,7 @@ impl<'a> Inliner<'a> {
         self.can_move_rhs(fact, rhs)
     }
 
-    fn can_inline_plain_in_block(
+    fn can_inline_locally(
         &self,
         stmts: &[HilStmt],
         source_idx: usize,
@@ -625,7 +615,15 @@ impl<'a> Inliner<'a> {
         sym: SymbolId,
         rhs: &HilExpr,
     ) -> bool {
-        if rhs.reads_symbol(&sym) || !matches_symbol_assignment(&stmts[source_idx], sym, rhs) {
+        if rhs.reads_symbol(&sym)
+            || !matches!(
+                &stmts[source_idx],
+                HilStmt::Assign {
+                    left: HilExpr::Symbol(target),
+                    value,
+                } if *target == sym && value == rhs
+            )
+        {
             return false;
         }
         if let Some(fact) = self.analysis.facts.get(&sym) {
@@ -635,13 +633,13 @@ impl<'a> Inliner<'a> {
         }
         if stmts[source_idx + 1..use_idx]
             .iter()
-            .any(|stmt| stmt_mentions_symbol(stmt, sym))
+            .any(|stmt| ReadCounter::new(sym).in_stmt(stmt) > 0)
         {
             return false;
         }
         if stmts[use_idx + 1..]
             .iter()
-            .any(|stmt| stmt_mentions_symbol(stmt, sym))
+            .any(|stmt| ReadCounter::new(sym).in_stmt(stmt) > 0)
         {
             return false;
         }
@@ -798,20 +796,12 @@ fn plain_assignment(stmt: &HilStmt) -> Option<(SymbolId, &HilExpr)> {
     }
 }
 
-fn matches_symbol_assignment(stmt: &HilStmt, sym: SymbolId, rhs: &HilExpr) -> bool {
-    matches!(
-        stmt,
-        HilStmt::Assign {
-            left: HilExpr::Symbol(target),
-            value,
-        } if *target == sym && value == rhs
-    )
-}
-
 fn stmt_writes_symbol(stmt: &HilStmt, sym: SymbolId) -> bool {
     match stmt {
-        HilStmt::Assign { left, .. } => lvalue_writes_symbol(left, sym),
-        HilStmt::AssignMany { left, .. } => left.iter().any(|left| lvalue_writes_symbol(left, sym)),
+        HilStmt::Assign { left, .. } => matches!(left, HilExpr::Symbol(target) if *target == sym),
+        HilStmt::AssignMany { left, .. } => left
+            .iter()
+            .any(|left| matches!(left, HilExpr::Symbol(target) if *target == sym)),
         HilStmt::SetList { table, .. } => *table == sym,
         HilStmt::Call(_) => false,
         HilStmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
@@ -825,24 +815,6 @@ fn stmt_has_effect(stmt: &HilStmt) -> bool {
             left.iter().any(|left| !left.is_pure()) || !value.is_pure()
         }
         HilStmt::SetList { .. } | HilStmt::Call(_) => true,
-        HilStmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
-    }
-}
-
-fn lvalue_writes_symbol(expr: &HilExpr, sym: SymbolId) -> bool {
-    matches!(expr, HilExpr::Symbol(target) if *target == sym)
-}
-
-fn stmt_mentions_symbol(stmt: &HilStmt, sym: SymbolId) -> bool {
-    match stmt {
-        HilStmt::Assign { left, value } => left.reads_symbol(&sym) || value.reads_symbol(&sym),
-        HilStmt::AssignMany { left, value } => {
-            left.iter().any(|left| left.reads_symbol(&sym)) || value.reads_symbol(&sym)
-        }
-        HilStmt::SetList { table, values, .. } => {
-            *table == sym || values.iter().any(|value| value.reads_symbol(&sym))
-        }
-        HilStmt::Call(expr) => expr.reads_symbol(&sym),
         HilStmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
     }
 }
@@ -882,7 +854,7 @@ fn is_adjacent_assignment_consumer(
 }
 
 fn can_inline_effectful_at_expr_occurrence(expr: &HilExpr, sym: SymbolId) -> bool {
-    expr_read_count(expr, sym) == 1 && occurrence_has_no_prior_effect(expr, sym)
+    ReadCounter::new(sym).in_expr(expr) == 1 && occurrence_has_no_prior_effect(expr, sym)
 }
 
 fn occurrence_has_no_prior_effect(expr: &HilExpr, sym: SymbolId) -> bool {
@@ -949,8 +921,8 @@ fn occurrence_has_no_prior_effect(expr: &HilExpr, sym: SymbolId) -> bool {
         }
         HilExpr::Table { items } => {
             let Some(idx) = items.iter().position(|item| match item {
-                crate::hil::ir::HilTableItem::List(expr) => expr.reads_symbol(&sym),
-                crate::hil::ir::HilTableItem::Index(key, value) => {
+                HilTableItem::List(expr) => expr.reads_symbol(&sym),
+                HilTableItem::Index(key, value) => {
                     key.reads_symbol(&sym) || value.reads_symbol(&sym)
                 }
             }) else {
@@ -958,13 +930,11 @@ fn occurrence_has_no_prior_effect(expr: &HilExpr, sym: SymbolId) -> bool {
             };
 
             items[..idx].iter().all(|item| match item {
-                crate::hil::ir::HilTableItem::List(expr) => expr.is_pure(),
-                crate::hil::ir::HilTableItem::Index(key, value) => key.is_pure() && value.is_pure(),
+                HilTableItem::List(expr) => expr.is_pure(),
+                HilTableItem::Index(key, value) => key.is_pure() && value.is_pure(),
             }) && match &items[idx] {
-                crate::hil::ir::HilTableItem::List(expr) => {
-                    occurrence_has_no_prior_effect(expr, sym)
-                }
-                crate::hil::ir::HilTableItem::Index(key, value) => {
+                HilTableItem::List(expr) => occurrence_has_no_prior_effect(expr, sym),
+                HilTableItem::Index(key, value) => {
                     if key.reads_symbol(&sym) {
                         occurrence_has_no_prior_effect(key, sym)
                     } else {
@@ -984,132 +954,56 @@ fn occurrence_has_no_prior_effect(expr: &HilExpr, sym: SymbolId) -> bool {
     }
 }
 
-fn expr_read_count(expr: &HilExpr, sym: SymbolId) -> usize {
-    match expr {
-        HilExpr::Symbol(target) => usize::from(*target == sym),
-        HilExpr::GetField { obj, .. } => expr_read_count(obj, sym),
-        HilExpr::GetIndex { obj, index } => expr_read_count(obj, sym) + expr_read_count(index, sym),
-        HilExpr::Call { fun, args } => {
-            expr_read_count(fun, sym)
-                + args
-                    .iter()
-                    .map(|arg| expr_read_count(arg, sym))
-                    .sum::<usize>()
-        }
-        HilExpr::MethodCall { object, args, .. } => {
-            expr_read_count(object, sym)
-                + args
-                    .iter()
-                    .map(|arg| expr_read_count(arg, sym))
-                    .sum::<usize>()
-        }
-        HilExpr::Binary { lhs, rhs, .. } => expr_read_count(lhs, sym) + expr_read_count(rhs, sym),
-        HilExpr::Unary { expr, .. } => expr_read_count(expr, sym),
-        HilExpr::IfElse {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            expr_read_count(condition, sym)
-                + expr_read_count(then_expr, sym)
-                + expr_read_count(else_expr, sym)
-        }
-        HilExpr::Table { items } => items
-            .iter()
-            .map(|item| match item {
-                crate::hil::ir::HilTableItem::List(expr) => expr_read_count(expr, sym),
-                crate::hil::ir::HilTableItem::Index(key, value) => {
-                    expr_read_count(key, sym) + expr_read_count(value, sym)
-                }
-            })
-            .sum(),
-        HilExpr::Nil
-        | HilExpr::Number(_)
-        | HilExpr::String(_)
-        | HilExpr::Bool(_)
-        | HilExpr::Closure { .. }
-        | HilExpr::Global(_)
-        | HilExpr::Import(_)
-        | HilExpr::VarArgs => 0,
+struct ReadCounter {
+    sym: SymbolId,
+    counter: usize,
+}
+
+impl ReadCounter {
+    fn new(sym: SymbolId) -> Self {
+        Self { sym, counter: 0 }
+    }
+
+    fn in_expr(mut self, expr: &HilExpr) -> usize {
+        self.visit_expr(expr);
+        self.counter
+    }
+
+    fn in_stmt(mut self, stmt: &HilStmt) -> usize {
+        self.visit_stmt(stmt);
+        self.counter
+    }
+
+    fn in_region(mut self, region: &RegionNode) -> usize {
+        self.visit_region(region);
+        self.counter
     }
 }
 
-fn region_mentions_symbol(region: &RegionNode, sym: SymbolId) -> bool {
-    match region {
-        RegionNode::BasicBlock { stmts } => {
-            stmts.iter().any(|stmt| stmt_mentions_symbol(stmt, sym))
+impl Visitor for ReadCounter {
+    fn visit_expr(&mut self, expr: &HilExpr) {
+        if let HilExpr::Symbol(sym) = expr
+            && *sym == self.sym
+        {
+            self.counter += 1;
+            return;
         }
-        RegionNode::Sequence { nodes } => {
-            nodes.iter().any(|node| region_mentions_symbol(node, sym))
-        }
-        RegionNode::If {
-            condition,
-            then_branch,
-            else_branch,
-        } => {
-            condition.reads_symbol(&sym)
-                || region_mentions_symbol(then_branch, sym)
-                || else_branch
-                    .as_deref()
-                    .is_some_and(|branch| region_mentions_symbol(branch, sym))
-        }
-        RegionNode::While { condition, body } | RegionNode::RepeatUntil { condition, body } => {
-            condition.reads_symbol(&sym) || region_mentions_symbol(body, sym)
-        }
-        RegionNode::NumericFor {
-            var,
-            start,
-            end,
-            step,
-            body,
-        } => {
-            *var == sym
-                || start.reads_symbol(&sym)
-                || end.reads_symbol(&sym)
-                || step.reads_symbol(&sym)
-                || region_mentions_symbol(body, sym)
-        }
-        RegionNode::GenericFor { vars, exprs, body } => {
-            vars.iter().any(|var| *var == sym)
-                || exprs.iter().any(|expr| expr.reads_symbol(&sym))
-                || region_mentions_symbol(body, sym)
-        }
-        RegionNode::Return { values } => values.iter().any(|value| value.reads_symbol(&sym)),
-        RegionNode::Continue | RegionNode::Break => false,
+
+        walk_expr(self, expr);
+    }
+
+    fn visit_phi(&mut self, _: &PhiNode) {
+        unreachable!("phi nodes should have been unfolded at this point")
     }
 }
 
-fn substitute_stmt_rvalues(stmt: &mut HilStmt, sym: SymbolId, replacement: &HilExpr) -> bool {
+fn substitute_in_stmt(stmt: &mut HilStmt, sym: SymbolId, replacement: &HilExpr) -> bool {
     let mut substituter = SymbolSubstituter {
         sym,
         replacement,
         changed: false,
     };
-    match stmt {
-        HilStmt::Assign { left, value } => {
-            match left {
-                HilExpr::Symbol(_) => {}
-                other => substituter.visit_expr(other),
-            }
-            substituter.visit_expr(value);
-        }
-        HilStmt::AssignMany { left, value } => {
-            for lvalue in left {
-                match lvalue {
-                    HilExpr::Symbol(_) => {}
-                    other => substituter.visit_expr(other),
-                }
-            }
-            substituter.visit_expr(value);
-        }
-        HilStmt::SetList { values, .. } => {
-            for value in values {
-                substituter.visit_expr(value);
-            }
-        }
-        HilStmt::Call(expr) => substituter.visit_expr(expr),
-        HilStmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
-    }
+    substituter.visit_stmt(stmt);
     substituter.changed
 }
 
@@ -1120,6 +1014,10 @@ struct SymbolSubstituter<'a> {
 }
 
 impl VisitorMut for SymbolSubstituter<'_> {
+    fn visit_phi(&mut self, _: &mut PhiNode) {
+        unreachable!("phi nodes should have been unfolded at this point")
+    }
+
     fn visit_expr(&mut self, expr: &mut HilExpr) {
         if let HilExpr::Symbol(sym) = expr
             && *sym == self.sym
