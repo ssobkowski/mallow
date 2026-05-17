@@ -2,12 +2,16 @@
 //!
 //! 1. If the *then* branch is empty and the *else* branch is not, swap the branches and invert the condition.
 //! 2. Canonicalize binary comparison expressions of the form `[literal] op [expr]` to `[expr] op [literal]`.
+//! 3. Simplify pattern `not (a == b)` into `a ~= b`.
 
-use crate::hil::{
-    StructuredFunction,
-    cflow::region::RegionNode,
-    ir::HilExpr,
-    visitor::{VisitorMut, walk_region_mut},
+use crate::{
+    ast::{BinOp, UnOp},
+    hil::{
+        StructuredFunction,
+        cflow::region::RegionNode,
+        ir::HilExpr,
+        visitor::{VisitorMut, walk_region_mut},
+    },
 };
 
 #[derive(Default)]
@@ -41,6 +45,26 @@ impl VisitorMut for Normalizer {
         {
             *op = flipped;
             std::mem::swap(lhs, rhs);
+            self.changed = true;
+        }
+
+        if let HilExpr::Unary {
+            op: un_op,
+            expr: inner,
+        } = expr
+            && *un_op == UnOp::Not
+            && let HilExpr::Binary {
+                op: bin_op,
+                lhs,
+                rhs,
+            } = inner.as_mut()
+            && *bin_op == BinOp::Eq
+        {
+            *expr = HilExpr::Binary {
+                lhs: Box::new(lhs.as_ref().clone()),
+                op: BinOp::Ne,
+                rhs: Box::new(rhs.as_ref().clone()),
+            };
             self.changed = true;
         }
     }
