@@ -619,14 +619,13 @@ impl Emitter {
                         unreachable!("non-symbol lvalues are never declarations");
                     };
 
-                    if named_closure {
-                        if let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
+                    if named_closure
+                        && let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
                             && let Expr::AnonymousFunction { params, body } = right
                         {
                             buf.push(Stmt::LocalFunction { name, params, body });
                             return;
                         }
-                    }
 
                     match self
                         .symbol_storage(*sym)

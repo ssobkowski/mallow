@@ -767,7 +767,7 @@ fn compute_live_in_registers<G: GraphView>(
                 defs: &mut block_defs[block_idx],
                 seen_defs: &mut seen_defs,
             }
-            .visit_stmt(&stmt);
+            .visit_stmt(stmt);
         }
 
         collect_exit_reg_uses(&block.exit, &reg_of, &mut block_uses[block_idx], &seen_defs);

@@ -317,9 +317,9 @@ impl LoopForest {
 
                 let mut body = HashSet::new();
                 let mut latches = HashSet::new();
-                for id in root_ids.iter().copied() {
-                    body.extend(loops[&id].body.iter().copied());
-                    latches.extend(loops[&id].latches.iter().copied());
+                for id in root_ids.iter() {
+                    body.extend(loops[id].body.iter().copied());
+                    latches.extend(loops[id].latches.iter().copied());
                 }
 
                 Some((header, representative, root_ids, body, latches))

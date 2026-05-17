@@ -429,12 +429,11 @@ impl AstPrinter {
                 self.write(&rendered);
             }
             Literal::String(value) => {
-                if should_use_long_string(value) {
-                    if let Some(level) = long_string_level(value) {
+                if should_use_long_string(value)
+                    && let Some(level) = long_string_level(value) {
                         self.write_long_string(value, level);
                         return;
                     }
-                }
                 self.write("\"");
                 self.write(&escape_string(value));
                 self.write("\"");

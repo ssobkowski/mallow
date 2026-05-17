@@ -456,12 +456,11 @@ impl<'a> Inliner<'a> {
 
     fn inline_next_block(&mut self, source_stmts: &mut Vec<HilStmt>, next_stmts: &mut [HilStmt]) {
         let mut removable = HashSet::new();
-        for source_idx in 0..source_stmts.len() {
+        for (source_idx, stmt) in source_stmts.iter().enumerate() {
             if removable.contains(&source_idx) {
                 continue;
             }
-            let Some((sym, rhs)) =
-                plain_assignment(&source_stmts[source_idx]).map(|(sym, rhs)| (sym, rhs.clone()))
+            let Some((sym, rhs)) = plain_assignment(stmt).map(|(sym, rhs)| (sym, rhs.clone()))
             else {
                 continue;
             };
@@ -515,12 +514,11 @@ impl<'a> Inliner<'a> {
 
     fn inline_expr_from_block(&mut self, stmts: &mut Vec<HilStmt>, expr: &mut HilExpr) {
         let mut removable = HashSet::new();
-        for source_idx in 0..stmts.len() {
+        for (source_idx, stmt) in stmts.iter().enumerate() {
             if removable.contains(&source_idx) {
                 continue;
             }
-            let Some((sym, rhs)) =
-                plain_assignment(&stmts[source_idx]).map(|(sym, rhs)| (sym, rhs.clone()))
+            let Some((sym, rhs)) = plain_assignment(stmt).map(|(sym, rhs)| (sym, rhs.clone()))
             else {
                 continue;
             };
@@ -685,14 +683,11 @@ impl<'a> Inliner<'a> {
                     })
                     .collect();
                 if source_targets == targets {
-                    let Some(write_pos) = self
+                    let write_pos = self
                         .analysis
                         .facts
                         .get(&targets[0])
-                        .and_then(|fact| fact.write_pos)
-                    else {
-                        return None;
-                    };
+                        .and_then(|fact| fact.write_pos)?;
 
                     Some((
                         idx,
@@ -754,10 +749,10 @@ impl<'a> Inliner<'a> {
         {
             return false;
         }
-        if let Some(fact) = self.analysis.facts.get(&sym) {
-            if fact.poisoned || fact.writes != 1 {
-                return false;
-            }
+        if let Some(fact) = self.analysis.facts.get(&sym)
+            && (fact.poisoned || fact.writes != 1)
+        {
+            return false;
         }
         if stmts[source_idx + 1..use_idx]
             .iter()
