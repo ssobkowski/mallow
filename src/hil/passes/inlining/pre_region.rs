@@ -402,7 +402,10 @@ fn kill_lvalues(stmt: &HilStmt, available: &mut HashMap<SymbolId, HilExpr>) {
     // assignment point. Any later write to one of those inputs invalidates the
     // expression, even when the expression itself is pure.
     available.retain(|sym, replacement| {
-        !written.contains(sym) && !written.iter().any(|written| replacement.reads_symbol(written))
+        !written.contains(sym)
+            && !written
+                .iter()
+                .any(|written| replacement.reads_symbol(written))
     });
 }
 
@@ -413,14 +416,13 @@ fn written_symbols(stmt: &HilStmt) -> Vec<SymbolId> {
             ..
         } => vec![*sym],
         HilStmt::Assign { .. } => Vec::new(),
-        HilStmt::AssignMany { left, .. } => {
-            left.iter()
-                .filter_map(|lvalue| match lvalue {
-                    HilExpr::Symbol(sym) => Some(*sym),
-                    _ => None,
-                })
-                .collect()
-        }
+        HilStmt::AssignMany { left, .. } => left
+            .iter()
+            .filter_map(|lvalue| match lvalue {
+                HilExpr::Symbol(sym) => Some(*sym),
+                _ => None,
+            })
+            .collect(),
         HilStmt::SetList { table, .. } => vec![*table],
         HilStmt::Call(_) => Vec::new(),
         HilStmt::Phi(_) => {

@@ -920,14 +920,8 @@ fn expr_read_symbols(expr: &HilExpr) -> HashSet<SymbolId> {
     reads.reads
 }
 
-fn can_substitute_in_stmt_context(
-    stmt: &HilStmt,
-    sym: SymbolId,
-    rhs: &HilExpr,
-) -> bool {
-    rhs.is_pure()
-        || matches!(rhs, HilExpr::Symbol(_))
-        || is_call_statement_consumer(stmt, sym, rhs)
+fn can_substitute_in_stmt_context(stmt: &HilStmt, sym: SymbolId, rhs: &HilExpr) -> bool {
+    rhs.is_pure() || matches!(rhs, HilExpr::Symbol(_)) || is_call_statement_consumer(stmt, sym, rhs)
 }
 
 fn can_substitute_in_expr_context(expr: &HilExpr, sym: SymbolId, rhs: &HilExpr) -> bool {
