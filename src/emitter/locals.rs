@@ -1,0 +1,380 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::{
+    emitter::collectors::ReadCollector,
+    hil::{
+        StructuredFunction,
+        cflow::region::RegionNode,
+        ir::{HilExpr, HilStmt},
+        lifter::ssa::SymbolId,
+        visitor::{Visitor, walk_expr},
+    },
+};
+
+#[derive(Default)]
+pub struct LocalPlan {
+    /// Final emitted slot for each HIL symbol known to this function.
+    slots: HashMap<SymbolId, usize>,
+    /// Number of source-local slots reserved by this plan.
+    slot_count: usize,
+}
+
+impl LocalPlan {
+    pub fn build(fun: &StructuredFunction) -> Self {
+        let mut analysis = LifetimeAnalysis::new(fun);
+        analysis.visit_region(&fun.root);
+        if is_straight_line_region(&fun.root) {
+            analysis.allocate()
+        } else {
+            analysis.allocate_without_reuse()
+        }
+    }
+
+    pub fn slot(&self, sym: SymbolId) -> Option<usize> {
+        self.slots.get(&sym).copied()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slot_count
+    }
+}
+
+#[derive(Default)]
+struct Event {
+    /// Symbols assigned by this event. Reads are kept in `last_read`; writes are
+    /// needed separately so a symbol is not released before its own assignment.
+    writes: HashSet<SymbolId>,
+}
+
+struct LifetimeAnalysis {
+    /// Linearized source events for the final HIL tree.
+    events: Vec<Event>,
+    /// Symbols that must keep stable slots because source semantics observe
+    /// their identity: params, upvalues, loop vars, and closure captures.
+    pinned: HashSet<SymbolId>,
+    /// Last event index where each symbol is read.
+    last_read: HashMap<SymbolId, usize>,
+    /// All symbols seen by the planner, including write-only symbols.
+    mentioned: HashSet<SymbolId>,
+}
+
+impl LifetimeAnalysis {
+    fn new(fun: &StructuredFunction) -> Self {
+        let mut pinned = HashSet::new();
+        pinned.extend(fun.params.iter().copied());
+        pinned.extend(fun.upvalues.iter().copied());
+
+        Self {
+            events: Vec::new(),
+            pinned,
+            last_read: HashMap::new(),
+            mentioned: HashSet::new(),
+        }
+    }
+
+    fn allocate(self) -> LocalPlan {
+        let mut allocation = SlotAllocator::default();
+
+        let mut pinned: Vec<_> = self.pinned.iter().copied().collect();
+        pinned.sort_by_key(|sym| sym.index());
+        for sym in pinned {
+            allocation.allocate_pinned(sym);
+        }
+
+        for (event_idx, event) in self.events.iter().enumerate() {
+            allocation.release_dead(event_idx, &self.last_read, &self.pinned);
+            allocation.release_after_reads(event_idx, &event.writes, &self.last_read, &self.pinned);
+
+            for &sym in &event.writes {
+                if allocation.has_slot(sym) {
+                    continue;
+                }
+                allocation.allocate(sym, &self.pinned);
+            }
+
+            allocation.release_dead(event_idx + 1, &self.last_read, &self.pinned);
+        }
+
+        let mut remaining: Vec<_> = self.mentioned.into_iter().collect();
+        remaining.sort_by_key(|sym| sym.index());
+        for sym in remaining {
+            if !allocation.has_slot(sym) {
+                allocation.allocate(sym, &self.pinned);
+            }
+        }
+
+        allocation.finish()
+    }
+
+    fn allocate_without_reuse(self) -> LocalPlan {
+        let mut symbols: Vec<_> = self.mentioned.into_iter().collect();
+        symbols.sort_by_key(|sym| sym.index());
+
+        let mut slots = HashMap::new();
+        for (slot, sym) in symbols.into_iter().enumerate() {
+            slots.insert(sym, slot);
+        }
+
+        LocalPlan {
+            slot_count: slots.len(),
+            slots,
+        }
+    }
+
+    fn record_expr_event(&mut self, expr: &HilExpr) {
+        self.pin_expr_captures(expr);
+        self.record_event(ReadCollector::in_expr(expr), HashSet::new());
+    }
+
+    fn record_event(&mut self, reads: HashSet<SymbolId>, writes: HashSet<SymbolId>) {
+        let event_idx = self.events.len();
+        for &sym in reads.iter().chain(&writes) {
+            self.mentioned.insert(sym);
+        }
+        for &sym in &reads {
+            self.last_read.insert(sym, event_idx);
+        }
+        for &sym in &writes {
+            self.last_read.entry(sym).or_insert(event_idx);
+        }
+        self.events.push(Event { writes });
+    }
+
+    fn pin_expr_captures(&mut self, expr: &HilExpr) {
+        self.pinned.extend(CaptureCollector::collect_in(expr));
+    }
+}
+
+impl Visitor for LifetimeAnalysis {
+    fn visit_region(&mut self, node: &RegionNode) {
+        match node {
+            RegionNode::BasicBlock { stmts } => {
+                for stmt in stmts {
+                    self.visit_stmt(stmt);
+                }
+            }
+            RegionNode::Sequence { nodes } => {
+                for node in nodes {
+                    self.visit_region(node);
+                }
+            }
+            RegionNode::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.record_expr_event(condition);
+                self.visit_region(then_branch);
+                if let Some(else_branch) = else_branch {
+                    self.visit_region(else_branch);
+                }
+            }
+            RegionNode::While { condition, body } => {
+                self.record_expr_event(condition);
+                self.visit_region(body);
+            }
+            RegionNode::RepeatUntil { body, condition } => {
+                self.visit_region(body);
+                self.record_expr_event(condition);
+            }
+            RegionNode::NumericFor {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                self.pinned.insert(*var);
+                self.pin_expr_captures(start);
+                self.pin_expr_captures(end);
+                self.pin_expr_captures(step);
+                self.record_event(
+                    ReadCollector::in_expr(start)
+                        .into_iter()
+                        .chain(ReadCollector::in_expr(end))
+                        .chain(ReadCollector::in_expr(step))
+                        .collect(),
+                    [*var].into_iter().collect(),
+                );
+                self.visit_region(body);
+            }
+            RegionNode::GenericFor { vars, exprs, body } => {
+                self.pinned.extend(vars.iter().copied());
+                for expr in exprs {
+                    self.pin_expr_captures(expr);
+                }
+                let reads = exprs.iter().flat_map(ReadCollector::in_expr).collect();
+                self.record_event(reads, vars.into_iter().map(|s| *s).collect());
+                self.visit_region(body);
+            }
+            RegionNode::Continue | RegionNode::Break => {}
+            RegionNode::Return { values } => {
+                for value in values {
+                    self.pin_expr_captures(value);
+                }
+                let reads = values.iter().flat_map(ReadCollector::in_expr).collect();
+                self.record_event(reads, HashSet::new());
+            }
+        }
+    }
+
+    fn visit_stmt(&mut self, stmt: &HilStmt) {
+        match stmt {
+            HilStmt::Assign { left, value } => {
+                self.pin_expr_captures(value);
+                let reads = ReadCollector::in_exprs([left, value]);
+                let writes = symbol_lvalue(left).into_iter().collect();
+                self.record_event(reads, writes);
+            }
+            HilStmt::AssignMany { left, value } => {
+                self.pin_expr_captures(value);
+                let mut reads = ReadCollector::in_exprs(left);
+                reads.extend(ReadCollector::in_expr(value));
+                let writes = left.iter().filter_map(symbol_lvalue).collect();
+                self.record_event(reads, writes);
+            }
+            HilStmt::SetList { table, values, .. } => {
+                for value in values {
+                    self.pin_expr_captures(value);
+                }
+                let mut reads = ReadCollector::in_exprs(values);
+                reads.insert(*table);
+                self.record_event(reads, HashSet::new());
+            }
+            HilStmt::Call(expr) => self.record_expr_event(expr),
+            HilStmt::Phi(_) => unreachable!(),
+        }
+    }
+}
+
+fn is_straight_line_region(node: &RegionNode) -> bool {
+    match node {
+        RegionNode::BasicBlock { .. } | RegionNode::Return { .. } => true,
+        RegionNode::Sequence { nodes } => nodes.iter().all(is_straight_line_region),
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct SlotAllocator {
+    slots: HashMap<SymbolId, usize>,
+    active: HashMap<SymbolId, usize>,
+    free_slots: Vec<usize>,
+    next_slot: usize,
+}
+
+impl SlotAllocator {
+    fn has_slot(&self, sym: SymbolId) -> bool {
+        self.slots.contains_key(&sym)
+    }
+
+    fn allocate_pinned(&mut self, sym: SymbolId) {
+        if self.has_slot(sym) {
+            return;
+        }
+        let slot = self.next_fresh_slot();
+        self.slots.insert(sym, slot);
+        self.active.insert(sym, slot);
+    }
+
+    fn allocate(&mut self, sym: SymbolId, pinned: &HashSet<SymbolId>) {
+        if pinned.contains(&sym) {
+            self.allocate_pinned(sym);
+            return;
+        }
+
+        let slot = self
+            .free_slots
+            .pop()
+            .unwrap_or_else(|| self.next_fresh_slot());
+        self.slots.insert(sym, slot);
+        self.active.insert(sym, slot);
+    }
+
+    fn release_dead(
+        &mut self,
+        next_event: usize,
+        last_read: &HashMap<SymbolId, usize>,
+        pinned: &HashSet<SymbolId>,
+    ) {
+        let dead: Vec<_> = self
+            .active
+            .keys()
+            .copied()
+            .filter(|sym| !pinned.contains(sym))
+            .filter(|sym| last_read.get(sym).copied().unwrap_or(0) < next_event)
+            .collect();
+
+        for sym in dead {
+            if let Some(slot) = self.active.remove(&sym) {
+                self.free_slots.push(slot);
+            }
+        }
+    }
+
+    fn release_after_reads(
+        &mut self,
+        event_idx: usize,
+        writes: &HashSet<SymbolId>,
+        last_read: &HashMap<SymbolId, usize>,
+        pinned: &HashSet<SymbolId>,
+    ) {
+        let dead: Vec<_> = self
+            .active
+            .keys()
+            .copied()
+            .filter(|sym| !pinned.contains(sym) && !writes.contains(sym))
+            .filter(|sym| last_read.get(sym).copied().unwrap_or(0) == event_idx)
+            .collect();
+
+        for sym in dead {
+            if let Some(slot) = self.active.remove(&sym) {
+                self.free_slots.push(slot);
+            }
+        }
+    }
+
+    fn next_fresh_slot(&mut self) -> usize {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        slot
+    }
+
+    fn finish(self) -> LocalPlan {
+        LocalPlan {
+            slots: self.slots,
+            slot_count: self.next_slot,
+        }
+    }
+}
+
+fn symbol_lvalue(expr: &HilExpr) -> Option<SymbolId> {
+    if let HilExpr::Symbol(sym) = expr {
+        Some(*sym)
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct CaptureCollector {
+    captures: HashSet<SymbolId>,
+}
+
+impl CaptureCollector {
+    fn collect_in(expr: &HilExpr) -> HashSet<SymbolId> {
+        let mut collector = Self::default();
+        collector.visit_expr(expr);
+        collector.captures
+    }
+}
+
+impl Visitor for CaptureCollector {
+    fn visit_expr(&mut self, expr: &HilExpr) {
+        if let HilExpr::Closure { captures, .. } = expr {
+            self.captures.extend(captures.iter().copied());
+        }
+
+        walk_expr(self, expr);
+    }
+}

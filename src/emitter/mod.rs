@@ -1,22 +1,27 @@
+mod collectors;
+mod declarations;
+mod locals;
 mod name;
 pub mod options;
+mod plan;
+mod storage;
 
-use std::collections::{HashMap, HashSet};
-
-use smol_str::SmolStr;
+use std::collections::HashSet;
 
 use crate::{
     ast::{Block, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt, TableItem, UnOp},
     common::is_valid_luau_identifier,
-    emitter::{name::NameAllocator, options::EmitterOptions},
+    emitter::{
+        collectors::ReadCollector, declarations::DeclarationState, options::EmitterOptions,
+        plan::FunctionPlan, storage::SymbolStorage,
+    },
     hil::{
         StructuredFunction,
         cflow::region::RegionNode,
         ir::{HilExpr, HilStmt, HilTableItem},
         lifter::ssa::SymbolId,
-        visitor::{Visitor, walk_expr},
+        visitor::Visitor,
     },
-    scopes::Scopes,
 };
 
 const MAX_LOCAL_COUNT: usize = 199;
@@ -57,78 +62,9 @@ impl Visitor for AssignCollector {
     }
 }
 
-#[derive(Default)]
-struct ReadCollector {
-    symbols: HashSet<SymbolId>,
-}
-
-impl ReadCollector {
-    fn collect_read_symbols(nodes: &[RegionNode]) -> HashSet<SymbolId> {
-        let mut collector = ReadCollector::default();
-        for node in nodes {
-            collector.visit_region(node);
-        }
-        collector.symbols
-    }
-}
-
-impl Visitor for ReadCollector {
-    /// Override lvalue traversal so that plain symbol write targets are *not* collected as reads.
-    /// Sub-expressions of compound lvalues (`t[k]`, `t.field`) are still traversed as reads.
-    fn visit_lvalue_expr(&mut self, expr: &HilExpr) {
-        match expr {
-            HilExpr::Symbol(_) => {}
-            HilExpr::GetField { obj, .. } => self.visit_expr(obj),
-            HilExpr::GetIndex { obj, index } => {
-                self.visit_expr(obj);
-                self.visit_expr(index);
-            }
-            other => walk_expr(self, other),
-        }
-    }
-
-    fn visit_symbol(&mut self, sym: SymbolId) {
-        self.symbols.insert(sym);
-    }
-
-    fn visit_capture(&mut self, _index: usize, sym: SymbolId) {
-        self.symbols.insert(sym);
-    }
-}
-
-#[derive(Clone)]
-struct SpillSlot {
-    table: Identifier,
-    slot: usize,
-}
-
-enum SymbolStorage {
-    Named(Identifier),
-    Spilled(SpillSlot),
-}
-
-impl SymbolStorage {
-    fn into_expr(self) -> Expr {
-        match self {
-            SymbolStorage::Named(name) => Expr::Named(name),
-            SymbolStorage::Spilled(SpillSlot { table, slot }) => Expr::Index {
-                base: Box::new(Expr::Named(table)),
-                index: Box::new(Expr::Literal(Literal::Number(slot as f64))),
-            },
-        }
-    }
-}
-
 struct FunctionContext {
     proto_idx: usize,
-    allocator: NameAllocator,
-    names: HashMap<SymbolId, Identifier>,
-
-    next_local_slot: usize,
-    forced_named_symbols: HashSet<SymbolId>,
-    inherited_spills: HashMap<SymbolId, SpillSlot>,
-    spill_table: Option<Identifier>,
-
+    plan: FunctionPlan,
     anomalies: Vec<String>,
 }
 
@@ -137,8 +73,7 @@ struct Emitter {
     entry: usize,
     options: EmitterOptions,
 
-    // symbol -> index of the local in the scope
-    scopes: Scopes<SymbolId, usize>,
+    declarations: DeclarationState,
     contexts: Vec<FunctionContext>,
     current_ctx: usize,
 }
@@ -152,12 +87,7 @@ impl Emitter {
     fn create_context(&mut self, proto_idx: usize) -> usize {
         let ctx = FunctionContext {
             proto_idx,
-            allocator: NameAllocator::default(),
-            names: HashMap::new(),
-            next_local_slot: 0,
-            forced_named_symbols: HashSet::new(),
-            inherited_spills: HashMap::new(),
-            spill_table: None,
+            plan: FunctionPlan::new(&self.functions[proto_idx]),
             anomalies: Vec::new(),
         };
         self.contexts.push(ctx);
@@ -175,16 +105,16 @@ impl Emitter {
         let proto_idx = self.current_proto_idx();
         let fun = self.functions[proto_idx].clone();
 
-        let scope = self.scopes.push_scope();
+        self.declarations.push_scope();
         for &sym in fun.cfg.params() {
-            let slot = self.contexts[self.current_ctx].next_local_slot;
-            self.contexts[self.current_ctx].next_local_slot += 1;
-            scope.declare(sym, slot);
+            let slot = self.declare_symbol(sym);
+            self.bind_slot_to_symbol_name(slot, sym);
+            self.declare_slot(slot);
         }
         for &sym in fun.cfg.upvalues() {
-            let slot = self.contexts[self.current_ctx].next_local_slot;
-            self.contexts[self.current_ctx].next_local_slot += 1;
-            scope.declare(sym, slot);
+            let slot = self.declare_symbol(sym);
+            self.bind_slot_to_symbol_name(slot, sym);
+            self.declare_slot(slot);
         }
 
         let upvalue_str = fun
@@ -209,7 +139,7 @@ impl Emitter {
                 },
             );
         }
-        if let Some(table) = self.contexts[self.current_ctx].spill_table.clone() {
+        if let Some(table) = self.contexts[self.current_ctx].plan.spill_table() {
             block.stmts.insert(
                 1 + self.contexts[self.current_ctx].anomalies.len(),
                 Stmt::LocalDeclaration {
@@ -218,44 +148,10 @@ impl Emitter {
                 },
             );
         }
-        self.scopes.pop_scope();
+        self.declarations.pop_scope();
 
         self.current_ctx = old_ctx;
         block
-    }
-
-    fn reserve_symbol_name_exact(
-        &mut self,
-        ctx_idx: usize,
-        sym: SymbolId,
-        preferred: SmolStr,
-    ) -> Identifier {
-        if let Some(name) = self.contexts[ctx_idx].names.get(&sym) {
-            return name.clone();
-        }
-
-        let name = self.contexts[ctx_idx].allocator.reserve_exact(preferred);
-        self.contexts[ctx_idx].names.insert(sym, name.clone());
-        name
-    }
-
-    fn reserve_symbol_name_fresh(
-        &mut self,
-        ctx_idx: usize,
-        sym: SymbolId,
-        is_param: bool,
-    ) -> Identifier {
-        if let Some(name) = self.contexts[ctx_idx].names.get(&sym) {
-            return name.clone();
-        }
-
-        let name = if is_param {
-            self.contexts[ctx_idx].allocator.fresh_param()
-        } else {
-            self.contexts[ctx_idx].allocator.fresh_local()
-        };
-        self.contexts[ctx_idx].names.insert(sym, name.clone());
-        name
     }
 
     fn get_symbol_name(&mut self, sym: &SymbolId) -> Identifier {
@@ -263,13 +159,17 @@ impl Emitter {
     }
 
     fn get_symbol_name_for(&mut self, ctx_idx: usize, sym: SymbolId) -> Identifier {
-        if let Some(name) = self.contexts[ctx_idx].names.get(&sym) {
-            return name.clone();
-        }
-
         let proto_idx = self.contexts[ctx_idx].proto_idx;
         let is_param = self.functions[proto_idx].params.contains(&sym);
-        self.reserve_symbol_name_fresh(ctx_idx, sym, is_param)
+        self.contexts[ctx_idx].plan.get_symbol_name(sym, is_param)
+    }
+
+    fn bind_slot_to_symbol_name(&mut self, slot: usize, sym: SymbolId) {
+        let proto_idx = self.current_context().proto_idx;
+        let is_param = self.functions[proto_idx].params.contains(&sym);
+        self.current_context_mut()
+            .plan
+            .bind_slot_to_symbol_name(slot, sym, is_param);
     }
 
     fn current_context(&self) -> &FunctionContext {
@@ -281,49 +181,35 @@ impl Emitter {
     }
 
     fn fresh_temp_local(&mut self) -> Identifier {
-        self.current_context_mut().allocator.fresh_local()
+        self.current_context_mut().plan.fresh_temp_local()
+    }
+
+    fn declare_symbol_slot(&mut self, sym: SymbolId) -> usize {
+        self.current_context_mut().plan.symbol_slot(sym)
     }
 
     fn declare_symbol(&mut self, sym: SymbolId) -> usize {
-        let slot = self.current_context().next_local_slot;
-        self.current_context_mut().next_local_slot += 1;
-        self.scopes.declare(sym, slot);
+        let slot = self.declare_symbol_slot(sym);
+        self.declarations.declare_symbol(sym, slot);
         slot
     }
 
-    fn reserve_spill_table(&mut self, ctx_idx: usize) -> Identifier {
-        if let Some(name) = self.contexts[ctx_idx].spill_table.clone() {
-            return name;
-        }
-
-        let name = self.contexts[ctx_idx].allocator.reserve_exact("_ms".into());
-        self.contexts[ctx_idx].spill_table = Some(name.clone());
-        name
+    fn declare_slot(&mut self, slot: usize) {
+        self.declarations.declare_slot(slot);
     }
 
     fn symbol_storage(&mut self, sym: SymbolId) -> Option<SymbolStorage> {
-        if let Some(spill) = self.current_context().inherited_spills.get(&sym) {
-            return Some(SymbolStorage::Spilled(spill.clone()));
+        if let Some(storage) = self.current_context().plan.inherited_storage(sym) {
+            return Some(storage);
         }
 
-        let proto_idx = self.current_context().proto_idx;
-        let fun = &self.functions[proto_idx];
-        if fun.params.contains(&sym)
-            || fun.upvalues.contains(&sym)
-            || self.current_context().forced_named_symbols.contains(&sym)
-        {
-            return Some(SymbolStorage::Named(self.get_symbol_name(&sym)));
-        }
-
-        let idx = *self.scopes.get(&sym)?;
-        if self.options.spill_locals && idx >= MAX_LOCAL_COUNT {
-            return Some(SymbolStorage::Spilled(SpillSlot {
-                table: self.reserve_spill_table(self.current_ctx),
-                slot: idx,
-            }));
-        }
-
-        Some(SymbolStorage::Named(self.get_symbol_name(&sym)))
+        let idx = self.declarations.symbol_slot(&sym)?;
+        let spill_locals = self.options.spill_locals;
+        Some(
+            self.current_context_mut()
+                .plan
+                .storage_for(sym, idx, spill_locals, MAX_LOCAL_COUNT),
+        )
     }
 
     fn symbol_expr(&mut self, sym: SymbolId) -> Expr {
@@ -401,19 +287,20 @@ impl Emitter {
         // (so it is live on all paths after the if) *and* is actually read somewhere
         // in the continuation.  Symbols that are dead after the if stay local to their
         // branch, which gives downstream HIL passes more room to fold them.
-        let continuation_reads = ReadCollector::collect_read_symbols(continuation);
+        let continuation_reads = ReadCollector::in_region(continuation);
 
         let mut hoisted: Vec<_> = then_assigned
             .intersection(&else_assigned)
             .copied()
-            .filter(|sym| !self.scopes.contains(sym))
+            .filter(|sym| !self.declarations.contains_symbol(sym))
             .filter(|sym| continuation.is_empty() || continuation_reads.contains(sym))
             .collect();
         hoisted.sort_by_key(|sym| sym.index());
 
         if !hoisted.is_empty() {
             for sym in &hoisted {
-                self.declare_symbol(*sym);
+                let slot = self.declare_symbol(*sym);
+                self.declare_slot(slot);
             }
 
             let names: Vec<_> = hoisted
@@ -431,14 +318,14 @@ impl Emitter {
             }
         }
 
-        self.scopes.push_scope();
+        self.declarations.push_scope();
         let then_body = self.visit_region(then_branch);
-        self.scopes.pop_scope();
+        self.declarations.pop_scope();
 
         let else_clause = else_branch.map(|e| {
-            self.scopes.push_scope();
+            self.declarations.push_scope();
             let region = self.visit_region(e);
-            self.scopes.pop_scope();
+            self.declarations.pop_scope();
 
             // if the region is only one If statement we can fold into an elseif
             if let [Stmt::If(elseif)] = region.stmts.as_slice() {
@@ -473,7 +360,7 @@ impl Emitter {
             RegionNode::While {
                 condition, body, ..
             } => {
-                self.scopes.push_scope();
+                self.declarations.push_scope();
 
                 let body = self.visit_region(body);
                 buf.push(Stmt::While {
@@ -481,10 +368,10 @@ impl Emitter {
                     body,
                 });
 
-                self.scopes.pop_scope();
+                self.declarations.pop_scope();
             }
             RegionNode::RepeatUntil { condition, body } => {
-                self.scopes.push_scope();
+                self.declarations.push_scope();
 
                 let body = self.visit_region(body);
                 buf.push(Stmt::RepeatUntil {
@@ -492,7 +379,7 @@ impl Emitter {
                     body,
                 });
 
-                self.scopes.pop_scope();
+                self.declarations.pop_scope();
             }
             RegionNode::NumericFor {
                 body,
@@ -502,11 +389,16 @@ impl Emitter {
                 step,
                 ..
             } => {
-                self.scopes.push_scope();
+                self.declarations.push_scope();
 
-                self.declare_symbol(*var);
-                self.current_context_mut().forced_named_symbols.insert(*var);
-                let var = self.get_symbol_name(var);
+                let slot = self.declare_symbol(*var);
+                self.bind_slot_to_symbol_name(slot, *var);
+                self.declare_slot(slot);
+                self.current_context_mut().plan.force_named_symbol(*var);
+                let var = match self.symbol_storage(*var).unwrap().into_expr() {
+                    Expr::Named(name) => name,
+                    _ => unreachable!("numeric-for variables cannot be spilled"),
+                };
                 let start = self.visit_expr(start);
                 let end = self.visit_expr(end);
                 let step = Some(self.visit_expr(step));
@@ -520,23 +412,31 @@ impl Emitter {
                     body,
                 });
 
-                self.scopes.pop_scope();
+                self.declarations.pop_scope();
             }
             RegionNode::GenericFor {
                 vars, exprs, body, ..
             } => {
-                self.scopes.push_scope();
+                self.declarations.push_scope();
 
                 for &var in vars {
-                    self.declare_symbol(var);
-                    self.current_context_mut().forced_named_symbols.insert(var);
+                    let slot = self.declare_symbol(var);
+                    self.bind_slot_to_symbol_name(slot, var);
+                    self.declare_slot(slot);
+                    self.current_context_mut().plan.force_named_symbol(var);
                 }
-                let vars = vars.iter().map(|s| self.get_symbol_name(s)).collect();
+                let vars = vars
+                    .iter()
+                    .map(|s| match self.symbol_storage(*s).unwrap().into_expr() {
+                        Expr::Named(name) => name,
+                        _ => unreachable!("generic-for variables cannot be spilled"),
+                    })
+                    .collect();
                 let exprs = exprs.iter().map(|expr| self.visit_expr(expr)).collect();
                 let body = self.visit_region(body);
                 buf.push(Stmt::GenericFor { vars, exprs, body });
 
-                self.scopes.pop_scope();
+                self.declarations.pop_scope();
             }
             RegionNode::Continue => buf.push(Stmt::Continue),
             RegionNode::Break => buf.push(Stmt::Break),
@@ -564,7 +464,8 @@ impl Emitter {
             return;
         };
 
-        if self.scopes.contains(sym) || !captures.iter().any(|capture| capture == sym) {
+        if self.declarations.contains_symbol(sym) || !captures.iter().any(|capture| capture == sym)
+        {
             return;
         }
 
@@ -574,7 +475,8 @@ impl Emitter {
             return;
         }
 
-        self.declare_symbol(*sym);
+        let slot = self.declare_symbol(*sym);
+        self.declare_slot(slot);
         if let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym) {
             buf.push(Stmt::LocalDeclaration {
                 names: vec![name],
@@ -591,22 +493,23 @@ impl Emitter {
 
                 let left_expr = match left {
                     HilExpr::Symbol(sym) => {
-                        if !self.scopes.contains(sym) {
+                        if !self.declarations.contains_symbol(sym) {
                             // If value is a named closure, reserve its debug_name
                             // as the symbol name before declaring/symbol_expr.
                             if let HilExpr::Closure { proto, .. } = value {
                                 let debug_name = self.functions[*proto].debug_name.clone();
                                 if let Some(ref name) = debug_name {
-                                    self.reserve_symbol_name_exact(
-                                        self.current_ctx,
-                                        *sym,
-                                        name.clone().into(),
-                                    );
+                                    self.current_context_mut()
+                                        .plan
+                                        .reserve_symbol_name_exact(*sym, name.clone().into());
                                     named_closure = true;
                                 }
                             }
-                            self.declare_symbol(*sym);
-                            needs_declaration = true;
+                            let slot = self.declare_symbol(*sym);
+                            needs_declaration = !self.declarations.contains_slot(slot);
+                            if needs_declaration {
+                                self.declare_slot(slot);
+                            }
                         }
                         self.symbol_expr(*sym)
                     }
@@ -621,11 +524,11 @@ impl Emitter {
 
                     if named_closure
                         && let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
-                            && let Expr::AnonymousFunction { params, body } = right
-                        {
-                            buf.push(Stmt::LocalFunction { name, params, body });
-                            return;
-                        }
+                        && let Expr::AnonymousFunction { params, body } = right
+                    {
+                        buf.push(Stmt::LocalFunction { name, params, body });
+                        return;
+                    }
 
                     match self
                         .symbol_storage(*sym)
@@ -686,7 +589,7 @@ impl Emitter {
 
                 let was_declared: Vec<_> = symbols
                     .iter()
-                    .map(|sym| self.scopes.contains(sym))
+                    .map(|sym| self.declarations.contains_symbol(sym))
                     .collect();
 
                 for (sym, declared) in symbols.iter().zip(&was_declared) {
@@ -703,7 +606,27 @@ impl Emitter {
                     })
                     .collect();
 
-                let all_declared = was_declared.iter().all(|declared| *declared);
+                let slot_was_declared: Vec<_> = symbols
+                    .iter()
+                    .map(|sym| {
+                        let slot = self
+                            .declarations
+                            .symbol_slot(sym)
+                            .expect("assign-many symbols must exist in scope");
+                        self.declarations.contains_slot(slot)
+                    })
+                    .collect();
+                for (sym, declared) in symbols.iter().zip(&slot_was_declared) {
+                    if !declared {
+                        let slot = self
+                            .declarations
+                            .symbol_slot(sym)
+                            .expect("assign-many symbols must exist in scope");
+                        self.declare_slot(slot);
+                    }
+                }
+
+                let all_declared = slot_was_declared.iter().all(|declared| *declared);
                 if all_declared {
                     buf.push(Stmt::Assignment {
                         lhs: storages.into_iter().map(|s| s.into_expr()).collect(),
@@ -739,7 +662,7 @@ impl Emitter {
                 });
 
                 for ((storage, was_declared), temp) in
-                    storages.into_iter().zip(was_declared).zip(temps)
+                    storages.into_iter().zip(slot_was_declared).zip(temps)
                 {
                     let rhs = vec![Expr::Named(temp)];
                     match (storage, was_declared) {
@@ -942,21 +865,20 @@ impl Emitter {
             if let Some(&child_upval_sym) = child_upvalues.get(i) {
                 match binding {
                     SymbolStorage::Named(name) => {
-                        self.reserve_symbol_name_exact(child_ctx, child_upval_sym, name.0);
+                        self.contexts[child_ctx]
+                            .plan
+                            .inherit_named_upvalue(child_upval_sym, name);
                     }
                     SymbolStorage::Spilled(spill) => {
                         self.contexts[child_ctx]
-                            .inherited_spills
-                            .insert(child_upval_sym, spill.clone());
-                        self.contexts[child_ctx]
-                            .allocator
-                            .reserve_exact(spill.table.0.clone());
+                            .plan
+                            .inherit_spilled_upvalue(child_upval_sym, spill);
                     }
                 }
             }
         }
 
-        let old_scopes = std::mem::take(&mut self.scopes);
+        let old_declarations = std::mem::take(&mut self.declarations);
 
         let param_symbols = self.functions[proto_idx].params.clone();
         let is_vararg = self.functions[proto_idx].is_vararg;
@@ -970,7 +892,7 @@ impl Emitter {
 
         let body = self.visit_function(child_ctx);
 
-        self.scopes = old_scopes;
+        self.declarations = old_declarations;
 
         Expr::AnonymousFunction { params, body }
     }
@@ -985,7 +907,7 @@ pub fn emit_ast(
         functions,
         entry,
         options,
-        scopes: Scopes::new(),
+        declarations: DeclarationState::new(),
         contexts: Vec::new(),
         current_ctx: 0,
     };
