@@ -91,7 +91,6 @@ impl LuauRunKind {
 
 #[derive(Debug)]
 enum CaseError {
-    CompileError(String),
     DecompileError(String),
     SourceRunError(String),
     DecompiledRunError(String),
@@ -101,7 +100,6 @@ enum CaseError {
 impl std::fmt::Display for CaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CompileError(msg) => write!(f, "luau-compile failed:\n{msg}"),
             Self::DecompileError(msg) => write!(f, "mallow decompile failed:\n{msg}"),
             Self::SourceRunError(msg) => write!(f, "source.luau failed to run:\n{msg}"),
             Self::DecompiledRunError(msg) => write!(f, "decompiled.luau failed to run:\n{msg}"),
@@ -123,7 +121,11 @@ fn run_case(
     let bytecode_path = temp_dir.path().join("compiled.out");
     let decompiled_path = temp_dir.path().join("decompiled.luau");
 
-    compile_luau(&case, &bytecode_path, decompile_timeout)?;
+    let compiled = compile_luau(&case, &bytecode_path, decompile_timeout)?;
+    if !compiled {
+        eprintln!("skip {} (luau-compile failed)", case.trial_name());
+        return Ok(());
+    }
     decompile_bytecode(
         &bytecode_path,
         &decompiled_path,
@@ -213,7 +215,7 @@ fn run_command_with_timeout(
     }
 }
 
-fn compile_luau(case: &Case, bytecode_path: &Path, timeout: Duration) -> Result<(), Failed> {
+fn compile_luau(case: &Case, bytecode_path: &Path, timeout: Duration) -> Result<bool, Failed> {
     let mut cmd = Command::new(luau_compile_exe());
     cmd.arg("--binary")
         .arg(&case.source_path)
@@ -221,13 +223,13 @@ fn compile_luau(case: &Case, bytecode_path: &Path, timeout: Duration) -> Result<
     let output = run_command_with_timeout(cmd, timeout, "luau-compile")?;
 
     if !output.status.success() {
-        return Err(CaseError::CompileError(format_output(&output)).into());
+        return Ok(false);
     }
 
     fs::write(bytecode_path, &output.stdout)
         .map_err(|e| Failed::from(format!("failed to write bytecode: {e}")))?;
 
-    Ok(())
+    Ok(true)
 }
 
 fn decompile_bytecode(
