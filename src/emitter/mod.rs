@@ -213,19 +213,20 @@ impl Emitter {
     }
 
     fn symbol_expr(&mut self, sym: SymbolId) -> Expr {
-        let name = self.get_symbol_name(&sym);
-        let Some(storage) = self.symbol_storage(sym) else {
-            let proto_idx = self.current_proto_idx();
-            self.record_anomaly(format!(
-                "undeclared symbol read during structuring: proto={}, symbol={}, emitted as {}",
-                proto_idx,
-                sym.index(),
-                name.as_str()
-            ));
-            return Expr::Named(name);
-        };
-
-        storage.into_expr()
+        match self.symbol_storage(sym) {
+            Some(storage) => storage.into_expr(),
+            None => {
+                let name = self.get_symbol_name(&sym);
+                let proto_idx = self.current_proto_idx();
+                self.record_anomaly(format!(
+                    "undeclared symbol read during structuring: proto={}, symbol={}, emitted as {}",
+                    proto_idx,
+                    sym.index(),
+                    name.as_str()
+                ));
+                Expr::Named(name)
+            }
+        }
     }
 
     fn record_anomaly(&mut self, message: String) {
