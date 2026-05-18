@@ -17,13 +17,9 @@ fn main() {
     let trials = discover_cases()
         .into_iter()
         .map(|case| {
-            Trial::test(
-                case.file_prefix()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("<invalid utf8>")
-                    .to_string(),
-                move || run_case(&case, decompile_timeout, runtime_timeout),
-            )
+            Trial::test(case.trial_name(), move || {
+                run_case(&case, decompile_timeout, runtime_timeout)
+            })
         })
         .collect();
 
@@ -39,6 +35,58 @@ fn parse_timeout_env(name: &str, default_secs: u64) -> Duration {
         .filter(|&n| n > 0)
         .map(Duration::from_secs)
         .unwrap_or(default)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OptLevel {
+    O0,
+    O1,
+    O2,
+}
+
+impl OptLevel {
+    const ALL: [Self; 3] = [Self::O0, Self::O1, Self::O2];
+
+    const fn flag(self) -> &'static str {
+        match self {
+            Self::O0 => "O0",
+            Self::O1 => "O1",
+            Self::O2 => "O2",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Case {
+    source_path: PathBuf,
+    opt: OptLevel,
+}
+
+impl Case {
+    fn trial_name(&self) -> String {
+        format!(
+            "{}/{}",
+            self.source_path
+                .file_prefix()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<invalid utf8>"),
+            self.opt.flag()
+        )
+    }
+}
+
+enum LuauRunKind {
+    Source,
+    Decompiled,
+}
+
+impl LuauRunKind {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Decompiled => "decompiled",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -66,7 +114,7 @@ impl std::fmt::Display for CaseError {
 }
 
 fn run_case(
-    source_path: &Path,
+    case: &Case,
     decompile_timeout: Duration,
     runtime_timeout: Duration,
 ) -> Result<(), Failed> {
@@ -75,19 +123,19 @@ fn run_case(
     let bytecode_path = temp_dir.path().join("compiled.out");
     let decompiled_path = temp_dir.path().join("decompiled.luau");
 
-    compile_luau(source_path, &bytecode_path, decompile_timeout)?;
+    compile_luau(&case, &bytecode_path, decompile_timeout)?;
     decompile_bytecode(
         &bytecode_path,
         &decompiled_path,
         // TODO: this is a hack
-        source_path
+        case.source_path
             .file_stem()
             .is_some_and(|name| name == "intg-sha2"),
         decompile_timeout,
     )?;
 
-    let source_output = run_luau(source_path, "source.luau", runtime_timeout)?;
-    let decompiled_output = run_luau(&decompiled_path, "decompiled.luau", runtime_timeout)?;
+    let source_output = run_luau(&case.source_path, LuauRunKind::Source, runtime_timeout)?;
+    let decompiled_output = run_luau(&decompiled_path, LuauRunKind::Decompiled, runtime_timeout)?;
 
     if source_output != decompiled_output {
         return Err(CaseError::OutputMismatch {
@@ -165,9 +213,11 @@ fn run_command_with_timeout(
     }
 }
 
-fn compile_luau(source_path: &Path, bytecode_path: &Path, timeout: Duration) -> Result<(), Failed> {
+fn compile_luau(case: &Case, bytecode_path: &Path, timeout: Duration) -> Result<(), Failed> {
     let mut cmd = Command::new(luau_compile_exe());
-    cmd.arg("--binary").arg(source_path);
+    cmd.arg("--binary")
+        .arg(&case.source_path)
+        .arg(&format!("-{}", case.opt.flag()));
     let output = run_command_with_timeout(cmd, timeout, "luau-compile")?;
 
     if !output.status.success() {
@@ -206,16 +256,15 @@ fn decompile_bytecode(
     Ok(())
 }
 
-fn run_luau(script_path: &Path, label: &str, timeout: Duration) -> Result<String, Failed> {
+fn run_luau(script_path: &Path, kind: LuauRunKind, timeout: Duration) -> Result<String, Failed> {
     let mut cmd = Command::new(luau_exe());
     cmd.arg(script_path);
-    let output = run_command_with_timeout(cmd, timeout, &format!("luau ({label})"))?;
+    let output = run_command_with_timeout(cmd, timeout, &format!("luau ({})", kind.label()))?;
 
     if !output.status.success() {
-        let err = if label == "source.luau" {
-            CaseError::SourceRunError(format_output(&output))
-        } else {
-            CaseError::DecompiledRunError(format_output(&output))
+        let err = match kind {
+            LuauRunKind::Source => CaseError::SourceRunError(format_output(&output)),
+            LuauRunKind::Decompiled => CaseError::DecompiledRunError(format_output(&output)),
         };
         return Err(err.into());
     }
@@ -236,16 +285,23 @@ fn normalize_output(output: &str) -> String {
     output.replace("\r\n", "\n")
 }
 
-fn discover_cases() -> Vec<PathBuf> {
-    fs::read_dir(cases_root())
+fn discover_cases() -> Vec<Case> {
+    let sources = fs::read_dir(cases_root())
         .unwrap_or_else(|e| panic!("failed to read cases dir: {e}"))
         .filter_map(|entry| {
             let entry = entry.unwrap_or_else(|e| panic!("bad entry: {e}"));
-            entry
-                .file_type()
-                .expect("failed to get the file type")
-                .is_file()
-                .then_some(entry.path())
+            let path = entry.path();
+            (entry.file_type().expect("file type").is_file()
+                && path.extension().and_then(|e| e.to_str()) == Some("luau"))
+            .then_some(path)
+        });
+
+    sources
+        .flat_map(|source| {
+            OptLevel::ALL.map(|opt| Case {
+                source_path: source.clone(),
+                opt,
+            })
         })
         .collect()
 }
