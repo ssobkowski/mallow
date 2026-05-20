@@ -1060,12 +1060,12 @@ impl<'cfg> Structurer<'cfg> {
             branch_exits.insert(*block);
         }
         if let Some(ctx) = loop_ctx {
-            branch_exits.extend(
-                ctx.continue_targets
-                    .iter()
-                    .copied()
-                    .filter(|target| !terminal_policy.suppresses(*target)),
-            );
+            // Implicit tails still contain loop-body statements; structure them
+            // in the branch and suppress only their final backedge.
+            branch_exits.extend(ctx.continue_targets.iter().copied().filter(|target| {
+                !terminal_policy.suppresses(*target)
+                    && !ctx.implicit_continue_sources.contains(target)
+            }));
             branch_exits.extend(ctx.exits.iter().copied());
         }
 
@@ -1441,13 +1441,37 @@ impl<'cfg> Structurer<'cfg> {
     }
 
     fn common_loop_follow(&self, loop_info: &LoopInfo) -> Option<usize> {
-        let follow = self.ipdoms.idom(loop_info.header)?;
-        (!loop_info.body.contains(&follow)).then_some(follow)
+        if let Some(follow) = self.ipdoms.idom(loop_info.header)
+            && !loop_info.body.contains(&follow)
+        {
+            return Some(follow);
+        }
+
+        let mut follow = None;
+        for &exit in &loop_info.exits {
+            let target = single_target(&self.graph.successors(exit).iter().copied().collect())?;
+            if loop_info.body.contains(&target) {
+                return None;
+            }
+
+            match follow {
+                Some(existing) if existing != target => return None,
+                Some(_) => {}
+                None => follow = Some(target),
+            }
+        }
+
+        follow
     }
 
     fn find_merge_point(&self, node: usize, scope: &Scope) -> Option<usize> {
         let merge = self.ipdoms.idom(node)?;
-        (scope.nodes.contains(&merge) && !scope.exits.contains(&merge)).then_some(merge)
+        // Nested conditionals may rejoin at the containing branch's merge.
+        // Such a node is outside the nested scope by ownership, but it is
+        // still ordinary fallthrough rather than a loop-control boundary.
+        ((scope.nodes.contains(&merge) && !scope.exits.contains(&merge))
+            || scope.implicit_exits.contains(&merge))
+        .then_some(merge)
     }
 
     fn shape_for_block(
