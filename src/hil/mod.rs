@@ -1,3 +1,10 @@
+pub mod cflow;
+pub mod common;
+pub mod ir;
+pub mod lifter;
+pub mod passes;
+pub mod visitor;
+
 use crate::{
     disasm::Proto,
     hil::{
@@ -8,15 +15,8 @@ use crate::{
         },
         lifter::ssa::SymbolId,
     },
-    logging::{is_verbose, verbose},
+    logging::{Diagnostics, LogLevel, LogTarget},
 };
-
-pub mod cflow;
-pub mod common;
-pub mod ir;
-pub mod lifter;
-pub mod passes;
-pub mod visitor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturnArity {
@@ -48,52 +48,27 @@ pub struct StructuredFunction {
 }
 
 impl StructuredFunction {
-    pub fn from_proto(proto: &Proto, all_protos: &[Proto]) -> Self {
-        verbose!(
-            "proto {} ({} params, {} upvalues)",
-            proto.index,
-            proto.num_params,
-            proto.num_upvals
+    pub fn from_proto(proto: &Proto, all_protos: &[Proto], diagnostics: &Diagnostics) -> Self {
+        let diagnostics = diagnostics.for_proto(proto.index as usize);
+        let info = diagnostics.at(LogLevel::Info, LogTarget::Hil);
+
+        info.line(
+            0,
+            format_args!("{} params, {} upvalues", proto.num_params, proto.num_upvals),
         );
 
-        verbose!(indent: 1, "building cfg...");
+        info.line(1, format_args!("building cfg..."));
         let mut cfg = ControlFlowGraph::from_proto(proto, all_protos);
 
-        verbose!(indent: 1, "running pre-region passes...");
+        info.line(1, format_args!("running pre-region passes..."));
         if passes::run_pre_region(&mut cfg) {
             cfg.simplify_conditions();
         }
 
-        if is_verbose() {
-            let idoms = cfg.build_idoms();
+        dump_cfg(&cfg, &diagnostics);
 
-            verbose!(indent: 1, "cfg {{");
-            for (i, block) in cfg.blocks().enumerate() {
-                verbose!(indent: 2, "block {} {{", i);
-
-                if block.stmts().is_empty() {
-                    verbose!(indent: 3, "stmts: [empty]");
-                } else {
-                    verbose!(indent: 3, "stmts: [");
-                    for stmt in block.stmts() {
-                        verbose!(indent: 3, "  {}", stmt);
-                    }
-                    verbose!(indent: 3, "]");
-                }
-
-                verbose!(indent: 3, "exit: {:?}", block.exit());
-
-                verbose!(indent: 3, "predecessors: {:?}", cfg.predecessors(i));
-                verbose!(indent: 3, "successors: {:?}", cfg.successors(i));
-                verbose!(indent: 3, "idom: {:?}", idoms.idom(i));
-
-                verbose!(indent: 2, "}}");
-            }
-            verbose!(indent: 1, "}}");
-        }
-
-        verbose!(indent: 1, "structuring region...");
-        let root = region::structure(&cfg);
+        info.line(1, format_args!("structuring region..."));
+        let root = region::structure(&cfg, &diagnostics);
 
         let params = cfg.params().to_vec();
         let upvalues = cfg.upvalues().to_vec();
@@ -109,4 +84,33 @@ impl StructuredFunction {
             return_arity: None,
         }
     }
+}
+
+fn dump_cfg(cfg: &ControlFlowGraph, diagnostics: &Diagnostics) {
+    let debug = diagnostics.at(LogLevel::Debug, LogTarget::Cfg);
+    debug.block("cfg {", |debug| {
+        let idoms = cfg.build_idoms();
+
+        for (i, block) in cfg.blocks().enumerate() {
+            debug.line(1, format_args!("block {} {{", i));
+
+            if block.stmts().is_empty() {
+                debug.line(2, format_args!("stmts: [empty]"));
+            } else {
+                debug.line(2, format_args!("stmts: ["));
+                for stmt in block.stmts() {
+                    debug.line(2, format_args!("  {}", stmt));
+                }
+                debug.line(2, format_args!("]"));
+            }
+
+            debug.line(2, format_args!("exit: {:?}", block.exit()));
+            debug.line(2, format_args!("predecessors: {:?}", cfg.predecessors(i)));
+            debug.line(2, format_args!("successors: {:?}", cfg.successors(i)));
+            debug.line(2, format_args!("idom: {:?}", idoms.idom(i)));
+
+            debug.line(1, format_args!("}}"));
+        }
+    });
+    debug.line(0, format_args!("}}"));
 }
