@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 
 use smallvec::SmallVec;
@@ -86,16 +84,12 @@ impl RegionNode {
 
 #[derive(Debug, Clone)]
 struct IfShape {
-    /// CFG block that owns the conditional terminator.
-    head: usize,
     condition: HilExpr,
     /// Structured payload reached when `condition` is true.
     then_branch: Box<Shape>,
     /// Structured payload reached when `condition` is false, omitted
     /// when that side has no observable payload.
     else_branch: Option<Box<Shape>>,
-    /// Immediate post-dominator inside the active scope, if one exists.
-    merge: Option<usize>,
 }
 
 /// Loop boundary facts needed while recursively structuring a loop body.
@@ -134,8 +128,6 @@ struct LoopId {
 #[derive(Debug, Clone)]
 struct LoopShape {
     id: LoopId,
-    /// Header that identified this loop in the loop forest.
-    header: usize,
     kind: LoopKind,
     body: Box<Shape>,
     /// Immediate successor blocks outside the natural loop body. A single exit
@@ -151,8 +143,6 @@ enum LoopKind {
     While {
         /// Source-level condition that reaches the loop body when truthy.
         condition: HilExpr,
-        /// First CFG block in the guard tree.
-        guard: usize,
         /// First payload block executed after the guard succeeds.
         body: usize,
         /// Empty conditional blocks consumed into `condition`; these are loop
@@ -173,7 +163,6 @@ enum LoopKind {
         start: HilExpr,
         end: HilExpr,
         step: HilExpr,
-        prep: usize,
         body: usize,
         exit: usize,
     },
@@ -181,7 +170,6 @@ enum LoopKind {
     GenericFor {
         vars: SmallVec<[SymbolId; 3]>,
         exprs: [HilExpr; 3],
-        prep: usize,
         body: usize,
         exit: usize,
     },
@@ -522,10 +510,6 @@ impl LoopForest {
         by_header
     }
 
-    fn get(&self, id: LoopId) -> Option<&LoopInfo> {
-        self.loops.get(&id)
-    }
-
     fn candidate_in_scope(
         &self,
         header: usize,
@@ -540,27 +524,6 @@ impl LoopForest {
             .filter_map(|id| self.loops.get(&id))
             .filter(|info| info.body.iter().all(|node| scope.nodes.contains(node)))
             .max_by_key(|info| (info.body.len(), info.id))
-    }
-
-    fn is_nested_in(&self, inner: LoopId, outer: LoopId) -> bool {
-        let mut current = self.get(inner).and_then(|info| info.parent);
-
-        while let Some(id) = current {
-            if id == outer {
-                return true;
-            }
-            current = self.get(id).and_then(|info| info.parent);
-        }
-
-        false
-    }
-
-    fn direct_children(&self, id: LoopId) -> &[LoopId] {
-        self.get(id).map_or(&[], |info| info.children.as_slice())
-    }
-
-    fn is_loop_header(&self, node: usize) -> bool {
-        self.by_header.contains_key(&node)
     }
 }
 
@@ -645,7 +608,6 @@ impl RegionGraph {
 struct Structurer<'cfg> {
     cfg: &'cfg ControlFlowGraph,
     graph: RegionGraph,
-    idoms: DominatorTree,
     ipdoms: DominatorTree,
     loops: LoopForest,
 }
@@ -653,14 +615,14 @@ struct Structurer<'cfg> {
 impl<'cfg> Structurer<'cfg> {
     fn new(cfg: &'cfg ControlFlowGraph) -> Self {
         let graph = RegionGraph::from_cfg(cfg);
-        let idoms = graph.build_idoms();
         let ipdoms = Reversed::new(&graph).build_idoms();
+
+        let idoms = graph.build_idoms();
         let loops = LoopForest::build(cfg, &idoms);
 
         Self {
             cfg,
             graph,
-            idoms,
             ipdoms,
             loops,
         }
@@ -870,7 +832,6 @@ impl<'cfg> Structurer<'cfg> {
 
         Some(LoopShape {
             id: loop_info.id,
-            header,
             kind,
             body: Box::new(self.structure_loop_body(&body_plan, &loop_ctx)),
             exits: lexical_exits,
@@ -1225,11 +1186,9 @@ impl<'cfg> Structurer<'cfg> {
         let else_shape = build_branch(shape.else_entry, else_nodes);
 
         Shape::If(IfShape {
-            head: shape.head,
             condition: shape.condition,
             then_branch: Box::new(then_shape),
             else_branch: (!else_shape.is_empty()).then(|| Box::new(else_shape)),
-            merge: shape.merge,
         })
     }
 
@@ -1264,7 +1223,6 @@ impl<'cfg> Structurer<'cfg> {
                 verbose!(indent: 1, "kind = NumericFor");
 
                 return LoopKind::NumericFor {
-                    prep: *base as usize,
                     body: *body_block,
                     exit: *exit_block,
                     var: *var,
@@ -1300,7 +1258,6 @@ impl<'cfg> Structurer<'cfg> {
                 return LoopKind::GenericFor {
                     vars: vars.clone(),
                     exprs: exprs.clone(),
-                    prep: prep_block,
                     body: *body_block,
                     exit: *exit_block,
                 };
@@ -1348,7 +1305,6 @@ impl<'cfg> Structurer<'cfg> {
             verbose!(indent: 1, "condition = ({})", guard.condition);
             return LoopKind::While {
                 condition: guard.condition,
-                guard: loop_info.header,
                 body: guard.body,
                 guard_nodes: guard.guard_nodes,
                 exits: guard.exits,
