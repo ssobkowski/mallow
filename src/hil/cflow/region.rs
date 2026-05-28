@@ -1,10 +1,11 @@
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 
-use either::Either;
 use smallvec::SmallVec;
 
 use crate::{
-    ast::BinOp,
+    ast::UnOp,
     hil::{
         cflow::{
             cfg::{BlockExit, ControlFlowGraph},
@@ -13,235 +14,26 @@ use crate::{
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
     },
+    logging::verbose,
 };
 
-#[derive(Debug)]
-enum Loop {
-    While {
-        cond: HilExpr,
-        exit_block: Option<usize>,
-        guard: Option<GuardTree>,
-        absorbed: Vec<usize>,
-    },
-    RepeatUntil {
-        // We don't need to hold cond here as it's a conditional jump inside the body.
-        exit_block: usize,
-    },
-    /// A structured numeric `for` loop recovered from `FORNPREP/FORNLOOP`.
-    NumericFor {
-        var: SymbolId,
-        start: HilExpr,
-        end: HilExpr,
-        step: HilExpr,
-        prep_block: usize,
-        exit_block: usize,
-    },
-    /// A structured generic `for` loop recovered from `FORGPREP/FORGLOOP`.
-    GenericFor {
-        vars: SmallVec<[SymbolId; 3]>,
-        exprs: [HilExpr; 3],
-        prep_block: usize,
-        exit_block: usize,
-    },
-}
-
+/// The lexical control-flow shape recognized from CFG facts.
+///
+/// This layer intentionally keeps raw block IDs. It should describe what the
+/// CFG proves, not how the final HIL tree is emitted.
 #[derive(Debug, Clone)]
-enum GuardTree {
-    Body,
-    Exit,
-    Branch {
-        condition: HilExpr,
-        then_branch: Box<GuardTree>,
-        else_branch: Box<GuardTree>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum BoolExpr {
-    True,
-    False,
-    Atom(HilExpr),
-    Not(Box<BoolExpr>),
-    And(Box<BoolExpr>, Box<BoolExpr>),
-    Or(Box<BoolExpr>, Box<BoolExpr>),
-}
-
-impl BoolExpr {
-    fn atom(expr: HilExpr) -> Self {
-        match expr {
-            HilExpr::Bool(true) => Self::True,
-            HilExpr::Bool(false) => Self::False,
-            other => Self::Atom(other),
-        }
-    }
-
-    fn not(self) -> Self {
-        match self {
-            Self::True => Self::False,
-            Self::False => Self::True,
-            Self::Atom(expr) => Self::atom(expr.invert()),
-            Self::Not(inner) => *inner,
-            other => Self::Not(Box::new(other)),
-        }
-    }
-
-    fn and(self, rhs: Self) -> Self {
-        match (self, rhs) {
-            (Self::False, _) | (_, Self::False) => Self::False,
-            (Self::True, rhs) => rhs,
-            (lhs, Self::True) => lhs,
-            (lhs, rhs) => Self::And(Box::new(lhs), Box::new(rhs)),
-        }
-    }
-
-    fn or(self, rhs: Self) -> Self {
-        match (self, rhs) {
-            (Self::True, _) | (_, Self::True) => Self::True,
-            (Self::False, rhs) => rhs,
-            (lhs, Self::False) => lhs,
-            (lhs, Self::And(and_lhs, and_rhs)) if lhs == and_lhs.as_ref().clone().not() => {
-                lhs.or(*and_rhs)
-            }
-            (Self::And(and_lhs, and_rhs), rhs) if rhs == and_lhs.as_ref().clone().not() => {
-                rhs.or(*and_rhs)
-            }
-            (lhs, rhs) => Self::Or(Box::new(lhs), Box::new(rhs)),
-        }
-    }
-
-    fn into_hil(self) -> HilExpr {
-        match self {
-            Self::True => HilExpr::Bool(true),
-            Self::False => HilExpr::Bool(false),
-            Self::Atom(expr) => expr,
-            Self::Not(expr) => expr.into_hil().invert(),
-            Self::And(lhs, rhs) => HilExpr::Binary {
-                lhs: Box::new(lhs.into_hil()),
-                op: BinOp::And,
-                rhs: Box::new(rhs.into_hil()),
-            },
-            Self::Or(lhs, rhs) => HilExpr::Binary {
-                lhs: Box::new(lhs.into_hil()),
-                op: BinOp::Or,
-                rhs: Box::new(rhs.into_hil()),
-            },
-        }
-    }
-}
-
-impl From<GuardTree> for BoolExpr {
-    fn from(guard: GuardTree) -> Self {
-        match guard {
-            GuardTree::Body => BoolExpr::True,
-            GuardTree::Exit => BoolExpr::False,
-            GuardTree::Branch {
-                condition,
-                then_branch,
-                else_branch,
-            } => {
-                let cond_expr = BoolExpr::atom(condition);
-                let then_condition = BoolExpr::from(*then_branch);
-                let else_condition = BoolExpr::from(*else_branch);
-
-                cond_expr
-                    .clone()
-                    .and(then_condition)
-                    .or(cond_expr.not().and(else_condition))
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct GuardBuild {
-    tree: GuardTree,
-    exit_block: Option<usize>,
-    has_body: bool,
-    absorbed: HashSet<usize>,
-}
-
-impl GuardBuild {
-    fn body() -> Self {
-        Self {
-            tree: GuardTree::Body,
-            exit_block: None,
-            has_body: true,
-            absorbed: HashSet::new(),
-        }
-    }
-
-    fn exit(exit_block: usize) -> Self {
-        Self {
-            tree: GuardTree::Exit,
-            exit_block: Some(exit_block),
-            has_body: false,
-            absorbed: HashSet::new(),
-        }
-    }
-}
-
-impl Loop {
-    fn exit_block(&self) -> Option<usize> {
-        match self {
-            Loop::While { exit_block, .. } => *exit_block,
-            Loop::RepeatUntil { exit_block, .. }
-            | Loop::NumericFor { exit_block, .. }
-            | Loop::GenericFor { exit_block, .. } => Some(*exit_block),
-        }
-    }
-}
-
-/// One structured control-flow node in the intermediate region tree.
-#[derive(Debug, Clone)]
-pub enum CfgNode {
-    /// A plain basic block payload that does not by itself decide control transfer.
-    BasicBlock { block: usize },
-    /// A sequence of nodes executed sequentially.
-    Sequence { nodes: Vec<CfgNode> },
-    /// A structured if/else split.
-    If {
-        condition: HilExpr,
-        then_branch: Box<CfgNode>,
-        else_branch: Option<Box<CfgNode>>,
-    },
-    /// A structured while loop recovered from backedges.
-    While {
-        condition: HilExpr,
-        body: Box<CfgNode>,
-    },
-    /// A structured numeric `for` loop recovered from `FORNPREP/FORNLOOP`.
-    NumericFor {
-        var: SymbolId,
-        start: HilExpr,
-        end: HilExpr,
-        step: HilExpr,
-        body: Box<CfgNode>,
-    },
-    /// A structured generic `for` loop recovered from `FORGPREP/FORGLOOP`.
-    GenericFor {
-        vars: SmallVec<[SymbolId; 3]>,
-        exprs: [HilExpr; 3],
-        body: Box<CfgNode>,
-    },
-    /// Explicit `continue` edge for a recovered loop.
-    Continue,
-    /// Explicit `break` edge from a loop body.
+enum Shape {
+    Block(usize),
+    Sequence(Vec<Shape>),
+    If(IfShape),
+    Loop(LoopShape),
     Break,
-    /// Explicit return.
-    Return { values: SmallVec<[HilExpr; 3]> },
-
-    /// A temporary scaffolding node used to merge multiple physical exits
-    /// into a Single-Entry, Single-Exit (SESE) graph.
+    Continue,
+    Return(SmallVec<[HilExpr; 3]>),
     VirtualExit,
 }
 
-impl CfgNode {
-    pub const fn is_empty(&self) -> bool {
-        matches!(self, CfgNode::Sequence { nodes } if nodes.is_empty())
-    }
-}
-
-/// A region node in the structured control flow graph.
+/// A structured region node in the structured control flow graph.
 #[derive(Debug, Clone)]
 pub enum RegionNode {
     /// A plain basic block payload that does not by itself decide control transfer.
@@ -288,366 +80,509 @@ pub enum RegionNode {
 
 impl RegionNode {
     pub fn is_empty(&self) -> bool {
-        match self {
-            RegionNode::BasicBlock { stmts } => stmts.is_empty(),
-            RegionNode::Sequence { nodes } => nodes.is_empty(),
-            _ => false,
-        }
+        matches!(self, RegionNode::Sequence { nodes } if nodes.is_empty())
     }
 }
 
-impl CfgNode {
-    /// Merges nodes into a `Sequence` node, flattening nested sequences.
-    fn merge(nodes: impl IntoIterator<Item = CfgNode>) -> CfgNode {
-        let seq_nodes = nodes
-            .into_iter()
-            .flat_map(|node| match node {
-                CfgNode::Sequence { nodes } => Either::Left(nodes.into_iter()),
-                other => Either::Right(std::iter::once(other)),
+#[derive(Debug, Clone)]
+struct IfShape {
+    /// CFG block that owns the conditional terminator.
+    head: usize,
+    condition: HilExpr,
+    /// Structured payload reached when `condition` is true.
+    then_branch: Box<Shape>,
+    /// Structured payload reached when `condition` is false, omitted
+    /// when that side has no observable payload.
+    else_branch: Option<Box<Shape>>,
+    /// Immediate post-dominator inside the active scope, if one exists.
+    merge: Option<usize>,
+}
+
+/// Loop boundary facts needed while recursively structuring a loop body.
+#[derive(Debug, Clone)]
+struct LoopCtx {
+    /// Loop header block, mostly for diagnostics and future loop-owned tests.
+    header: usize,
+    /// In-body edge targets that mean "finish this iteration". For pre-test
+    /// loops this includes the header/latch; for Luau numeric and generic
+    /// loops this is the loop instruction latch.
+    continue_targets: HashSet<usize>,
+    /// Blocks whose edge to a continue target is the loop's ordinary tail edge.
+    /// That edge is represented by the surrounding loop syntax and must not be
+    /// lowered as an explicit `continue`.
+    implicit_continue_sources: HashSet<usize>,
+    /// Continue targets that still carry loop-body payload before completing
+    /// the iteration.
+    continue_payload_entries: HashSet<usize>,
+    /// Edge targets immediately outside the natural loop body. These are raw
+    /// CFG targets, not proof that the target block is payload-free.
+    exits: HashSet<usize>,
+    /// Exit targets that still belong to a branch inside the loop because they
+    /// carry statements before reaching the loop's canonical resume point.
+    exit_payload_entries: HashSet<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct LoopId {
+    /// Dominating loop header reached by the backedge.
+    header: usize,
+    /// Backedge source block.
+    latch: usize,
+}
+
+/// Structured loop plus the raw CFG exits used to resume the enclosing scope.
+#[derive(Debug, Clone)]
+struct LoopShape {
+    id: LoopId,
+    /// Header that identified this loop in the loop forest.
+    header: usize,
+    kind: LoopKind,
+    body: Box<Shape>,
+    /// Immediate successor blocks outside the natural loop body. A single exit
+    /// is the enclosing scope's next block; multiple exits require enclosing
+    /// structure to account for them before linear sequencing can continue.
+    exits: HashSet<usize>,
+}
+
+/// Determines where a recovered loop condition belongs in the source shape.
+#[derive(Debug, Clone)]
+enum LoopKind {
+    /// `while cond do`; condition is owned by the loop header.
+    While {
+        /// Source-level condition that reaches the loop body when truthy.
+        condition: HilExpr,
+        /// First CFG block in the guard tree.
+        guard: usize,
+        /// First payload block executed after the guard succeeds.
+        body: usize,
+        /// Empty conditional blocks consumed into `condition`; these are loop
+        /// syntax, not body payload.
+        guard_nodes: HashSet<usize>,
+        /// Guard leaves reached when the while condition fails.
+        exits: HashSet<usize>,
+    },
+    /// `repeat ... until cond`; condition is owned by the loop latch.
+    RepeatUntil {
+        condition: HilExpr,
+        latch: usize,
+        body: usize,
+    },
+    /// for var = start, step, end
+    NumericFor {
+        var: SymbolId,
+        start: HilExpr,
+        end: HilExpr,
+        step: HilExpr,
+        prep: usize,
+        body: usize,
+        exit: usize,
+    },
+    /// for [vars] in [exprs]
+    GenericFor {
+        vars: SmallVec<[SymbolId; 3]>,
+        exprs: [HilExpr; 3],
+        prep: usize,
+        body: usize,
+        exit: usize,
+    },
+    /// `while true do`; loop exits are represented by `break`.
+    Infinite { body: usize },
+}
+
+#[derive(Debug, Clone)]
+struct LoopBodyPlan {
+    /// Loop currently being structured. Passed back as `blocked_loop` so the
+    /// body traversal does not recursively recognize the same loop again.
+    loop_id: LoopId,
+    /// First CFG block to structure as the loop body.
+    entry: usize,
+    /// Blocks considered available to the loop body scope. This starts from the
+    /// natural loop body; branch structuring may still pull in an exit target
+    /// when that target is the branch entry and carries statements before
+    /// leaving the loop.
+    nodes: HashSet<usize>,
+    /// Boundary targets for the body scope. Reaching one stops ordinary linear
+    /// traversal and is later lowered through `LoopCtx` when appropriate.
+    exits: HashSet<usize>,
+    terminal_policy: TerminalPolicy,
+}
+
+#[derive(Debug, Clone)]
+enum TerminalPolicy {
+    Normal,
+    SuppressExitOf { block: usize },
+}
+
+impl TerminalPolicy {
+    fn suppresses(&self, block: usize) -> bool {
+        matches!(self, TerminalPolicy::SuppressExitOf { block: suppressed } if *suppressed == block)
+    }
+}
+
+/// The CFG boundary currently being structured.
+#[derive(Debug, Clone)]
+struct Scope {
+    /// First block to emit in this recursive structuring call.
+    entry: usize,
+    /// Blocks owned by this scope. Ordinary traversal should not walk outside
+    /// this set, but a branch entry that is also an exit target is still allowed
+    /// to be structured so its payload is not lost.
+    nodes: HashSet<usize>,
+    /// Boundary targets for this scope. These are stop points for sequencing,
+    /// not a claim that the target blocks have no statements.
+    exits: HashSet<usize>,
+    /// Exit targets that represent ordinary fallthrough for this scope, such as
+    /// the merge block of a structured conditional branch.
+    implicit_exits: HashSet<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct ConditionalShape {
+    /// CFG block whose terminator branches to `then_entry` or `else_entry`.
+    head: usize,
+    condition: HilExpr,
+    then_entry: usize,
+    else_entry: usize,
+    /// In-scope immediate post-dominator where both branches rejoin.
+    merge: Option<usize>,
+}
+
+/// Natural-loop facts discovered from dominators and backedges.
+#[derive(Debug, Clone)]
+struct LoopInfo {
+    id: LoopId,
+    header: usize,
+    latch: usize,
+    /// Backedge sources owned by this logical loop. Most loops have a single
+    /// latch, but source-level pre-test loops can have several body exits that
+    /// jump back to the same header.
+    latches: HashSet<usize>,
+    /// Natural loop body collected by walking predecessors from latch to
+    /// header. This identifies the cycle that proves the loop exists; Phoenix
+    /// expands it into a lexical body after classifying the loop kind.
+    body: HashSet<usize>,
+    /// Successor targets reached by edges leaving the natural cycle body.
+    exits: HashSet<usize>,
+    /// Smallest containing loop, when loop bodies are nested by containment.
+    parent: Option<LoopId>,
+    /// Loops directly nested inside this loop.
+    children: Vec<LoopId>,
+}
+
+#[derive(Debug, Clone)]
+struct WhileGuard {
+    /// Combined truth condition for all guard paths that reach `body`.
+    condition: HilExpr,
+    /// Unique payload entry reached by the truthy guard paths.
+    body: usize,
+    /// Empty CFG blocks folded into `condition`.
+    guard_nodes: HashSet<usize>,
+    /// CFG targets reached by falsy guard paths.
+    exits: HashSet<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct GuardBranch {
+    /// Condition under which this branch reaches `body`.
+    condition: HilExpr,
+    /// Payload entry reached by this branch, or `None` for a loop exit branch.
+    body: Option<usize>,
+    /// Empty CFG blocks folded while following this branch.
+    guard_nodes: HashSet<usize>,
+    /// Exit targets discovered while following this branch.
+    exits: HashSet<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct LoopForest {
+    loops: HashMap<LoopId, LoopInfo>,
+    by_header: HashMap<usize, Vec<LoopId>>,
+}
+
+impl LoopForest {
+    fn build(cfg: &ControlFlowGraph, idoms: &DominatorTree) -> Self {
+        let mut loops = HashMap::new();
+        let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::new();
+        let reachable: HashSet<_> = cfg.reverse_post_order().into_iter().collect();
+
+        for latch in cfg.iter() {
+            if !reachable.contains(&latch) {
+                continue;
+            }
+
+            for &header in cfg.successors(latch) {
+                if reachable.contains(&header) && idoms.dominates(header, latch) {
+                    let id = LoopId { header, latch };
+                    let body = natural_loop_body(cfg, header, latch, &reachable);
+                    let exits = body
+                        .iter()
+                        .flat_map(|&block| cfg.successors(block).iter().copied())
+                        .filter(|target| !body.contains(target))
+                        .collect();
+
+                    loops.insert(
+                        id,
+                        LoopInfo {
+                            id,
+                            header,
+                            latch,
+                            latches: [latch].into_iter().collect(),
+                            body,
+                            exits,
+                            parent: None,
+                            children: Vec::new(),
+                        },
+                    );
+                    by_header.entry(header).or_default().push(id);
+                }
+            }
+        }
+
+        for ids in by_header.values_mut() {
+            ids.sort_unstable_by_key(|id| (loops[id].body.len(), *id));
+        }
+
+        Self::recompute_exits(cfg, &mut loops);
+        Self::rebuild_tree(&mut loops);
+        Self::propagate_child_bodies(&mut loops);
+        Self::recompute_exits(cfg, &mut loops);
+
+        let aggregate_same_header_loops: Vec<_> = by_header
+            .iter()
+            .filter_map(|(&header, ids)| {
+                let root_ids: Vec<_> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| loops[id].parent.is_none())
+                    .collect();
+
+                if root_ids.len() < 2 {
+                    return None;
+                }
+
+                let representative = root_ids
+                    .iter()
+                    .copied()
+                    .max_by_key(|id| (loops[id].body.len(), *id))?;
+
+                let mut body = HashSet::new();
+                let mut latches = HashSet::new();
+                for id in root_ids.iter() {
+                    body.extend(loops[id].body.iter().copied());
+                    latches.extend(loops[id].latches.iter().copied());
+                }
+
+                Some((header, representative, root_ids, body, latches))
             })
             .collect();
 
-        CfgNode::Sequence { nodes: seq_nodes }
+        for (header, representative, merged_ids, body, latches) in aggregate_same_header_loops {
+            let info = loops
+                .get_mut(&representative)
+                .expect("representative loop should exist");
+            info.header = header;
+            info.latches = latches;
+            info.body = body;
+
+            for id in merged_ids {
+                if id != representative {
+                    loops.remove(&id);
+                }
+            }
+        }
+
+        Self::recompute_exits(cfg, &mut loops);
+        Self::rebuild_tree(&mut loops);
+        Self::propagate_child_bodies(&mut loops);
+        Self::recompute_exits(cfg, &mut loops);
+        let by_header = Self::rebuild_by_header(&loops);
+
+        Self { loops, by_header }
     }
 
-    /// Recursively replaces raw basic blocks that jump to the loop header/exit
-    /// with explicit Break and Continue nodes.
-    pub fn resolve_escapes(
-        &mut self,
-        continue_target: usize,
-        continue_target_alt: Option<usize>,
-        exit: Option<usize>,
-        cfg: &ControlFlowGraph,
-        region_map: &HashMap<usize, usize>,
-        require_empty_continue_target: bool,
-    ) {
-        let is_continue_target = |raw_target: usize, active_target: usize| {
-            if active_target == continue_target {
-                !require_empty_continue_target || cfg.get(raw_target).is_empty()
-            } else {
-                continue_target_alt.is_some_and(|target| raw_target == target)
-            }
-        };
-
-        match self {
-            CfgNode::Sequence { nodes } => nodes.iter_mut().for_each(|n| {
-                n.resolve_escapes(
-                    continue_target,
-                    continue_target_alt,
-                    exit,
-                    cfg,
-                    region_map,
-                    require_empty_continue_target,
-                )
-            }),
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                then_branch.resolve_escapes(
-                    continue_target,
-                    continue_target_alt,
-                    exit,
-                    cfg,
-                    region_map,
-                    require_empty_continue_target,
-                );
-                if let Some(e) = else_branch {
-                    e.resolve_escapes(
-                        continue_target,
-                        continue_target_alt,
-                        exit,
-                        cfg,
-                        region_map,
-                        require_empty_continue_target,
-                    );
-                }
-            }
-            CfgNode::BasicBlock { block } => {
-                let replacement = match cfg.get(*block).exit() {
-                    BlockExit::Jump(raw_target) => {
-                        let active = region_map[raw_target];
-                        if is_continue_target(*raw_target, active) {
-                            Some(CfgNode::Continue)
-                        } else if exit.is_some_and(|exit| active == exit) {
-                            Some(CfgNode::Break)
-                        } else {
-                            None
-                        }
-                    }
-                    BlockExit::Fallthrough(raw_target) => {
-                        let active = region_map[raw_target];
-                        if exit.is_some_and(|exit| active == exit) {
-                            Some(CfgNode::Break)
-                        } else {
-                            None
-                        }
-                    }
-                    BlockExit::CondJump {
-                        cond,
-                        then_block,
-                        else_block,
-                    } => {
-                        let active_then = region_map[then_block];
-                        let active_else = region_map[else_block];
-
-                        let then_terminal = if is_continue_target(*then_block, active_then) {
-                            Some(CfgNode::Continue)
-                        } else if exit.is_some_and(|exit| active_then == exit) {
-                            Some(CfgNode::Break)
-                        } else {
-                            None
-                        };
-
-                        let else_terminal = if is_continue_target(*else_block, active_else) {
-                            Some(CfgNode::Continue)
-                        } else if exit.is_some_and(|exit| active_else == exit) {
-                            Some(CfgNode::Break)
-                        } else {
-                            None
-                        };
-
-                        match (then_terminal, else_terminal) {
-                            (None, None) => None,
-                            (Some(terminal), None) => Some(CfgNode::If {
-                                condition: cond.clone(),
-                                then_branch: Box::new(terminal),
-                                else_branch: None,
-                            }),
-                            (None, Some(terminal)) => Some(CfgNode::If {
-                                condition: cond.clone().invert(),
-                                then_branch: Box::new(terminal),
-                                else_branch: None,
-                            }),
-                            (Some(then_terminal), Some(else_terminal)) => Some(CfgNode::If {
-                                condition: cond.clone(),
-                                then_branch: Box::new(then_terminal),
-                                else_branch: Some(Box::new(else_terminal)),
-                            }),
-                        }
-                    }
-                    _ => None,
-                };
-
-                if let Some(terminal) = replacement {
-                    *self = CfgNode::Sequence {
-                        nodes: vec![CfgNode::BasicBlock { block: *block }, terminal],
-                    };
-                }
-            }
-            _ => {}
+    fn recompute_exits(cfg: &ControlFlowGraph, loops: &mut HashMap<LoopId, LoopInfo>) {
+        for info in loops.values_mut() {
+            info.exits = info
+                .body
+                .iter()
+                .flat_map(|&block| cfg.successors(block).iter().copied())
+                .filter(|target| !info.body.contains(target))
+                .collect();
         }
     }
 
-    fn strip_virtual_exits(&mut self) {
-        match self {
-            CfgNode::Sequence { nodes } => {
-                nodes.retain(|n| !matches!(n, CfgNode::VirtualExit));
-                for node in nodes {
-                    node.strip_virtual_exits();
-                }
-            }
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                then_branch.strip_virtual_exits();
-                if let Some(e) = else_branch {
-                    e.strip_virtual_exits();
-                }
-            }
-            CfgNode::While { body, .. }
-            | CfgNode::NumericFor { body, .. }
-            | CfgNode::GenericFor { body, .. } => {
-                body.strip_virtual_exits();
-            }
-            _ => {}
+    fn rebuild_tree(loops: &mut HashMap<LoopId, LoopInfo>) {
+        for info in loops.values_mut() {
+            info.parent = None;
+            info.children.clear();
+        }
+
+        let ids: Vec<_> = loops.keys().copied().collect();
+        let parents: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter_map(|id| {
+                let loop_body = &loops.get(&id)?.body;
+                let parent = ids
+                    .iter()
+                    .copied()
+                    .filter(|&candidate| candidate != id)
+                    .filter(|&candidate| {
+                        let candidate_body = &loops[&candidate].body;
+                        loop_body.len() < candidate_body.len()
+                            && loop_body.iter().all(|node| candidate_body.contains(node))
+                    })
+                    .min_by_key(|candidate| (loops[candidate].body.len(), *candidate))?;
+
+                Some((id, parent))
+            })
+            .collect();
+
+        for (id, parent) in parents {
+            loops.get_mut(&id).expect("child loop should exist").parent = Some(parent);
+            loops
+                .get_mut(&parent)
+                .expect("parent loop should exist")
+                .children
+                .push(id);
+        }
+
+        let ids: Vec<_> = loops.keys().copied().collect();
+        let same_header_parents: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|id| loops[id].parent.is_none())
+            .filter_map(|id| {
+                let child = &loops[&id];
+                ids.iter()
+                    .copied()
+                    .filter(|&candidate| candidate != id)
+                    .filter(|candidate| loops[candidate].header == child.header)
+                    .filter(|candidate| {
+                        child
+                            .exits
+                            .iter()
+                            .all(|exit| loops[candidate].body.contains(exit))
+                    })
+                    .min_by_key(|candidate| (loops[candidate].body.len(), *candidate))
+                    .map(|parent| (id, parent))
+            })
+            .collect();
+
+        for (id, parent) in same_header_parents {
+            loops.get_mut(&id).expect("child loop should exist").parent = Some(parent);
+            loops
+                .get_mut(&parent)
+                .expect("parent loop should exist")
+                .children
+                .push(id);
+        }
+
+        for info in loops.values_mut() {
+            info.children.sort_unstable();
+            info.children.dedup();
         }
     }
 
-    /// Recursively replaces raw basic blocks that terminate with a return
-    /// with explicit Return nodes.
-    fn resolve_returns(&mut self, cfg: &ControlFlowGraph) {
-        match self {
-            CfgNode::Sequence { nodes } => {
-                for node in nodes.iter_mut() {
-                    node.resolve_returns(cfg);
-                }
-            }
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                then_branch.resolve_returns(cfg);
-                if let Some(e) = else_branch {
-                    e.resolve_returns(cfg);
-                }
-            }
-            CfgNode::While { body, .. }
-            | CfgNode::NumericFor { body, .. }
-            | CfgNode::GenericFor { body, .. } => {
-                body.resolve_returns(cfg);
-            }
-            CfgNode::BasicBlock { block } => {
-                if let BlockExit::Return(values) = cfg.get(*block).exit() {
-                    let terminal = CfgNode::Return {
-                        values: values.clone(),
-                    };
+    fn propagate_child_bodies(loops: &mut HashMap<LoopId, LoopInfo>) {
+        loop {
+            let mut changed = false;
+            let ids: Vec<_> = loops.keys().copied().collect();
 
-                    *self = CfgNode::Sequence {
-                        nodes: vec![CfgNode::BasicBlock { block: *block }, terminal],
-                    };
+            for id in ids {
+                let children = loops[&id].children.clone();
+                let mut child_body = HashSet::new();
+                for child in children {
+                    child_body.extend(loops[&child].body.iter().copied());
                 }
+
+                let info = loops.get_mut(&id).expect("loop should exist");
+                let old_len = info.body.len();
+                info.body.extend(child_body);
+                changed |= info.body.len() != old_len;
             }
-            _ => {}
+
+            if !changed {
+                break;
+            }
         }
     }
 
-    /// Returns the first raw basic block contained in this structured node.
-    ///
-    /// Post-structuring cleanup uses this to relate a structured loop body back to
-    /// the raw CFG edge that re-enters it.
-    fn first_block(&self) -> Option<usize> {
-        match self {
-            CfgNode::BasicBlock { block } => Some(*block),
-            CfgNode::Sequence { nodes } => nodes.first().and_then(|n| n.first_block()),
-            _ => None,
+    fn rebuild_by_header(loops: &HashMap<LoopId, LoopInfo>) -> HashMap<usize, Vec<LoopId>> {
+        let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::new();
+
+        for (&id, info) in loops {
+            by_header.entry(info.header).or_default().push(id);
         }
+
+        for ids in by_header.values_mut() {
+            ids.sort_unstable_by_key(|id| (loops[id].body.len(), *id));
+        }
+
+        by_header
     }
 
-    /// Returns whether this node starts with the given raw CFG block.
-    ///
-    /// Sequence nodes recurse into their first child so merged wrappers do not
-    /// hide the real leading block.
-    fn starts_with_block(&self, block: usize) -> bool {
-        self.first_block().is_some_and(|id| id == block)
+    fn get(&self, id: LoopId) -> Option<&LoopInfo> {
+        self.loops.get(&id)
     }
 
-    /// Returns whether this node ends in an explicit terminal statement.
-    fn ends_with_escape(&self) -> bool {
-        match self {
-            CfgNode::Continue | CfgNode::Break | CfgNode::Return { .. } => true,
-            CfgNode::Sequence { nodes } => nodes.last().is_some_and(|n| n.ends_with_escape()),
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                then_branch.ends_with_escape()
-                    && else_branch.as_ref().is_some_and(|e| e.ends_with_escape())
+    fn candidate_in_scope(
+        &self,
+        header: usize,
+        scope: &Scope,
+        blocked_loop: Option<LoopId>,
+    ) -> Option<&LoopInfo> {
+        self.by_header
+            .get(&header)?
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != blocked_loop)
+            .filter_map(|id| self.loops.get(&id))
+            .filter(|info| info.body.iter().all(|node| scope.nodes.contains(node)))
+            .max_by_key(|info| (info.body.len(), info.id))
+    }
+
+    fn is_nested_in(&self, inner: LoopId, outer: LoopId) -> bool {
+        let mut current = self.get(inner).and_then(|info| info.parent);
+
+        while let Some(id) = current {
+            if id == outer {
+                return true;
             }
-            _ => false,
+            current = self.get(id).and_then(|info| info.parent);
         }
+
+        false
     }
 
-    /// Lowers the node into an owned [`RegionNode`], consuming the control flow graph.
-    fn lower(self, cfg: &ControlFlowGraph) -> RegionNode {
-        match self {
-            CfgNode::BasicBlock { block } => RegionNode::BasicBlock {
-                // TODO: `std::mem::take` here to avoid cloning?
-                stmts: cfg.get(block).stmts().to_vec(),
-            },
-            CfgNode::Sequence { nodes } => {
-                // Because we now own the statements, we can flatten sequences of
-                // BasicBlocks into one basic block with chained statements.
-                let mut out = Vec::new();
-                let mut buf = Vec::new();
+    fn direct_children(&self, id: LoopId) -> &[LoopId] {
+        self.get(id).map_or(&[], |info| info.children.as_slice())
+    }
 
-                for n in nodes {
-                    match n.lower(cfg) {
-                        RegionNode::BasicBlock { stmts } => buf.extend(stmts),
-                        other => {
-                            if !buf.is_empty() {
-                                out.push(RegionNode::BasicBlock {
-                                    stmts: std::mem::take(&mut buf),
-                                });
-                            }
-                            out.push(other);
-                        }
-                    }
-                }
-                if !buf.is_empty() {
-                    out.push(RegionNode::BasicBlock { stmts: buf });
-                }
-                RegionNode::Sequence {
-                    nodes: flatten_regions(out),
-                }
-            }
-            CfgNode::If {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => RegionNode::If {
-                condition,
-                then_branch: Box::new(then_branch.lower(cfg)),
-                else_branch: else_branch.map(|e| Box::new(e.lower(cfg))),
-            },
-            CfgNode::While {
-                condition, body, ..
-            } => RegionNode::While {
-                condition,
-                body: Box::new(body.lower(cfg)),
-            },
-            CfgNode::NumericFor {
-                var,
-                start,
-                end,
-                step,
-                body,
-            } => RegionNode::NumericFor {
-                var,
-                start,
-                end,
-                step,
-                body: Box::new(body.lower(cfg)),
-            },
-            CfgNode::GenericFor {
-                vars, exprs, body, ..
-            } => RegionNode::GenericFor {
-                vars,
-                exprs: exprs.into(),
-                body: Box::new(body.lower(cfg)),
-            },
-            CfgNode::Continue => RegionNode::Continue,
-            CfgNode::Break => RegionNode::Break,
-            CfgNode::Return { values } => RegionNode::Return { values },
-            CfgNode::VirtualExit => unreachable!("should be stripped before lowering"),
-        }
+    fn is_loop_header(&self, node: usize) -> bool {
+        self.by_header.contains_key(&node)
     }
 }
 
-pub struct FoldableGraph<'a> {
-    cfg: &'a ControlFlowGraph,
-    nodes: HashMap<usize, CfgNode>,
-    region_for_block: HashMap<usize, usize>,
-
-    entry_node: usize,
-    exit_node: usize,
-
+pub struct RegionGraph {
+    entry: usize,
+    exit: usize,
+    nodes: HashMap<usize, Shape>,
     successors: HashMap<usize, Vec<usize>>,
     predecessors: HashMap<usize, Vec<usize>>,
-
-    idoms: Option<DominatorTree>,
-    postidoms: Option<DominatorTree>,
-
-    id_counter: usize,
 }
 
-impl GraphView for FoldableGraph<'_> {
+impl GraphView for RegionGraph {
     fn entry(&self) -> usize {
-        self.entry_node
+        self.entry
     }
 
     fn successors(&self, node: usize) -> &[usize] {
-        self.successors.get(&node).map_or(&[], Vec::as_slice)
+        self.successors.get(&node).map_or(&[], |v| v.as_slice())
     }
 
     fn predecessors(&self, node: usize) -> &[usize] {
-        self.predecessors.get(&node).map_or(&[], Vec::as_slice)
+        self.predecessors.get(&node).map_or(&[], |v| v.as_slice())
     }
 
     fn contains_node(&self, node: usize) -> bool {
@@ -663,27 +598,22 @@ impl GraphView for FoldableGraph<'_> {
     }
 }
 
-impl SeseGraphView for FoldableGraph<'_> {
+impl SeseGraphView for RegionGraph {
     fn exit(&self) -> usize {
-        self.exit_node
+        self.exit
     }
 }
 
-impl<'a> FoldableGraph<'a> {
-    pub fn new(cfg: &'a ControlFlowGraph) -> Self {
-        let mut nodes: HashMap<_, _> = cfg
-            .blocks()
-            .enumerate()
-            .map(|(i, _)| (i, CfgNode::BasicBlock { block: i }))
+impl RegionGraph {
+    pub fn from_cfg(cfg: &ControlFlowGraph) -> Self {
+        let mut nodes: HashMap<_, _> = cfg.iter().map(|i| (i, Shape::Block(i))).collect();
+        let mut successors: HashMap<_, _> = cfg
+            .iter()
+            .map(|i| (i, cfg.successors(i).to_vec()))
             .collect();
-
-        let mut successors: HashMap<_, _> = nodes
-            .keys()
-            .map(|n| (*n, cfg.successors(*n).to_vec()))
-            .collect();
-        let mut predecessors: HashMap<_, _> = nodes
-            .keys()
-            .map(|n| (*n, cfg.predecessors(*n).to_vec()))
+        let mut predecessors: HashMap<_, _> = cfg
+            .iter()
+            .map(|i| (i, cfg.predecessors(i).to_vec()))
             .collect();
 
         let terminal_nodes: Vec<_> = nodes
@@ -692,2607 +622,1122 @@ impl<'a> FoldableGraph<'a> {
             .filter(|&id| successors.get(&id).is_none_or(|s| s.is_empty()))
             .collect();
 
-        let mut id_counter = cfg.blocks().count();
-        let exit_node = if terminal_nodes.len() == 1 {
-            terminal_nodes[0]
-        } else {
-            // Because we have multiple exit points, we create a "virtual exit",
-            // which all current exits point in order to have a complete SESE graph.
-            let virtual_exit_id = id_counter;
-            id_counter += 1;
+        let virtual_exit = usize::MAX;
+        nodes.insert(virtual_exit, Shape::VirtualExit);
 
-            nodes.insert(virtual_exit_id, CfgNode::VirtualExit);
-
-            for node in terminal_nodes {
-                successors.entry(node).or_default().push(virtual_exit_id);
-                predecessors.entry(virtual_exit_id).or_default().push(node);
-            }
-            successors.insert(virtual_exit_id, Vec::new());
-
-            virtual_exit_id
-        };
-
-        let mut reachable = HashSet::new();
-        let mut stack = vec![cfg.entry()];
-        while let Some(node) = stack.pop() {
-            if reachable.insert(node)
-                && let Some(succs) = successors.get(&node)
-            {
-                stack.extend(succs.iter().copied());
-            }
+        for node in terminal_nodes {
+            successors.entry(node).or_default().push(virtual_exit);
+            predecessors.entry(virtual_exit).or_default().push(node);
         }
 
-        let all_nodes: Vec<_> = nodes.keys().copied().collect();
-        for node in all_nodes {
-            if !reachable.contains(&node) {
-                nodes.remove(&node);
+        successors.insert(virtual_exit, Vec::new());
 
-                if let Some(succs) = successors.remove(&node) {
-                    for succ in succs {
-                        if let Some(preds) = predecessors.get_mut(&succ) {
-                            preds.retain(|&p| p != node);
-                        }
-                    }
-                }
-                predecessors.remove(&node);
-            }
-        }
-
-        FoldableGraph {
-            cfg,
+        Self {
+            entry: cfg.entry(),
+            exit: virtual_exit,
             nodes,
-            region_for_block: (0..cfg.blocks().count()).map(|i| (i, i)).collect(),
-            entry_node: cfg.entry(),
-            exit_node,
             successors,
             predecessors,
-            idoms: None,
-            postidoms: None,
-            id_counter,
+        }
+    }
+}
+
+struct Structurer<'cfg> {
+    cfg: &'cfg ControlFlowGraph,
+    graph: RegionGraph,
+    idoms: DominatorTree,
+    ipdoms: DominatorTree,
+    loops: LoopForest,
+}
+
+impl<'cfg> Structurer<'cfg> {
+    fn new(cfg: &'cfg ControlFlowGraph) -> Self {
+        let graph = RegionGraph::from_cfg(cfg);
+        let idoms = graph.build_idoms();
+        let ipdoms = Reversed::new(&graph).build_idoms();
+        let loops = LoopForest::build(cfg, &idoms);
+
+        Self {
+            cfg,
+            graph,
+            idoms,
+            ipdoms,
+            loops,
         }
     }
 
-    /// Returns the next available node ID and increments the counter.
-    fn next_id(&mut self) -> usize {
-        let id = self.id_counter;
-        self.id_counter += 1;
-        id
+    fn structure(&self) -> Shape {
+        let nodes = self.graph.reverse_post_order().into_iter().collect();
+        let exits = [self.graph.exit()].into_iter().collect();
+        let scope = Scope {
+            entry: self.graph.entry(),
+            nodes,
+            exits,
+            implicit_exits: HashSet::new(),
+        };
+
+        self.structure_scope(&scope, None, &TerminalPolicy::Normal, None)
     }
 
-    /// Lazily recalculates the immediate dominators for each node in the graph.
-    fn get_or_calc_idoms(&mut self) -> &DominatorTree {
-        if self.idoms.is_none() {
-            self.idoms = Some(self.build_idoms());
+    fn structure_scope(
+        &self,
+        scope: &Scope,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+        blocked_loop: Option<LoopId>,
+    ) -> Shape {
+        verbose!("scope:");
+        verbose!(indent: 1, "entry = {}", scope.entry);
+        verbose!(indent: 1, "nodes = {:?}", sorted_nodes(&scope.nodes));
+        verbose!(indent: 1, "exits = {:?}", sorted_nodes(&scope.exits));
+        verbose!(
+            indent: 1,
+            "implicit_exits = {:?}",
+            sorted_nodes(&scope.implicit_exits)
+        );
+        verbose!(indent: 1, "terminal_policy = {:?}", terminal_policy);
+        verbose!(indent: 1, "blocked_loop = {:?}", blocked_loop);
+        if let Some(ctx) = loop_ctx {
+            verbose!(indent: 1, "loop_ctx.header = {}", ctx.header);
+            verbose!(
+                indent: 1,
+                "loop_ctx.continue_targets = {:?}",
+                sorted_nodes(&ctx.continue_targets)
+            );
+            verbose!(
+                indent: 1,
+                "loop_ctx.implicit_continue_sources = {:?}",
+                sorted_nodes(&ctx.implicit_continue_sources)
+            );
+            verbose!(indent: 1, "loop_ctx.exits = {:?}", sorted_nodes(&ctx.exits));
         }
 
-        self.idoms
-            .as_ref()
-            .expect("immediate dominators should be cached")
-    }
+        let mut nodes = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current = scope.entry;
 
-    /// Lazily recalculates the post-dominators for each node in the graph.
-    fn get_or_calc_postidoms(&mut self) -> &DominatorTree {
-        if self.postidoms.is_none() {
-            self.postidoms = Some(Reversed::new(&*self).build_idoms());
-        }
+        visited.insert(usize::MAX); // virtual exit
 
-        self.postidoms
-            .as_ref()
-            .expect("post-dominators should be cached")
-    }
-
-    /// Invalidates the cached immediate dominators and post-dominators,
-    /// forcing a recalculation on the next `get_or_calc*` call.
-    fn invalidate_doms(&mut self) {
-        self.idoms = None;
-        self.postidoms = None;
-    }
-
-    /// Removes stale adjacency entries after region nodes have absorbed raw CFG nodes.
-    ///
-    /// Folding keeps the original block IDs inside `CfgNode::BasicBlock` leaves, but
-    /// the folded-away graph node IDs must disappear from `successors` and
-    /// `predecessors`. If they remain, later SESE checks see phantom edges and skip
-    /// otherwise valid conditional or loop folds.
-    fn prune_stale_edges(&mut self) {
-        let live: HashSet<_> = self.nodes.keys().copied().collect();
-
-        self.successors.retain(|node, _| live.contains(node));
-        for succs in self.successors.values_mut() {
-            let mut seen = HashSet::new();
-            succs.retain(|succ| live.contains(succ));
-            succs.retain(|succ| seen.insert(*succ));
-        }
-
-        self.predecessors.retain(|node, _| live.contains(node));
-        for preds in self.predecessors.values_mut() {
-            let mut seen = HashSet::new();
-            preds.retain(|pred| live.contains(pred));
-            preds.retain(|pred| seen.insert(*pred));
-        }
-    }
-
-    /// Transfers all predecessors from `from` to `to`, updating the successor list of each predecessor.
-    fn transfer_predecessors(&mut self, from: usize, to: usize) {
-        let preds = self.predecessors.remove(&from).unwrap_or_default();
-        for p in &preds {
-            if let Some(succs) = self.successors.get_mut(p) {
-                for s in succs.iter_mut() {
-                    if *s == from {
-                        *s = to;
-                    }
-                }
-            }
-        }
-        self.predecessors.entry(to).or_default().extend(preds);
-    }
-
-    /// Transfers all successors from `from` to `to`, updating the predecessor list of each successor.
-    fn transfer_successors(&mut self, from: usize, to: usize) {
-        let succs = self.successors.remove(&from).unwrap_or_default();
-        for s in &succs {
-            if let Some(preds) = self.predecessors.get_mut(s) {
-                for p in preds.iter_mut() {
-                    if *p == from {
-                        *p = to;
-                    }
-                }
-            }
-        }
-        self.successors.entry(to).or_default().extend(succs);
-    }
-
-    fn update_regionmap(&mut self, mut pred: impl FnMut(usize) -> bool, new: usize) {
-        for val in self.region_for_block.values_mut() {
-            if pred(*val) {
-                *val = new;
-            }
-        }
-    }
-
-    fn refresh_entry_node(&mut self) {
-        if self.nodes.contains_key(&self.entry_node) {
-            return;
-        }
-
-        if let Some(&entry_node) = self.region_for_block.get(&self.cfg.entry())
-            && self.nodes.contains_key(&entry_node)
+        while scope.nodes.contains(&current)
+            && !scope.exits.contains(&current)
+            && visited.insert(current)
         {
-            self.entry_node = entry_node;
-        }
-    }
+            verbose!(indent: 1, "visit block {}", current);
 
-    /// Returns the exact successors of a node, if the successor count matches `N`.
-    fn exact_successors<const N: usize>(&self, node: usize) -> Option<[usize; N]> {
-        self.successors
-            .get(&node)
-            .and_then(|v| v.as_slice().try_into().ok())
-    }
+            if terminal_policy.suppresses(current) {
+                verbose!(indent: 2, "terminal policy suppresses this block");
+                nodes.push(Shape::Block(current));
+                break;
+            }
 
-    /// Returns the exact predecessors of a node, if the predecessor count matches `N`.
-    fn exact_predecessors<const N: usize>(&self, node: usize) -> Option<[usize; N]> {
-        self.predecessors
-            .get(&node)
-            .and_then(|v| v.as_slice().try_into().ok())
-    }
+            if let Some(loop_shape) = self.recognize_loop(current, scope, blocked_loop) {
+                let next = single_target(&loop_shape.exits);
+                verbose!(indent: 2, "recognized loop {:?}, next = {:?}", loop_shape.id, next);
+                nodes.push(Shape::Loop(loop_shape));
 
-    fn should_preserve_loop_exit_stub(&self, node: usize) -> bool {
-        let Some([pred]) = self.exact_predecessors(node) else {
-            return false;
-        };
-
-        let Some((_, raw_then, raw_else)) = self.extract_cond_jump(&self.nodes[&pred]) else {
-            return false;
-        };
-
-        let Some(&active_then) = self.region_for_block.get(&raw_then) else {
-            return false;
-        };
-        let Some(&active_else) = self.region_for_block.get(&raw_else) else {
-            return false;
-        };
-
-        (active_then == pred && active_else == node) || (active_else == pred && active_then == node)
-    }
-
-    /// Collapses sequentially executed blocks into a `BlockSequence` node.
-    fn collapse_sequential(&mut self) -> bool {
-        // Theory: If a basic block A has only one successor B, and B has only one predecessor A,
-        // then A and B are sequential and can be collapsed into a `BlockSequence` node.
-
-        let mut changed = false;
-
-        let mut work = self.post_order();
-        while let Some(curr) = work.pop() {
-            if !self.nodes.contains_key(&curr) {
+                let Some(next) = next else {
+                    break;
+                };
+                current = next;
                 continue;
             }
 
-            if let Some([next]) = self.exact_successors(curr)
-                && let Some([prev]) = self.exact_predecessors(next)
-                && prev == curr
-                && curr != next
-                && !self.should_preserve_loop_exit_stub(curr)
+            if let Some(conditional) =
+                self.recognize_conditional(current, scope, loop_ctx, terminal_policy)
             {
-                let seq_id = self.next_id();
+                let merge = conditional.merge;
+                verbose!(
+                    indent: 2,
+                    "recognized conditional: cond = ({}), then = {}, else = {}, merge = {:?}",
+                    conditional.condition,
+                    conditional.then_entry,
+                    conditional.else_entry,
+                    merge
+                );
 
-                let node_a = self.nodes.remove(&curr).unwrap();
-                let node_b = self.nodes.remove(&next).unwrap();
-
-                self.nodes.insert(seq_id, CfgNode::merge([node_a, node_b]));
-
-                self.update_regionmap(|val| val == curr || val == next, seq_id);
-
-                self.transfer_predecessors(curr, seq_id);
-                self.transfer_successors(next, seq_id);
-
-                self.successors.remove(&curr);
-                self.predecessors.remove(&next);
-
-                if curr == self.entry_node {
-                    self.entry_node = seq_id;
+                if !self.cfg.get(current).is_empty() {
+                    nodes.push(Shape::Block(current));
                 }
-                if next == self.exit_node {
-                    self.exit_node = seq_id;
-                }
-                self.invalidate_doms();
 
-                work.push(seq_id);
-                changed = true;
+                nodes.push(self.structure_conditional(
+                    conditional,
+                    scope,
+                    loop_ctx,
+                    terminal_policy,
+                    blocked_loop,
+                ));
+
+                let Some(merge) = merge else {
+                    break;
+                };
+                current = merge;
+                continue;
             }
+
+            nodes.push(self.shape_for_block(current, scope, loop_ctx, terminal_policy));
+
+            let next = self
+                .graph
+                .successors(current)
+                .iter()
+                .copied()
+                .find(|succ| scope.nodes.contains(succ) || scope.exits.contains(succ));
+
+            let Some(next) = next else {
+                verbose!(indent: 2, "no in-scope successor");
+                break;
+            };
+
+            if scope.exits.contains(&next) {
+                verbose!(indent: 2, "next block {} is a scope exit", next);
+                break;
+            }
+
+            verbose!(indent: 2, "next block = {}", next);
+            current = next;
         }
 
-        changed
+        if scope.nodes.contains(&current) && !scope.exits.contains(&current) {
+            verbose!(indent: 1, "stopped at block {} after revisit or terminal stop", current);
+        } else {
+            verbose!(indent: 1, "stopped before block {}", current);
+        }
+
+        Shape::sequence(nodes)
     }
 
-    fn extract_exit(&self, node: &CfgNode) -> Option<&BlockExit> {
-        match node {
-            CfgNode::BasicBlock { block } => Some(self.cfg.get(*block).exit()),
-            CfgNode::Sequence { nodes } => nodes.last().and_then(|n| self.extract_exit(n)),
-            _ => None,
+    fn recognize_loop(
+        &self,
+        header: usize,
+        scope: &Scope,
+        blocked_loop: Option<LoopId>,
+    ) -> Option<LoopShape> {
+        let loop_info = self.loops.candidate_in_scope(header, scope, blocked_loop)?;
+        let kind = self.classify_loop(loop_info);
+        let (lexical_body, lexical_exits) = self.lexical_loop_body(loop_info, &kind);
+        let body_plan = self.plan_loop_body(
+            loop_info,
+            &kind,
+            lexical_body.clone(),
+            lexical_exits.clone(),
+        );
+
+        let loop_ctx = LoopCtx {
+            header,
+            continue_targets: self.continue_targets(loop_info, &kind),
+            implicit_continue_sources: self.implicit_continue_sources(loop_info, &kind),
+            continue_payload_entries: self.continue_payload_entries(loop_info, &kind),
+            exits: lexical_exits.clone(),
+            exit_payload_entries: self.exit_payload_entries(loop_info, &lexical_exits),
+        };
+
+        verbose!("loop:");
+        verbose!(indent: 1, "id = {:?}", loop_info.id);
+        verbose!(indent: 1, "header = {}", header);
+        verbose!(
+            indent: 1,
+            "natural_body = {:?}",
+            sorted_nodes(&loop_info.body)
+        );
+        verbose!(indent: 1, "body = {:?}", sorted_nodes(&body_plan.nodes));
+        verbose!(indent: 1, "exits = {:?}", sorted_nodes(&lexical_exits));
+        verbose!(
+            indent: 1,
+            "exit_payload_entries = {:?}",
+            sorted_nodes(&loop_ctx.exit_payload_entries)
+        );
+        verbose!(
+            indent: 1,
+            "continue_targets = {:?}",
+            sorted_nodes(&loop_ctx.continue_targets)
+        );
+        verbose!(
+            indent: 1,
+            "implicit_continue_sources = {:?}",
+            sorted_nodes(&loop_ctx.implicit_continue_sources)
+        );
+        verbose!(
+            indent: 1,
+            "continue_payload_entries = {:?}",
+            sorted_nodes(&loop_ctx.continue_payload_entries)
+        );
+        verbose!(indent: 1, "body_entry = {}", body_plan.entry);
+        verbose!(
+            indent: 1,
+            "body_terminal_policy = {:?}",
+            body_plan.terminal_policy
+        );
+
+        Some(LoopShape {
+            id: loop_info.id,
+            header,
+            kind,
+            body: Box::new(self.structure_loop_body(&body_plan, &loop_ctx)),
+            exits: lexical_exits,
+        })
+    }
+
+    fn plan_loop_body(
+        &self,
+        loop_info: &LoopInfo,
+        kind: &LoopKind,
+        lexical_body: HashSet<usize>,
+        lexical_exits: HashSet<usize>,
+    ) -> LoopBodyPlan {
+        match kind {
+            LoopKind::While {
+                body, guard_nodes, ..
+            } => {
+                let mut nodes = lexical_body;
+                for guard in guard_nodes {
+                    nodes.remove(guard);
+                }
+
+                LoopBodyPlan {
+                    loop_id: loop_info.id,
+                    entry: *body,
+                    nodes,
+                    exits: [loop_info.header]
+                        .into_iter()
+                        .chain(lexical_exits.iter().copied())
+                        .collect(),
+                    terminal_policy: TerminalPolicy::Normal,
+                }
+            }
+            LoopKind::Infinite { body } => LoopBodyPlan {
+                loop_id: loop_info.id,
+                entry: *body,
+                nodes: lexical_body,
+                exits: lexical_exits,
+                terminal_policy: TerminalPolicy::Normal,
+            },
+            LoopKind::RepeatUntil { latch, body, .. } => LoopBodyPlan {
+                loop_id: loop_info.id,
+                entry: *body,
+                nodes: lexical_body,
+                exits: lexical_exits,
+                terminal_policy: TerminalPolicy::SuppressExitOf { block: *latch },
+            },
+            LoopKind::NumericFor { body, .. } | LoopKind::GenericFor { body, .. } => LoopBodyPlan {
+                loop_id: loop_info.id,
+                entry: *body,
+                nodes: lexical_body,
+                exits: lexical_exits,
+                terminal_policy: TerminalPolicy::Normal,
+            },
         }
     }
 
-    fn extract_cond_jump(&self, node: &CfgNode) -> Option<(HilExpr, usize, usize)> {
-        if let Some(BlockExit::CondJump {
+    fn lexical_loop_body(
+        &self,
+        loop_info: &LoopInfo,
+        kind: &LoopKind,
+    ) -> (HashSet<usize>, HashSet<usize>) {
+        let exits = self.lexical_loop_exits(loop_info, kind);
+        let mut body = loop_info.body.clone();
+        let mut stack: Vec<_> = body
+            .iter()
+            .flat_map(|&block| self.graph.successors(block).iter().copied())
+            .filter(|target| !body.contains(target) && !exits.contains(target))
+            .collect();
+
+        while let Some(node) = stack.pop() {
+            if exits.contains(&node) || !body.insert(node) {
+                continue;
+            }
+
+            stack.extend(
+                self.graph
+                    .successors(node)
+                    .iter()
+                    .copied()
+                    .filter(|target| !body.contains(target) && !exits.contains(target)),
+            );
+        }
+
+        (body, exits)
+    }
+
+    fn lexical_loop_exits(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+        match kind {
+            LoopKind::NumericFor { exit, .. } | LoopKind::GenericFor { exit, .. } => {
+                [*exit].into_iter().collect()
+            }
+            LoopKind::RepeatUntil { latch, .. } => self
+                .graph
+                .successors(*latch)
+                .iter()
+                .copied()
+                .filter(|target| *target != loop_info.header)
+                .collect(),
+            LoopKind::While { exits, .. } => exits.clone(),
+            LoopKind::Infinite { .. } => self.common_loop_follow(loop_info).map_or_else(
+                || loop_info.exits.clone(),
+                |follow| [follow].into_iter().collect(),
+            ),
+        }
+    }
+
+    fn structure_loop_body(&self, plan: &LoopBodyPlan, loop_ctx: &LoopCtx) -> Shape {
+        let scope = Scope {
+            entry: plan.entry,
+            nodes: plan.nodes.clone(),
+            exits: plan.exits.clone(),
+            implicit_exits: HashSet::new(),
+        };
+
+        self.structure_scope(
+            &scope,
+            Some(loop_ctx),
+            &plan.terminal_policy,
+            Some(plan.loop_id),
+        )
+    }
+
+    fn continue_targets(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+        match kind {
+            LoopKind::While { .. } | LoopKind::Infinite { .. } => [loop_info.header]
+                .into_iter()
+                .chain(loop_info.latches.iter().copied())
+                .collect(),
+            LoopKind::RepeatUntil { .. }
+            | LoopKind::NumericFor { .. }
+            | LoopKind::GenericFor { .. } => [loop_info.latch].into_iter().collect(),
+        }
+    }
+
+    fn implicit_continue_sources(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+        match kind {
+            LoopKind::While { .. } | LoopKind::Infinite { .. } => loop_info
+                .latches
+                .iter()
+                .copied()
+                .filter(|latch| *latch != loop_info.header)
+                .collect(),
+            _ => HashSet::new(),
+        }
+    }
+
+    fn exit_payload_entries(
+        &self,
+        loop_info: &LoopInfo,
+        lexical_exits: &HashSet<usize>,
+    ) -> HashSet<usize> {
+        loop_info.exits.difference(lexical_exits).copied().collect()
+    }
+
+    fn continue_payload_entries(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+        match kind {
+            LoopKind::While { .. } | LoopKind::Infinite { .. } => loop_info
+                .latches
+                .iter()
+                .copied()
+                .filter(|latch| *latch != loop_info.header)
+                .collect(),
+            LoopKind::NumericFor { .. } | LoopKind::GenericFor { .. }
+                if !self.cfg.get(loop_info.latch).is_empty() =>
+            {
+                [loop_info.latch].into_iter().collect()
+            }
+            _ => HashSet::new(),
+        }
+    }
+
+    fn recognize_conditional(
+        &self,
+        head: usize,
+        scope: &Scope,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+    ) -> Option<ConditionalShape> {
+        let BlockExit::CondJump {
             cond,
             then_block,
             else_block,
-        }) = self.extract_exit(node)
-        {
-            Some((cond.clone(), *then_block, *else_block))
-        } else {
-            None
-        }
-    }
+        } = self.cfg.get(head).exit()
+        else {
+            return None;
+        };
 
-    fn node_emits_statements(&self, node: &CfgNode) -> bool {
-        match node {
-            CfgNode::BasicBlock { block } => !self.cfg.get(*block).is_empty(),
-            CfgNode::Sequence { nodes } => {
-                nodes.iter().any(|node| self.node_emits_statements(node))
-            }
-            CfgNode::If { .. }
-            | CfgNode::While { .. }
-            | CfgNode::NumericFor { .. }
-            | CfgNode::GenericFor { .. }
-            | CfgNode::Continue
-            | CfgNode::Break
-            | CfgNode::Return { .. } => true,
-            CfgNode::VirtualExit => false,
-        }
-    }
-
-    fn node_ends_with_terminal(&self, node: &CfgNode) -> bool {
-        match node {
-            CfgNode::BasicBlock { block } => {
-                matches!(self.cfg.get(*block).exit(), BlockExit::Return(_))
-            }
-            CfgNode::Sequence { nodes } => nodes
-                .last()
-                .is_some_and(|node| self.node_ends_with_terminal(node)),
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.node_ends_with_terminal(then_branch)
-                    && else_branch
-                        .as_ref()
-                        .is_some_and(|branch| self.node_ends_with_terminal(branch))
-            }
-            _ => node.ends_with_escape(),
-        }
-    }
-
-    /// Returns the normalized `(start, end, step)` shape for a range that contains
-    /// exactly one structured numeric `for` loop.
-    ///
-    /// Flattened loop regions often look like:
-    ///
-    /// ```text
-    /// BasicBlock(assign loop bounds)
-    /// NumericFor(start = bound_symbol, end = bound_symbol, step = bound_symbol)
-    /// ```
-    ///
-    /// This helper treats those simple binding blocks as part of the loop range and
-    /// resolves the loop bounds through them, so two adjacent alternatives can be
-    /// compared by value rather than by temporary SSA symbol IDs.
-    fn numeric_for_range_shape(
-        &self,
-        nodes: &[CfgNode],
-        start: usize,
-        end: usize,
-    ) -> Option<(HilExpr, HilExpr, HilExpr)> {
-        let mut bindings = HashMap::new();
-        for node in &nodes[start..end] {
-            self.collect_simple_bindings(node, &mut bindings);
-        }
-
-        // There should be one real loop-emitting node in the range. Binding-only
-        // blocks are allowed because FORNPREP setup can remain as a sibling of the
-        // recovered `NumericFor` node until lowering.
-        let mut shape = None;
-
-        for node in &nodes[start..end] {
-            if let Some((start, end, step)) = self.node_numeric_for_shape(node) {
-                let normalized = (
-                    Self::resolve_simple_binding(start, &bindings),
-                    Self::resolve_simple_binding(end, &bindings),
-                    Self::resolve_simple_binding(step, &bindings),
-                );
-
-                if shape.replace(normalized).is_some() {
-                    return None;
-                }
-            } else if self.node_is_simple_binding_block(node) || !self.node_emits_statements(node) {
-                continue;
-            } else {
-                return None;
-            }
-        }
-
-        shape
-    }
-
-    /// Collects single-symbol assignments that can be used to normalize loop bounds.
-    ///
-    /// The bindings are intentionally shallow and local to the candidate branch
-    /// range. They are used only for shape comparison, not for rewriting the IR.
-    fn collect_simple_bindings(&self, node: &CfgNode, bindings: &mut HashMap<SymbolId, HilExpr>) {
-        match node {
-            CfgNode::BasicBlock { block } => {
-                for stmt in self.cfg.get(*block).stmts() {
-                    if let HilStmt::Assign {
-                        left: HilExpr::Symbol(symbol),
-                        value,
-                    } = &stmt
-                    {
-                        bindings.insert(*symbol, value.clone());
-                    }
-                }
-            }
-            CfgNode::Sequence { nodes } => {
-                for node in nodes {
-                    self.collect_simple_bindings(node, bindings);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Returns true when a node only defines temporary values.
-    ///
-    /// Such blocks are safe to ignore while looking for the numeric-for shape,
-    /// because their statements are loop setup that will still be emitted wherever
-    /// the containing branch is moved.
-    fn node_is_simple_binding_block(&self, node: &CfgNode) -> bool {
-        match node {
-            CfgNode::BasicBlock { block } => self.cfg.get(*block).stmts().iter().all(|stmt| {
-                matches!(
-                    &stmt,
-                    HilStmt::Assign {
-                        left: HilExpr::Symbol(_),
-                        ..
-                    } | HilStmt::Phi(_)
-                )
+        Some(ConditionalShape {
+            head,
+            condition: cond.clone(),
+            then_entry: *then_block,
+            else_entry: *else_block,
+            merge: self.find_merge_point(head, scope).or_else(|| {
+                self.local_branch_merge(*then_block, *else_block, scope, loop_ctx, terminal_policy)
             }),
-            CfgNode::Sequence { nodes } => nodes
-                .iter()
-                .all(|node| self.node_is_simple_binding_block(node)),
-            _ => false,
-        }
+        })
     }
 
-    /// Replaces a symbol expression with a simple binding collected from the same range.
-    fn resolve_simple_binding(expr: HilExpr, bindings: &HashMap<SymbolId, HilExpr>) -> HilExpr {
-        match expr {
-            HilExpr::Symbol(symbol) => bindings
-                .get(&symbol)
-                .cloned()
-                .unwrap_or(HilExpr::Symbol(symbol)),
-            other => other,
-        }
-    }
-
-    /// Extracts the raw numeric-for bounds from a single structured loop node.
-    fn node_numeric_for_shape(&self, node: &CfgNode) -> Option<(HilExpr, HilExpr, HilExpr)> {
-        match node {
-            CfgNode::NumericFor {
-                start, end, step, ..
-            } => Some((start.clone(), end.clone(), step.clone())),
-            _ => None,
-        }
-    }
-
-    /// Extracts a normalized numeric-for shape from a branch node.
-    ///
-    /// Used by the cleanup pass that repairs one-armed `if` nodes followed by the
-    /// matching alternative loop.
-    fn branch_numeric_for_shape(&self, node: &CfgNode) -> Option<(HilExpr, HilExpr, HilExpr)> {
-        match node {
-            CfgNode::Sequence { nodes } => self.numeric_for_range_shape(nodes, 0, nodes.len()),
-            other => self.node_numeric_for_shape(other),
-        }
-    }
-
-    /// Checks whether two flattened branch ranges contain matching numeric loops.
-    ///
-    /// The comparison is deliberately narrow: both ranges must reduce to exactly one
-    /// numeric-for shape after ignoring simple loop-setup bindings. This prevents
-    /// broad if/else reconstruction in hash code where adjacent numeric loops may be
-    /// sequential work rather than alternatives.
-    fn ranges_are_matching_numeric_fors(
+    fn local_branch_merge(
         &self,
-        nodes: &[CfgNode],
-        then_idx: usize,
-        then_end: usize,
-        else_idx: usize,
-        else_end: usize,
-    ) -> bool {
-        let Some(then_shape) = self.numeric_for_range_shape(nodes, then_idx, then_end) else {
-            return false;
-        };
-        self.numeric_for_range_shape(nodes, else_idx, else_end)
-            .is_some_and(|else_shape| then_shape == else_shape)
+        then_entry: usize,
+        else_entry: usize,
+        scope: &Scope,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+    ) -> Option<usize> {
+        let then_target =
+            single_target(&self.graph.successors(then_entry).iter().copied().collect())?;
+        let else_target =
+            single_target(&self.graph.successors(else_entry).iter().copied().collect())?;
+
+        let is_loop_payload =
+            loop_ctx.is_some_and(|ctx| ctx.continue_payload_entries.contains(&then_target));
+
+        (then_target == else_target
+            && (scope.nodes.contains(&then_target) || is_loop_payload)
+            && (!scope.exits.contains(&then_target)
+                || terminal_policy.suppresses(then_target)
+                || is_loop_payload))
+            .then_some(then_target)
     }
 
-    /// Restructures a loop header's conditional branch inside a recovered loop body.
-    ///
-    /// Numeric and generic loop recovery can leave the header block and the two raw
-    /// conditional targets as siblings in the loop body. This pass recognizes those
-    /// target siblings and rebuilds the source-level `if`, either as an escape guard
-    /// (`if cond then break end`) or as a normal `if/else`.
-    fn fold_head_escape_guard(&self, head_node: CfgNode, body_ast: CfgNode) -> CfgNode {
-        let Some((mut cond, then_block, else_block)) = self.extract_cond_jump(&head_node) else {
-            return CfgNode::merge([head_node, body_ast]);
+    fn structure_conditional(
+        &self,
+        shape: ConditionalShape,
+        scope: &Scope,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+        blocked_loop: Option<LoopId>,
+    ) -> Shape {
+        let mut branch_exits = scope.exits.clone();
+        if let Some(merge) = shape.merge {
+            branch_exits.insert(merge);
+        }
+        if let TerminalPolicy::SuppressExitOf { block } = terminal_policy {
+            branch_exits.insert(*block);
+        }
+        if let Some(ctx) = loop_ctx {
+            // Implicit tails still contain loop-body statements; structure them
+            // in the branch and suppress only their final backedge.
+            branch_exits.extend(ctx.continue_targets.iter().copied().filter(|target| {
+                !terminal_policy.suppresses(*target)
+                    && !ctx.implicit_continue_sources.contains(target)
+            }));
+            branch_exits.extend(ctx.exits.iter().copied());
+        }
+
+        verbose!("conditional:");
+        verbose!(indent: 1, "head = {}", shape.head);
+        verbose!(indent: 1, "then_entry = {}", shape.then_entry);
+        verbose!(indent: 1, "else_entry = {}", shape.else_entry);
+        verbose!(indent: 1, "merge = {:?}", shape.merge);
+        verbose!(indent: 1, "branch_exits = {:?}", sorted_nodes(&branch_exits));
+
+        let owned_boundary_entry = |entry: usize| {
+            Some(entry) != shape.merge
+                && !terminal_policy.suppresses(entry)
+                && loop_ctx.is_some_and(|ctx| {
+                    ctx.continue_payload_entries.contains(&entry)
+                        || ctx.exit_payload_entries.contains(&entry)
+                })
         };
 
-        let CfgNode::Sequence { mut nodes } = body_ast else {
-            return CfgNode::merge([head_node, body_ast]);
-        };
+        let then_nodes = self.collect_reachable_until(
+            shape.then_entry,
+            scope,
+            &branch_exits,
+            owned_boundary_entry(shape.then_entry),
+        );
+        let else_nodes = self.collect_reachable_until(
+            shape.else_entry,
+            scope,
+            &branch_exits,
+            owned_boundary_entry(shape.else_entry),
+        );
 
-        // Locate the current structured nodes that start with each raw conditional
-        // target. After earlier folds these are usually not bare blocks anymore:
-        // they can be sequences such as `prep block + NumericFor`.
-        let then_idx = nodes
-            .iter()
-            .position(|node| node.starts_with_block(then_block));
-        let else_idx = nodes
-            .iter()
-            .position(|node| node.starts_with_block(else_block));
+        verbose!(indent: 1, "then_nodes = {:?}", sorted_nodes(&then_nodes));
+        verbose!(indent: 1, "else_nodes = {:?}", sorted_nodes(&else_nodes));
 
-        let Some((then_idx, else_idx)) = (match (then_idx, else_idx) {
-            (Some(t), Some(e)) if t != e => Some((t, e)),
-            _ => {
-                return CfgNode::merge([head_node, CfgNode::Sequence { nodes }]);
-            }
-        }) else {
-            return CfgNode::merge([head_node, CfgNode::Sequence { nodes }]);
-        };
+        let build_branch = |entry: usize, mut nodes: HashSet<usize>| {
+            verbose!(
+                indent: 1,
+                "build_branch entry = {}, nodes = {:?}",
+                entry,
+                sorted_nodes(&nodes)
+            );
 
-        // The simplest loop-header condition is a guard where one or both branches
-        // exit the current loop. Pull those targets next to the header so lowering
-        // emits a clear guard instead of leaving the raw jump shape in the sequence.
-        let then_escape = self.node_ends_with_terminal(&nodes[then_idx]);
-        let else_escape = self.node_ends_with_terminal(&nodes[else_idx]);
-
-        if then_escape && else_escape {
-            let mut guarded = Vec::with_capacity(nodes.len() + 2);
-            guarded.push(head_node);
-            let mut then_node = None;
-            let mut else_node = None;
-            let mut remove_order = [then_idx, else_idx];
-            remove_order.sort_unstable_by(|a, b| b.cmp(a));
-
-            for idx in remove_order {
-                let removed = nodes.remove(idx);
-                if idx == then_idx {
-                    then_node = Some(removed);
-                } else {
-                    else_node = Some(removed);
+            if nodes.is_empty() {
+                // If the branch naturally falls through to the merge point, it's just empty.
+                if Some(entry) == shape.merge {
+                    verbose!(indent: 2, "empty branch falls through to merge");
+                    return Shape::sequence(Vec::new());
                 }
-            }
-
-            guarded.push(CfgNode::If {
-                condition: cond,
-                then_branch: Box::new(then_node.unwrap()),
-                else_branch: Some(Box::new(else_node.unwrap())),
-            });
-            guarded.extend(nodes);
-            return CfgNode::Sequence { nodes: guarded };
-        }
-
-        if let Some((escape_idx, invert)) = if then_escape {
-            Some((then_idx, false))
-        } else if else_escape {
-            Some((else_idx, true))
-        } else {
-            None
-        } {
-            if invert {
-                cond = cond.invert();
-            }
-
-            let mut guarded = Vec::with_capacity(nodes.len() + 2);
-            guarded.push(head_node);
-
-            let escape_node = nodes.remove(escape_idx);
-            guarded.push(CfgNode::If {
-                condition: cond,
-                then_branch: Box::new(escape_node),
-                else_branch: None,
-            });
-            guarded.extend(nodes);
-
-            return CfgNode::Sequence { nodes: guarded };
-        }
-
-        // Neither branch always escapes, but both targets are present in the body.
-        // Preserve the older single-node fold for ordinary branch shapes. The wider
-        // segment logic below is only for flattened loop regions where a branch is
-        // represented by multiple adjacent siblings.
-        let has_flattened_loop_region = nodes.iter().any(|node| {
-            matches!(
-                node,
-                CfgNode::NumericFor { .. } | CfgNode::GenericFor { .. }
-            )
-        });
-
-        if !has_flattened_loop_region {
-            if let Some((then_branch, fallback_node, remaining)) =
-                self.build_shared_fallback_chain(&nodes, then_block, else_block)
-            {
-                let mut folded = Vec::with_capacity(remaining.len() + 3);
-                folded.push(head_node);
-                folded.push(CfgNode::If {
-                    condition: cond,
-                    then_branch: Box::new(then_branch),
-                    else_branch: None,
-                });
-                folded.push(fallback_node);
-                folded.extend(remaining);
-
-                return CfgNode::Sequence { nodes: folded };
-            }
-
-            if let Some((else_branch, fallback_node, remaining)) =
-                self.build_shared_fallback_chain(&nodes, else_block, then_block)
-            {
-                let mut folded = Vec::with_capacity(remaining.len() + 3);
-                folded.push(head_node);
-                folded.push(CfgNode::If {
-                    condition: cond.invert(),
-                    then_branch: Box::new(else_branch),
-                    else_branch: None,
-                });
-                folded.push(fallback_node);
-                folded.extend(remaining);
-
-                return CfgNode::Sequence { nodes: folded };
-            }
-
-            let mut then_node_val = None;
-            let mut else_node_val = None;
-            let mut remove_order = [then_idx, else_idx];
-            remove_order.sort_unstable_by(|a, b| b.cmp(a));
-
-            for idx in remove_order {
-                let removed = nodes.remove(idx);
-                if idx == then_idx {
-                    then_node_val = Some(removed);
-                } else {
-                    else_node_val = Some(removed);
+                if terminal_policy.suppresses(entry) {
+                    verbose!(indent: 2, "empty branch reaches suppressed terminal");
+                    return Shape::sequence(Vec::new());
                 }
-            }
 
-            let then_branch = CfgNode::merge(std::iter::once(then_node_val.unwrap()).chain(nodes));
-            let else_branch = else_node_val.unwrap();
-
-            return CfgNode::Sequence {
-                nodes: vec![
-                    head_node,
-                    CfgNode::If {
-                        condition: cond,
-                        then_branch: Box::new(then_branch),
-                        else_branch: Some(Box::new(else_branch)),
-                    },
-                ],
-            };
-        }
-
-        // For flattened loop branches, include the prep block plus the immediately
-        // following structured loop. When the opposite conditional target appears
-        // later, a one-armed branch may also include the intervening continuation
-        // nodes; this is the shape produced by some hash finalization loops.
-        let branch_end = |start: usize, other_start: usize| {
-            let mut end = start + 1;
-            let mut saw_loop = false;
-            if matches!(
-                nodes.get(end),
-                Some(CfgNode::NumericFor { .. } | CfgNode::GenericFor { .. })
-            ) {
-                end += 1;
-                saw_loop = true;
-            }
-
-            if saw_loop && start < other_start {
-                end = other_start;
-            }
-
-            end
-        };
-
-        let then_end = branch_end(then_idx, else_idx);
-        let else_end = branch_end(else_idx, then_idx);
-
-        let then_touches_else = then_end == else_idx && then_end > then_idx + 1;
-        let else_touches_then = else_end == then_idx && else_end > else_idx + 1;
-        if then_touches_else || else_touches_then {
-            // Adjacent branch ranges can be either real alternatives or a one-armed
-            // guard followed by continuation. Only rebuild an `if/else` here when
-            // both sides are matching numeric-for ranges; otherwise keep the safer
-            // one-armed interpretation.
-            if then_touches_else
-                && else_end > else_idx + 1
-                && self.ranges_are_matching_numeric_fors(
-                    &nodes, then_idx, then_end, else_idx, else_end,
-                )
-            {
-                let mut then_nodes = Vec::new();
-                let mut else_nodes = Vec::new();
-                let mut remaining = Vec::with_capacity(nodes.len());
-                for (idx, node) in nodes.into_iter().enumerate() {
-                    if (then_idx..then_end).contains(&idx) {
-                        then_nodes.push(node);
-                    } else if (else_idx..else_end).contains(&idx) {
-                        else_nodes.push(node);
-                    } else {
-                        remaining.push(node);
+                // If the branch jumps out of the region entirely, map it to the correct exit instruction.
+                if let Some(ctx) = loop_ctx {
+                    if ctx.continue_targets.contains(&entry) {
+                        verbose!(indent: 2, "empty branch reaches loop continuation -> continue");
+                        return Shape::Continue;
+                    }
+                    if ctx.exits.contains(&entry) {
+                        verbose!(indent: 2, "empty branch exits loop -> break");
+                        return Shape::Break;
                     }
                 }
 
-                let mut folded = Vec::with_capacity(remaining.len() + 2);
-                folded.push(head_node);
-                folded.push(CfgNode::If {
-                    condition: cond,
-                    then_branch: Box::new(CfgNode::Sequence { nodes: then_nodes }),
-                    else_branch: Some(Box::new(CfgNode::Sequence { nodes: else_nodes })),
-                });
-                folded.extend(remaining);
-
-                return CfgNode::Sequence { nodes: folded };
+                // Empty branch nodes mean the target is a boundary owned by an
+                // outer scope. Do not inspect that block's payload here: a
+                // shared continuation may itself end in Return, but the edge is
+                // still ordinary fallthrough from this branch.
+                verbose!(indent: 2, "empty branch reaches outer boundary");
+                return Shape::sequence(Vec::new());
             }
 
-            if else_touches_then
-                && then_end > then_idx + 1
-                && self.ranges_are_matching_numeric_fors(
-                    &nodes, then_idx, then_end, else_idx, else_end,
-                )
-            {
-                let mut then_nodes = Vec::new();
-                let mut else_nodes = Vec::new();
-                let mut remaining = Vec::with_capacity(nodes.len());
-                for (idx, node) in nodes.into_iter().enumerate() {
-                    if (then_idx..then_end).contains(&idx) {
-                        then_nodes.push(node);
-                    } else if (else_idx..else_end).contains(&idx) {
-                        else_nodes.push(node);
-                    } else {
-                        remaining.push(node);
-                    }
-                }
-
-                let mut folded = Vec::with_capacity(remaining.len() + 2);
-                folded.push(head_node);
-                folded.push(CfgNode::If {
-                    condition: cond,
-                    then_branch: Box::new(CfgNode::Sequence { nodes: then_nodes }),
-                    else_branch: Some(Box::new(CfgNode::Sequence { nodes: else_nodes })),
-                });
-                folded.extend(remaining);
-
-                return CfgNode::Sequence { nodes: folded };
-            }
-
-            // If the adjacent ranges do not prove to be matching alternatives, fold
-            // the range that touches the other target as a guard and leave the rest
-            // of the sequence in place. This avoids swallowing sequential work.
-            let (branch_idx, branch_end, invert) = if then_end == else_idx {
-                (then_idx, then_end, false)
-            } else {
-                (else_idx, else_end, true)
-            };
-
-            if invert {
-                cond = cond.invert();
-            }
-
-            let mut branch_nodes = Vec::new();
-            let mut remaining = Vec::with_capacity(nodes.len());
-            for (idx, node) in nodes.into_iter().enumerate() {
-                if (branch_idx..branch_end).contains(&idx) {
-                    branch_nodes.push(node);
-                } else {
-                    remaining.push(node);
-                }
-            }
-
-            let mut folded = Vec::with_capacity(remaining.len() + 2);
-            folded.push(head_node);
-            folded.push(CfgNode::If {
-                condition: cond,
-                then_branch: Box::new(CfgNode::Sequence {
-                    nodes: branch_nodes,
-                }),
-                else_branch: None,
+            let owned_payload_exit = loop_ctx.and_then(|ctx| {
+                ctx.continue_payload_entries
+                    .iter()
+                    .copied()
+                    .filter(|payload| {
+                        Some(*payload) != shape.merge || scope.exits.contains(payload)
+                    })
+                    .find(|payload| {
+                        entry == *payload
+                            || single_target(
+                                &self.graph.successors(entry).iter().copied().collect(),
+                            ) == Some(*payload)
+                    })
             });
-            folded.extend(remaining);
-
-            return CfgNode::Sequence { nodes: folded };
-        }
-
-        let ranges_overlap = then_idx < else_end && else_idx < then_end;
-        if ranges_overlap || then_idx == then_end || else_idx == else_end {
-            return CfgNode::merge([head_node, CfgNode::Sequence { nodes }]);
-        }
-
-        // Non-adjacent flattened branches can be moved into a regular if/else while
-        // preserving all unrelated nodes after the conditional.
-        let mut then_node_val = None;
-        let mut else_node_val = None;
-
-        let mut remaining = Vec::with_capacity(nodes.len());
-        for (idx, node) in nodes.into_iter().enumerate() {
-            if (then_idx..then_end).contains(&idx) {
-                then_node_val.get_or_insert_with(|| CfgNode::Sequence { nodes: Vec::new() });
-                if let Some(CfgNode::Sequence { nodes }) = &mut then_node_val {
-                    nodes.push(node);
-                }
-            } else if (else_idx..else_end).contains(&idx) {
-                else_node_val.get_or_insert_with(|| CfgNode::Sequence { nodes: Vec::new() });
-                if let Some(CfgNode::Sequence { nodes }) = &mut else_node_val {
-                    nodes.push(node);
-                }
-            } else {
-                remaining.push(node);
+            if let Some(payload) = owned_payload_exit {
+                nodes.insert(payload);
             }
-        }
 
-        let mut folded = Vec::with_capacity(remaining.len() + 2);
-        folded.push(head_node);
-        folded.push(CfgNode::If {
-            condition: cond,
-            then_branch: Box::new(then_node_val.unwrap()),
-            else_branch: Some(Box::new(else_node_val.unwrap())),
-        });
-        folded.extend(remaining);
+            let branch_scope = Scope {
+                entry,
+                nodes,
+                exits: branch_exits
+                    .iter()
+                    .copied()
+                    .filter(|exit| *exit != entry && Some(*exit) != owned_payload_exit)
+                    .collect(),
+                implicit_exits: shape.merge.into_iter().chain(owned_payload_exit).collect(),
+            };
+            self.structure_scope(&branch_scope, loop_ctx, terminal_policy, blocked_loop)
+        };
 
-        CfgNode::Sequence { nodes: folded }
+        let then_shape = build_branch(shape.then_entry, then_nodes);
+        let else_shape = build_branch(shape.else_entry, else_nodes);
+
+        Shape::If(IfShape {
+            head: shape.head,
+            condition: shape.condition,
+            then_branch: Box::new(then_shape),
+            else_branch: (!else_shape.is_empty()).then(|| Box::new(else_shape)),
+            merge: shape.merge,
+        })
     }
 
-    fn build_shared_fallback_chain(
-        &self,
-        nodes: &[CfgNode],
-        start_block: usize,
-        fallback_block: usize,
-    ) -> Option<(CfgNode, CfgNode, Vec<CfgNode>)> {
-        let mut guards = Vec::new();
-        let mut used_blocks = HashSet::new();
-        let mut current = start_block;
+    fn classify_loop(&self, loop_info: &LoopInfo) -> LoopKind {
+        verbose!("classify_loop: loop_info = {:?}", loop_info);
 
-        loop {
-            if !used_blocks.insert(current) {
-                return None;
-            }
+        let single_latch = (loop_info.latches.len() == 1).then_some(loop_info.latch);
 
-            let current_node = nodes
+        if let Some(latch) = single_latch
+            && let BlockExit::FornLoop { base, .. } = self.cfg.get(latch).exit()
+        {
+            let prep_block = self
+                .cfg
+                .predecessors(loop_info.header)
                 .iter()
-                .find(|node| node.starts_with_block(current))?
-                .clone();
-            let BlockExit::CondJump {
+                .copied()
+                .find(|&pred| {
+                    matches!(self.cfg.get(pred).exit(), BlockExit::FornPrep { base: prep_base, .. } if prep_base == base)
+                });
+
+            if let Some(prep_block) = prep_block
+                && let BlockExit::FornPrep {
+                    var,
+                    start,
+                    end,
+                    step,
+                    body_block,
+                    exit_block,
+                    ..
+                } = self.cfg.get(prep_block).exit()
+            {
+                verbose!(indent: 1, "kind = NumericFor");
+
+                return LoopKind::NumericFor {
+                    prep: *base as usize,
+                    body: *body_block,
+                    exit: *exit_block,
+                    var: *var,
+                    start: start.clone(),
+                    end: end.clone(),
+                    step: step.clone(),
+                };
+            }
+        }
+
+        if let Some(latch) = single_latch
+            && let BlockExit::ForgLoop {
+                base,
+                vars,
+                body_block,
+                exit_block,
+            } = self.cfg.get(latch).exit()
+        {
+            let prep_block = self
+                .cfg
+                .predecessors(loop_info.header)
+                .iter()
+                .copied()
+                .find(|&pred| {
+                    matches!(self.cfg.get(pred).exit(), BlockExit::ForgPrep { base: prep_base, .. } if prep_base == base)
+                });
+
+            if let Some(prep_block) = prep_block
+                && let BlockExit::ForgPrep { exprs, .. } = self.cfg.get(prep_block).exit()
+            {
+                verbose!(indent: 1, "kind = GenericFor");
+
+                return LoopKind::GenericFor {
+                    vars: vars.clone(),
+                    exprs: exprs.clone(),
+                    prep: prep_block,
+                    body: *body_block,
+                    exit: *exit_block,
+                };
+            }
+        }
+
+        // If the latch condition has one edge back to the header and one edge out,
+        // this is a post-test loop. The latch owns the condition.
+        if let Some(latch) = single_latch
+            && let BlockExit::CondJump {
                 cond,
                 then_block,
                 else_block,
-            } = self.cfg.get(current).exit()
-            else {
-                let success_node = current_node;
-                if !self.node_ends_with_terminal(&success_node) || guards.is_empty() {
-                    return None;
+            } = self.cfg.get(latch).exit()
+            && (*then_block == loop_info.header) ^ (*else_block == loop_info.header)
+        {
+            let condition = if *then_block == loop_info.header {
+                HilExpr::Unary {
+                    op: UnOp::Not,
+                    expr: Box::new(cond.clone()),
                 }
-
-                let fallback_node = nodes
-                    .iter()
-                    .find(|node| node.starts_with_block(fallback_block))?
-                    .clone();
-                used_blocks.insert(fallback_block);
-
-                let mut branch = success_node;
-                for (guard_node, condition) in guards.into_iter().rev() {
-                    branch = CfgNode::merge([
-                        guard_node,
-                        CfgNode::If {
-                            condition,
-                            then_branch: Box::new(branch),
-                            else_branch: None,
-                        },
-                    ]);
-                }
-
-                let remaining = nodes
-                    .iter()
-                    .filter(|node| {
-                        node.first_block()
-                            .is_none_or(|block| !used_blocks.contains(&block))
-                    })
-                    .cloned()
-                    .collect();
-
-                return Some((branch, fallback_node, remaining));
-            };
-
-            if *else_block == fallback_block {
-                guards.push((current_node, cond.clone()));
-                current = *then_block;
-            } else if *then_block == fallback_block {
-                guards.push((current_node, cond.clone().invert()));
-                current = *else_block;
             } else {
-                return None;
+                cond.clone()
+            };
+
+            let loop_exit = if *then_block == loop_info.header {
+                *else_block
+            } else {
+                *then_block
+            };
+
+            if self.can_represent_as_repeat_until(loop_info, loop_exit) {
+                verbose!(indent: 1, "kind = RepeatUntil");
+                verbose!(indent: 1, "condition = ({})", condition);
+                return LoopKind::RepeatUntil {
+                    condition,
+                    latch,
+                    body: loop_info.header,
+                };
             }
+        }
+
+        if let Some(guard) = self.recognize_while_guard(loop_info) {
+            verbose!(indent: 1, "kind = While");
+            verbose!(indent: 1, "condition = ({})", guard.condition);
+            return LoopKind::While {
+                condition: guard.condition,
+                guard: loop_info.header,
+                body: guard.body,
+                guard_nodes: guard.guard_nodes,
+                exits: guard.exits,
+            };
+        }
+
+        verbose!(indent: 1, "kind=Infinite");
+        LoopKind::Infinite {
+            body: loop_info.header,
         }
     }
 
-    /// Folds one conditional in a sequence into an explicit escape guard.
-    ///
-    /// Detects `head` blocks whose branch targets are represented later in the
-    /// same sequence and where at least one target ends in `break`/`continue`.
-    /// Rewrites the suffix via `fold_head_escape_guard`.
-    fn fold_escape_guard_in_sequence(&self, nodes: &mut Vec<CfgNode>) -> bool {
-        for i in 0..nodes.len() {
-            let Some((cond, then_block, else_block)) = self.extract_cond_jump(&nodes[i]) else {
-                continue;
-            };
+    fn recognize_while_guard(&self, loop_info: &LoopInfo) -> Option<WhileGuard> {
+        let mut visiting = HashSet::new();
+        let guard = self.recognize_while_guard_node(loop_info, loop_info.header, &mut visiting)?;
+        let body = guard.body?;
 
-            let then_idx =
-                (i + 1..nodes.len()).find(|&idx| nodes[idx].starts_with_block(then_block));
-            let else_idx =
-                (i + 1..nodes.len()).find(|&idx| nodes[idx].starts_with_block(else_block));
-
-            if let Some(escape_idx) = then_idx
-                && else_idx.is_none()
-                && self.node_ends_with_terminal(&nodes[escape_idx])
-            {
-                let suffix = nodes.split_off(i + 1);
-                let head = nodes.pop().unwrap();
-                let mut suffix_nodes = suffix;
-
-                let suffix_escape_idx = suffix_nodes
-                    .iter()
-                    .position(|node| node.starts_with_block(then_block))
-                    .unwrap();
-                let escape_node = suffix_nodes.remove(suffix_escape_idx);
-
-                nodes.push(head);
-                nodes.push(CfgNode::If {
-                    condition: cond,
-                    then_branch: Box::new(escape_node),
-                    else_branch: None,
-                });
-                nodes.extend(suffix_nodes);
-                return true;
-            }
-
-            if let Some(escape_idx) = else_idx
-                && then_idx.is_none()
-                && self.node_ends_with_terminal(&nodes[escape_idx])
-            {
-                let suffix = nodes.split_off(i + 1);
-                let head = nodes.pop().unwrap();
-                let mut suffix_nodes = suffix;
-
-                let suffix_escape_idx = suffix_nodes
-                    .iter()
-                    .position(|node| node.starts_with_block(else_block))
-                    .unwrap();
-                let escape_node = suffix_nodes.remove(suffix_escape_idx);
-
-                nodes.push(head);
-                nodes.push(CfgNode::If {
-                    condition: cond.invert(),
-                    then_branch: Box::new(escape_node),
-                    else_branch: None,
-                });
-                nodes.extend(suffix_nodes);
-                return true;
-            }
-
-            let Some(then_idx) = then_idx else {
-                continue;
-            };
-            let Some(else_idx) = else_idx else {
-                continue;
-            };
-            if then_idx == else_idx {
-                continue;
-            }
-
-            let then_escape = self.node_ends_with_terminal(&nodes[then_idx]);
-            let else_escape = self.node_ends_with_terminal(&nodes[else_idx]);
-            if !then_escape && !else_escape {
-                continue;
-            }
-
-            let suffix = nodes.split_off(i + 1);
-            let head = nodes.pop().unwrap();
-            let folded = self.fold_head_escape_guard(head, CfgNode::Sequence { nodes: suffix });
-
-            match folded {
-                CfgNode::Sequence {
-                    nodes: mut folded_nodes,
-                } => nodes.append(&mut folded_nodes),
-                other => nodes.push(other),
-            }
-
-            return true;
-        }
-
-        false
+        Some(WhileGuard {
+            condition: guard.condition,
+            body,
+            guard_nodes: guard.guard_nodes,
+            exits: guard.exits,
+        })
     }
 
-    fn normalize_escape_guards(&self, node: &mut CfgNode) {
-        match node {
-            CfgNode::Sequence { nodes } => {
-                for node in nodes.iter_mut() {
-                    self.normalize_escape_guards(node);
-                }
-
-                while self.fold_escape_guard_in_sequence(nodes) {}
-            }
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.normalize_escape_guards(then_branch);
-                if let Some(else_branch) = else_branch {
-                    self.normalize_escape_guards(else_branch);
-                }
-            }
-            CfgNode::While { body, .. }
-            | CfgNode::NumericFor { body, .. }
-            | CfgNode::GenericFor { body, .. } => self.normalize_escape_guards(body),
-            _ => {}
+    fn recognize_while_guard_node(
+        &self,
+        loop_info: &LoopInfo,
+        node: usize,
+        visiting: &mut HashSet<usize>,
+    ) -> Option<GuardBranch> {
+        if !loop_info.body.contains(&node) || !self.cfg.get(node).is_empty() {
+            return None;
         }
+        if !visiting.insert(node) {
+            return None;
+        }
+
+        let BlockExit::CondJump {
+            cond,
+            then_block,
+            else_block,
+        } = self.cfg.get(node).exit()
+        else {
+            visiting.remove(&node);
+            return None;
+        };
+
+        let then_branch = self.recognize_while_guard_branch(loop_info, *then_block, visiting);
+        let else_branch = self.recognize_while_guard_branch(loop_info, *else_block, visiting);
+
+        visiting.remove(&node);
+
+        let then_branch = then_branch?;
+        let else_branch = else_branch?;
+        let body = merge_optional_body(then_branch.body, else_branch.body)?;
+        let mut guard_nodes = then_branch.guard_nodes;
+        guard_nodes.extend(else_branch.guard_nodes);
+        guard_nodes.insert(node);
+
+        let mut exits = then_branch.exits;
+        exits.extend(else_branch.exits);
+
+        Some(GuardBranch {
+            condition: HilExpr::or(
+                HilExpr::and(cond.clone(), then_branch.condition),
+                HilExpr::and(cond.clone().invert(), else_branch.condition),
+            ),
+            body,
+            guard_nodes,
+            exits,
+        })
     }
 
-    /// Recursively pulls loop-reentering suffixes back into their infinite loop.
-    ///
-    /// Some irreducible-looking loop finalization shapes reduce to:
-    ///
-    /// ```text
-    /// while true do
-    ///     if done then return ... end
-    ///     ...
-    ///     if should_continue then break end
-    /// end
-    /// suffix_that_jumps_back_to_loop_head
-    /// ```
-    ///
-    /// The suffix is not really after the loop; it is the continuation payload for
-    /// the final guard. Moving it under that guard preserves the backedge and keeps
-    /// the loop body executable in source form.
-    fn absorb_reentering_loop_suffixes(&self, node: &mut CfgNode) {
-        match node {
-            CfgNode::Sequence { nodes } => {
-                for node in nodes.iter_mut() {
-                    self.absorb_reentering_loop_suffixes(node);
-                }
-
-                while self.absorb_reentering_loop_suffix(nodes) {}
-            }
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.absorb_reentering_loop_suffixes(then_branch);
-                if let Some(else_branch) = else_branch {
-                    self.absorb_reentering_loop_suffixes(else_branch);
-                }
-            }
-            CfgNode::While { body, .. }
-            | CfgNode::NumericFor { body, .. }
-            | CfgNode::GenericFor { body, .. } => {
-                self.absorb_reentering_loop_suffixes(body);
-            }
-            _ => {}
-        }
-    }
-
-    /// Repairs adjacent loop alternatives that were conservatively folded as a guard.
-    ///
-    /// `fold_head_escape_guard` prefers one-armed guards when adjacent branch ranges
-    /// could be sequential work. In the common nested-loop alternative shape, that
-    /// leaves:
-    ///
-    /// ```text
-    /// if not cond then
-    ///     else_loop
-    /// end
-    /// then_loop
-    /// ```
-    ///
-    /// If the following range is a matching numeric-for branch, this pass rewrites it
-    /// back into `if cond then then_loop else else_loop end`.
-    fn fold_adjacent_loop_branches(&self, node: &mut CfgNode) {
-        match node {
-            CfgNode::Sequence { nodes } => {
-                for node in nodes.iter_mut() {
-                    self.fold_adjacent_loop_branches(node);
-                }
-
-                let mut idx = 0;
-                while idx + 1 < nodes.len() {
-                    // Candidate right-hand branch is either the next node alone or a
-                    // loop setup block followed by a `NumericFor`.
-                    let next_end = if idx + 2 < nodes.len()
-                        && matches!(nodes[idx + 2], CfgNode::NumericFor { .. })
-                    {
-                        idx + 3
-                    } else {
-                        idx + 2
-                    };
-
-                    let should_fold = match &nodes[idx] {
-                        CfgNode::If {
-                            then_branch,
-                            else_branch: None,
-                            ..
-                        } => {
-                            // Require both sides to have the same normalized numeric
-                            // loop bounds. This keeps the pass from combining adjacent
-                            // loops that merely happen to sit next to each other.
-                            let then_shape = self.branch_numeric_for_shape(then_branch);
-                            let next_shape = self.numeric_for_range_shape(nodes, idx + 1, next_end);
-                            then_shape.is_some_and(|then_shape| {
-                                next_shape.is_some_and(|next_shape| then_shape == next_shape)
-                            })
-                        }
-                        _ => false,
-                    };
-
-                    if !should_fold {
-                        idx += 1;
-                        continue;
-                    }
-
-                    // Convert `if not C then A end; B` into
-                    // `if C then B else A end`. The condition inversion is paired
-                    // with swapping the old guarded branch into `else`.
-                    let next_nodes: Vec<_> = nodes.drain(idx + 1..next_end).collect();
-                    let next_branch = CfgNode::Sequence { nodes: next_nodes };
-                    let current =
-                        std::mem::replace(&mut nodes[idx], CfgNode::Sequence { nodes: Vec::new() });
-                    let CfgNode::If {
-                        condition,
-                        then_branch,
-                        else_branch: None,
-                    } = current
-                    else {
-                        unreachable!();
-                    };
-
-                    nodes[idx] = CfgNode::If {
-                        condition: condition.invert(),
-                        then_branch: Box::new(next_branch),
-                        else_branch: Some(then_branch),
-                    };
-                    idx += 1;
-                }
-            }
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.fold_adjacent_loop_branches(then_branch);
-                if let Some(else_branch) = else_branch {
-                    self.fold_adjacent_loop_branches(else_branch);
-                }
-            }
-            CfgNode::While { body, .. }
-            | CfgNode::NumericFor { body, .. }
-            | CfgNode::GenericFor { body, .. } => self.fold_adjacent_loop_branches(body),
-            _ => {}
-        }
-    }
-
-    /// Absorbs one suffix-after-loop pattern from a sequence.
-    ///
-    /// Returns true when it moved a suffix, allowing the caller to keep scanning the
-    /// same sequence until no more nested suffixes match.
-    fn absorb_reentering_loop_suffix(&self, nodes: &mut Vec<CfgNode>) -> bool {
-        let Some(loop_idx) = nodes.iter().enumerate().find_map(|(idx, node)| {
-            if idx + 1 >= nodes.len() {
-                return None;
-            }
-
-            let CfgNode::While {
-                condition: HilExpr::Bool(true),
-                body,
-            } = node
-            else {
-                return None;
-            };
-
-            let CfgNode::Sequence { nodes: body_nodes } = body.as_ref() else {
-                return None;
-            };
-
-            let loop_head = body.first_block()?;
-
-            // This pass is intentionally narrow. A return guard tells us the loop
-            // already has source-level exits, and the trailing break guard gives us a
-            // concrete place to attach the re-entering suffix.
-            let has_return_guard = body_nodes.iter().any(|node| match node {
-                CfgNode::If { then_branch, .. } => self.node_has_return_exit(then_branch),
-                _ => false,
+    fn recognize_while_guard_branch(
+        &self,
+        loop_info: &LoopInfo,
+        target: usize,
+        visiting: &mut HashSet<usize>,
+    ) -> Option<GuardBranch> {
+        if !loop_info.body.contains(&target) {
+            return Some(GuardBranch {
+                condition: HilExpr::Bool(false),
+                body: None,
+                guard_nodes: HashSet::new(),
+                exits: [target].into_iter().collect(),
             });
+        }
 
-            let ends_with_break_guard = matches!(
-                body_nodes.last(),
-                Some(CfgNode::If {
-                    then_branch,
-                    else_branch: None,
-                    ..
-                }) if matches!(then_branch.as_ref(), CfgNode::Break)
-            );
+        if !loop_info.latches.contains(&target)
+            && self.cfg.get(target).is_empty()
+            && matches!(self.cfg.get(target).exit(), BlockExit::CondJump { .. })
+            && self.conditional_has_loop_exit(loop_info, target)
+            && let Some(guard) = self.recognize_while_guard_node(loop_info, target, visiting)
+        {
+            return Some(guard);
+        }
 
-            // Only absorb suffixes that still contain a raw jump to the loop head;
-            // otherwise the nodes really are after the loop.
-            let suffix_reenters_loop = nodes[idx + 1..]
-                .iter()
-                .any(|node| self.node_jumps_to_block(node, loop_head));
+        Some(GuardBranch {
+            condition: HilExpr::Bool(true),
+            body: Some(target),
+            guard_nodes: HashSet::new(),
+            exits: HashSet::new(),
+        })
+    }
 
-            (has_return_guard && ends_with_break_guard && suffix_reenters_loop).then_some(idx)
-        }) else {
+    fn conditional_has_loop_exit(&self, loop_info: &LoopInfo, node: usize) -> bool {
+        let BlockExit::CondJump {
+            then_block,
+            else_block,
+            ..
+        } = self.cfg.get(node).exit()
+        else {
             return false;
         };
 
-        // Everything after the loop becomes the payload of the final break guard.
-        // Later escape resolution turns the retained raw jumps into source-level
-        // control flow.
-        let suffix = nodes.split_off(loop_idx + 1);
-        let CfgNode::While { body, .. } = &mut nodes[loop_idx] else {
-            unreachable!();
-        };
-        let CfgNode::Sequence { nodes: body_nodes } = body.as_mut() else {
-            unreachable!();
-        };
-        let Some(CfgNode::If { then_branch, .. }) = body_nodes.last_mut() else {
-            unreachable!();
-        };
-
-        **then_branch = CfgNode::Sequence { nodes: suffix };
-        true
+        !loop_info.body.contains(then_block) || !loop_info.body.contains(else_block)
     }
 
-    /// Returns true when a structured node contains a raw or lowered return exit.
-    fn node_has_return_exit(&self, node: &CfgNode) -> bool {
-        match node {
-            CfgNode::Return { .. } => true,
-            CfgNode::BasicBlock { block } => {
-                matches!(self.cfg.get(*block).exit(), BlockExit::Return(_))
-            }
-            CfgNode::Sequence { nodes } => nodes.iter().any(|node| self.node_has_return_exit(node)),
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.node_has_return_exit(then_branch)
-                    || else_branch
-                        .as_ref()
-                        .is_some_and(|branch| self.node_has_return_exit(branch))
-            }
-            CfgNode::While { body, .. }
-            | CfgNode::NumericFor { body, .. }
-            | CfgNode::GenericFor { body, .. } => self.node_has_return_exit(body),
-            _ => false,
-        }
-    }
+    fn can_represent_as_repeat_until(&self, loop_info: &LoopInfo, loop_exit: usize) -> bool {
+        let Some(latch) = (loop_info.latches.len() == 1).then_some(loop_info.latch) else {
+            return false;
+        };
 
-    /// Returns true when a structured node still contains a raw edge to `target`.
-    ///
-    /// This is used only by post-structuring cleanup passes that need to detect
-    /// whether a seemingly external suffix is actually part of a loop.
-    fn node_jumps_to_block(&self, node: &CfgNode, target: usize) -> bool {
-        match node {
-            CfgNode::BasicBlock { block } => match self.cfg.get(*block).exit() {
-                BlockExit::Jump(block) | BlockExit::Fallthrough(block) => *block == target,
-                BlockExit::CondJump {
-                    then_block,
-                    else_block,
-                    ..
-                } => *then_block == target || *else_block == target,
-                _ => false,
-            },
-            CfgNode::Sequence { nodes } => nodes
+        if loop_info.header != latch
+            && self
+                .graph
+                .successors(loop_info.header)
                 .iter()
-                .any(|node| self.node_jumps_to_block(node, target)),
-            CfgNode::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.node_jumps_to_block(then_branch, target)
-                    || else_branch
-                        .as_ref()
-                        .is_some_and(|branch| self.node_jumps_to_block(branch, target))
-            }
-            CfgNode::While { body, .. }
-            | CfgNode::NumericFor { body, .. }
-            | CfgNode::GenericFor { body, .. } => self.node_jumps_to_block(body, target),
-            _ => false,
-        }
-    }
-
-    /// Returns whether `dom` dominates `node`.
-    #[must_use]
-    pub fn dominates(&mut self, dom: usize, node: usize) -> bool {
-        let idoms = self.get_or_calc_idoms();
-        idoms.dominates(dom, node)
-    }
-
-    /// Collapses conditionally executed blocks into a `If` node.
-    fn collapse_conditional(&mut self) -> bool {
-        // Let 'Head' be a node with exactly two successors: 'Left' and 'Right'
-        //
-        // Theory(if):
-        // If 'Left' has exactly one predecessor ('Head') and exactly one successor ('Right'),
-        // then subgraph [Head, Left] is a SESE region. [Head, Left] is collapsed into a new `If` node,
-        // and its successor wired to 'Right'.
-        // (This applies symmetrically if `Right` is the body and `Left` is the merge point).
-        // ```luau
-        // [Head]
-        // if <cond> then
-        //   [Left]
-        // end
-        // [Right]
-        // ```
-        //
-        // Theory(if-else):
-        // Let 'Merge' be the immediate post-dominator of 'Head'. If both 'Left' and 'Right' have exactly
-        // one predecessor ('Head'), and exactly one successor ('Merge'), then subgraph [Head, Left, Right]
-        // is a SESE region. [Head, Left, Right] is collapsed into a new `If` node, and its successor wired to 'Merge'.
-        // ```luau
-        // [Head]
-        // if <cond> then
-        //   [Left]
-        // else
-        //   [Right]
-        // end
-        // [Merge]
-        // ```
-        //
-        // Both patterns must also not have any loop edges.
-
-        let mut work = self.post_order();
-        work.reverse();
-
-        while let Some(head) = work.pop() {
-            if !self.nodes.contains_key(&head) {
-                continue;
-            }
-
-            if let Some([left, right]) = self.exact_successors(head) {
-                let Some(tail) = self.get_or_calc_postidoms().idom(head) else {
-                    continue;
-                };
-
-                let Some((mut cond, raw_then, raw_else)) =
-                    self.extract_cond_jump(&self.nodes[&head])
-                else {
-                    continue;
-                };
-
-                let active_then = self.region_for_block[&raw_then];
-                let active_else = self.region_for_block[&raw_else];
-
-                let (left, right) = if left == active_then && right == active_else {
-                    (left, right)
-                } else if left == active_else && right == active_then {
-                    cond = cond.invert();
-                    (right, left)
-                } else {
-                    continue;
-                };
-
-                // A block is a strict body if it only comes from Head, and only goes to Tail.
-                let is_strict_body = |node: usize, tail: usize| {
-                    self.exact_predecessors(node).is_some_and(|p| p == [head])
-                        && self.exact_successors(node).is_some_and(|s| s == [tail])
-                };
-
-                // TODO: clean this shitchain up
-                let mut then_node_id = None;
-                let mut else_node_id = None;
-
-                if left == tail && is_strict_body(right, tail) {
-                    // If-Then (The body is on the FALSE path)
-                    then_node_id = Some(right);
-                    cond = cond.invert();
-                } else if right == tail && is_strict_body(left, tail) {
-                    // If-Then (The body is on the TRUE path)
-                    then_node_id = Some(left);
-                } else if is_strict_body(left, tail) && is_strict_body(right, tail) {
-                    // If-Then-Else
-                    then_node_id = Some(left);
-                    else_node_id = Some(right);
-                }
-
-                let Some(then_node_id) = then_node_id else {
-                    continue;
-                };
-
-                let new_id = self.next_id();
-                let header_node = self.nodes.remove(&head).unwrap();
-                let then_ast = Box::new(self.nodes.remove(&then_node_id).unwrap());
-                let else_ast = else_node_id.map(|id| Box::new(self.nodes.remove(&id).unwrap()));
-                self.nodes.insert(
-                    new_id,
-                    CfgNode::merge([
-                        header_node,
-                        CfgNode::If {
-                            condition: cond,
-                            then_branch: then_ast,
-                            else_branch: else_ast,
-                        },
-                    ]),
-                );
-                self.transfer_predecessors(head, new_id);
-
-                self.update_regionmap(
-                    |val| val == head || val == then_node_id || Some(val) == else_node_id,
-                    new_id,
-                );
-
-                if let Some(tail_preds) = self.predecessors.get_mut(&tail) {
-                    tail_preds
-                        .retain(|&p| p != head && p != then_node_id && Some(p) != else_node_id);
-                    tail_preds.push(new_id)
-                }
-
-                self.successors.insert(new_id, vec![tail]);
-
-                self.successors.remove(&head);
-                self.successors.remove(&then_node_id);
-                self.predecessors.remove(&then_node_id);
-
-                if let Some(else_id) = else_node_id {
-                    self.successors.remove(&else_id);
-                    self.predecessors.remove(&else_id);
-                }
-
-                if head == self.entry_node {
-                    self.entry_node = new_id;
-                }
-                self.invalidate_doms();
-
-                return true;
-            }
+                .any(|target| !loop_info.body.contains(target))
+        {
+            return false;
         }
 
-        false
-    }
-
-    fn collapse_acyclic_conditional(&mut self) -> bool {
-        let mut work = self.post_order();
-        work.reverse();
-
-        while let Some(head) = work.pop() {
-            if !self.nodes.contains_key(&head) || self.exact_successors::<2>(head).is_none() {
-                continue;
-            }
-
-            let Some(tail) = self.get_or_calc_postidoms().idom(head) else {
-                continue;
-            };
-
-            let Some((mut cond, raw_then, raw_else)) = self.extract_cond_jump(&self.nodes[&head])
-            else {
-                continue;
-            };
-
-            let active_then = self.region_for_block[&raw_then];
-            let active_else = self.region_for_block[&raw_else];
-            let Some([left, right]) = self.exact_successors(head) else {
-                continue;
-            };
-
-            let (then_start, else_start) = if left == active_then && right == active_else {
-                (left, right)
-            } else if left == active_else && right == active_then {
-                cond = cond.invert();
-                (right, left)
-            } else {
-                continue;
-            };
-
-            if let Some((then_branch, then_used)) =
-                self.build_one_armed_branch(head, then_start, else_start)
-            {
-                self.collapse_one_armed_conditional(head, else_start, then_branch, then_used, cond);
-                return true;
-            }
-
-            if let Some((else_branch, else_used)) =
-                self.build_one_armed_branch(head, else_start, then_start)
-            {
-                self.collapse_one_armed_conditional(
-                    head,
-                    then_start,
-                    else_branch,
-                    else_used,
-                    cond.invert(),
-                );
-                return true;
-            }
-
-            let mut then_seen = HashSet::new();
-            let Some((then_branch, then_used)) =
-                self.build_acyclic_branch(then_start, tail, &mut then_seen)
-            else {
-                continue;
-            };
-
-            let mut else_seen = HashSet::new();
-            let Some((else_branch, else_used)) =
-                self.build_acyclic_branch(else_start, tail, &mut else_seen)
-            else {
-                continue;
-            };
-
-            if then_used.is_empty() && else_used.is_empty() {
-                continue;
-            }
-
-            let mut used = then_used;
-            used.extend(else_used);
-            used.remove(&tail);
-            used.remove(&head);
-
-            if !self.is_closed_conditional_region(head, tail, &used) {
-                continue;
-            }
-
-            let new_id = self.next_id();
-            let header_node = self.nodes.remove(&head).unwrap();
-            for node in &used {
-                self.nodes.remove(node);
-            }
-
-            let if_node = build_if_node(cond, then_branch, else_branch)
-                .expect("empty conditional region was skipped");
-
-            self.nodes
-                .insert(new_id, CfgNode::merge([header_node, if_node]));
-
-            self.update_regionmap(|val| val == head || used.contains(&val), new_id);
-            self.transfer_predecessors(head, new_id);
-
-            for node in &used {
-                self.successors.remove(node);
-                self.predecessors.remove(node);
-            }
-            self.successors.remove(&head);
-
-            if let Some(tail_preds) = self.predecessors.get_mut(&tail) {
-                tail_preds.retain(|&p| p != head && !used.contains(&p));
-                tail_preds.push(new_id);
-            }
-            self.successors.insert(new_id, vec![tail]);
-
-            if head == self.entry_node {
-                self.entry_node = new_id;
-            }
-            self.invalidate_doms();
-
+        if loop_info.exits.len() == 1 {
             return true;
         }
 
-        false
+        self.cfg.get(loop_exit).is_empty()
     }
 
-    /// Builds a branch for a conditional where only one side should be folded.
-    ///
-    /// This is restricted to the current entry node and to branches that end in a
-    /// terminal escape. Without those guards, ordinary if/else regions can be
-    /// misread as `if cond then ... end; ...`, duplicating the fall-through side.
-    fn build_one_armed_branch(
-        &mut self,
-        head: usize,
-        branch_start: usize,
-        merge: usize,
-    ) -> Option<(CfgNode, HashSet<usize>)> {
-        // Keep this fold at the active graph entry. Deeper conditionals are handled
-        // by the normal two-arm fold or by the sequence cleanup passes after loops
-        // have been recovered.
-        if head != self.entry_node {
-            return None;
+    fn common_loop_follow(&self, loop_info: &LoopInfo) -> Option<usize> {
+        if let Some(follow) = self.ipdoms.idom(loop_info.header)
+            && !loop_info.body.contains(&follow)
+        {
+            return Some(follow);
         }
 
-        let mut seen = HashSet::new();
-        let (branch, mut used) = self.build_acyclic_branch(branch_start, merge, &mut seen)?;
-        if used.is_empty() {
-            return None;
-        }
-        // A one-armed fold is only valid when the branch cannot fall through into
-        // the merge path. Otherwise the missing branch would execute both sides.
-        if !self.node_ends_with_terminal(&branch) {
-            return None;
-        }
-        used.remove(&merge);
-        used.remove(&head);
+        let mut follow = None;
+        for &exit in &loop_info.exits {
+            let target = single_target(&self.graph.successors(exit).iter().copied().collect())?;
+            if loop_info.body.contains(&target) {
+                return None;
+            }
 
-        if self.is_closed_conditional_region(head, merge, &used) {
-            Some((branch, used))
-        } else {
-            None
+            match follow {
+                Some(existing) if existing != target => return None,
+                Some(_) => {}
+                None => follow = Some(target),
+            }
         }
+
+        follow
     }
 
-    fn collapse_one_armed_conditional(
-        &mut self,
-        head: usize,
-        tail: usize,
-        branch: CfgNode,
-        used: HashSet<usize>,
-        condition: HilExpr,
-    ) {
-        let new_id = self.next_id();
-        let header_node = self.nodes.remove(&head).unwrap();
-        for node in &used {
-            self.nodes.remove(node);
-        }
-
-        self.nodes.insert(
-            new_id,
-            CfgNode::merge([
-                header_node,
-                CfgNode::If {
-                    condition,
-                    then_branch: Box::new(branch),
-                    else_branch: None,
-                },
-            ]),
-        );
-
-        self.update_regionmap(|val| val == head || used.contains(&val), new_id);
-        self.transfer_predecessors(head, new_id);
-
-        for node in &used {
-            self.successors.remove(node);
-            self.predecessors.remove(node);
-        }
-        self.successors.remove(&head);
-
-        if let Some(tail_preds) = self.predecessors.get_mut(&tail) {
-            tail_preds.retain(|&p| p != head && !used.contains(&p));
-            tail_preds.push(new_id);
-        }
-        self.successors.insert(new_id, vec![tail]);
-
-        if head == self.entry_node {
-            self.entry_node = new_id;
-        }
-        self.invalidate_doms();
+    fn find_merge_point(&self, node: usize, scope: &Scope) -> Option<usize> {
+        let merge = self.ipdoms.idom(node)?;
+        // Nested conditionals may rejoin at the containing branch's merge.
+        // Such a node is outside the nested scope by ownership, but it is
+        // still ordinary fallthrough rather than a loop-control boundary.
+        ((scope.nodes.contains(&merge) && !scope.exits.contains(&merge))
+            || scope.implicit_exits.contains(&merge))
+        .then_some(merge)
     }
 
-    fn build_acyclic_branch(
+    fn shape_for_block(
         &self,
-        node: usize,
-        tail: usize,
-        seen: &mut HashSet<usize>,
-    ) -> Option<(CfgNode, HashSet<usize>)> {
-        if node == tail {
-            return Some((CfgNode::Sequence { nodes: Vec::new() }, HashSet::new()));
-        }
-        if !seen.insert(node) {
-            return None;
-        }
+        block: usize,
+        scope: &Scope,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+    ) -> Shape {
+        let block_shape = Shape::Block(block);
 
-        let current = self.nodes.get(&node)?.clone();
-        if matches!(
-            self.extract_exit(&current),
-            Some(
-                BlockExit::FornPrep { .. }
-                    | BlockExit::FornLoop { .. }
-                    | BlockExit::ForgPrep { .. }
-                    | BlockExit::ForgLoop { .. }
-            )
-        ) {
-            return None;
-        }
-
-        let mut used = HashSet::from([node]);
-
-        match self.successors.get(&node).map(Vec::as_slice).unwrap_or(&[]) {
-            [] => Some((current, used)),
-            [next] => {
-                let (next_node, next_used) = self.build_acyclic_branch(*next, tail, seen)?;
-                used.extend(next_used);
-                Some((CfgNode::merge([current, next_node]), used))
+        match self.cfg.get(block).exit() {
+            BlockExit::Jump(target) | BlockExit::Fallthrough(target)
+                if scope.implicit_exits.contains(target) =>
+            {
+                verbose!(indent: 2, "block {} exits to implicit target {}", block, target);
+                block_shape
             }
-            [left, right] => {
-                let (mut cond, raw_then, raw_else) = self.extract_cond_jump(&current)?;
-                let active_then = self.region_for_block[&raw_then];
-                let active_else = self.region_for_block[&raw_else];
+            BlockExit::Jump(target) | BlockExit::Fallthrough(target)
+                if loop_ctx.is_some_and(|ctx| ctx.continue_targets.contains(target)) =>
+            {
+                if terminal_policy.suppresses(*target) && self.ipdoms.idom(block) == Some(*target) {
+                    verbose!(
+                        indent: 2,
+                        "block {} reaches suppressed loop terminal {}",
+                        block,
+                        target
+                    );
+                    return block_shape;
+                }
 
-                let (then_start, else_start) = if *left == active_then && *right == active_else {
-                    (*left, *right)
-                } else if *left == active_else && *right == active_then {
-                    cond = cond.invert();
-                    (*right, *left)
-                } else {
-                    return None;
-                };
+                if loop_ctx.is_some_and(|ctx| ctx.implicit_continue_sources.contains(&block)) {
+                    verbose!(
+                        indent: 2,
+                        "block {} exits through implicit loop tail to {}",
+                        block,
+                        target
+                    );
+                    return block_shape;
+                }
 
-                let mut then_seen = seen.clone();
-                let (then_branch, then_used) =
-                    self.build_acyclic_branch(then_start, tail, &mut then_seen)?;
-                let mut else_seen = seen.clone();
-                let (else_branch, else_used) =
-                    self.build_acyclic_branch(else_start, tail, &mut else_seen)?;
-
-                used.extend(then_used);
-                used.extend(else_used);
-
-                let Some(branch) = build_if_node(cond, then_branch, else_branch) else {
-                    return Some((current, used));
-                };
-
-                Some((CfgNode::merge([current, branch]), used))
+                verbose!(indent: 2, "block {} exits to continue target {}", block, target);
+                Shape::sequence([block_shape, Shape::Continue])
             }
-            _ => None,
+            BlockExit::Jump(target) | BlockExit::Fallthrough(target)
+                if loop_ctx.is_some_and(|ctx| ctx.exits.contains(target)) =>
+            {
+                verbose!(indent: 2, "block {} exits to break target {}", block, target);
+                Shape::sequence([block_shape, Shape::Break])
+            }
+            BlockExit::Return(values) => {
+                Shape::sequence([block_shape, Shape::Return(values.clone())])
+            }
+            _ => block_shape,
         }
     }
 
-    fn is_closed_conditional_region(
+    fn collect_reachable_until(
         &self,
-        head: usize,
-        tail: usize,
-        nodes: &HashSet<usize>,
-    ) -> bool {
-        nodes.iter().all(|node| {
-            self.predecessors
-                .get(node)
-                .into_iter()
-                .flatten()
-                .all(|pred| *pred == head || nodes.contains(pred))
-                && self
-                    .successors
-                    .get(node)
-                    .into_iter()
-                    .flatten()
-                    .all(|succ| *succ == tail || nodes.contains(succ))
-        })
-    }
-
-    fn find_backedges(&mut self, node: usize) -> Vec<usize> {
-        let mut backedges = Vec::new();
-        let Some(preds) = self.predecessors.get(&node).cloned() else {
-            return backedges;
-        };
-
-        for pred in preds {
-            if self.dominates(node, pred) {
-                backedges.push(pred);
-            }
-        }
-
-        backedges
-    }
-
-    /// Identifies all nodes belonging to a SESE loop region.
-    #[must_use]
-    fn get_loop_region(&mut self, head: usize, exit: Option<usize>) -> HashSet<usize> {
-        self.post_order()
-            .into_iter()
-            .filter(|&node| {
-                self.dominates(head, node) && exit.is_none_or(|exit| !self.dominates(exit, node))
-            })
-            .collect()
-    }
-
-    /// Computes the standard "natural loop" (only nodes that reach the backedge)
-    /// strictly to safely identify the loop type and exit block.
-    #[must_use]
-    fn get_natural_loop(&self, head: usize, tail: usize) -> HashSet<usize> {
-        let mut stack = vec![tail];
-        let mut seen = HashSet::new();
-        seen.insert(head);
+        entry: usize,
+        scope: &Scope,
+        exits: &HashSet<usize>,
+        include_boundary_entry: bool,
+    ) -> HashSet<usize> {
+        let mut nodes = HashSet::new();
+        let mut stack = vec![entry];
 
         while let Some(node) = stack.pop() {
-            if seen.insert(node)
-                && let Some(preds) = self.predecessors.get(&node)
-            {
-                stack.extend(preds.iter().copied());
+            let owns_boundary_entry = include_boundary_entry && node == entry;
+            if !scope.nodes.contains(&node) && !owns_boundary_entry {
+                continue;
             }
+            if exits.contains(&node) && !owns_boundary_entry {
+                continue;
+            }
+            if !nodes.insert(node) {
+                continue;
+            }
+            if exits.contains(&node) {
+                continue;
+            }
+
+            stack.extend(
+                self.graph
+                    .successors(node)
+                    .iter()
+                    .copied()
+                    .filter(|succ| !exits.contains(succ)),
+            );
         }
 
-        seen.remove(&head);
-        seen
+        nodes
+    }
+}
+
+impl Shape {
+    fn sequence(nodes: impl IntoIterator<Item = Shape>) -> Shape {
+        let nodes = nodes
+            .into_iter()
+            .flat_map(|node| match node {
+                Shape::Sequence(nodes) => nodes,
+                Shape::VirtualExit => Vec::new(),
+                other => vec![other],
+            })
+            .collect();
+
+        Shape::Sequence(nodes)
     }
 
-    /// Identifies the loop type, if there is one.
-    fn identify_loop(
-        &self,
-        head: usize,
-        tail: usize,
-        body_blocks: &HashSet<usize>,
-    ) -> Option<Loop> {
-        if let Some(tail_exit) = self.extract_exit(&self.nodes[&tail]) {
-            match tail_exit {
-                BlockExit::Jump(raw_target)
-                    if self.region_for_block[raw_target] == head
-                        && self.extract_cond_jump(&self.nodes[&head]).is_none() =>
-                {
-                    return Some(Loop::While {
-                        cond: HilExpr::Bool(true),
-                        exit_block: None,
-                        guard: None,
-                        absorbed: Vec::new(),
-                    });
-                }
-                BlockExit::FornLoop {
-                    base, exit_block, ..
-                } => {
-                    let prep_id = self.predecessors[&head].iter().copied().find(|&p| {
-                        if p == tail || body_blocks.contains(&p) {
-                            return false;
-                        }
-                        if let Some(BlockExit::FornPrep { base: p_base, .. }) =
-                            self.extract_exit(&self.nodes[&p])
-                        {
-                            return p_base == base;
-                        }
-                        false
-                    });
-                    if let Some(prep) = prep_id
-                        && let Some(BlockExit::FornPrep {
-                            var,
-                            start,
-                            end,
-                            step,
-                            ..
-                        }) = self.extract_exit(&self.nodes[&prep])
-                    {
-                        return Some(Loop::NumericFor {
-                            var: *var,
-                            start: start.clone(),
-                            end: end.clone(),
-                            step: step.clone(),
-                            prep_block: prep,
-                            exit_block: self.region_for_block[exit_block],
-                        });
-                    }
-                }
-                BlockExit::ForgLoop {
-                    base,
-                    exit_block,
-                    vars,
-                    ..
-                } => {
-                    let prep_id = self.predecessors[&head].iter().copied().find(|&p| {
-                        if p == tail || body_blocks.contains(&p) {
-                            return false;
-                        }
-                        if let Some(BlockExit::ForgPrep { base: p_base, .. }) =
-                            self.extract_exit(&self.nodes[&p])
-                        {
-                            return p_base == base;
-                        }
-                        false
-                    });
-                    if let Some(prep) = prep_id
-                        && let Some(BlockExit::ForgPrep { exprs, .. }) =
-                            self.extract_exit(&self.nodes[&prep])
-                    {
-                        return Some(Loop::GenericFor {
-                            vars: vars.clone(),
-                            exprs: exprs.clone(),
-                            prep_block: prep,
-                            exit_block: self.region_for_block[exit_block],
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // repeat..until: condition is evaluated at the tail.
-        if tail != head
-            && let Some((_, raw_then, raw_else)) = self.extract_cond_jump(&self.nodes[&tail])
-        {
-            let active_then = self.region_for_block[&raw_then];
-            let active_else = self.region_for_block[&raw_else];
-            if active_then == head || active_else == head {
-                let exit_block = if active_then == head {
-                    active_else // Branches to head on TRUE, meaning it repeats while true (until false)
-                } else {
-                    active_then
-                };
-
-                return Some(Loop::RepeatUntil {
-                    exit_block: self.forward_jump_exit(exit_block, head),
-                });
-            }
-        }
-
-        // while: condition is evaluated at the head.
-        if let Some((cond, raw_then, raw_else)) = self.extract_cond_jump(&self.nodes[&head]) {
-            // One branch must go into the loop body, the other must exit.
-            let active_then = self.region_for_block[&raw_then];
-            let active_else = self.region_for_block[&raw_else];
-
-            let then_in_body = body_blocks.contains(&active_then) || active_then == tail;
-            let else_in_body = body_blocks.contains(&active_else) || active_else == tail;
-
-            if let Some(guard) = self.build_loop_guard(head, tail, body_blocks)
-                && !guard.absorbed.is_empty()
-            {
-                return Some(Loop::While {
-                    cond: HilExpr::Bool(true),
-                    exit_block: guard.exit_block,
-                    guard: Some(guard.tree),
-                    absorbed: guard.absorbed.into_iter().collect(),
-                });
-            }
-
-            if then_in_body != else_in_body {
-                let (exit_block, invert) = if then_in_body {
-                    (active_else, false)
-                } else {
-                    (active_then, true)
-                };
-
-                let final_cond = if invert { cond.invert() } else { cond };
-                return Some(Loop::While {
-                    cond: final_cond,
-                    exit_block: self.nodes.contains_key(&exit_block).then_some(exit_block),
-                    guard: None,
-                    absorbed: Vec::new(),
-                });
-            }
-
-            if let Some(guard) = self.build_loop_guard(head, tail, body_blocks) {
-                return Some(Loop::While {
-                    cond: HilExpr::Bool(true),
-                    exit_block: guard.exit_block,
-                    guard: Some(guard.tree),
-                    absorbed: guard.absorbed.into_iter().collect(),
-                });
-            }
-        }
-
-        None
+    fn is_empty(&self) -> bool {
+        matches!(self, Shape::Sequence(nodes) if nodes.is_empty())
     }
 
-    fn build_loop_guard(
-        &self,
-        head: usize,
-        tail: usize,
-        body_blocks: &HashSet<usize>,
-    ) -> Option<GuardBuild> {
-        let mut seen = HashSet::new();
-        let guard = self.build_guard_tree(head, head, tail, body_blocks, &mut seen)?;
-
-        if guard.has_body && guard.exit_block.is_some() {
-            Some(guard)
-        } else {
-            None
-        }
-    }
-
-    fn build_guard_tree(
-        &self,
-        node: usize,
-        head: usize,
-        tail: usize,
-        body_blocks: &HashSet<usize>,
-        seen: &mut HashSet<usize>,
-    ) -> Option<GuardBuild> {
-        if !seen.insert(node) || self.extract_cond_jump(&self.nodes[&node]).is_none() {
-            return None;
-        }
-
-        let (_, raw_then, raw_else) = self.extract_cond_jump(&self.nodes[&node])?;
-        let mut then_seen = seen.clone();
-        let mut else_seen = seen.clone();
-        let mut then_branch =
-            self.build_guard_successor(raw_then, head, tail, body_blocks, &mut then_seen);
-        let mut else_branch =
-            self.build_guard_successor(raw_else, head, tail, body_blocks, &mut else_seen);
-
-        if then_branch.exit_block.is_none()
-            && !then_branch.has_body
-            && else_branch.exit_block.is_none()
-            && !else_branch.has_body
-        {
-            return None;
-        }
-
-        let exit_block = match (then_branch.exit_block, else_branch.exit_block) {
-            (Some(left), Some(right)) if left == right => Some(left),
-            (Some(left), None) => Some(left),
-            (None, Some(right)) => Some(right),
-            (None, None) => None,
-            (Some(_), Some(_)) => return None,
-        };
-
-        let condition_can_duplicate =
-            guard_condition_can_duplicate(&then_branch.tree, &else_branch.tree);
-        let condition = self.guard_node_condition(node, !condition_can_duplicate)?;
-
-        let mut absorbed = HashSet::new();
-        absorbed.extend(then_branch.absorbed.drain());
-        absorbed.extend(else_branch.absorbed.drain());
-        if node != head {
-            absorbed.insert(node);
-        }
-
-        Some(GuardBuild {
-            tree: GuardTree::Branch {
-                condition,
-                then_branch: Box::new(then_branch.tree),
-                else_branch: Box::new(else_branch.tree),
+    fn lower(self, cfg: &ControlFlowGraph) -> RegionNode {
+        match self {
+            Shape::Block(block) => RegionNode::BasicBlock {
+                stmts: cfg.get(block).stmts().to_vec(),
             },
-            exit_block,
-            has_body: then_branch.has_body || else_branch.has_body,
-            absorbed,
-        })
-    }
-
-    fn build_guard_successor(
-        &self,
-        raw_target: usize,
-        head: usize,
-        tail: usize,
-        body_blocks: &HashSet<usize>,
-        seen: &mut HashSet<usize>,
-    ) -> GuardBuild {
-        let Some(&active) = self.region_for_block.get(&raw_target) else {
-            return GuardBuild::exit(raw_target);
-        };
-
-        if active == tail || active == head {
-            return GuardBuild::body();
-        }
-
-        if !body_blocks.contains(&active) {
-            return GuardBuild::exit(active);
-        }
-
-        if self.extract_cond_jump(&self.nodes[&active]).is_some()
-            && let Some(guard) = self.build_guard_tree(active, head, tail, body_blocks, seen)
-            && guard.exit_block.is_some()
-        {
-            return guard;
-        }
-
-        if active != raw_target
-            && self.nodes.contains_key(&raw_target)
-            && self.extract_cond_jump(&self.nodes[&raw_target]).is_some()
-            && let Some(guard) = self.build_guard_tree(raw_target, head, tail, body_blocks, seen)
-            && guard.exit_block.is_some()
-        {
-            return guard;
-        }
-
-        GuardBuild::body()
-    }
-
-    fn guard_node_condition(&self, node: usize, _allow_impure_prelude: bool) -> Option<HilExpr> {
-        let (condition, _, _) = self.extract_cond_jump(&self.nodes[&node])?;
-        if self.node_has_prelude(&self.nodes[&node]) {
-            return None;
-        }
-
-        Some(condition)
-    }
-
-    fn node_has_prelude(&self, node: &CfgNode) -> bool {
-        match node {
-            CfgNode::BasicBlock { block } => !self.cfg.get(*block).is_empty(),
-            CfgNode::Sequence { nodes } => nodes.iter().any(|node| self.node_has_prelude(node)),
-            _ => false,
-        }
-    }
-
-    fn build_guard_node(&self, guard: &GuardTree, break_payload: &CfgNode) -> Option<CfgNode> {
-        match guard {
-            GuardTree::Body => None,
-            GuardTree::Exit => Some(break_payload.clone()),
-            GuardTree::Branch {
-                condition,
-                then_branch,
-                else_branch,
-            } => {
-                let then_node = self.build_guard_node(then_branch, break_payload);
-                let else_node = self.build_guard_node(else_branch, break_payload);
-
-                let guard_if = match (then_node, else_node) {
-                    (Some(then_branch), Some(else_branch)) => CfgNode::If {
-                        condition: condition.clone(),
-                        then_branch: Box::new(then_branch),
-                        else_branch: Some(Box::new(else_branch)),
-                    },
-                    (Some(then_branch), None) => CfgNode::If {
-                        condition: condition.clone(),
-                        then_branch: Box::new(then_branch),
-                        else_branch: None,
-                    },
-                    (None, Some(else_branch)) => CfgNode::If {
-                        condition: condition.clone().invert(),
-                        then_branch: Box::new(else_branch),
-                        else_branch: None,
-                    },
-                    (None, None) => return None,
-                };
-
-                Some(guard_if)
-            }
-        }
-    }
-
-    fn forward_jump_exit(&self, exit_block: usize, loop_head: usize) -> usize {
-        let Some(exit_node) = self.nodes.get(&exit_block) else {
-            return exit_block;
-        };
-
-        let Some(BlockExit::Jump(next_raw)) = self.extract_exit(exit_node) else {
-            return exit_block;
-        };
-
-        let Some(&next_block) = self.region_for_block.get(next_raw) else {
-            return exit_block;
-        };
-
-        if next_block == loop_head {
-            exit_block
-        } else {
-            next_block
-        }
-    }
-
-    fn collapse_loops(&mut self) -> bool {
-        // Theory: In a simple program, the control flow always moves "forward". A loop exists when a node has a backedge,
-        // ie. an edge from node 'Tail' to node 'Head' is a backedge if and only if 'Head' dominates 'Tail'. Because 'Head'
-        // dominates 'Tail', it is physically impossible to reach 'Tail' without first passing through 'Head'.
-
-        let mut changed = false;
-
-        let mut work = self.post_order();
-        work.reverse();
-
-        while let Some(head) = work.pop() {
-            let mut selected_loop = None;
-            for tail in self.find_backedges(head) {
-                let natural_body = self.get_natural_loop(head, tail);
-
-                // We can expect two types of a loop here:
-                // 1. while: the backedge is an unconditional jump, while the head either jumps to the body or the loop exit
-                // 2. repeat..until: the backedge is a conditional jump, the header can be any block
-                if let Some(kind) = self.identify_loop(head, tail, &natural_body) {
-                    selected_loop = Some((tail, kind));
-                    break;
-                }
-            }
-
-            if let Some((tail, kind)) = selected_loop {
-                let loop_exit = kind.exit_block();
-                let mut body_blocks_used = self.get_loop_region(head, loop_exit);
-                if let Loop::While { absorbed, .. } = &kind {
-                    for block in absorbed {
-                        body_blocks_used.remove(block);
-                    }
-                }
-
-                let mut body_nodes: Vec<_> = self
-                    .nodes
-                    .extract_if(|id, _| body_blocks_used.contains(id) && *id != head)
-                    .collect();
-
-                let po_rank: HashMap<_, _> = self
-                    .post_order()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, node)| (node, i))
-                    .collect();
-
-                body_nodes.sort_unstable_by_key(|(id, _)| std::cmp::Reverse(po_rank[id]));
-
-                let mut body_ast = CfgNode::merge(body_nodes.into_iter().map(|(_, b)| b));
-
-                // While loops jump to the head, repeat..until/for loops jump to the tail.
-                let (continue_tgt, continue_tgt_alt) = match &kind {
-                    Loop::While { .. } => (head, Some(tail)),
-                    _ => (tail, None),
-                };
-                let require_empty_continue_target =
-                    matches!(&kind, Loop::NumericFor { .. } | Loop::GenericFor { .. });
-                body_ast.resolve_escapes(
-                    continue_tgt,
-                    continue_tgt_alt,
-                    loop_exit,
-                    self.cfg,
-                    &self.region_for_block,
-                    require_empty_continue_target,
-                );
-
-                let loop_id = self.next_id();
-                let head_node = self.nodes.remove(&head).unwrap();
-
-                let mut absorbed_blocks = HashSet::new();
-                let (region_entry, loop_node, exit_block) = match kind {
-                    Loop::While {
-                        cond,
-                        exit_block,
-                        guard,
-                        absorbed,
-                    } => {
-                        absorbed_blocks.extend(absorbed);
-                        let mut effective_exit = exit_block;
-                        let mut break_payload = CfgNode::Break;
-
-                        if let Some(exit_block) = exit_block
-                            && let Some(exit_node) = self.nodes.get(&exit_block)
-                            && let Some(BlockExit::Jump(next_raw)) = self.extract_exit(exit_node)
-                            && let Some(&next_block) = self.region_for_block.get(next_raw)
-                            && next_block != head
-                        {
-                            effective_exit = Some(next_block);
-                            absorbed_blocks.insert(exit_block);
-                            if self.node_emits_statements(exit_node) {
-                                break_payload = CfgNode::merge([exit_node.clone(), CfgNode::Break]);
-                            }
-                        }
-
-                        let loop_node = if let Some(guard) = guard {
-                            if matches!(break_payload, CfgNode::Break) {
-                                CfgNode::While {
-                                    condition: BoolExpr::from(guard).into_hil(),
-                                    body: Box::new(body_ast),
-                                }
-                            } else {
-                                let guard_node = self
-                                    .build_guard_node(&guard, &break_payload)
-                                    .unwrap_or_else(|| CfgNode::If {
-                                        condition: cond.invert(),
-                                        then_branch: Box::new(break_payload.clone()),
-                                        else_branch: None,
-                                    });
-
-                                CfgNode::While {
-                                    condition: HilExpr::Bool(true),
-                                    body: Box::new(CfgNode::merge([guard_node, body_ast])),
-                                }
-                            }
-                        } else if self.node_emits_statements(&head_node)
-                            || !matches!(break_payload, CfgNode::Break)
-                        {
-                            let mut parts = Vec::with_capacity(3);
-                            if self.node_emits_statements(&head_node) {
-                                parts.push(head_node);
-                            }
-
-                            let break_guard = CfgNode::If {
-                                condition: cond.invert(),
-                                then_branch: Box::new(break_payload),
-                                else_branch: None,
-                            };
-                            parts.push(break_guard);
-                            parts.push(body_ast);
-
-                            CfgNode::While {
-                                condition: HilExpr::Bool(true),
-                                body: Box::new(CfgNode::merge(parts)),
-                            }
-                        } else {
-                            CfgNode::While {
-                                condition: cond,
-                                body: Box::new(body_ast),
-                            }
-                        };
-
-                        (head, loop_node, effective_exit)
-                    }
-                    Loop::RepeatUntil { exit_block } => (
-                        head,
-                        {
-                            let mut body = self.fold_head_escape_guard(head_node, body_ast);
-                            self.normalize_escape_guards(&mut body);
-
-                            CfgNode::While {
-                                condition: HilExpr::Bool(true),
-                                body: Box::new(body),
-                            }
-                        },
-                        Some(exit_block),
-                    ),
-                    Loop::NumericFor {
-                        var,
-                        start,
-                        end,
-                        step,
-                        prep_block,
-                        exit_block,
-                    } => {
-                        let prep_node = self.nodes.remove(&prep_block).unwrap();
-                        let mut for_body = self.fold_head_escape_guard(head_node, body_ast);
-                        self.normalize_escape_guards(&mut for_body);
-                        let for_node = CfgNode::NumericFor {
-                            var,
-                            start,
-                            end,
-                            step,
-                            body: Box::new(for_body),
-                        };
-                        (
-                            prep_block,
-                            CfgNode::merge([prep_node, for_node]),
-                            Some(exit_block),
-                        )
-                    }
-                    Loop::GenericFor {
-                        vars,
-                        exprs,
-                        prep_block,
-                        exit_block,
-                    } => {
-                        let prep_node = self.nodes.remove(&prep_block).unwrap();
-                        let mut for_body = self.fold_head_escape_guard(head_node, body_ast);
-                        self.normalize_escape_guards(&mut for_body);
-                        let for_node = CfgNode::GenericFor {
-                            vars,
-                            exprs,
-                            body: Box::new(for_body),
-                        };
-                        (
-                            prep_block,
-                            CfgNode::merge([prep_node, for_node]),
-                            Some(exit_block),
-                        )
-                    }
-                };
-
-                self.nodes.insert(loop_id, loop_node);
-                self.update_regionmap(
-                    |val| {
-                        val == region_entry
-                            || val == head
-                            || body_blocks_used.contains(&val)
-                            || absorbed_blocks.contains(&val)
-                    },
-                    loop_id,
-                );
-
-                self.transfer_predecessors(region_entry, loop_id);
-                if let Some(preds) = self.predecessors.get_mut(&loop_id) {
-                    preds.retain(|&p| {
-                        !body_blocks_used.contains(&p)
-                            && !absorbed_blocks.contains(&p)
-                            && p != tail
-                            && p != loop_id
-                            && p != head
-                    });
-                }
-
-                if let Some(exit_block) = exit_block {
-                    self.successors.insert(loop_id, vec![exit_block]);
-                    if let Some(exit_preds) = self.predecessors.get_mut(&exit_block) {
-                        exit_preds.retain(|&p| {
-                            p != region_entry
-                                && p != head
-                                && p != tail
-                                && !absorbed_blocks.contains(&p)
-                                && !body_blocks_used.contains(&p)
-                        });
-                        exit_preds.push(loop_id);
-                    }
-                } else {
-                    self.successors.insert(loop_id, Vec::new());
-                }
-
-                for block in &body_blocks_used {
-                    self.successors.remove(block);
-                    self.predecessors.remove(block);
-                }
-                for block in &absorbed_blocks {
-                    self.nodes.remove(block);
-                    self.successors.remove(block);
-                    self.predecessors.remove(block);
-                }
-                self.successors.remove(&head);
-                if region_entry != head {
-                    self.successors.remove(&region_entry);
-                }
-                if region_entry == self.entry_node || head == self.entry_node {
-                    self.entry_node = loop_id;
-                }
-                self.invalidate_doms();
-
-                work.push(loop_id);
-                changed = true;
-            }
-        }
-
-        changed
-    }
-
-    /// Returns the post-order traversal of the region nodes.
-    fn post_order(&self) -> Vec<usize> {
-        let mut order = Vec::new();
-        let mut visited = HashSet::new();
-
-        fn dfs(
-            block: usize,
-            successors: &HashMap<usize, Vec<usize>>,
-            visited: &mut HashSet<usize>,
-            order: &mut Vec<usize>,
-        ) {
-            visited.insert(block);
-
-            let block_successors = successors
-                .get(&block)
-                .map_or(&[] as &[usize], |p| p.as_slice());
-
-            for &succ in block_successors {
-                if !visited.contains(&succ) {
-                    dfs(succ, successors, visited, order);
-                }
-            }
-            order.push(block);
-        }
-
-        dfs(self.entry_node, &self.successors, &mut visited, &mut order);
-
-        order
-    }
-
-    fn structure(&mut self) {
-        loop {
-            self.refresh_entry_node();
-            self.prune_stale_edges();
-            self.refresh_entry_node();
-
-            if self.collapse_sequential() {
-                continue;
-            }
-
-            if self.collapse_conditional() {
-                continue;
-            }
-
-            if self.collapse_acyclic_conditional() {
-                continue;
-            }
-
-            if self.collapse_loops() {
-                continue;
-            }
-
-            break;
+            Shape::Sequence(nodes) => RegionNode::Sequence {
+                nodes: nodes.into_iter().map(|node| node.lower(cfg)).collect(),
+            },
+            Shape::If(shape) => RegionNode::If {
+                condition: shape.condition,
+                then_branch: Box::new(shape.then_branch.lower(cfg)),
+                else_branch: shape.else_branch.map(|branch| Box::new(branch.lower(cfg))),
+            },
+            Shape::Loop(shape) => match shape.kind {
+                LoopKind::While { condition, .. } => RegionNode::While {
+                    condition,
+                    body: Box::new(shape.body.lower(cfg)),
+                },
+                LoopKind::RepeatUntil { condition, .. } => RegionNode::RepeatUntil {
+                    condition,
+                    body: Box::new(shape.body.lower(cfg)),
+                },
+                LoopKind::NumericFor {
+                    var,
+                    start,
+                    end,
+                    step,
+                    ..
+                } => RegionNode::NumericFor {
+                    var,
+                    start,
+                    end,
+                    step,
+                    body: Box::new(shape.body.lower(cfg)),
+                },
+                LoopKind::GenericFor { vars, exprs, .. } => RegionNode::GenericFor {
+                    vars,
+                    exprs: exprs.into(),
+                    body: Box::new(shape.body.lower(cfg)),
+                },
+                LoopKind::Infinite { .. } => RegionNode::While {
+                    condition: HilExpr::Bool(true),
+                    body: Box::new(shape.body.lower(cfg)),
+                },
+            },
+            Shape::Break => RegionNode::Break,
+            Shape::Continue => RegionNode::Continue,
+            Shape::Return(values) => RegionNode::Return { values },
+            Shape::VirtualExit => unreachable!("should have been unfolded already"),
         }
     }
 }
 
-fn guard_condition_can_duplicate(then_branch: &GuardTree, else_branch: &GuardTree) -> bool {
-    !matches!(then_branch, GuardTree::Body | GuardTree::Exit)
-        && !matches!(else_branch, GuardTree::Body | GuardTree::Exit)
-}
+/// Collect the natural loop body by walking predecessors back from `latch`
+/// until `header` is reached. Returns the full set including header.
+fn natural_loop_body(
+    cfg: &ControlFlowGraph,
+    header: usize,
+    latch: usize,
+    reachable: &HashSet<usize>,
+) -> HashSet<usize> {
+    let mut body = HashSet::new();
+    body.insert(header);
 
-fn flatten_regions(nodes: Vec<RegionNode>) -> Vec<RegionNode> {
-    let mut out = Vec::new();
+    let mut stack = vec![latch];
+    while let Some(node) = stack.pop() {
+        if !reachable.contains(&node) {
+            continue;
+        }
 
-    for n in nodes {
-        match n {
-            RegionNode::Sequence { nodes: inner } => {
-                out.extend(flatten_regions(inner));
+        if body.insert(node) && node != header {
+            for &pred in cfg.predecessors(node) {
+                if reachable.contains(&pred) {
+                    stack.push(pred);
+                }
             }
-            other => out.push(other),
         }
     }
 
-    out
+    body
 }
 
-fn build_if_node(
-    condition: HilExpr,
-    then_branch: CfgNode,
-    else_branch: CfgNode,
-) -> Option<CfgNode> {
-    match (then_branch.is_empty(), else_branch.is_empty()) {
-        (false, false) => Some(CfgNode::If {
-            condition,
-            then_branch: Box::new(then_branch),
-            else_branch: Some(Box::new(else_branch)),
-        }),
-        (false, true) => Some(CfgNode::If {
-            condition,
-            then_branch: Box::new(then_branch),
-            else_branch: None,
-        }),
-        (true, false) => Some(CfgNode::If {
-            condition: condition.invert(),
-            then_branch: Box::new(else_branch),
-            else_branch: None,
-        }),
-        (true, true) => None,
+fn single_target(targets: &HashSet<usize>) -> Option<usize> {
+    let mut targets = targets.iter().copied();
+    let target = targets.next()?;
+    targets.next().is_none().then_some(target)
+}
+
+fn merge_optional_body(lhs: Option<usize>, rhs: Option<usize>) -> Option<Option<usize>> {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) if lhs != rhs => None,
+        (Some(body), _) | (_, Some(body)) => Some(Some(body)),
+        (None, None) => Some(None),
     }
 }
 
-pub fn structure(cfg: &ControlFlowGraph) -> (RegionNode, bool) {
-    let mut fg = FoldableGraph::new(cfg);
-
-    fg.structure();
-    fg.refresh_entry_node();
-
-    let reduced = fg.nodes.iter().len() == 1;
-
-    let mut root = fg
-        .nodes
-        .remove(&fg.entry_node)
-        .expect("entry node should be present after refreshing from the region map");
-    root.strip_virtual_exits();
-
-    // These cleanup passes operate on the final tree rather than the foldable graph:
-    // they repair shapes that only become obvious after all graph-level regions have
-    // been collapsed.
-    fg.absorb_reentering_loop_suffixes(&mut root);
-    fg.fold_adjacent_loop_branches(&mut root);
-
-    root.resolve_returns(cfg);
-    (root.lower(cfg), reduced)
+fn sorted_nodes(nodes: &HashSet<usize>) -> Vec<usize> {
+    let mut nodes: Vec<_> = nodes.iter().copied().collect();
+    nodes.sort_unstable();
+    nodes
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use id_arena::Arena;
-//     use smallvec::SmallVec;
-
-//     use crate::common::ToSpanned as _;
-//     use crate::hil::{
-//         cflow::{
-//             cfg::{Block, BlockExit, ControlFlowGraph},
-//             graph::{AdjGraph, GraphView as _},
-//         },
-//         ir::{HilExpr, HilStmt},
-//         lifter::ssa::Symbol,
-//     };
-
-//     use super::{CfgNode, FoldableGraph, RegionNode, structure};
-
-//     fn cfg_from_blocks(blocks: Vec<Block>) -> ControlFlowGraph {
-//         let (successors, predecessors) =
-//             crate::hil::cflow::graph::build_graph(blocks.iter().map(Block::exit_targets));
-//         let idoms = AdjGraph::new(0, &successors, &predecessors).build_idoms();
-
-//         ControlFlowGraph {
-//             blocks,
-//             entry_block: 0,
-//             successors,
-//             predecessors,
-//             idoms,
-//             params: Vec::new(),
-//             upvalues: Vec::new(),
-//         }
-//     }
-
-//     // This is an exception to the rule of verifying by integration testing over unit testing, as naturally
-//     // this would not only force a timeout but put a lot of work on the CPU. Resolving the shape of the loop
-//     // is still tested extensively in the integration tests, but this "edge case" is here only because it's
-//     // simpler to manually build and check it over testing it in the test suite.
-//     #[test]
-//     fn structures_exitless_self_loop() {
-//         let cfg = cfg_from_blocks(vec![Block {
-//             stmts: Vec::new(),
-//             exit: BlockExit::Jump(0),
-//         }]);
-
-//         let (root, reduced) = structure(&cfg);
-
-//         assert!(reduced);
-//         assert!(matches!(
-//             root,
-//             RegionNode::While {
-//                 condition: HilExpr::Bool(true),
-//                 ..
-//             }
-//         ));
-//     }
-
-//     #[test]
-//     fn guard_prelude_rejects_impure_single_read() {
-//         let mut symbols: Arena<_> = Arena::new();
-//         let tmp = symbols.alloc(Symbol::reg(0));
-
-//         let cfg = cfg_from_blocks(vec![
-//             Block {
-//                 stmts: vec![
-//                     HilStmt::Assign {
-//                         left: HilExpr::Symbol(tmp),
-//                         value: HilExpr::Call {
-//                             fun: Box::new(HilExpr::Global("make".into())),
-//                             args: Vec::new(),
-//                         },
-//                     }
-//                     .to_spanned(0),
-//                 ],
-//                 exit: BlockExit::CondJump {
-//                     cond: HilExpr::Symbol(tmp),
-//                     then_block: 1,
-//                     else_block: 2,
-//                 },
-//             },
-//             Block {
-//                 stmts: Vec::new(),
-//                 exit: BlockExit::Return(SmallVec::new()),
-//             },
-//             Block {
-//                 stmts: Vec::new(),
-//                 exit: BlockExit::Return(SmallVec::new()),
-//             },
-//         ]);
-//         let graph = FoldableGraph::new(&cfg);
-
-//         assert_eq!(graph.guard_node_condition(0, false), None);
-//     }
-
-//     #[test]
-//     fn shared_fallback_chain_rejects_cycles() {
-//         let cfg = cfg_from_blocks(vec![
-//             Block {
-//                 stmts: Vec::new(),
-//                 exit: BlockExit::CondJump {
-//                     cond: HilExpr::Bool(true),
-//                     then_block: 0,
-//                     else_block: 1,
-//                 },
-//             },
-//             Block {
-//                 stmts: Vec::new(),
-//                 exit: BlockExit::Return(SmallVec::new()),
-//             },
-//         ]);
-//         let graph = FoldableGraph::new(&cfg);
-//         let nodes = vec![
-//             CfgNode::BasicBlock { block: 0 },
-//             CfgNode::BasicBlock { block: 1 },
-//         ];
-
-//         assert!(graph.build_shared_fallback_chain(&nodes, 0, 1).is_none());
-//     }
-// }
+pub fn structure(cfg: &ControlFlowGraph) -> RegionNode {
+    let root = Structurer::new(cfg).structure().lower(cfg);
+    root
+}

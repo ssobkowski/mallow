@@ -4,7 +4,6 @@ use crate::{
         cflow::{
             cfg::ControlFlowGraph,
             graph::GraphView,
-            phoenix,
             region::{self, RegionNode},
         },
         lifter::ssa::SymbolId,
@@ -46,8 +45,6 @@ pub struct StructuredFunction {
     pub upvalues: Vec<SymbolId>,
     pub is_vararg: bool,
     pub return_arity: Option<ReturnArity>,
-
-    pub was_reduced: bool,
 }
 
 impl StructuredFunction {
@@ -96,19 +93,7 @@ impl StructuredFunction {
         }
 
         verbose!(indent: 1, "structuring region...");
-        let (root, was_reduced) =
-            if std::env::var("MALLOW_LEGACY_STRUCTURER").is_ok_and(|f| f == "1") {
-                region::structure(&cfg)
-            } else {
-                phoenix::structure(&cfg)
-            };
-
-        if !was_reduced {
-            eprintln!(
-                "[proto {}] Failed to structure region properly. The output may be incorrect.",
-                proto.index
-            )
-        }
+        let root = region::structure(&cfg);
 
         let params = cfg.params().to_vec();
         let upvalues = cfg.upvalues().to_vec();
@@ -122,7 +107,6 @@ impl StructuredFunction {
             upvalues,
             is_vararg: proto.is_vararg,
             return_arity: None,
-            was_reduced,
         }
     }
 }

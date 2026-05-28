@@ -101,20 +101,16 @@ fn decompile_bytecode(bytecode: &[u8], options: EmitterOptions) -> Result<String
         .iter()
         .map(|proto| StructuredFunction::from_proto(proto, &disasssembled.protos))
         .collect();
-    let error = fns.iter().any(|f| !f.was_reduced);
 
     verbose!("running passes...");
     hil::passes::run(&mut fns);
 
     let ast = emitter::emit_ast(fns, disasssembled.entry_proto as usize, options);
 
-    let mut comments = vec![format!(
+    let comments = vec![format!(
         "Decompiled by mallow {}",
         env!("CARGO_PKG_VERSION")
     )];
-    if error {
-        comments.push("Failed to structure all functions - output may be incomplete".to_string());
-    }
 
     Ok(printer::print(&ast, &comments))
 }
