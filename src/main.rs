@@ -129,6 +129,9 @@ fn decompile_bytecode(
         .line(0, format_args!("running passes..."));
     hil::passes::run(&mut fns);
 
+    diagnostics
+        .at(LogLevel::Info, LogTarget::Driver)
+        .line(0, format_args!("emitting AST..."));
     let ast = emitter::emit_ast(fns, disasssembled.entry_proto as usize, options);
 
     let comments = vec![format!(
@@ -136,6 +139,9 @@ fn decompile_bytecode(
         env!("CARGO_PKG_VERSION")
     )];
 
+    diagnostics
+        .at(LogLevel::Info, LogTarget::Driver)
+        .line(0, format_args!("done"));
     Ok(printer::print(&ast, &comments))
 }
 
