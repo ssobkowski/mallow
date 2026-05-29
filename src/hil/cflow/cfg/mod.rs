@@ -217,7 +217,7 @@ impl BlockExit {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum CondRhs {
     /// A physical register
     Reg(u8),
@@ -229,7 +229,7 @@ pub enum CondRhs {
     Bool(bool),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Cond {
     /// A binary condition, i.e. `lhs op rhs`
     Binary {
@@ -281,15 +281,14 @@ impl ControlFlowGraph {
             }
         }
 
-        let blocks = loop {
+        loop {
             let (_, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
-            let (changed_cond, new_blocks) = fold_condition_chains(blocks, &predecessors);
+            let changed = fold_condition_chains(&mut blocks, &predecessors);
 
-            if !changed_cond {
-                break new_blocks;
+            if !changed {
+                break;
             }
-            blocks = new_blocks;
-        };
+        }
 
         // Rebuild after folding
         let (successors, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
@@ -325,11 +324,9 @@ impl ControlFlowGraph {
 
         loop {
             let (_, predecessors) = build_graph(self.blocks.iter().map(|b| b.exit_targets()));
-            let blocks = std::mem::take(&mut self.blocks);
-            let (changed_cond, new_blocks) = fold_condition_chains(blocks, &predecessors);
-            self.blocks = new_blocks;
+            let changed = fold_condition_chains(&mut self.blocks, &predecessors);
 
-            if !changed_cond {
+            if !changed {
                 break;
             }
         }
@@ -888,67 +885,64 @@ fn fold_truthy_cond_jumps(blocks: &mut [Block]) -> bool {
 
 /// Folds condition chains into the block exit, replacing them with a direct
 /// jump to the target block.
-fn fold_condition_chains(
-    mut blocks: Vec<Block>,
-    predecessors: &[Vec<usize>],
-) -> (bool, Vec<Block>) {
+fn fold_condition_chains(blocks: &mut [Block], predecessors: &[Vec<usize>]) -> bool {
     let mut was_changed = false;
 
     for i in 0..blocks.len() {
-        let (cond_a, then_a, else_a) = match &blocks[i].exit {
-            BlockExit::CondJump {
-                cond,
-                then_block,
-                else_block,
-            } => (cond.clone(), *then_block, *else_block),
-            _ => continue,
+        let BlockExit::CondJump {
+            cond: cond_a,
+            then_block: then_a,
+            else_block: else_a,
+        } = &blocks[i].exit
+        else {
+            continue;
         };
 
-        if predecessors[then_a].len() == 1
-            && blocks[then_a].stmts.is_empty()
+        if predecessors[*then_a].len() == 1
+            && blocks[*then_a].stmts.is_empty()
             && let BlockExit::CondJump {
                 cond: cond_b,
                 then_block: then_b,
                 else_block: else_b,
-            } = blocks[then_a].exit.clone()
+            } = &blocks[*then_a].exit
             && else_a == else_b
         {
             blocks[i].exit = BlockExit::CondJump {
                 cond: HilExpr::Binary {
-                    lhs: Box::new(cond_a),
+                    lhs: Box::new(cond_a.clone()),
                     op: BinOp::And,
-                    rhs: Box::new(cond_b),
+                    rhs: Box::new(cond_b.clone()),
                 },
-                then_block: then_b,
-                else_block: else_a,
+                then_block: *then_b,
+                else_block: *else_a,
             };
             was_changed = true;
             continue;
         }
 
-        if predecessors[else_a].len() == 1
-            && blocks[else_a].stmts.is_empty()
+        if predecessors[*else_a].len() == 1
+            && blocks[*else_a].stmts.is_empty()
             && let BlockExit::CondJump {
                 cond: cond_b,
                 then_block: then_b,
                 else_block: else_b,
-            } = blocks[else_a].exit.clone()
+            } = &blocks[*else_a].exit
             && then_a == then_b
         {
             blocks[i].exit = BlockExit::CondJump {
                 cond: HilExpr::Binary {
-                    lhs: Box::new(cond_a),
+                    lhs: Box::new(cond_a.clone()),
                     op: BinOp::Or,
-                    rhs: Box::new(cond_b),
+                    rhs: Box::new(cond_b.clone()),
                 },
-                then_block: then_a,
-                else_block: else_b,
+                then_block: *then_a,
+                else_block: *else_b,
             };
             was_changed = true;
         }
     }
 
-    (was_changed, blocks)
+    was_changed
 }
 
 /// Folds blocks with no statements and single jump exits.
