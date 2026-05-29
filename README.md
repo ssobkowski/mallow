@@ -37,22 +37,24 @@ print(fib(24))
 Decompiled output:
 
 ```luau
+-- Decompiled by mallow 0.3.2
+
 local v0 = {}
 local v1 = nil
 local v2
 v2 = function(p0)
+    -- proto 0: upvalues = [v0, v2]
     if v0[p0] then
         return v0[p0]
+    elseif p0 <= 1 then
+        return p0
     else
-        if p0 > 1 then
-            v0[p0] = v2(p0 - 1) + v2(p0 - 2)
-            return v0[p0]
-        else
-            return p0
-        end
+        v0[p0] = v2(p0 - 1) + v2(p0 - 2)
+        return v0[p0]
     end
 end
 print(v2(24))
+return
 ```
 
 Control flow graph of the inner closure:
