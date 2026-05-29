@@ -61,7 +61,7 @@ Control flow graph of the inner closure:
 
 ## Building
 
-Requires Cargo.
+Requires Cargo and Rust 1.95+.
 
 ```sh
 cargo build --release
