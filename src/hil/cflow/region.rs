@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use smallvec::SmallVec;
 
@@ -222,6 +222,10 @@ struct Scope {
     /// Exit targets that represent ordinary fallthrough for this scope, such as
     /// the merge block of a structured conditional branch.
     implicit_exits: HashSet<usize>,
+    /// Whether a jump from a loop latch back to the loop header is represented
+    /// by this scope's surrounding loop syntax. Conditional branch scopes must
+    /// keep such jumps explicit so they do not fall into sibling branches.
+    allow_implicit_continue: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -639,6 +643,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             nodes,
             exits,
             implicit_exits: HashSet::new(),
+            allow_implicit_continue: false,
         };
 
         self.structure_scope(&scope, None, &TerminalPolicy::Normal, None)
@@ -659,6 +664,13 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             trace.line(
                 1,
                 format_args!("implicit_exits = {:?}", sorted_nodes(&scope.implicit_exits)),
+            );
+            trace.line(
+                1,
+                format_args!(
+                    "allow_implicit_continue = {}",
+                    scope.allow_implicit_continue
+                ),
             );
             trace.line(1, format_args!("terminal_policy = {:?}", terminal_policy));
             trace.line(1, format_args!("blocked_loop = {:?}", blocked_loop));
@@ -714,6 +726,24 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                 let Some(next) = next else {
                     break;
                 };
+                if scope.exits.contains(&next) {
+                    if !scope.allow_implicit_continue
+                        && loop_ctx.is_some_and(|ctx| {
+                            ctx.continue_targets.contains(&next)
+                                && !ctx.continue_payload_entries.contains(&next)
+                        })
+                    {
+                        trace.line(
+                            2,
+                            format_args!("nested loop exits to outer continuation -> continue"),
+                        );
+                        nodes.push(Shape::Continue);
+                    } else if loop_ctx.is_some_and(|ctx| ctx.exits.contains(&next)) {
+                        trace.line(2, format_args!("nested loop exits outer loop -> break"));
+                        nodes.push(Shape::Break);
+                    }
+                    break;
+                }
                 current = next;
                 continue;
             }
@@ -996,6 +1026,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             nodes: plan.nodes.clone(),
             exits: plan.exits.clone(),
             implicit_exits: HashSet::new(),
+            allow_implicit_continue: true,
         };
 
         self.structure_scope(
@@ -1077,12 +1108,19 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             then_entry: *then_block,
             else_entry: *else_block,
             merge: self.find_merge_point(head, scope).or_else(|| {
-                self.local_branch_merge(*then_block, *else_block, scope, loop_ctx, terminal_policy)
+                self.scoped_branch_merge(*then_block, *else_block, scope, loop_ctx, terminal_policy)
             }),
         })
     }
 
-    fn local_branch_merge(
+    /// Finds a local branch merge when full-graph postdominators are too coarse.
+    ///
+    /// Infinite loop bodies often postdominate through the loop latch/header, so
+    /// the global immediate postdominator can miss the lexical continuation of
+    /// a conditional. Searching only within the active scope recovers the first
+    /// common continuation without pulling later sibling statements into both
+    /// branches.
+    fn scoped_branch_merge(
         &self,
         then_entry: usize,
         else_entry: usize,
@@ -1090,20 +1128,93 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         loop_ctx: Option<&LoopCtx>,
         terminal_policy: &TerminalPolicy,
     ) -> Option<usize> {
-        let then_target =
-            single_target(&self.graph.successors(then_entry).iter().copied().collect())?;
-        let else_target =
-            single_target(&self.graph.successors(else_entry).iter().copied().collect())?;
+        let branch_exits = conditional_branch_exits(scope, loop_ctx, terminal_policy, None);
+        let then_reachable = self.branch_reachable_distances(
+            then_entry,
+            scope,
+            &branch_exits,
+            loop_ctx,
+            terminal_policy,
+        );
+        let else_reachable = self.branch_reachable_distances(
+            else_entry,
+            scope,
+            &branch_exits,
+            loop_ctx,
+            terminal_policy,
+        );
 
-        let is_loop_payload =
-            loop_ctx.is_some_and(|ctx| ctx.continue_payload_entries.contains(&then_target));
+        then_reachable
+            .iter()
+            .filter_map(|(&node, &then_distance)| {
+                let else_distance = else_reachable.get(&node).copied()?;
+                Some((node, then_distance, else_distance))
+            })
+            .min_by_key(|&(node, then_distance, else_distance)| {
+                (
+                    then_distance.max(else_distance),
+                    then_distance + else_distance,
+                    node,
+                )
+            })
+            .map(|(node, _, _)| node)
+    }
 
-        (then_target == else_target
-            && (scope.nodes.contains(&then_target) || is_loop_payload)
-            && (!scope.exits.contains(&then_target)
-                || terminal_policy.suppresses(then_target)
-                || is_loop_payload))
-            .then_some(then_target)
+    fn branch_reachable_distances(
+        &self,
+        entry: usize,
+        scope: &Scope,
+        branch_exits: &HashSet<usize>,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+    ) -> HashMap<usize, usize> {
+        let mut distances = HashMap::new();
+        let mut queue = VecDeque::from([(entry, 0)]);
+
+        while let Some((node, distance)) = queue.pop_front() {
+            if distances.contains_key(&node) {
+                continue;
+            }
+
+            if !self.is_scoped_merge_candidate(node, scope, branch_exits, loop_ctx, terminal_policy)
+            {
+                continue;
+            }
+
+            distances.insert(node, distance);
+
+            if branch_exits.contains(&node) {
+                continue;
+            }
+
+            queue.extend(
+                self.graph
+                    .successors(node)
+                    .iter()
+                    .copied()
+                    .map(|successor| (successor, distance + 1)),
+            );
+        }
+
+        distances
+    }
+
+    fn is_scoped_merge_candidate(
+        &self,
+        node: usize,
+        scope: &Scope,
+        branch_exits: &HashSet<usize>,
+        loop_ctx: Option<&LoopCtx>,
+        terminal_policy: &TerminalPolicy,
+    ) -> bool {
+        let is_loop_payload = loop_ctx.is_some_and(|ctx| {
+            ctx.continue_payload_entries.contains(&node) || ctx.exit_payload_entries.contains(&node)
+        });
+
+        (scope.nodes.contains(&node) || is_loop_payload)
+            && (!branch_exits.contains(&node)
+                || terminal_policy.suppresses(node)
+                || is_loop_payload)
     }
 
     fn structure_conditional(
@@ -1114,22 +1225,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         terminal_policy: &TerminalPolicy,
         blocked_loop: Option<LoopId>,
     ) -> Shape {
-        let mut branch_exits = scope.exits.clone();
-        if let Some(merge) = shape.merge {
-            branch_exits.insert(merge);
-        }
-        if let TerminalPolicy::SuppressExitOf { block } = terminal_policy {
-            branch_exits.insert(*block);
-        }
-        if let Some(ctx) = loop_ctx {
-            // Implicit tails still contain loop-body statements; structure them
-            // in the branch and suppress only their final backedge.
-            branch_exits.extend(ctx.continue_targets.iter().copied().filter(|target| {
-                !terminal_policy.suppresses(*target)
-                    && !ctx.implicit_continue_sources.contains(target)
-            }));
-            branch_exits.extend(ctx.exits.iter().copied());
-        }
+        let branch_exits = conditional_branch_exits(scope, loop_ctx, terminal_policy, shape.merge);
 
         let trace = self.diagnostics.at(LogLevel::Trace, LogTarget::Region);
         trace.block("conditional:", |trace| {
@@ -1146,6 +1242,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         let owned_boundary_entry = |entry: usize| {
             Some(entry) != shape.merge
                 && !terminal_policy.suppresses(entry)
+                && !scope.implicit_exits.contains(&entry)
                 && loop_ctx.is_some_and(|ctx| {
                     ctx.continue_payload_entries.contains(&entry)
                         || ctx.exit_payload_entries.contains(&entry)
@@ -1194,6 +1291,10 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                     trace.line(2, format_args!("empty branch reaches suppressed terminal"));
                     return Shape::sequence(Vec::new());
                 }
+                if scope.implicit_exits.contains(&entry) {
+                    trace.line(2, format_args!("empty branch reaches implicit outer merge"));
+                    return Shape::sequence(Vec::new());
+                }
 
                 // If the branch jumps out of the region entirely, map it to the correct exit instruction.
                 if let Some(ctx) = loop_ctx {
@@ -1223,7 +1324,8 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                     .iter()
                     .copied()
                     .filter(|payload| {
-                        Some(*payload) != shape.merge || scope.exits.contains(payload)
+                        !scope.implicit_exits.contains(payload)
+                            && (Some(*payload) != shape.merge || scope.exits.contains(payload))
                     })
                     .find(|payload| {
                         entry == *payload
@@ -1245,6 +1347,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                     .filter(|exit| *exit != entry && Some(*exit) != owned_payload_exit)
                     .collect(),
                 implicit_exits: shape.merge.into_iter().chain(owned_payload_exit).collect(),
+                allow_implicit_continue: false,
             };
             self.structure_scope(&branch_scope, loop_ctx, terminal_policy, blocked_loop)
         };
@@ -1583,7 +1686,9 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                     return block_shape;
                 }
 
-                if loop_ctx.is_some_and(|ctx| ctx.implicit_continue_sources.contains(&block)) {
+                if scope.allow_implicit_continue
+                    && loop_ctx.is_some_and(|ctx| ctx.implicit_continue_sources.contains(&block))
+                {
                     trace.line(
                         2,
                         format_args!(
@@ -1772,6 +1877,31 @@ fn sorted_nodes(nodes: &HashSet<usize>) -> Vec<usize> {
     let mut nodes: Vec<_> = nodes.iter().copied().collect();
     nodes.sort_unstable();
     nodes
+}
+
+fn conditional_branch_exits(
+    scope: &Scope,
+    loop_ctx: Option<&LoopCtx>,
+    terminal_policy: &TerminalPolicy,
+    merge: Option<usize>,
+) -> HashSet<usize> {
+    let mut branch_exits = scope.exits.clone();
+    if let Some(merge) = merge {
+        branch_exits.insert(merge);
+    }
+    if let TerminalPolicy::SuppressExitOf { block } = terminal_policy {
+        branch_exits.insert(*block);
+    }
+    if let Some(ctx) = loop_ctx {
+        // Implicit tails still contain loop-body statements; structure them
+        // in the branch and suppress only their final backedge.
+        branch_exits.extend(ctx.continue_targets.iter().copied().filter(|target| {
+            !terminal_policy.suppresses(*target) && !ctx.implicit_continue_sources.contains(target)
+        }));
+        branch_exits.extend(ctx.exits.iter().copied());
+    }
+
+    branch_exits
 }
 
 pub fn structure(cfg: &ControlFlowGraph, diagnostics: &Diagnostics) -> RegionNode {
