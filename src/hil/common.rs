@@ -15,7 +15,7 @@ pub fn const_expr(consts: &[Constant], index: usize) -> HilExpr {
     }
 }
 
-/// Decodes a Luau call/return sentinel count field into a [`Count`](crate::il::Count).
+/// Decodes a Luau call/return sentinel count field into a [`Count`].
 pub const fn decoded_count(encoded: u8) -> Count {
     match encoded {
         0 => Count::Variadic,

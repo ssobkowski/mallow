@@ -766,7 +766,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         flush_multiret(multiret, self.block_idx, self.ssa, &mut self.stmts);
     }
 
-    /// See: [const_expr](crate::hil::common::const_expr)
+    /// See: [const_expr]
     #[inline]
     #[must_use]
     fn const_expr(&self, index: usize) -> HilExpr {

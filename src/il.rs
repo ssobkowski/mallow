@@ -71,9 +71,9 @@ pub enum Instr {
     GetImport { dest: u8, index: u16, path: u32 },
 
     // 13..20: table access and call setup
-    /// Table read: dest = table[key]
+    /// Table read: dest = table\[key\]
     GetTable { dest: u8, table: u8, key: u8 },
-    /// Table write: table[key] = src
+    /// Table write: table\[key\] = src
     SetTable { src: u8, table: u8, key: u8 },
     /// Table read with constant string key.
     GetTableKS {
@@ -95,7 +95,7 @@ pub enum Instr {
     SetTableN { src: u8, table: u8, index: u16 },
     /// Create a new closure from a proto.
     NewClosure { dest: u8, proto: u16 },
-    /// Method call setup: dest+1 = object, dest = object[method]
+    /// Method call setup: dest+1 = object, dest = object\[method\]
     NameCall {
         dest: u8,
         object: u8,
