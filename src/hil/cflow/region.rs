@@ -798,6 +798,22 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         let loop_info = self.loops.candidate_in_scope(header, scope, blocked_loop)?;
         let kind = self.classify_loop(loop_info);
         let (lexical_body, lexical_exits) = self.lexical_loop_body(loop_info, &kind);
+
+        if blocked_loop.is_some_and(|blocked| {
+            blocked.header == loop_info.header && lexical_body.contains(&blocked.latch)
+        }) {
+            self.diagnostics
+                .at(LogLevel::Trace, LogTarget::Region)
+                .line(
+                    2,
+                    format_args!(
+                        "skip same-header loop {:?}: body would re-enter blocked loop {:?}",
+                        loop_info.id, blocked_loop
+                    ),
+                );
+            return None;
+        }
+
         let body_plan = self.plan_loop_body(
             loop_info,
             &kind,
