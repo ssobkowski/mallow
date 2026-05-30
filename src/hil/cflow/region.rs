@@ -86,9 +86,18 @@ pub enum RegionNode {
 }
 
 impl RegionNode {
-    /// Returns whether this node is empty, i.e. a sequence with no nodes.
-    pub const fn is_empty(&self) -> bool {
-        matches!(self, RegionNode::Sequence { nodes } if nodes.is_empty())
+    /// Returns an empty structured region.
+    pub fn empty() -> Self {
+        RegionNode::Sequence { nodes: Vec::new() }
+    }
+
+    /// Returns whether this node has no observable payload.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            RegionNode::BasicBlock { stmts } => stmts.is_empty(),
+            RegionNode::Sequence { nodes } => nodes.iter().all(Self::is_empty),
+            _ => false,
+        }
     }
 }
 

@@ -194,11 +194,20 @@ impl HilExpr {
         }
     }
 
-    /// Returns the inverted expression, i.e. `!expr`.
+    /// Returns the semantic negation of this expression.
+    ///
+    /// Ordered comparisons are wrapped in `not` instead of being converted to
+    /// the opposite comparison because values such as NaN make those forms
+    /// observably different.
     pub fn invert(self) -> HilExpr {
         match self {
             HilExpr::Bool(b) => HilExpr::Bool(!b),
-            HilExpr::Binary { lhs, op, rhs } if let Some(inverted) = op.invert() => {
+            HilExpr::Binary {
+                lhs,
+                op: op @ (BinOp::Eq | BinOp::Ne),
+                rhs,
+            } => {
+                let inverted = op.invert().expect("equality operators are invertible");
                 HilExpr::Binary {
                     lhs: Box::new(*lhs),
                     op: inverted,
