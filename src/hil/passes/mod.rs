@@ -4,6 +4,7 @@ mod continue_cleanup;
 mod fold_bool_assign;
 mod fold_tables;
 mod inlining;
+mod nested_ifs;
 mod normalize;
 mod return_arity;
 mod short_circuit;
@@ -29,6 +30,7 @@ pub fn run(fns: &mut [StructuredFunction]) {
             changed |= fold_bool_assign::run(fun);
             changed |= continue_cleanup::run(fun);
             changed |= terminator_cleanup::run(fun);
+            changed |= nested_ifs::run(fun);
             changed |= normalize::run(fun);
 
             if !changed {
