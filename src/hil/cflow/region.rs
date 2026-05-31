@@ -1033,10 +1033,10 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
     /// Translates loop kind into a body traversal plan.
     ///
     /// - For `While`, guard nodes are removed from `nodes` (they became the
-    /// condition expression, not statements) and the header is added to `exits`
-    /// so an in-body jump back to it is recognized as a continue boundary.
+    ///   condition expression, not statements) and the header is added to `exits`
+    ///   so an in-body jump back to it is recognized as a continue boundary.
     /// - For `RepeatUntil`, the latch is suppressed so its statements are emitted
-    /// before the loop syntax claims the conditional exit.
+    ///   before the loop syntax claims the conditional exit.
     ///
     /// All other kinds pass the lexical body through unchanged.
     fn plan_loop_body(
@@ -2120,6 +2120,5 @@ fn conditional_branch_exits(
 
 /// Structures the given [`ControlFlowGraph`] into a [`RegionNode`].
 pub fn structure(cfg: &ControlFlowGraph, diagnostics: &Diagnostics) -> RegionNode {
-    let root = Structurer::new(cfg, diagnostics).structure().lower(cfg);
-    root
+    Structurer::new(cfg, diagnostics).structure().lower(cfg)
 }

@@ -204,7 +204,7 @@ impl Visitor for LifetimeAnalysis {
                     self.pin_expr_captures(expr);
                 }
                 let reads = exprs.iter().flat_map(ReadCollector::in_expr).collect();
-                self.record_event(reads, vars.into_iter().map(|s| *s).collect());
+                self.record_event(reads, vars.into_iter().copied().collect());
                 self.visit_region(body);
             }
             RegionNode::Continue | RegionNode::Break => {}
