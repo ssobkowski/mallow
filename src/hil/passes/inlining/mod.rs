@@ -1,5 +1,6 @@
 use crate::hil::{ReturnArity, StructuredFunction, cflow::cfg::ControlFlowGraph};
 
+mod common;
 mod post_region;
 mod pre_region;
 

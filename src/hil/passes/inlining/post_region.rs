@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use smallvec::{SmallVec, smallvec};
 
@@ -8,7 +8,12 @@ use crate::hil::{
     ir::{HilExpr, HilStmt, HilTableItem, PhiNode},
     lifter::ssa::SymbolId,
     passes::return_arity::luau_global_arity,
-    visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut},
+    visitor::{Visitor, walk_expr},
+};
+
+use super::common::{
+    count_symbol_reads_in_expr, count_symbol_reads_in_stmt, expr_read_symbols, region_read_symbols,
+    replace_symbol_in_expr, replace_symbol_in_stmt, stmt_writes_symbol,
 };
 
 #[derive(Debug, Default)]
@@ -28,6 +33,46 @@ impl BlockSummary {
 
     fn reads_in_stmt(&self, idx: usize) -> impl Iterator<Item = SymbolId> + '_ {
         self.stmt_reads[idx].iter().copied()
+    }
+}
+
+#[derive(Debug, Default)]
+struct BlockSourceIndex {
+    source_positions: HashMap<SymbolId, Vec<usize>>,
+}
+
+impl BlockSourceIndex {
+    /// Indexes plain assignment sources by symbol while preserving statement order.
+    fn new(plain_sources: &[Option<SymbolId>]) -> Self {
+        let mut index = Self::default();
+        for (idx, sym) in plain_sources.iter().enumerate() {
+            let Some(sym) = sym else {
+                continue;
+            };
+            index.source_positions.entry(*sym).or_default().push(idx);
+        }
+        index
+    }
+
+    fn add_sources_in_range(
+        &self,
+        sym: SymbolId,
+        lower_bound: usize,
+        upper_bound: usize,
+        candidates: &mut BTreeSet<usize>,
+    ) {
+        let Some(positions) = self.source_positions.get(&sym) else {
+            return;
+        };
+        let start = positions.partition_point(|idx| *idx < lower_bound);
+        for idx in &positions[start..] {
+            if *idx >= upper_bound {
+                break;
+            }
+            if *idx >= lower_bound {
+                candidates.insert(*idx);
+            }
+        }
     }
 }
 
@@ -75,26 +120,6 @@ impl Visitor for StmtSummary {
         }
     }
 
-    fn visit_expr(&mut self, expr: &HilExpr) {
-        if let HilExpr::Symbol(sym) = expr {
-            self.reads.insert(*sym);
-            return;
-        }
-
-        walk_expr(self, expr);
-    }
-
-    fn visit_phi(&mut self, _: &PhiNode) {
-        unreachable!("phi nodes should have been unfolded at this point")
-    }
-}
-
-#[derive(Debug, Default)]
-struct RegionReadSet {
-    reads: HashSet<SymbolId>,
-}
-
-impl Visitor for RegionReadSet {
     fn visit_expr(&mut self, expr: &HilExpr) {
         if let HilExpr::Symbol(sym) = expr {
             self.reads.insert(*sym);
@@ -329,6 +354,7 @@ struct RewriteStats {
     replacement_read_symbol_total: usize,
     substitution_attempts: usize,
     successful_substitutions: usize,
+    inline_block_source_candidates: usize,
     read_counter_calls: usize,
     removed_statements: usize,
     direct_statement_removals: usize,
@@ -363,6 +389,7 @@ impl<'a> Inliner<'a> {
             replacement_read_symbol_total = tracing::field::Empty,
             substitution_attempts = tracing::field::Empty,
             successful_substitutions = tracing::field::Empty,
+            inline_block_source_candidates = tracing::field::Empty,
             read_counter_calls = tracing::field::Empty,
             removed_statements = tracing::field::Empty,
             direct_statement_removals = tracing::field::Empty,
@@ -399,6 +426,10 @@ impl<'a> Inliner<'a> {
         span.record(
             "successful_substitutions",
             self.stats.successful_substitutions,
+        );
+        span.record(
+            "inline_block_source_candidates",
+            self.stats.inline_block_source_candidates,
         );
         span.record("read_counter_calls", self.stats.read_counter_calls);
         span.record("removed_statements", self.stats.removed_statements);
@@ -465,11 +496,23 @@ impl<'a> Inliner<'a> {
             .iter()
             .map(|stmt| plain_assignment(stmt).map(|(sym, _)| sym))
             .collect();
+        let source_index = BlockSourceIndex::new(&plain_sources);
         let mut removable = HashSet::new();
         let mut idx = 0;
         while idx < stmts.len() {
             let mut active_reads: HashSet<_> = summary.reads_in_stmt(idx).collect();
-            for source_idx in 0..idx {
+            let mut candidate_sources = BTreeSet::new();
+            for sym in active_reads.iter().copied() {
+                source_index.add_sources_in_range(sym, 0, idx, &mut candidate_sources);
+            }
+
+            let mut next_source_idx = 0;
+            while let Some(source_idx) = candidate_sources.pop_first() {
+                if source_idx < next_source_idx {
+                    continue;
+                }
+                next_source_idx = source_idx + 1;
+                self.stats.inline_block_source_candidates += 1;
                 if removable.contains(&source_idx) {
                     continue;
                 }
@@ -505,13 +548,21 @@ impl<'a> Inliner<'a> {
                     self.stats.substitution_attempts += 1;
                 }
 
-                if inlineable && substitute_in_stmt(&mut stmts[idx], sym, &rhs) {
+                if inlineable && replace_symbol_in_stmt(&mut stmts[idx], sym, &rhs) > 0 {
                     self.stats.successful_substitutions += 1;
-                    let mut replacement_reads = RegionReadSet::default();
-                    replacement_reads.visit_expr(&rhs);
+                    let replacement_reads = expr_read_symbols(&rhs);
                     self.stats.replacement_read_collections += 1;
-                    self.stats.replacement_read_symbol_total += replacement_reads.reads.len();
-                    active_reads.extend(replacement_reads.reads);
+                    self.stats.replacement_read_symbol_total += replacement_reads.len();
+                    for sym in replacement_reads {
+                        if active_reads.insert(sym) {
+                            source_index.add_sources_in_range(
+                                sym,
+                                next_source_idx,
+                                idx,
+                                &mut candidate_sources,
+                            );
+                        }
+                    }
                     removable.insert(source_idx);
                 }
             }
@@ -532,25 +583,14 @@ impl<'a> Inliner<'a> {
         self.inline_block_inner(stmts, Some(tail_reads));
     }
 
-    fn inline_block_with_tail(&mut self, stmts: &mut Vec<HilStmt>, tail: &[RegionNode]) {
-        self.stats.tail_read_collections += 1;
-        self.stats.tail_read_node_total += tail.len();
-        let mut reads = HashSet::new();
-        for node in tail {
-            let mut collector = RegionReadSet::default();
-            collector.visit_region(node);
-            reads.extend(collector.reads);
-        }
-        self.stats.tail_read_symbol_total += reads.len();
-        self.inline_block_with_tail_reads(stmts, &reads);
-    }
-
     fn inline_sequence_edges(&mut self, nodes: &mut [RegionNode]) {
         self.stats.inline_sequence_edge_calls += 1;
+        let tail_reads = self.collect_sequence_tail_reads(nodes);
+
         for idx in 0..nodes.len() {
-            let (left, tail) = nodes.split_at_mut(idx + 1);
+            let left = &mut nodes[..=idx];
             if let RegionNode::BasicBlock { stmts } = &mut left[idx] {
-                self.inline_block_with_tail(stmts, tail);
+                self.inline_block_with_tail_reads(stmts, &tail_reads[idx + 1]);
             }
         }
 
@@ -577,6 +617,21 @@ impl<'a> Inliner<'a> {
         }
     }
 
+    fn collect_sequence_tail_reads(&mut self, nodes: &[RegionNode]) -> Vec<HashSet<SymbolId>> {
+        self.stats.tail_read_collections += 1;
+        self.stats.tail_read_node_total += nodes.len();
+
+        let mut tail_reads = vec![HashSet::new(); nodes.len() + 1];
+        for idx in (0..nodes.len()).rev() {
+            let mut reads = region_read_symbols(&nodes[idx]);
+            self.stats.tail_read_symbol_total += reads.len();
+            reads.extend(tail_reads[idx + 1].iter().copied());
+            tail_reads[idx] = reads;
+        }
+
+        tail_reads
+    }
+
     fn inline_next_block(&mut self, source_stmts: &mut Vec<HilStmt>, next_stmts: &mut [HilStmt]) {
         self.stats.inline_next_block_calls += 1;
         let mut removable = HashSet::new();
@@ -593,12 +648,12 @@ impl<'a> Inliner<'a> {
             }
             for stmt in next_stmts.iter_mut() {
                 self.stats.read_counter_calls += 1;
-                if ReadCounter::new(sym).in_stmt(stmt) == 0 {
+                if count_symbol_reads_in_stmt(stmt, sym) == 0 {
                     continue;
                 }
                 if can_substitute_in_stmt_context(stmt, sym, &rhs) {
                     self.stats.substitution_attempts += 1;
-                    if substitute_in_stmt(stmt, sym, &rhs) {
+                    if replace_symbol_in_stmt(stmt, sym, &rhs) > 0 {
                         self.stats.successful_substitutions += 1;
                         removable.insert(source_idx);
                     }
@@ -658,14 +713,8 @@ impl<'a> Inliner<'a> {
             if !can_substitute_in_expr_context(expr, sym, &rhs) {
                 continue;
             }
-            let mut substituter = SymbolSubstituter {
-                sym,
-                replacement: &rhs,
-                changed: false,
-            };
             self.stats.substitution_attempts += 1;
-            substituter.visit_expr(expr);
-            if substituter.changed {
+            if replace_symbol_in_expr(expr, sym, &rhs) > 0 {
                 self.stats.successful_substitutions += 1;
                 removable.insert(source_idx);
             }
@@ -878,13 +927,13 @@ impl<'a> Inliner<'a> {
         }
         if stmts[source_idx + 1..use_idx]
             .iter()
-            .any(|stmt| ReadCounter::new(sym).in_stmt(stmt) > 0)
+            .any(|stmt| count_symbol_reads_in_stmt(stmt, sym) > 0)
         {
             return false;
         }
         if stmts[use_idx + 1..]
             .iter()
-            .any(|stmt| ReadCounter::new(sym).in_stmt(stmt) > 0)
+            .any(|stmt| count_symbol_reads_in_stmt(stmt, sym) > 0)
         {
             return false;
         }
@@ -1025,18 +1074,6 @@ fn plain_assignment(stmt: &HilStmt) -> Option<(SymbolId, &HilExpr)> {
     }
 }
 
-fn stmt_writes_symbol(stmt: &HilStmt, sym: SymbolId) -> bool {
-    match stmt {
-        HilStmt::Assign { left, .. } => matches!(left, HilExpr::Symbol(target) if *target == sym),
-        HilStmt::AssignMany { left, .. } => left
-            .iter()
-            .any(|left| matches!(left, HilExpr::Symbol(target) if *target == sym)),
-        HilStmt::SetList { table, .. } => *table == sym,
-        HilStmt::Call(_) => false,
-        HilStmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
-    }
-}
-
 fn stmt_has_effect(stmt: &HilStmt) -> bool {
     match stmt {
         HilStmt::Assign { left, value } => !left.is_pure() || !value.is_pure(),
@@ -1046,12 +1083,6 @@ fn stmt_has_effect(stmt: &HilStmt) -> bool {
         HilStmt::SetList { .. } | HilStmt::Call(_) => true,
         HilStmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
     }
-}
-
-fn expr_read_symbols(expr: &HilExpr) -> HashSet<SymbolId> {
-    let mut reads = RegionReadSet::default();
-    reads.visit_expr(expr);
-    reads.reads
 }
 
 fn can_substitute_in_stmt_context(stmt: &HilStmt, sym: SymbolId, rhs: &HilExpr) -> bool {
@@ -1085,7 +1116,7 @@ fn is_call_statement_consumer(stmt: &HilStmt, sym: SymbolId, rhs: &HilExpr) -> b
 }
 
 fn can_inline_effectful_at_expr_occurrence(expr: &HilExpr, sym: SymbolId) -> bool {
-    ReadCounter::new(sym).in_expr(expr) == 1 && occurrence_has_no_prior_effect(expr, sym)
+    count_symbol_reads_in_expr(expr, sym) == 1 && occurrence_has_no_prior_effect(expr, sym)
 }
 
 fn occurrence_has_no_prior_effect(expr: &HilExpr, sym: SymbolId) -> bool {
@@ -1182,78 +1213,6 @@ fn occurrence_has_no_prior_effect(expr: &HilExpr, sym: SymbolId) -> bool {
         | HilExpr::Global(_)
         | HilExpr::Import(_)
         | HilExpr::VarArgs => false,
-    }
-}
-
-struct ReadCounter {
-    sym: SymbolId,
-    counter: usize,
-}
-
-impl ReadCounter {
-    fn new(sym: SymbolId) -> Self {
-        Self { sym, counter: 0 }
-    }
-
-    fn in_expr(mut self, expr: &HilExpr) -> usize {
-        self.visit_expr(expr);
-        self.counter
-    }
-
-    fn in_stmt(mut self, stmt: &HilStmt) -> usize {
-        self.visit_stmt(stmt);
-        self.counter
-    }
-}
-
-impl Visitor for ReadCounter {
-    fn visit_expr(&mut self, expr: &HilExpr) {
-        if let HilExpr::Symbol(sym) = expr
-            && *sym == self.sym
-        {
-            self.counter += 1;
-            return;
-        }
-
-        walk_expr(self, expr);
-    }
-
-    fn visit_phi(&mut self, _: &PhiNode) {
-        unreachable!("phi nodes should have been unfolded at this point")
-    }
-}
-
-fn substitute_in_stmt(stmt: &mut HilStmt, sym: SymbolId, replacement: &HilExpr) -> bool {
-    let mut substituter = SymbolSubstituter {
-        sym,
-        replacement,
-        changed: false,
-    };
-    substituter.visit_stmt(stmt);
-    substituter.changed
-}
-
-struct SymbolSubstituter<'a> {
-    sym: SymbolId,
-    replacement: &'a HilExpr,
-    changed: bool,
-}
-
-impl VisitorMut for SymbolSubstituter<'_> {
-    fn visit_phi(&mut self, _: &mut PhiNode) {
-        unreachable!("phi nodes should have been unfolded at this point")
-    }
-
-    fn visit_expr(&mut self, expr: &mut HilExpr) {
-        if let HilExpr::Symbol(sym) = expr
-            && *sym == self.sym
-        {
-            *expr = self.replacement.clone();
-            self.changed = true;
-            return;
-        }
-
-        walk_expr_mut(self, expr);
     }
 }
 

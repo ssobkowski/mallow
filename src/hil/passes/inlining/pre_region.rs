@@ -6,10 +6,12 @@ use crate::{
         cflow::graph::GraphView,
         ir::{HilExpr, HilStmt},
         lifter::ssa::SymbolId,
-        visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut},
+        visitor::{Visitor, walk_expr},
     },
     scopes::Scope,
 };
+
+use super::common::{expr_read_symbols, replace_symbol_in_expr, stmt_written_symbols};
 
 #[derive(Debug, Clone, Default)]
 pub struct SymbolFacts {
@@ -224,26 +226,6 @@ impl SubstitutionStats {
     }
 }
 
-struct SymbolSubstituter<'a> {
-    sym: SymbolId,
-    replacement: &'a HilExpr,
-    change_count: usize,
-}
-
-impl VisitorMut for SymbolSubstituter<'_> {
-    fn visit_expr(&mut self, expr: &mut HilExpr) {
-        if let HilExpr::Symbol(sym) = expr
-            && *sym == self.sym
-        {
-            *expr = self.replacement.clone();
-            self.change_count += 1;
-            return;
-        }
-
-        walk_expr_mut(self, expr);
-    }
-}
-
 impl Inliner {
     fn with_facts(facts: Scope<SymbolId, SymbolFacts>) -> Self {
         Self {
@@ -382,7 +364,7 @@ impl Inliner {
                 return false;
             }
 
-            let replacement_count = replace_symbol(&mut condition, *sym, value);
+            let replacement_count = replace_symbol_in_expr(&mut condition, *sym, value);
             if replacement_count == 0 {
                 return false;
             }
@@ -452,11 +434,16 @@ fn substitute_available_expr(
     // this block without needing another outer pass iteration.
     loop {
         let mut changed = false;
+        let read_symbols = expr_read_symbols(expr);
 
-        for (sym, replacement) in available {
+        for sym in read_symbols {
+            let Some(replacement) = available.get(&sym) else {
+                continue;
+            };
+
             stats.attempts += 1;
-            if replace_symbol(expr, *sym, replacement) > 0 {
-                removable.insert(*sym);
+            if replace_symbol_in_expr(expr, sym, replacement) > 0 {
+                removable.insert(sym);
                 stats.successes += 1;
                 changed = true;
             }
@@ -470,7 +457,7 @@ fn substitute_available_expr(
 }
 
 fn kill_lvalues(stmt: &HilStmt, available: &mut HashMap<SymbolId, HilExpr>) {
-    let written = written_symbols(stmt);
+    let written = stmt_written_symbols(stmt);
     if written.is_empty() {
         return;
     }
@@ -484,38 +471,6 @@ fn kill_lvalues(stmt: &HilStmt, available: &mut HashMap<SymbolId, HilExpr>) {
                 .iter()
                 .any(|written| replacement.reads_symbol(written))
     });
-}
-
-fn written_symbols(stmt: &HilStmt) -> Vec<SymbolId> {
-    match stmt {
-        HilStmt::Assign {
-            left: HilExpr::Symbol(sym),
-            ..
-        } => vec![*sym],
-        HilStmt::Assign { .. } => Vec::new(),
-        HilStmt::AssignMany { left, .. } => left
-            .iter()
-            .filter_map(|lvalue| match lvalue {
-                HilExpr::Symbol(sym) => Some(*sym),
-                _ => None,
-            })
-            .collect(),
-        HilStmt::SetList { table, .. } => vec![*table],
-        HilStmt::Call(_) => Vec::new(),
-        HilStmt::Phi(_) => {
-            unreachable!("phi nodes should have been unfolded at this point")
-        }
-    }
-}
-
-fn replace_symbol(expr: &mut HilExpr, sym: SymbolId, replacement: &HilExpr) -> usize {
-    let mut substituter = SymbolSubstituter {
-        sym,
-        replacement,
-        change_count: 0,
-    };
-    substituter.visit_expr(expr);
-    substituter.change_count
 }
 
 pub fn run(cfg: &mut ControlFlowGraph) -> bool {
