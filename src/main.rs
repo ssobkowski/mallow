@@ -26,6 +26,11 @@ struct Cli {
     /// Proto diagnostic filter. Accepts a proto index or 'entry'. Repeatable.
     #[arg(long, global = true, value_delimiter = ',')]
     log_proto: Vec<ProtoSelector>,
+
+    /// Write a Chrome trace profile to this path.
+    #[cfg(feature = "profile")]
+    #[arg(long, global = true, value_name = "PATH")]
+    profile_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -83,7 +88,9 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    let diagnostics = Diagnostics::new(diagnostic_config(&cli));
+    let diagnostic_config = diagnostic_config(&cli);
+    let _tracing_guard = init_tracing(&cli, diagnostic_config.is_enabled());
+    let diagnostics = Diagnostics::new(diagnostic_config);
 
     match cli.command {
         Commands::Disasm { input, output } => {
@@ -168,6 +175,23 @@ fn main() {
             }
         }
     }
+}
+
+#[cfg(not(feature = "profile"))]
+fn init_tracing(cli: &Cli, diagnostics_enabled: bool) -> mallow::TracingGuard {
+    let _ = cli;
+    mallow::init_tracing(diagnostics_enabled).unwrap_or_else(|e| {
+        eprintln!("failed to initialize tracing: {e}");
+        std::process::exit(1);
+    })
+}
+
+#[cfg(feature = "profile")]
+fn init_tracing(cli: &Cli, diagnostics_enabled: bool) -> mallow::TracingGuard {
+    mallow::init_tracing(diagnostics_enabled, cli.profile_output.clone()).unwrap_or_else(|e| {
+        eprintln!("failed to initialize tracing: {e}");
+        std::process::exit(1);
+    })
 }
 
 fn diagnostic_config(cli: &Cli) -> DiagnosticConfig {

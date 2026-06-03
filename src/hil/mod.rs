@@ -49,6 +49,15 @@ pub struct StructuredFunction {
 
 impl StructuredFunction {
     pub fn from_proto(proto: &Proto, all_protos: &[Proto], diagnostics: &Diagnostics) -> Self {
+        let span = tracing::info_span!(
+            "structure_proto",
+            proto = proto.index as usize,
+            instr_count = proto.instrs.len(),
+            param_count = proto.num_params,
+            upvalue_count = proto.num_upvals,
+        );
+        let _enter = span.enter();
+
         let diagnostics = diagnostics.for_proto(proto.index as usize);
         let info = diagnostics.at(LogLevel::Info, LogTarget::Hil);
 
@@ -58,17 +67,38 @@ impl StructuredFunction {
         );
 
         info.line(1, format_args!("building cfg..."));
-        let mut cfg = ControlFlowGraph::from_proto(proto, all_protos);
+        let mut cfg = {
+            let span = tracing::info_span!("build_cfg", proto = proto.index as usize);
+            let _enter = span.enter();
+            ControlFlowGraph::from_proto(proto, all_protos)
+        };
 
         info.line(1, format_args!("running pre-region passes..."));
-        if passes::run_pre_region(&mut cfg) {
+        let pre_region_changed = {
+            let span = tracing::info_span!(
+                "pre_region_passes",
+                proto = proto.index as usize,
+                changed = tracing::field::Empty,
+            );
+            let _enter = span.enter();
+            let changed = passes::run_pre_region(&mut cfg);
+            span.record("changed", changed);
+            changed
+        };
+        if pre_region_changed {
+            let span = tracing::info_span!("simplify_conditions", proto = proto.index as usize);
+            let _enter = span.enter();
             cfg.simplify_conditions();
         }
 
         dump_cfg(&cfg, &diagnostics);
 
         info.line(1, format_args!("structuring region..."));
-        let root = region::structure(&cfg, &diagnostics);
+        let root = {
+            let span = tracing::info_span!("structure_region", proto = proto.index as usize);
+            let _enter = span.enter();
+            region::structure(&cfg, &diagnostics)
+        };
 
         let params = cfg.params().to_vec();
         let upvalues = cfg.upvalues().to_vec();

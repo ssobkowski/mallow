@@ -1,14 +1,25 @@
 use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt;
 use std::io::IsTerminal;
+#[cfg(feature = "profile")]
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use clap::ValueEnum;
+use tracing::{Event, Subscriber, field::Visit};
+use tracing_subscriber::{
+    Layer, Registry,
+    layer::{Context, SubscriberExt},
+    util::SubscriberInitExt,
+};
 
 static START: OnceLock<Instant> = OnceLock::new();
 
 const TARGET_WIDTH: usize = 6;
+const DIAGNOSTIC_EVENT_TARGET: &str = "mallow::diagnostic";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum LogLevel {
@@ -88,6 +99,10 @@ impl DiagnosticConfig {
             protos,
             entry_proto: None,
         }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.level.is_some()
     }
 
     pub fn with_entry_proto(&self, entry_proto: usize) -> Self {
@@ -188,7 +203,13 @@ impl DiagnosticSink<'_> {
 
     pub fn line(&self, indent: usize, args: std::fmt::Arguments<'_>) {
         if self.enabled() {
-            log_args(self.target, self.diagnostics.proto, indent, args);
+            emit_diagnostic_event(
+                self.level,
+                self.target,
+                self.diagnostics.proto,
+                indent,
+                args,
+            );
         }
     }
 
@@ -202,6 +223,65 @@ impl DiagnosticSink<'_> {
     }
 }
 
+#[derive(Default)]
+pub struct TracingGuard {
+    #[cfg(feature = "profile")]
+    _chrome_guard: Option<tracing_chrome::FlushGuard>,
+}
+
+/// Initializes tracing for CLI diagnostics.
+#[cfg(not(feature = "profile"))]
+pub fn init_tracing(
+    diagnostics_enabled: bool,
+) -> Result<TracingGuard, Box<dyn Error + Send + Sync>> {
+    if diagnostics_enabled {
+        Registry::default().with(DiagnosticLayer).try_init()?;
+    }
+
+    Ok(TracingGuard::default())
+}
+
+/// Initializes tracing for CLI diagnostics and optional Chrome trace output.
+#[cfg(feature = "profile")]
+pub fn init_tracing(
+    diagnostics_enabled: bool,
+    profile_output: Option<PathBuf>,
+) -> Result<TracingGuard, Box<dyn Error + Send + Sync>> {
+    let chrome_guard = match profile_output {
+        Some(output) => {
+            if diagnostics_enabled {
+                let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+                    .include_args(true)
+                    .file(output)
+                    .build();
+                Registry::default()
+                    .with(DiagnosticLayer)
+                    .with(chrome_layer)
+                    .try_init()?;
+                Some(guard)
+            } else {
+                let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+                    .include_args(true)
+                    .file(output)
+                    .build();
+                Registry::default().with(chrome_layer).try_init()?;
+                Some(guard)
+            }
+        }
+        None => {
+            if diagnostics_enabled {
+                Registry::default().with(DiagnosticLayer).try_init()?;
+            }
+
+            None
+        }
+    };
+
+    Ok(TracingGuard {
+        _chrome_guard: chrome_guard,
+    })
+}
+
 pub fn elapsed_ms() -> u128 {
     START.get_or_init(Instant::now).elapsed().as_millis()
 }
@@ -210,7 +290,7 @@ pub fn use_color() -> bool {
     std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
-fn fit_target(target: &'static str) -> &'static str {
+fn fit_target(target: &str) -> &str {
     if target.len() <= TARGET_WIDTH {
         return target;
     }
@@ -218,13 +298,46 @@ fn fit_target(target: &'static str) -> &'static str {
     &target[target.len() - TARGET_WIDTH..]
 }
 
-pub fn log_args(
+fn emit_diagnostic_event(
+    level: LogLevel,
     target: LogTarget,
     proto: Option<usize>,
     indent: usize,
     args: std::fmt::Arguments<'_>,
 ) {
-    let target = fit_target(target.label());
+    let proto = proto.map(|proto| proto as i64).unwrap_or(-1);
+    let indent = indent as u64;
+
+    match level {
+        LogLevel::Info => tracing::event!(
+            target: DIAGNOSTIC_EVENT_TARGET,
+            tracing::Level::INFO,
+            log_target = target.label(),
+            proto,
+            indent,
+            message = %args
+        ),
+        LogLevel::Debug => tracing::event!(
+            target: DIAGNOSTIC_EVENT_TARGET,
+            tracing::Level::DEBUG,
+            log_target = target.label(),
+            proto,
+            indent,
+            message = %args
+        ),
+        LogLevel::Trace => tracing::event!(
+            target: DIAGNOSTIC_EVENT_TARGET,
+            tracing::Level::TRACE,
+            log_target = target.label(),
+            proto,
+            indent,
+            message = %args
+        ),
+    }
+}
+
+fn write_diagnostic_line(target: &str, proto: Option<usize>, indent: usize, message: &str) {
+    let target = fit_target(target);
     let indent_width = indent * 2;
     let proto = proto
         .map(|proto| format!(" P{proto:<4}"))
@@ -236,7 +349,7 @@ pub fn log_args(
             elapsed_ms(),
             target,
             "",
-            args,
+            message,
         );
     } else {
         eprintln!(
@@ -244,7 +357,75 @@ pub fn log_args(
             elapsed_ms(),
             target,
             "",
-            args,
+            message,
         );
+    }
+}
+
+struct DiagnosticLayer;
+
+impl<S> Layer<S> for DiagnosticLayer
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != DIAGNOSTIC_EVENT_TARGET {
+            return;
+        }
+
+        let mut diagnostic = DiagnosticEvent::default();
+        event.record(&mut diagnostic);
+
+        let Some(message) = diagnostic.message else {
+            return;
+        };
+
+        write_diagnostic_line(
+            diagnostic
+                .log_target
+                .as_deref()
+                .unwrap_or(LogTarget::Driver.label()),
+            diagnostic
+                .proto
+                .and_then(|proto| (proto >= 0).then_some(proto as usize)),
+            diagnostic.indent.unwrap_or(0) as usize,
+            &message,
+        );
+    }
+}
+
+#[derive(Default)]
+struct DiagnosticEvent {
+    log_target: Option<String>,
+    proto: Option<i64>,
+    indent: Option<u64>,
+    message: Option<String>,
+}
+
+impl Visit for DiagnosticEvent {
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        if field.name() == "proto" {
+            self.proto = Some(value);
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "indent" {
+            self.indent = Some(value);
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "log_target" => self.log_target = Some(value.to_owned()),
+            "message" => self.message = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
     }
 }

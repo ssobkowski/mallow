@@ -11,8 +11,28 @@ mod short_circuit;
 mod terminator_cleanup;
 mod tuple_assign;
 
+macro_rules! run_pass {
+    ($proto:expr, $iteration:expr, $name:literal, $run:expr) => {{
+        let span = tracing::info_span!(
+            $name,
+            proto = $proto,
+            iteration = $iteration,
+            changed = tracing::field::Empty,
+        );
+        let _enter = span.enter();
+
+        let changed = $run;
+        span.record("changed", changed);
+        changed
+    }};
+}
+
 pub fn run(fns: &mut [StructuredFunction]) {
-    return_arity::infer_all(fns);
+    {
+        let span = tracing::info_span!("infer_return_arity", function_count = fns.len());
+        let _enter = span.enter();
+        return_arity::infer_all(fns);
+    }
     let return_arities: Vec<_> = fns
         .iter()
         .map(|f| {
@@ -22,16 +42,36 @@ pub fn run(fns: &mut [StructuredFunction]) {
         .collect();
 
     for fun in fns {
+        let span = tracing::info_span!("post_region_function", proto = fun.proto);
+        let _enter = span.enter();
+        let mut iteration = 0;
+
         loop {
-            let mut changed = inlining::run_post_region(fun, &return_arities);
-            changed |= tuple_assign::run(fun);
-            changed |= fold_tables::run(fun);
-            changed |= short_circuit::run(fun);
-            changed |= fold_bool_assign::run(fun);
-            changed |= continue_cleanup::run(fun);
-            changed |= terminator_cleanup::run(fun);
-            changed |= nested_ifs::run(fun);
-            changed |= normalize::run(fun);
+            iteration += 1;
+
+            let mut changed = run_pass!(fun.proto, iteration, "inlining_post_region", {
+                inlining::run_post_region(fun, &return_arities)
+            });
+            changed |= run_pass!(fun.proto, iteration, "tuple_assign", {
+                tuple_assign::run(fun)
+            });
+            changed |= run_pass!(fun.proto, iteration, "fold_tables", {
+                fold_tables::run(fun)
+            });
+            changed |= run_pass!(fun.proto, iteration, "short_circuit", {
+                short_circuit::run(fun)
+            });
+            changed |= run_pass!(fun.proto, iteration, "fold_bool_assign", {
+                fold_bool_assign::run(fun)
+            });
+            changed |= run_pass!(fun.proto, iteration, "continue_cleanup", {
+                continue_cleanup::run(fun)
+            });
+            changed |= run_pass!(fun.proto, iteration, "terminator_cleanup", {
+                terminator_cleanup::run(fun)
+            });
+            changed |= run_pass!(fun.proto, iteration, "nested_ifs", { nested_ifs::run(fun) });
+            changed |= run_pass!(fun.proto, iteration, "normalize", { normalize::run(fun) });
 
             if !changed {
                 break;
@@ -41,5 +81,10 @@ pub fn run(fns: &mut [StructuredFunction]) {
 }
 
 pub(crate) fn run_pre_region(cfg: &mut ControlFlowGraph) -> bool {
-    inlining::run_pre_region(cfg)
+    let span = tracing::info_span!("inlining_pre_region", changed = tracing::field::Empty,);
+    let _enter = span.enter();
+
+    let changed = inlining::run_pre_region(cfg);
+    span.record("changed", changed);
+    changed
 }

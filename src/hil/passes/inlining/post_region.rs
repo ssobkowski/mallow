@@ -169,6 +169,15 @@ struct Analyzer {
 
 impl Analyzer {
     fn analyze(fun: &StructuredFunction) -> Self {
+        let span = tracing::info_span!(
+            "post_region_inlining_analyze",
+            proto = fun.proto,
+            symbol_count = tracing::field::Empty,
+            effect_count = tracing::field::Empty,
+            position_count = tracing::field::Empty,
+        );
+        let _enter = span.enter();
+
         let mut analyzer = Self::default();
         for param in &fun.params {
             analyzer.facts.entry(*param).or_default().poisoned = true;
@@ -177,6 +186,10 @@ impl Analyzer {
             analyzer.facts.entry(*upvalue).or_default().poisoned = true;
         }
         analyzer.visit_region(&fun.root);
+
+        span.record("symbol_count", analyzer.facts.len());
+        span.record("effect_count", analyzer.effect_positions.len());
+        span.record("position_count", analyzer.next_pos);
         analyzer
     }
 
@@ -299,6 +312,30 @@ struct Inliner<'a> {
     analysis: Analyzer,
     return_arities: &'a [ReturnArity],
     changed: bool,
+    stats: RewriteStats,
+}
+
+#[derive(Debug, Default)]
+struct RewriteStats {
+    regions_visited: usize,
+    blocks_visited: usize,
+    sequences_visited: usize,
+    inline_block_inner_calls: usize,
+    inline_block_stmt_total: usize,
+    tail_read_collections: usize,
+    tail_read_node_total: usize,
+    tail_read_symbol_total: usize,
+    replacement_read_collections: usize,
+    replacement_read_symbol_total: usize,
+    substitution_attempts: usize,
+    successful_substitutions: usize,
+    read_counter_calls: usize,
+    removed_statements: usize,
+    direct_statement_removals: usize,
+    inline_sequence_edge_calls: usize,
+    inline_next_block_calls: usize,
+    inline_expr_from_block_calls: usize,
+    inline_return_calls: usize,
 }
 
 impl<'a> Inliner<'a> {
@@ -307,19 +344,92 @@ impl<'a> Inliner<'a> {
             analysis: Analyzer::analyze(fun),
             return_arities,
             changed: false,
+            stats: RewriteStats::default(),
         }
     }
 
     fn run(&mut self, root: &mut RegionNode) {
+        let span = tracing::info_span!(
+            "post_region_inlining_rewrite",
+            regions_visited = tracing::field::Empty,
+            blocks_visited = tracing::field::Empty,
+            sequences_visited = tracing::field::Empty,
+            inline_block_inner_calls = tracing::field::Empty,
+            inline_block_stmt_total = tracing::field::Empty,
+            tail_read_collections = tracing::field::Empty,
+            tail_read_node_total = tracing::field::Empty,
+            tail_read_symbol_total = tracing::field::Empty,
+            replacement_read_collections = tracing::field::Empty,
+            replacement_read_symbol_total = tracing::field::Empty,
+            substitution_attempts = tracing::field::Empty,
+            successful_substitutions = tracing::field::Empty,
+            read_counter_calls = tracing::field::Empty,
+            removed_statements = tracing::field::Empty,
+            direct_statement_removals = tracing::field::Empty,
+            inline_sequence_edge_calls = tracing::field::Empty,
+            inline_next_block_calls = tracing::field::Empty,
+            inline_expr_from_block_calls = tracing::field::Empty,
+            inline_return_calls = tracing::field::Empty,
+        );
+        let _enter = span.enter();
         self.visit_region(root);
+        span.record("regions_visited", self.stats.regions_visited);
+        span.record("blocks_visited", self.stats.blocks_visited);
+        span.record("sequences_visited", self.stats.sequences_visited);
+        span.record(
+            "inline_block_inner_calls",
+            self.stats.inline_block_inner_calls,
+        );
+        span.record(
+            "inline_block_stmt_total",
+            self.stats.inline_block_stmt_total,
+        );
+        span.record("tail_read_collections", self.stats.tail_read_collections);
+        span.record("tail_read_node_total", self.stats.tail_read_node_total);
+        span.record("tail_read_symbol_total", self.stats.tail_read_symbol_total);
+        span.record(
+            "replacement_read_collections",
+            self.stats.replacement_read_collections,
+        );
+        span.record(
+            "replacement_read_symbol_total",
+            self.stats.replacement_read_symbol_total,
+        );
+        span.record("substitution_attempts", self.stats.substitution_attempts);
+        span.record(
+            "successful_substitutions",
+            self.stats.successful_substitutions,
+        );
+        span.record("read_counter_calls", self.stats.read_counter_calls);
+        span.record("removed_statements", self.stats.removed_statements);
+        span.record(
+            "direct_statement_removals",
+            self.stats.direct_statement_removals,
+        );
+        span.record(
+            "inline_sequence_edge_calls",
+            self.stats.inline_sequence_edge_calls,
+        );
+        span.record(
+            "inline_next_block_calls",
+            self.stats.inline_next_block_calls,
+        );
+        span.record(
+            "inline_expr_from_block_calls",
+            self.stats.inline_expr_from_block_calls,
+        );
+        span.record("inline_return_calls", self.stats.inline_return_calls);
     }
 
     fn visit_region(&mut self, node: &mut RegionNode) {
+        self.stats.regions_visited += 1;
         match node {
             RegionNode::BasicBlock { stmts } => {
+                self.stats.blocks_visited += 1;
                 self.inline_block(stmts);
             }
             RegionNode::Sequence { nodes } => {
+                self.stats.sequences_visited += 1;
                 for node in nodes.iter_mut() {
                     self.visit_region(node);
                 }
@@ -348,6 +458,8 @@ impl<'a> Inliner<'a> {
         stmts: &mut Vec<HilStmt>,
         tail_reads: Option<&HashSet<SymbolId>>,
     ) {
+        self.stats.inline_block_inner_calls += 1;
+        self.stats.inline_block_stmt_total += stmts.len();
         let summary = BlockSummary::new(stmts);
         let plain_sources: Vec<_> = stmts
             .iter()
@@ -389,9 +501,16 @@ impl<'a> Inliner<'a> {
                     }
                 };
 
+                if inlineable {
+                    self.stats.substitution_attempts += 1;
+                }
+
                 if inlineable && substitute_in_stmt(&mut stmts[idx], sym, &rhs) {
+                    self.stats.successful_substitutions += 1;
                     let mut replacement_reads = RegionReadSet::default();
                     replacement_reads.visit_expr(&rhs);
+                    self.stats.replacement_read_collections += 1;
+                    self.stats.replacement_read_symbol_total += replacement_reads.reads.len();
                     active_reads.extend(replacement_reads.reads);
                     removable.insert(source_idx);
                 }
@@ -414,16 +533,20 @@ impl<'a> Inliner<'a> {
     }
 
     fn inline_block_with_tail(&mut self, stmts: &mut Vec<HilStmt>, tail: &[RegionNode]) {
+        self.stats.tail_read_collections += 1;
+        self.stats.tail_read_node_total += tail.len();
         let mut reads = HashSet::new();
         for node in tail {
             let mut collector = RegionReadSet::default();
             collector.visit_region(node);
             reads.extend(collector.reads);
         }
+        self.stats.tail_read_symbol_total += reads.len();
         self.inline_block_with_tail_reads(stmts, &reads);
     }
 
     fn inline_sequence_edges(&mut self, nodes: &mut [RegionNode]) {
+        self.stats.inline_sequence_edge_calls += 1;
         for idx in 0..nodes.len() {
             let (left, tail) = nodes.split_at_mut(idx + 1);
             if let RegionNode::BasicBlock { stmts } = &mut left[idx] {
@@ -455,6 +578,7 @@ impl<'a> Inliner<'a> {
     }
 
     fn inline_next_block(&mut self, source_stmts: &mut Vec<HilStmt>, next_stmts: &mut [HilStmt]) {
+        self.stats.inline_next_block_calls += 1;
         let mut removable = HashSet::new();
         for (source_idx, stmt) in source_stmts.iter().enumerate() {
             if removable.contains(&source_idx) {
@@ -468,13 +592,16 @@ impl<'a> Inliner<'a> {
                 continue;
             }
             for stmt in next_stmts.iter_mut() {
+                self.stats.read_counter_calls += 1;
                 if ReadCounter::new(sym).in_stmt(stmt) == 0 {
                     continue;
                 }
-                if can_substitute_in_stmt_context(stmt, sym, &rhs)
-                    && substitute_in_stmt(stmt, sym, &rhs)
-                {
-                    removable.insert(source_idx);
+                if can_substitute_in_stmt_context(stmt, sym, &rhs) {
+                    self.stats.substitution_attempts += 1;
+                    if substitute_in_stmt(stmt, sym, &rhs) {
+                        self.stats.successful_substitutions += 1;
+                        removable.insert(source_idx);
+                    }
                 }
                 break;
             }
@@ -483,6 +610,7 @@ impl<'a> Inliner<'a> {
     }
 
     fn inline_return(&mut self, stmts: &mut Vec<HilStmt>, values: &mut SmallVec<[HilExpr; 3]>) {
+        self.stats.inline_return_calls += 1;
         if self.try_inline_tuple_return(stmts, values) {
             return;
         }
@@ -514,6 +642,7 @@ impl<'a> Inliner<'a> {
     }
 
     fn inline_expr_from_block(&mut self, stmts: &mut Vec<HilStmt>, expr: &mut HilExpr) {
+        self.stats.inline_expr_from_block_calls += 1;
         let mut removable = HashSet::new();
         for (source_idx, stmt) in stmts.iter().enumerate() {
             if removable.contains(&source_idx) {
@@ -534,8 +663,10 @@ impl<'a> Inliner<'a> {
                 replacement: &rhs,
                 changed: false,
             };
+            self.stats.substitution_attempts += 1;
             substituter.visit_expr(expr);
             if substituter.changed {
+                self.stats.successful_substitutions += 1;
                 removable.insert(source_idx);
             }
         }
@@ -571,6 +702,7 @@ impl<'a> Inliner<'a> {
         values.clear();
         values.push(source.value);
         stmts.remove(idx);
+        self.stats.direct_statement_removals += 1;
         self.changed = true;
         true
     }
@@ -606,6 +738,7 @@ impl<'a> Inliner<'a> {
 
         *exprs = smallvec![source.value];
         stmts.remove(idx);
+        self.stats.direct_statement_removals += 1;
         self.changed = true;
     }
 
@@ -871,6 +1004,7 @@ impl<'a> Inliner<'a> {
         if removable.is_empty() {
             return;
         }
+        self.stats.removed_statements += removable.len();
         let mut idx = 0usize;
         stmts.retain(|_| {
             let keep = !removable.contains(&idx);
@@ -1130,9 +1264,20 @@ fn positions_contain_in_range(positions: &[usize], start: usize, end: usize) -> 
 
 pub fn run(fun: &mut StructuredFunction, return_arities: &[ReturnArity]) -> bool {
     let mut changed = false;
+    let mut iteration = 0;
     loop {
+        iteration += 1;
+        let span = tracing::info_span!(
+            "post_region_inlining_iteration",
+            proto = fun.proto,
+            iteration,
+            changed = tracing::field::Empty,
+        );
+        let _enter = span.enter();
+
         let mut inliner = Inliner::new(fun, return_arities);
         inliner.run(&mut fun.root);
+        span.record("changed", inliner.changed);
         if !inliner.changed {
             break;
         }
