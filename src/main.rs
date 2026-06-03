@@ -1,22 +1,9 @@
-mod ast;
-mod common;
-mod disasm;
-mod emitter;
-mod hil;
-mod il;
-mod logging;
-mod printer;
-mod scopes;
-
 use std::{path::PathBuf, process::Command};
 
 use clap::{Parser, Subcommand};
-
-use crate::{
-    disasm::{DisasmError, Disassembly},
-    emitter::options::EmitterOptions,
-    hil::StructuredFunction,
-    logging::{DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector},
+use mallow::{
+    DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
+    decompile_bytecode_with_diagnostics, disassemble_bytecode_with_diagnostics,
 };
 
 #[derive(Debug, Parser)]
@@ -94,57 +81,6 @@ enum Commands {
     },
 }
 
-fn disassemble_bytecode(
-    bytecode: &[u8],
-    diagnostics: &Diagnostics,
-) -> Result<Disassembly, DisasmError> {
-    let info = diagnostics.at(LogLevel::Info, LogTarget::Driver);
-    info.line(0, format_args!("disassembling..."));
-
-    let d = disasm::disassemble(bytecode)?;
-
-    info.line(1, format_args!("LBC Version: {}", d.version));
-    info.line(1, format_args!("Proto count: {}", d.protos.len()));
-    info.line(1, format_args!("Entry: {}", d.entry_proto));
-
-    Ok(d)
-}
-
-fn decompile_bytecode(
-    bytecode: &[u8],
-    options: EmitterOptions,
-    diagnostics: &Diagnostics,
-) -> Result<String, DisasmError> {
-    let disasssembled = disassemble_bytecode(bytecode, diagnostics)?;
-    let diagnostics = diagnostics.with_entry_proto(disasssembled.entry_proto as usize);
-
-    let mut fns: Vec<_> = disasssembled
-        .protos
-        .iter()
-        .map(|proto| StructuredFunction::from_proto(proto, &disasssembled.protos, &diagnostics))
-        .collect();
-
-    diagnostics
-        .at(LogLevel::Info, LogTarget::Driver)
-        .line(0, format_args!("running passes..."));
-    hil::passes::run(&mut fns);
-
-    diagnostics
-        .at(LogLevel::Info, LogTarget::Driver)
-        .line(0, format_args!("emitting AST..."));
-    let ast = emitter::emit_ast(fns, disasssembled.entry_proto as usize, options);
-
-    let comments = vec![format!(
-        "Decompiled by mallow {}",
-        env!("CARGO_PKG_VERSION")
-    )];
-
-    diagnostics
-        .at(LogLevel::Info, LogTarget::Driver)
-        .line(0, format_args!("done"));
-    Ok(printer::print(&ast, &comments))
-}
-
 fn main() {
     let cli = Cli::parse();
     let diagnostics = Diagnostics::new(diagnostic_config(&cli));
@@ -153,7 +89,7 @@ fn main() {
         Commands::Disasm { input, output } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
 
-            match disassemble_bytecode(&bytecode, &diagnostics) {
+            match disassemble_bytecode_with_diagnostics(&bytecode, &diagnostics) {
                 Ok(d) => {
                     let content = d.to_string();
                     if let Err(e) = write_output(output, &content) {
@@ -173,17 +109,14 @@ fn main() {
             diagnostics
                 .at(LogLevel::Info, LogTarget::Driver)
                 .line(0, format_args!("decompiling..."));
-            let code = match decompile_bytecode(
-                &bytecode,
-                EmitterOptions { spill_locals },
-                &diagnostics,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error during decompilation: {}", e);
-                    return;
-                }
-            };
+            let code =
+                match decompile_bytecode_with_diagnostics(&bytecode, spill_locals, &diagnostics) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error during decompilation: {}", e);
+                        return;
+                    }
+                };
 
             if let Err(e) = write_output(output, &code) {
                 eprintln!("Error writing decompilation output: {e}");
@@ -211,9 +144,9 @@ fn main() {
                 return;
             }
 
-            let code = match decompile_bytecode(
+            let code = match decompile_bytecode_with_diagnostics(
                 &compile_out.stdout,
-                EmitterOptions { spill_locals },
+                spill_locals,
                 &diagnostics,
             ) {
                 Ok(c) => c,
@@ -229,19 +162,10 @@ fn main() {
         }
         #[cfg(feature = "visualize")]
         Commands::Visualize { input, output } => {
-            use crate::hil::cflow::{cfg::ControlFlowGraph, visualize::dump_cfgs};
-
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
-            let disasm =
-                disassemble_bytecode(&bytecode, &diagnostics).expect("failed to disassemble");
-
-            let cfgs: Vec<_> = disasm
-                .protos
-                .iter()
-                .map(|proto| ControlFlowGraph::from_proto(proto, &disasm.protos))
-                .collect();
-
-            dump_cfgs(&cfgs, disasm.entry_proto as usize, output);
+            if let Err(e) = mallow::visualize_bytecode(&bytecode, output, &diagnostics) {
+                eprintln!("Error during visualization: {e}");
+            }
         }
     }
 }

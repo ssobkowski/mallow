@@ -169,6 +169,12 @@ impl Diagnostics {
     }
 }
 
+impl Default for Diagnostics {
+    fn default() -> Self {
+        Self::new(DiagnosticConfig::default())
+    }
+}
+
 pub struct DiagnosticSink<'a> {
     diagnostics: &'a Diagnostics,
     level: LogLevel,

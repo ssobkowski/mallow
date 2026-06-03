@@ -11,14 +11,14 @@ use tempfile::TempDir;
 
 fn main() {
     let args = Arguments::from_args();
-    let decompile_timeout = parse_timeout_env("MALLOW_TEST_DECOMPILE_TIMEOUT", 5);
+    let compile_timeout = parse_timeout_env("MALLOW_TEST_COMPILE_TIMEOUT", 5);
     let runtime_timeout = parse_timeout_env("MALLOW_TEST_RUNTIME_TIMEOUT", 10);
 
     let trials = discover_cases()
         .into_iter()
         .map(|case| {
             Trial::test(case.trial_name(), move || {
-                run_case(&case, decompile_timeout, runtime_timeout)
+                run_case(&case, compile_timeout, runtime_timeout)
             })
         })
         .collect();
@@ -113,7 +113,7 @@ impl std::fmt::Display for CaseError {
 
 fn run_case(
     case: &Case,
-    decompile_timeout: Duration,
+    compile_timeout: Duration,
     runtime_timeout: Duration,
 ) -> Result<(), Failed> {
     let temp_dir =
@@ -121,7 +121,7 @@ fn run_case(
     let bytecode_path = temp_dir.path().join("compiled.out");
     let decompiled_path = temp_dir.path().join("decompiled.luau");
 
-    let compiled = compile_luau(&case, &bytecode_path, decompile_timeout)?;
+    let compiled = compile_luau(&case, &bytecode_path, compile_timeout)?;
     if !compiled {
         eprintln!("skip {} (luau-compile failed)", case.trial_name());
         return Ok(());
@@ -133,7 +133,6 @@ fn run_case(
         case.source_path
             .file_stem()
             .is_some_and(|name| name == "intg-sha2"),
-        decompile_timeout,
     )?;
 
     let source_output = run_luau(&case.source_path, LuauRunKind::Source, runtime_timeout)?;
@@ -236,24 +235,20 @@ fn decompile_bytecode(
     bytecode_path: &Path,
     decompiled_path: &Path,
     spill_locals: bool,
-    timeout: Duration,
 ) -> Result<(), Failed> {
-    let mut command = Command::new(mallow_exe());
-    command
-        .arg("decompile")
-        .arg("-i")
-        .arg(bytecode_path)
-        .arg("-o")
-        .arg(decompiled_path);
-    if spill_locals {
-        command.arg("--spill-locals");
-    }
+    let bytecode = fs::read(bytecode_path)
+        .map_err(|e| Failed::from(format!("failed to read bytecode: {e}")))?;
+    let code = mallow::decompile_bytecode(
+        &bytecode,
+        mallow::DecompileOptions {
+            spill_locals,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| CaseError::DecompileError(e.to_string()))?;
 
-    let output = run_command_with_timeout(command, timeout, "mallow decompile")?;
-
-    if !output.status.success() {
-        return Err(CaseError::DecompileError(format_output(&output)).into());
-    }
+    fs::write(decompiled_path, code)
+        .map_err(|e| Failed::from(format!("failed to write decompiled source: {e}")))?;
 
     Ok(())
 }
@@ -327,10 +322,6 @@ fn find_external_exe(stem: &str) -> PathBuf {
         return local;
     }
     PathBuf::from(exe_name(stem))
-}
-
-fn mallow_exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_mallow"))
 }
 
 fn repo_root() -> &'static Path {
