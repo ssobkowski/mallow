@@ -221,10 +221,7 @@ impl<'a> Disassembler<'a> {
                 let start_pc = self.read_varint()? as usize;
                 let end_pc = self.read_varint()? as usize;
                 let register = self.read::<u8>()?;
-                let name = strings
-                    .get(name_idx.saturating_sub(1) as usize)
-                    .cloned()
-                    .unwrap_or_default();
+                let name = resolve_required_string_index(strings, name_idx)?;
                 locals.push(LocalDebug {
                     name,
                     start_pc,
@@ -235,7 +232,7 @@ impl<'a> Disassembler<'a> {
 
             let num_upvals = self.read_varint()?;
             for _ in 0..num_upvals {
-                self.read_varint()?; // upval name index
+                self.read_string(strings)?; // upval name index
             }
 
             locals
@@ -273,10 +270,9 @@ impl<'a> Disassembler<'a> {
             }
             CONST_STRING => {
                 let index = self.read_varint()?;
-                if index == 0 || index > strings.len() as u64 {
-                    return Err(DisasmError::InvalidStringIndex(index, strings.len()));
-                }
-                Ok(Constant::String(strings[index as usize - 1].clone()))
+                Ok(Constant::String(resolve_required_string_index(
+                    strings, index,
+                )?))
             }
             CONST_IMPORT => {
                 let value = self.read::<u32>()?;
@@ -314,12 +310,7 @@ impl<'a> Disassembler<'a> {
             return Ok(None);
         }
 
-        Ok(Some(
-            strings
-                .get(idx.saturating_sub(1) as usize)
-                .cloned()
-                .unwrap_or_default(),
-        ))
+        resolve_string_index(strings, idx)
     }
 
     #[inline]
@@ -349,6 +340,23 @@ impl<'a> Disassembler<'a> {
         let len = self.read_varint()? as usize;
         (0..len).map(|_| self.read::<T>()).collect()
     }
+}
+
+fn resolve_string_index(strings: &[String], index: u64) -> Result<Option<String>, DisasmError> {
+    if index == 0 {
+        return Ok(None);
+    }
+
+    strings
+        .get(usize::try_from(index - 1).unwrap_or(usize::MAX))
+        .cloned()
+        .map(Some)
+        .ok_or(DisasmError::InvalidStringIndex(index, strings.len()))
+}
+
+fn resolve_required_string_index(strings: &[String], index: u64) -> Result<String, DisasmError> {
+    resolve_string_index(strings, index)?
+        .ok_or(DisasmError::InvalidStringIndex(index, strings.len()))
 }
 
 impl fmt::Display for Disassembly {
