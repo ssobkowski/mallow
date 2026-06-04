@@ -60,6 +60,7 @@ fn binop_for_instr(instr: &Instr) -> BinOp {
         Instr::Sub { .. } | Instr::SubK { .. } | Instr::SubRK { .. } => BinOp::Sub,
         Instr::Mul { .. } | Instr::MulK { .. } => BinOp::Mul,
         Instr::Div { .. } | Instr::DivK { .. } | Instr::DivRK { .. } => BinOp::Div,
+        Instr::IDiv { .. } | Instr::IDivK { .. } => BinOp::IDiv,
         Instr::Mod { .. } | Instr::ModK { .. } => BinOp::Mod,
         Instr::Pow { .. } | Instr::PowK { .. } => BinOp::Pow,
         Instr::And { .. } | Instr::AndK { .. } => BinOp::And,
@@ -283,6 +284,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 Instr::LoadK { reg, index } => {
                     self.assign_reg(*reg, self.const_expr(*index as usize));
                 }
+                Instr::LoadKX { reg, index } => {
+                    self.assign_reg(*reg, self.const_expr(*index as usize));
+                }
                 Instr::Move { dest, src } => {
                     let sym = self.get_reg_symbol(*src);
                     self.assign_reg(*dest, HilExpr::Symbol(sym))
@@ -411,6 +415,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 | Instr::Sub { dest, a, b }
                 | Instr::Mul { dest, a, b }
                 | Instr::Div { dest, a, b }
+                | Instr::IDiv { dest, a, b }
                 | Instr::Mod { dest, a, b }
                 | Instr::Pow { dest, a, b }
                 | Instr::And { dest, a, b }
@@ -432,6 +437,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 | Instr::SubK { dest, reg, k }
                 | Instr::MulK { dest, reg, k }
                 | Instr::DivK { dest, reg, k }
+                | Instr::IDivK { dest, reg, k }
                 | Instr::ModK { dest, reg, k }
                 | Instr::PowK { dest, reg, k } => {
                     let num = match self.consts[*k as usize] {
@@ -585,7 +591,31 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     }
                 },
 
-                other => eprintln!("Unsupported lifter instruction: {:#?}", other),
+                // Lifter does not need to handle these instructions
+                Instr::Break
+                | Instr::Jump { .. }
+                | Instr::JumpBack { .. }
+                | Instr::JumpIf { .. }
+                | Instr::JumpIfNot { .. }
+                | Instr::JumpX { .. }
+                | Instr::JumpIfEq { .. }
+                | Instr::JumpIfLe { .. }
+                | Instr::JumpIfLt { .. }
+                | Instr::JumpIfNotEq { .. }
+                | Instr::JumpIfNotLe { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpXEqKNil { .. }
+                | Instr::JumpXEqKB { .. }
+                | Instr::JumpXEqKN { .. }
+                | Instr::JumpXEqKS { .. }
+                | Instr::FornPrep { .. }
+                | Instr::ForgPrep { .. }
+                | Instr::ForgPrepInext { .. }
+                | Instr::ForgPrepNext { .. }
+                | Instr::FornLoop { .. }
+                | Instr::ForgLoop { .. }
+                | Instr::Coverage
+                | Instr::NativeCall => {}
             }
         }
 

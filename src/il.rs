@@ -225,7 +225,7 @@ pub enum Instr {
     /// Prepare variadic function frame.
     PrepVarArgs { nparams: u8 },
     /// Load extended constant.
-    LoadKX { dest: u8, k: u32 },
+    LoadKX { reg: u8, index: u32 },
     /// Extended unconditional jump.
     JumpX { offset: i32 },
     /// Fast path for a builtin call (skipped, falls through to CALL).
@@ -698,8 +698,8 @@ impl Instr {
             },
             65 => Instr::PrepVarArgs { nparams: a },
             66 => Instr::LoadKX {
-                dest: a,
-                k: aux_word,
+                reg: a,
+                index: aux_word,
             },
             67 => Instr::JumpX { offset: e },
             68 => Instr::FastCall {
@@ -930,7 +930,7 @@ impl fmt::Display for Instr {
             Instr::PrepVarArgs { nparams } => write!(f, "PREPVARARGS {nparams}"),
             Instr::DupClosure { dest, k } => write!(f, "DUPCLOSURE R{dest} K{k}"),
             Instr::Capture { capture_type, reg } => write!(f, "CAPTURE {capture_type} R{reg}"),
-            Instr::LoadKX { dest, k } => write!(f, "LOADKX R{dest} K{k}"),
+            Instr::LoadKX { reg, index } => write!(f, "LOADKX R{reg} K{index}"),
             Instr::JumpX { offset } => write!(f, "JUMPX {offset:+}"),
             Instr::Coverage => write!(f, "COVERAGE"),
             Instr::SubRK { dest, k, reg } => write!(f, "SUBRK R{dest} K{k} R{reg}"),

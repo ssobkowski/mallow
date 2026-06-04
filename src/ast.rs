@@ -283,6 +283,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    IDiv,
     Mod,
     Pow,
     Eq,
@@ -304,6 +305,7 @@ impl BinOp {
             BinOp::Sub => "-",
             BinOp::Mul => "*",
             BinOp::Div => "/",
+            BinOp::IDiv => "//",
             BinOp::Mod => "%",
             BinOp::Pow => "^",
             BinOp::Eq => "==",
@@ -326,7 +328,7 @@ impl BinOp {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => 3,
             BinOp::Concat => 4,
             BinOp::Add | BinOp::Sub => 5,
-            BinOp::Mul | BinOp::Div | BinOp::Mod => 6,
+            BinOp::Mul | BinOp::Div | BinOp::IDiv | BinOp::Mod => 6,
             BinOp::Pow => 8,
         }
     }
@@ -335,7 +337,13 @@ impl BinOp {
     pub const fn is_compound(&self) -> bool {
         matches!(
             self,
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::IDiv
+                | BinOp::Mod
+                | BinOp::Pow
         )
     }
 
@@ -384,6 +392,7 @@ pub enum CompoundBinOp {
     Sub,
     Mul,
     Div,
+    IDiv,
     Mod,
     Pow,
     Concat,
@@ -397,6 +406,7 @@ impl CompoundBinOp {
             CompoundBinOp::Sub => "-=",
             CompoundBinOp::Mul => "*=",
             CompoundBinOp::Div => "/=",
+            CompoundBinOp::IDiv => "//=",
             CompoundBinOp::Mod => "%=",
             CompoundBinOp::Pow => "^=",
             CompoundBinOp::Concat => "..=",
@@ -417,6 +427,7 @@ impl From<BinOp> for CompoundBinOp {
             BinOp::Sub => CompoundBinOp::Sub,
             BinOp::Mul => CompoundBinOp::Mul,
             BinOp::Div => CompoundBinOp::Div,
+            BinOp::IDiv => CompoundBinOp::IDiv,
             BinOp::Mod => CompoundBinOp::Mod,
             BinOp::Pow => CompoundBinOp::Pow,
             BinOp::Concat => CompoundBinOp::Concat,
