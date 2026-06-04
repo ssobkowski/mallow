@@ -278,6 +278,30 @@ impl GraphView for AdjGraph<'_> {
     }
 }
 
+/// Builds forward/backward adjacency lists based on the given block exits.
+pub fn build_graph<I>(exits_iter: I) -> (Vec<Vec<usize>>, Vec<Vec<usize>>)
+where
+    I: IntoIterator<Item = [Option<usize>; 2]>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let iter = exits_iter.into_iter();
+    let len = iter.len();
+
+    let successors: Vec<Vec<_>> = iter
+        .map(|targets| targets.into_iter().flatten().filter(|&t| t < len).collect())
+        .collect();
+
+    let mut predecessors = vec![Vec::new(); len];
+
+    for (src, targets) in successors.iter().enumerate() {
+        for &target in targets {
+            predecessors[target].push(src);
+        }
+    }
+
+    (successors, predecessors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AdjGraph, GraphView, Reversed, SeseGraphView};
@@ -397,28 +421,4 @@ mod tests {
         assert_eq!(postidoms.idom(30), Some(40));
         assert_eq!(postidoms.idom(40), None);
     }
-}
-
-/// Builds forward/backward adjacency lists based on the given block exits.
-pub fn build_graph<I>(exits_iter: I) -> (Vec<Vec<usize>>, Vec<Vec<usize>>)
-where
-    I: IntoIterator<Item = [Option<usize>; 2]>,
-    I::IntoIter: ExactSizeIterator,
-{
-    let iter = exits_iter.into_iter();
-    let len = iter.len();
-
-    let successors: Vec<Vec<_>> = iter
-        .map(|targets| targets.into_iter().flatten().filter(|&t| t < len).collect())
-        .collect();
-
-    let mut predecessors = vec![Vec::new(); len];
-
-    for (src, targets) in successors.iter().enumerate() {
-        for &target in targets {
-            predecessors[target].push(src);
-        }
-    }
-
-    (successors, predecessors)
 }

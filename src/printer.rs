@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn should_use_long_string_long_escaped() {
         // A string of 90 tab characters has an escape ratio of 2.0, well above 1.2.
-        let s: String = std::iter::repeat('\t').take(90).collect();
+        let s = "\t".repeat(90);
         assert!(should_use_long_string(&s));
     }
 }

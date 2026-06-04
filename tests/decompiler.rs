@@ -121,7 +121,7 @@ fn run_case(
     let bytecode_path = temp_dir.path().join("compiled.out");
     let decompiled_path = temp_dir.path().join("decompiled.luau");
 
-    let compiled = compile_luau(&case, &bytecode_path, compile_timeout)?;
+    let compiled = compile_luau(case, &bytecode_path, compile_timeout)?;
     if !compiled {
         eprintln!("skip {} (luau-compile failed)", case.trial_name());
         return Ok(());
@@ -218,7 +218,7 @@ fn compile_luau(case: &Case, bytecode_path: &Path, timeout: Duration) -> Result<
     let mut cmd = Command::new(luau_compile_exe());
     cmd.arg("--binary")
         .arg(&case.source_path)
-        .arg(&format!("-{}", case.opt.flag()));
+        .arg(format!("-{}", case.opt.flag()));
     let output = run_command_with_timeout(cmd, timeout, "luau-compile")?;
 
     if !output.status.success() {
