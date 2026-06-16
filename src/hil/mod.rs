@@ -1,12 +1,13 @@
 pub mod cflow;
-pub mod common;
 pub mod ir;
 pub mod lifter;
 pub mod passes;
 pub mod visitor;
 
+use anyhow::Result;
+
 use crate::{
-    disasm::Proto,
+    disasm::Chunk,
     hil::{
         cflow::{
             cfg::ControlFlowGraph,
@@ -15,6 +16,7 @@ use crate::{
         },
         lifter::ssa::SymbolId,
     },
+    il::{Proto, ProtoId},
     logging::{Diagnostics, LogLevel, LogTarget},
 };
 
@@ -36,7 +38,7 @@ impl ReturnArity {
 
 #[derive(Debug, Clone)]
 pub struct StructuredFunction {
-    pub proto: usize,
+    pub proto: ProtoId,
     pub debug_name: Option<String>,
     pub cfg: ControlFlowGraph,
     pub root: RegionNode,
@@ -48,17 +50,17 @@ pub struct StructuredFunction {
 }
 
 impl StructuredFunction {
-    pub fn from_proto(proto: &Proto, all_protos: &[Proto], diagnostics: &Diagnostics) -> Self {
+    pub fn from_proto(proto: &Proto, chunk: &Chunk, diagnostics: &Diagnostics) -> Result<Self> {
         let span = tracing::info_span!(
             "structure_proto",
-            proto = proto.index as usize,
+            proto = proto.id.0,
             instr_count = proto.instrs.len(),
             param_count = proto.num_params,
             upvalue_count = proto.num_upvals,
         );
         let _enter = span.enter();
 
-        let diagnostics = diagnostics.for_proto(proto.index as usize);
+        let diagnostics = diagnostics.for_proto(proto.id.0);
         let info = diagnostics.at(LogLevel::Info, LogTarget::Hil);
 
         info.line(
@@ -68,16 +70,16 @@ impl StructuredFunction {
 
         info.line(1, format_args!("building cfg..."));
         let mut cfg = {
-            let span = tracing::info_span!("build_cfg", proto = proto.index as usize);
+            let span = tracing::info_span!("build_cfg", proto = proto.id.0);
             let _enter = span.enter();
-            ControlFlowGraph::from_proto(proto, all_protos)
+            ControlFlowGraph::from_proto(proto, chunk)?
         };
 
         info.line(1, format_args!("running pre-region passes..."));
         let pre_region_changed = {
             let span = tracing::info_span!(
                 "pre_region_passes",
-                proto = proto.index as usize,
+                proto = proto.id.0,
                 changed = tracing::field::Empty,
             );
             let _enter = span.enter();
@@ -86,7 +88,7 @@ impl StructuredFunction {
             changed
         };
         if pre_region_changed {
-            let span = tracing::info_span!("simplify_conditions", proto = proto.index as usize);
+            let span = tracing::info_span!("simplify_conditions", proto = proto.id.0);
             let _enter = span.enter();
             cfg.simplify_conditions();
         }
@@ -95,7 +97,7 @@ impl StructuredFunction {
 
         info.line(1, format_args!("structuring region..."));
         let root = {
-            let span = tracing::info_span!("structure_region", proto = proto.index as usize);
+            let span = tracing::info_span!("structure_region", proto = proto.id.0);
             let _enter = span.enter();
             region::structure(&cfg, &diagnostics)
         };
@@ -103,16 +105,19 @@ impl StructuredFunction {
         let params = cfg.params().to_vec();
         let upvalues = cfg.upvalues().to_vec();
 
-        Self {
-            proto: proto.index as usize,
-            debug_name: proto.debug_name.clone(),
+        Ok(Self {
+            proto: proto.id,
+            debug_name: proto
+                .debug_name
+                .and_then(|id| chunk.get_string(id))
+                .map(|s| s.to_string()),
             cfg,
             root,
             params,
             upvalues,
             is_vararg: proto.is_vararg,
             return_arity: None,
-        }
+        })
     }
 }
 

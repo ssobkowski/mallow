@@ -50,7 +50,7 @@ impl LogTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtoSelector {
     Entry,
-    Index(usize),
+    Index(u16),
 }
 
 impl FromStr for ProtoSelector {
@@ -73,7 +73,7 @@ pub struct DiagnosticConfig {
     level: Option<LogLevel>,
     targets: BTreeSet<LogTarget>,
     protos: Vec<ProtoSelector>,
-    entry_proto: Option<usize>,
+    entry_proto: Option<u16>,
 }
 
 impl DiagnosticConfig {
@@ -105,13 +105,13 @@ impl DiagnosticConfig {
         self.level.is_some()
     }
 
-    pub fn with_entry_proto(&self, entry_proto: usize) -> Self {
+    pub fn with_entry_proto(&self, entry_proto: u16) -> Self {
         let mut config = self.clone();
         config.entry_proto = Some(entry_proto);
         config
     }
 
-    fn enabled(&self, level: LogLevel, target: LogTarget, proto: Option<usize>) -> bool {
+    fn enabled(&self, level: LogLevel, target: LogTarget, proto: Option<u16>) -> bool {
         let Some(configured_level) = self.level else {
             return false;
         };
@@ -121,7 +121,7 @@ impl DiagnosticConfig {
             && self.proto_matches(target, proto)
     }
 
-    fn proto_matches(&self, target: LogTarget, proto: Option<usize>) -> bool {
+    fn proto_matches(&self, target: LogTarget, proto: Option<u16>) -> bool {
         if self.protos.is_empty() || matches!(target, LogTarget::Driver) {
             return true;
         }
@@ -146,7 +146,7 @@ impl Default for DiagnosticConfig {
 #[derive(Debug, Clone)]
 pub struct Diagnostics {
     config: DiagnosticConfig,
-    proto: Option<usize>,
+    proto: Option<u16>,
 }
 
 impl Diagnostics {
@@ -157,14 +157,14 @@ impl Diagnostics {
         }
     }
 
-    pub fn with_entry_proto(&self, entry_proto: usize) -> Self {
+    pub fn with_entry_proto(&self, entry_proto: u16) -> Self {
         Self {
             config: self.config.with_entry_proto(entry_proto),
             proto: self.proto,
         }
     }
 
-    pub fn for_proto(&self, proto: usize) -> Self {
+    pub fn for_proto(&self, proto: u16) -> Self {
         Self {
             config: self.config.clone(),
             proto: Some(proto),
@@ -201,7 +201,7 @@ impl DiagnosticSink<'_> {
         self.diagnostics.enabled(self.level, self.target)
     }
 
-    pub fn line(&self, indent: usize, args: std::fmt::Arguments<'_>) {
+    pub fn line(&self, indent: u16, args: std::fmt::Arguments<'_>) {
         if self.enabled() {
             emit_diagnostic_event(
                 self.level,
@@ -301,8 +301,8 @@ fn fit_target(target: &str) -> &str {
 fn emit_diagnostic_event(
     level: LogLevel,
     target: LogTarget,
-    proto: Option<usize>,
-    indent: usize,
+    proto: Option<u16>,
+    indent: u16,
     args: std::fmt::Arguments<'_>,
 ) {
     let proto = proto.map(|proto| proto as i64).unwrap_or(-1);
@@ -336,9 +336,9 @@ fn emit_diagnostic_event(
     }
 }
 
-fn write_diagnostic_line(target: &str, proto: Option<usize>, indent: usize, message: &str) {
+fn write_diagnostic_line(target: &str, proto: Option<u16>, indent: u64, message: &str) {
     let target = fit_target(target);
-    let indent_width = indent * 2;
+    let indent_width = (indent * 2) as usize;
     let proto = proto
         .map(|proto| format!(" P{proto:<4}"))
         .unwrap_or_default();
@@ -387,8 +387,8 @@ where
                 .unwrap_or(LogTarget::Driver.label()),
             diagnostic
                 .proto
-                .and_then(|proto| (proto >= 0).then_some(proto as usize)),
-            diagnostic.indent.unwrap_or(0) as usize,
+                .and_then(|proto| (proto >= 0).then_some(proto as u16)),
+            diagnostic.indent.unwrap_or(0),
             &message,
         );
     }

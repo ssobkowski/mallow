@@ -1,13 +1,13 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Spanned<T> {
     pub node: T,
-    pub pc: usize,
+    pub pc: u32,
 }
 
 impl<T> Spanned<T> {
     #[inline]
     #[must_use]
-    pub const fn new(node: T, pc: usize) -> Self {
+    pub const fn new(node: T, pc: u32) -> Self {
         Self { node, pc }
     }
 
@@ -28,7 +28,7 @@ impl<T> Spanned<T> {
 }
 
 pub trait ToSpanned {
-    fn to_spanned(self, pc: usize) -> Spanned<Self>
+    fn to_spanned(self, pc: u32) -> Spanned<Self>
     where
         Self: Sized,
     {

@@ -1,22 +1,27 @@
 pub mod common;
 pub mod ssa;
 
+use smol_str::ToSmolStr;
 use ssa::Ssa;
+
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
     ast::{BinOp, UnOp},
-    common::{Spanned, ToSpanned as _, escape_string, is_valid_luau_identifier},
-    disasm::Proto,
+    common::{Spanned, ToSpanned as _},
+    disasm::Chunk,
     hil::{
         cflow::graph::GraphView,
-        common::{const_expr, decoded_count, reg_add, reg_range},
         ir::{HilExpr, HilStmt},
         lifter::{
             common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL},
             ssa::{Symbol, SymbolId},
         },
     },
-    il::{Constant, Count, Instr},
+    il::{
+        ChildProtoId, ConstId, Constant, Count, ImportPath, Instr, LuauString, Proto, ProtoId,
+        reg_add, reg_range,
+    },
 };
 
 /// A deferred variadic source that has not yet been consumed.
@@ -38,7 +43,7 @@ pub struct MultiRet {
 ///
 /// Luau can insert bookkeeping opcodes (e.g. `CLOSEUPVALS`) between a variadic
 /// call and the eventual `RETURN`, so we must not flush the pending source there.
-fn instr_preserves_multiret(instr: Instr, pending_src_reg: u8) -> bool {
+const fn instr_preserves_multiret(instr: Instr, pending_src_reg: u8) -> bool {
     match instr {
         Instr::FastCall1 { .. }
         | Instr::FastCall2 { .. }
@@ -80,9 +85,8 @@ fn unop_for_instr(instr: &Instr) -> UnOp {
 
 pub struct LiftContext<'a, 'cfg, G: GraphView> {
     pub instrs: &'a [Spanned<Instr>],
-    pub consts: &'a [Constant],
-    pub parent_proto: &'a Proto,
-    pub protos: &'a [Proto],
+    pub chunk: &'a Chunk,
+    pub proto: &'a Proto,
     pub ssa: &'a mut Ssa<'cfg, G>,
     pub block_idx: usize,
 }
@@ -91,9 +95,8 @@ pub struct Lifter<'a, 'cfg, G: GraphView> {
     ip: usize,
 
     instrs: &'a [Spanned<Instr>],
-    consts: &'a [Constant],
-    parent_proto: &'a Proto,
-    protos: &'a [Proto],
+    chunk: &'a Chunk,
+    proto: &'a Proto,
 
     ssa: &'a mut Ssa<'cfg, G>,
     block_idx: usize,
@@ -110,9 +113,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         Self {
             ip: 0,
             instrs: ctx.instrs,
-            consts: ctx.consts,
-            parent_proto: ctx.parent_proto,
-            protos: ctx.protos,
+            chunk: ctx.chunk,
+            proto: ctx.proto,
             ssa: ctx.ssa,
             block_idx: ctx.block_idx,
             stmts: Vec::new(),
@@ -122,7 +124,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         }
     }
 
-    fn current_pc(&self) -> usize {
+    fn current_pc(&self) -> u32 {
         let ip = self.ip.saturating_sub(1);
         debug_assert!(
             ip < self.instrs.len(),
@@ -237,11 +239,11 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         match instr {
             Instr::Call {
                 func, arg_count, ..
-            } if decoded_count(arg_count) == Count::Variadic => {
+            } if Count::from(arg_count) == Count::Variadic => {
                 pending.base >= func.saturating_add(1)
             }
 
-            Instr::SetList { base, count, .. } if decoded_count(count) == Count::Variadic => {
+            Instr::SetList { base, count, .. } if Count::from(count) == Count::Variadic => {
                 pending.base >= base
             }
 
@@ -270,7 +272,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
     }
 
     /// Lifts all instructions into pc-spanned HIL statements in bytecode order.
-    pub fn run(mut self) -> (Vec<Spanned<HilStmt>>, Option<MultiRet>) {
+    pub fn run(mut self) -> Result<(Vec<Spanned<HilStmt>>, Option<MultiRet>)> {
         while let Some(instr) = self.next() {
             self.flush_pending_before(instr);
 
@@ -282,10 +284,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     self.assign_reg(*reg, HilExpr::Number(*value as f64))
                 }
                 Instr::LoadK { reg, index } => {
-                    self.assign_reg(*reg, self.const_expr(*index as usize));
+                    let value = self.const_expr(ConstId(*index as u32))?;
+                    self.assign_reg(*reg, value);
                 }
                 Instr::LoadKX { reg, index } => {
-                    self.assign_reg(*reg, self.const_expr(*index as usize));
+                    let value = self.const_expr(ConstId(*index))?;
+                    self.assign_reg(*reg, value);
                 }
                 Instr::Move { dest, src } => {
                     let sym = self.get_reg_symbol(*src);
@@ -294,13 +298,21 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 Instr::GetGlobal { dest, key, .. } => {
                     self.assign_reg(
                         *dest,
-                        HilExpr::Global(self.const_string(*key as usize).into()),
+                        HilExpr::Global(
+                            self.const_string(ConstId(*key))
+                                .with_context(|| format!("invalid string constant {key}"))?
+                                .to_smolstr(),
+                        ),
                     );
                 }
                 Instr::SetGlobal { src, key, .. } => {
                     let sym = self.get_reg_symbol(*src);
                     self.assign(
-                        HilExpr::Global(self.const_string(*key as usize).into()),
+                        HilExpr::Global(
+                            self.const_string(ConstId(*key))
+                                .with_context(|| format!("invalid string constant {key}"))?
+                                .to_smolstr(),
+                        ),
                         HilExpr::Symbol(sym),
                     );
                 }
@@ -316,11 +328,11 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
                     self.assign(HilExpr::Symbol(upval_sym), HilExpr::Symbol(src_sym))
                 }
-                Instr::GetImport { dest, index, path } => {
-                    let name = self
-                        .decode_import_path(*path)
-                        .unwrap_or_else(|| format!("import_k{}", index));
-                    self.assign_reg(*dest, HilExpr::Import(name.into()));
+                Instr::GetImport { dest, path, .. } => {
+                    self.assign_reg(
+                        *dest,
+                        HilExpr::import(ImportPath(*path), self.chunk, self.proto)?,
+                    );
                 }
 
                 Instr::NameCall {
@@ -328,7 +340,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     object,
                     method,
                     ..
-                } => self.lift_namecall(*dest, *object, *method),
+                } => self.lift_namecall(*dest, *object, *method)?,
                 Instr::Call {
                     func,
                     arg_count,
@@ -341,13 +353,13 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 Instr::GetTableKS {
                     dest, table, key, ..
                 } => {
-                    let key_str = self.const_string(*key as usize);
                     let sym = self.get_reg_symbol(*table);
+                    let field = self.const_string(ConstId(*key))?;
                     self.assign_reg(
                         *dest,
                         HilExpr::GetField {
                             obj: Box::new(HilExpr::Symbol(sym)),
-                            field: key_str.into(),
+                            field: field.to_smolstr(),
                         },
                     );
                 }
@@ -377,11 +389,11 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 } => {
                     let table_sym = self.get_reg_symbol(*table);
                     let value_sym = self.get_reg_symbol(*src);
-
+                    let field = self.const_string(ConstId(*key))?;
                     self.assign(
                         HilExpr::GetField {
                             obj: Box::new(HilExpr::Symbol(table_sym)),
-                            field: self.const_string(*key as usize).into(),
+                            field: field.to_smolstr(),
                         },
                         HilExpr::Symbol(value_sym),
                     );
@@ -440,10 +452,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 | Instr::IDivK { dest, reg, k }
                 | Instr::ModK { dest, reg, k }
                 | Instr::PowK { dest, reg, k } => {
-                    let num = match self.consts[*k as usize] {
-                        Constant::Number(x) => x,
-                        _ => unreachable!(
-                            "*K arithmetic instructions can only reference number constants"
+                    let num = match self.proto.get_constant(ConstId(*k as u32)) {
+                        Some(Constant::Number(x)) => *x,
+                        other => bail!(
+                            "*K arithmetic instructions can only reference number constants, got {other:?} instead",
                         ),
                     };
                     let lhs_sym = self.get_reg_symbol(*reg);
@@ -459,10 +471,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
                 // const(number) op reg — operands are flipped; only Sub and Div have this form.
                 Instr::SubRK { dest, k, reg } | Instr::DivRK { dest, k, reg } => {
-                    let num = match self.consts[*k as usize] {
-                        Constant::Number(x) => x,
-                        _ => unreachable!(
-                            "*RK arithmetic instructions can only reference number constants"
+                    let num = match self.proto.get_constant(ConstId(*k as u32)) {
+                        Some(Constant::Number(x)) => *x,
+                        other => bail!(
+                            "*RK arithmetic instructions can only reference number constants, got {other:?} instead",
                         ),
                     };
                     let rhs_sym = self.get_reg_symbol(*reg);
@@ -484,7 +496,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                         HilExpr::Binary {
                             lhs: Box::new(HilExpr::Symbol(lhs_sym)),
                             op: binop_for_instr(&instr),
-                            rhs: Box::new(const_expr(self.consts, usize::from(*k))),
+                            rhs: Box::new(self.const_expr(ConstId(*k as u32))?),
                         },
                     );
                 }
@@ -521,43 +533,27 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
                 Instr::NewClosure { dest, proto: index } => {
                     let pc = self.current_pc();
-                    let sym = self.alloc_reg_symbol(*dest);
-
-                    let resolved = self.parent_proto.protos[*index as usize];
-                    let n_captures = self.proto_upval_count(resolved);
-                    let captures = self.consume_captures(n_captures);
-                    self.stmts.push(
-                        HilStmt::Assign {
-                            left: HilExpr::Symbol(sym),
-                            value: HilExpr::Closure {
-                                proto: resolved,
-                                captures,
-                            },
-                        }
-                        .to_spanned(pc),
-                    );
+                    let Some(proto_id) = self.proto.get_child_proto(ChildProtoId(*index)) else {
+                        bail!(
+                            "did not find child proto for index {} in proto {:?}",
+                            *index,
+                            self.proto.id,
+                        );
+                    };
+                    self.lift_closure(*dest, proto_id, pc)?;
                 }
-
                 Instr::DupClosure { dest, k } => {
                     let pc = self.current_pc();
-                    let sym = self.alloc_reg_symbol(*dest);
-
-                    let resolved = match self.consts.get(*k as usize) {
-                        Some(Constant::Closure(proto_idx)) => *proto_idx as usize,
-                        _ => panic!("DUPCLOSURE constant at index {} is not a closure", k),
+                    let Some(Constant::Closure(proto_id)) =
+                        self.proto.get_constant(ConstId(*k as u32))
+                    else {
+                        bail!(
+                            "constant {} of proto {:?} is missing or not a closure",
+                            *k,
+                            self.proto.id
+                        );
                     };
-                    let n_captures = self.proto_upval_count(resolved);
-                    let captures = self.consume_captures(n_captures);
-                    self.stmts.push(
-                        HilStmt::Assign {
-                            left: HilExpr::Symbol(sym),
-                            value: HilExpr::Closure {
-                                proto: resolved,
-                                captures,
-                            },
-                        }
-                        .to_spanned(pc),
-                    );
+                    self.lift_closure(*dest, *proto_id, pc)?;
                 }
 
                 Instr::CloseUpvals { reg } => self.note_close_upvals(*reg),
@@ -574,7 +570,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     "CAPTURE instructions should have been consumed by NEWCLOSURE/DUPCLOSURE handling"
                 ),
 
-                Instr::GetVarArgs { dest, count } => match decoded_count(*count) {
+                Instr::GetVarArgs { dest, count } => match Count::from(*count) {
                     Count::Variadic => {
                         debug_assert!(self.pending_multiret.is_none());
                         self.pending_multiret = Some(MultiRet {
@@ -619,12 +615,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             }
         }
 
-        (self.stmts, self.pending_multiret)
+        Ok((self.stmts, self.pending_multiret))
     }
 
     fn lift_call(&mut self, func: u8, arg_count: u8, ret_count: u8) {
         let first_arg = reg_add(func, 1);
-        let args = match decoded_count(arg_count) {
+        let args = match Count::from(arg_count) {
             Count::Number(argc) => {
                 if argc > 0 {
                     self.read_regs(first_arg, argc)
@@ -644,28 +640,35 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         self.emit_call_result(func, ret_count, call);
     }
 
-    fn lift_namecall(&mut self, dest: u8, object: u8, method: u32) {
+    fn lift_namecall(&mut self, dest: u8, object: u8, method: u32) -> Result<()> {
+        let namecall_pc = self.current_pc();
         let (func, arg_count, ret_count) = match self.next() {
             Some(Instr::Call {
                 func,
                 arg_count,
                 ret_count,
             }) => (func, arg_count, ret_count),
-            Some(other) => panic!("NAMECALL not followed by CALL, got instr: {other:#?}"),
+            Some(other) => {
+                bail!(
+                    "malformed bytecode: NAMECALL at {namecall_pc} not followed by CALL (got {other:?})"
+                )
+            }
             None => {
-                panic!("NAMECALL at end of stream with no following CALL")
+                bail!(
+                    "malformed bytecode: NAMECALL at the end of the stream with no following CALL"
+                )
             }
         };
 
-        assert_eq!(
-            func, dest,
-            "CALL func reg {func} does not match NAMECALL dest reg {dest}"
+        ensure!(
+            func == dest,
+            "malformed bytecode: CALL func reg {func} does not match NAMECALL dest reg {dest}"
         );
 
-        let method = self.const_string(method as usize);
+        let method = self.const_string(ConstId(method))?;
 
         let first_arg = reg_add(func, 2); // receiver is at func+1, user args start at func+2
-        let variadic_args = match decoded_count(arg_count) {
+        let variadic_args = match Count::from(arg_count) {
             Count::Variadic => self.take_variadic_from(first_arg),
             Count::Number(_) => None,
         };
@@ -686,7 +689,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             }
         }
 
-        let args = match decoded_count(arg_count) {
+        let args = match Count::from(arg_count) {
             Count::Number(argc) if argc > 1 => self.read_regs(first_arg, argc - 1),
             Count::Variadic => variadic_args.unwrap_or_default(),
             _ => Vec::new(),
@@ -694,14 +697,15 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
         let method_call = HilExpr::MethodCall {
             object: Box::new(HilExpr::Symbol(self.get_reg_symbol(object))),
-            method: method.into(),
+            method: method.to_smolstr(),
             args,
         };
         self.emit_call_result(func, ret_count, method_call);
+        Ok(())
     }
 
     fn lift_setlist(&mut self, table: u8, base: u8, count: u8, index: u32) {
-        let (values, has_variadic_tail) = match decoded_count(count) {
+        let (values, has_variadic_tail) = match Count::from(count) {
             Count::Number(n) => (self.read_regs(base, n), false),
             Count::Variadic => (
                 self.take_variadic_from(base).unwrap_or_else(|| {
@@ -723,7 +727,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
     /// Emit the result of a CALL or NAMECALL depending on the return count.
     fn emit_call_result(&mut self, dest: u8, ret_count: u8, expr: HilExpr) {
-        match decoded_count(ret_count) {
+        match Count::from(ret_count) {
             Count::Number(0) => self.push(HilStmt::Call(expr)),
             Count::Number(1) => self.assign_reg(dest, expr),
             Count::Number(n) => {
@@ -738,6 +742,29 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 });
             }
         }
+    }
+
+    fn lift_closure(&mut self, dest: u8, proto_id: ProtoId, pc: u32) -> Result<()> {
+        let sym = self.alloc_reg_symbol(dest);
+        let proto = self
+            .chunk
+            .get_proto(proto_id)
+            .with_context(|| format!("did not find proto {proto_id:?}"))?;
+
+        let captures = self.consume_captures(proto.num_upvals)?;
+
+        self.stmts.push(
+            HilStmt::Assign {
+                left: HilExpr::Symbol(sym),
+                value: HilExpr::Closure {
+                    proto: proto.id,
+                    captures,
+                },
+            }
+            .to_spanned(pc),
+        );
+
+        Ok(())
     }
 
     /// Build a variadic argument list from the pending multiret starting no
@@ -759,12 +786,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
     /// Consume `count` CAPTURE instructions immediately following the current
     /// cursor position.
-    ///
-    /// # Panics
-    /// Panics if any expected instruction is not a `CAPTURE`.
-    fn consume_captures(&mut self, count: u8) -> Vec<SymbolId> {
+    fn consume_captures(&mut self, count: u8) -> Result<Vec<SymbolId>> {
         if count == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut captures = Vec::with_capacity(count as usize);
@@ -779,11 +803,19 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     };
                     captures.push(symbol);
                 }
-                Some(other) => panic!("expected CAPTURE #{i} after closure got instr: {other:#?}"),
-                None => panic!("unexpected end of instructions while consuming CAPTURE #{i}"),
+                Some(other) => {
+                    bail!(
+                        "malformed bytecode: expected CAPTURE #{i} after closure got instr: {other:?}"
+                    );
+                }
+                None => {
+                    bail!(
+                        "malformed bytecode: unexpected end of instructions while consuming CAPTURE #{i}"
+                    );
+                }
             }
         }
-        captures
+        Ok(captures)
     }
 
     /// Flush the pending multiret to `self.stmts` as a standalone call-stmt or
@@ -796,63 +828,29 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         flush_multiret(multiret, self.block_idx, self.ssa, &mut self.stmts);
     }
 
-    /// See: [const_expr]
+    /// A helper for resolving string constants from the chunk.
     #[inline]
-    #[must_use]
-    fn const_expr(&self, index: usize) -> HilExpr {
-        const_expr(self.consts, index)
-    }
-
-    /// Retrieves a string constant from the constant table.
-    ///
-    /// # Panics
-    /// Panics if the constant at the given index is not a string.
-    #[inline]
-    #[must_use]
-    fn const_string(&self, index: usize) -> String {
-        match self.consts.get(index) {
-            Some(Constant::String(s)) => s.clone(),
-            _ => panic!("expected string constant at index {}", index),
-        }
-    }
-
-    /// Returns the number of upvalues of a child proto.
-    ///
-    /// # Panics
-    /// Panics if the given proto id is invalid.
-    fn proto_upval_count(&self, proto_id: usize) -> u8 {
-        match self.protos.get(proto_id) {
-            Some(p) => p.num_upvals,
-            None => panic!("invalid proto id: {}", proto_id),
-        }
-    }
-
-    fn decode_import_path(&self, path: u32) -> Option<String> {
-        let count = (path >> 30) as usize;
-        if !(1..=3).contains(&count) {
-            return None;
-        }
-
-        let ids = [(path >> 20) & 0x3ff, (path >> 10) & 0x3ff, path & 0x3ff];
-
-        let first = self.const_string(ids[0] as usize);
-        let mut out = if is_valid_luau_identifier(&first) {
-            first
-        } else {
-            format!("_G[\"{}\"]", escape_string(&first))
+    fn const_string(&self, id: ConstId) -> Result<LuauString> {
+        let ct = self
+            .proto
+            .get_constant(id)
+            .with_context(|| format!("missing constant at {id:?}"))?;
+        let Constant::String(sid) = ct else {
+            bail!("expected string constant at {id:?}, got {ct:?}");
         };
+        self.chunk
+            .get_string(*sid)
+            .with_context(|| format!("invalid string id {:?}", sid))
+    }
 
-        for id in ids.iter().skip(1).take(count - 1) {
-            let key = self.const_string(*id as usize);
-            if is_valid_luau_identifier(&key) {
-                out.push('.');
-                out.push_str(&key);
-            } else {
-                out.push_str(&format!("[\"{}\"]", escape_string(&key)));
-            }
-        }
-
-        Some(out)
+    /// A helper for resolving expression constants from the proto.
+    #[inline]
+    fn const_expr(&self, id: ConstId) -> Result<HilExpr> {
+        let ct = self
+            .proto
+            .get_constant(id)
+            .with_context(|| format!("missing constant at {id:?}"))?;
+        HilExpr::from_constant(ct, self.chunk, self.proto)
     }
 }
 
@@ -890,10 +888,9 @@ pub fn flush_multiret<G: GraphView>(
 }
 
 /// Lifts one instruction slice into raw HIL statements.
-#[must_use]
 pub fn lift<'a, 'cfg, G: GraphView>(
     ctx: LiftContext<'a, 'cfg, G>,
-) -> (Vec<Spanned<HilStmt>>, Option<MultiRet>) {
+) -> Result<(Vec<Spanned<HilStmt>>, Option<MultiRet>)> {
     let lifter = Lifter::new(ctx);
     lifter.run()
 }

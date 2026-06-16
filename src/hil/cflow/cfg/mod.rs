@@ -7,17 +7,18 @@ use std::{
 
 use smallvec::SmallVec;
 
+use anyhow::{Result, anyhow, ensure};
+
 use crate::{
     ast::BinOp,
     common::Spanned,
-    disasm::Proto,
+    disasm::Chunk,
     hil::{
         cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
-        common::{reg_add, reg_range},
         ir::{HilExpr, HilStmt, PhiNode},
         lifter::ssa::SymbolId,
     },
-    il::Instr,
+    il::{Instr, Proto, reg_add, reg_range},
 };
 
 /// Represents an unlifted block
@@ -222,7 +223,7 @@ pub enum CondRhs {
     /// A physical register
     Reg(u8),
     /// An index into the proto's constants
-    Const(usize),
+    Const(u32),
     /// Nil value
     Nil,
     /// A boolean value
@@ -258,11 +259,11 @@ pub struct ControlFlowGraph {
 }
 
 impl ControlFlowGraph {
-    pub fn from_proto(proto: &Proto, all_protos: &[Proto]) -> Self {
+    pub fn from_proto(proto: &Proto, chunk: &Chunk) -> Result<Self> {
         let instrs = proto.instrs.as_slice();
 
-        let entries = find_block_entries(instrs);
-        let raw_blocks = build_raw_blocks(&entries, instrs);
+        let entries = find_block_entries(instrs)?;
+        let raw_blocks = build_raw_blocks(&entries, instrs)?;
 
         let (successors, predecessors) = build_graph(raw_blocks.iter().map(|b| b.exit.targets()));
         let graph = AdjGraph::new(0, &successors, &predecessors);
@@ -271,7 +272,7 @@ impl ControlFlowGraph {
             mut blocks,
             params,
             upvalues,
-        } = block_lifter::build_blocks(proto, all_protos, &raw_blocks, &graph);
+        } = block_lifter::build_blocks(proto, chunk, &raw_blocks, &graph)?;
 
         loop {
             let changed_cond = fold_truthy_cond_jumps(&mut blocks);
@@ -306,7 +307,7 @@ impl ControlFlowGraph {
         for i in 0..graph.blocks.len() {
             graph.unfold_phis(i);
         }
-        graph
+        Ok(graph)
     }
 
     /// Re-runs CFG-level simplifications that depend on block bodies being empty.
@@ -463,8 +464,7 @@ impl GraphView for ControlFlowGraph {
 }
 
 /// Returns the list of instruction indices which are block entries.
-#[must_use]
-pub fn find_block_entries(instrs: &[Spanned<Instr>]) -> Vec<usize> {
+pub fn find_block_entries(instrs: &[Spanned<Instr>]) -> Result<Vec<usize>> {
     let mut entries = BTreeSet::new();
     entries.insert(0);
 
@@ -477,13 +477,13 @@ pub fn find_block_entries(instrs: &[Spanned<Instr>]) -> Vec<usize> {
             | Instr::ForgPrep { offset, .. }
             | Instr::ForgPrepInext { offset, .. }
             | Instr::ForgPrepNext { offset, .. } => {
-                entries.insert(rel_target_from_instr(idx, offset.into(), instrs));
+                entries.insert(rel_target_from_instr(idx, offset.into(), instrs)?);
                 if idx + 1 < instrs.len() {
                     entries.insert(idx + 1);
                 }
             }
             Instr::FornLoop { offset, .. } | Instr::ForgLoop { offset, .. } => {
-                entries.insert(rel_target_from_instr(idx, offset.into(), instrs));
+                entries.insert(rel_target_from_instr(idx, offset.into(), instrs)?);
                 if idx + 1 < instrs.len() {
                     entries.insert(idx + 1);
                 }
@@ -492,13 +492,13 @@ pub fn find_block_entries(instrs: &[Spanned<Instr>]) -> Vec<usize> {
             | Instr::JumpBack { offset }
             | Instr::JumpIf { offset, .. }
             | Instr::JumpIfNot { offset, .. } => {
-                entries.insert(rel_target_from_instr(idx, offset.into(), instrs));
+                entries.insert(rel_target_from_instr(idx, offset.into(), instrs)?);
                 if idx + 1 < instrs.len() {
                     entries.insert(idx + 1);
                 }
             }
             Instr::JumpX { offset } => {
-                entries.insert(rel_target_from_instr(idx, offset, instrs));
+                entries.insert(rel_target_from_instr(idx, offset, instrs)?);
                 if idx + 1 < instrs.len() {
                     entries.insert(idx + 1);
                 }
@@ -513,23 +513,23 @@ pub fn find_block_entries(instrs: &[Spanned<Instr>]) -> Vec<usize> {
             | Instr::JumpXEqKB { offset, .. }
             | Instr::JumpXEqKN { offset, .. }
             | Instr::JumpXEqKS { offset, .. } => {
-                entries.insert(rel_target_from_instr(idx, offset.into(), instrs));
+                entries.insert(rel_target_from_instr(idx, offset.into(), instrs)?);
                 if idx + 1 < instrs.len() {
                     entries.insert(idx + 1);
                 }
             }
             Instr::LoadB { jump, .. } if jump > 0 => {
-                entries.insert(rel_target_from_instr(idx, jump.into(), instrs));
+                entries.insert(rel_target_from_instr(idx, jump.into(), instrs)?);
             }
             _ => {}
         }
     }
 
-    entries.into_iter().collect()
+    Ok(entries.into_iter().collect())
 }
 
 /// Builds raw blocks from a list of entries and instructions.
-fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBlock> {
+fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Result<Vec<RawBlock>> {
     let mut raw_blocks = Vec::with_capacity(entries.len());
 
     for (block_idx, &start) in entries.iter().enumerate() {
@@ -561,15 +561,15 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
         let exit = match exit_instr {
             Some(Instr::Return { base, count }) => RawBlockExit::Return { base, count },
             Some(Instr::Jump { offset }) | Some(Instr::JumpBack { offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::Jump(pc_to_block_idx(entries, target))
             }
             Some(Instr::JumpX { offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset, instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset, instrs)?;
                 RawBlockExit::Jump(pc_to_block_idx(entries, target))
             }
             Some(Instr::JumpIfNotLt { reg, aux, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
                         lhs: reg,
@@ -581,7 +581,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 }
             }
             Some(Instr::JumpIf { reg, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Unary(reg),
                     then_block: pc_to_block_idx(entries, target),
@@ -589,7 +589,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 }
             }
             Some(Instr::JumpIfNot { reg, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Unary(reg),
                     then_block: block_idx + 1,
@@ -597,7 +597,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 }
             }
             Some(Instr::JumpIfEq { reg, aux, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
                         lhs: reg,
@@ -609,7 +609,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 }
             }
             Some(Instr::JumpIfNotEq { reg, aux, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
                         lhs: reg,
@@ -621,7 +621,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 }
             }
             Some(Instr::JumpIfLe { reg, aux, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
                         lhs: reg,
@@ -633,7 +633,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 }
             }
             Some(Instr::JumpIfNotLe { reg, aux, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
                         lhs: reg,
@@ -645,7 +645,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 }
             }
             Some(Instr::JumpIfLt { reg, aux, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
                         lhs: reg,
@@ -661,7 +661,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 invert,
                 offset,
             }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 let (then_block, else_block) = if invert {
                     (block_idx + 1, pc_to_block_idx(entries, target))
                 } else {
@@ -683,7 +683,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 invert,
                 offset,
             }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 let (then_block, else_block) = if invert {
                     (block_idx + 1, pc_to_block_idx(entries, target))
                 } else {
@@ -711,7 +711,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 invert,
                 offset,
             }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 let (then_block, else_block) = if invert {
                     (block_idx + 1, pc_to_block_idx(entries, target))
                 } else {
@@ -721,14 +721,14 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                     cond: Cond::Binary {
                         lhs: reg,
                         op: BinOp::Eq,
-                        rhs: CondRhs::Const(k as usize),
+                        rhs: CondRhs::Const(k),
                     },
                     then_block,
                     else_block,
                 }
             }
             Some(Instr::FornPrep { base, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::FornPrep {
                     base,
                     body_block: block_idx + 1,
@@ -736,7 +736,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 }
             }
             Some(Instr::FornLoop { base, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::FornLoop {
                     base,
                     body_block: pc_to_block_idx(entries, target),
@@ -746,7 +746,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
             Some(Instr::ForgPrep { base, offset })
             | Some(Instr::ForgPrepInext { base, offset })
             | Some(Instr::ForgPrepNext { base, offset }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 let exit_block = pc_to_block_idx(entries, target);
 
                 let end = entries.get(exit_block + 1).copied().unwrap_or(instrs.len());
@@ -754,9 +754,11 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                     .get(end.saturating_sub(1))
                     .map(|spanned| spanned.node)
                 {
-                    Some(Instr::ForgLoop { var_count, .. }) => var_count,
-                    other => panic!("FORGPREP target block must end in FORGLOOP, got {other:?}"),
-                };
+                    Some(Instr::ForgLoop { var_count, .. }) => Ok(var_count),
+                    other => Err(anyhow!(
+                        "FORGPREP target block must end in FORGLOOP, got {other:?}"
+                    )),
+                }?;
 
                 exit_writes = reg_range(reg_add(base, 3), result_count).collect();
 
@@ -772,7 +774,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 var_count,
                 ..
             }) => {
-                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, offset.into(), instrs)?;
                 RawBlockExit::ForgLoop {
                     base,
                     body_block: pc_to_block_idx(entries, target),
@@ -781,7 +783,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
                 }
             }
             Some(Instr::LoadB { jump, .. }) if jump > 0 => {
-                let target = rel_target_from_instr(exit_instr_idx, jump.into(), instrs);
+                let target = rel_target_from_instr(exit_instr_idx, jump.into(), instrs)?;
                 RawBlockExit::Jump(pc_to_block_idx(entries, target))
             }
             _ => RawBlockExit::Fallthrough(block_idx + 1),
@@ -794,36 +796,35 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Vec<RawBloc
         });
     }
 
-    raw_blocks
+    Ok(raw_blocks)
 }
 
 /// Resolves a relative branch target from an instruction index.
-#[must_use]
-fn rel_target_from_instr(instr_idx: usize, offset: i32, instrs: &[Spanned<Instr>]) -> usize {
-    if instrs.is_empty() {
-        return 0;
-    }
+fn rel_target_from_instr(
+    instr_idx: usize,
+    offset: i32,
+    instrs: &[Spanned<Instr>],
+) -> Result<usize> {
+    ensure!(!instrs.is_empty(), "instrs must not be empty");
 
     if instr_idx >= instrs.len() {
         let target = (instr_idx + 1).saturating_add_signed(offset as isize);
-        return if target >= instrs.len() {
+        ensure!(
+            target < instrs.len(),
+            "target instr {target} was out of range (max: {})",
             instrs.len() - 1
-        } else {
-            target
-        };
+        );
+        return Ok(target);
     }
 
     let target_word_pc = instrs[instr_idx]
         .pc
         .saturating_add(1)
-        .saturating_add_signed(offset as isize);
+        .saturating_add_signed(offset);
 
-    match instrs.binary_search_by(|spanned| spanned.pc.cmp(&target_word_pc)) {
-        Ok(idx) => idx,
-        Err(0) => 0,
-        Err(pos) if pos >= instrs.len() => instrs.len() - 1,
-        Err(pos) => pos - 1,
-    }
+    instrs
+        .binary_search_by(|spanned| spanned.pc.cmp(&target_word_pc))
+        .map_err(|_| anyhow!("branch target {target_word_pc} does not point at an instruction"))
 }
 
 /// Maps an instruction PC to its containing basic block index.

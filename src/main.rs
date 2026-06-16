@@ -1,5 +1,6 @@
 use std::{path::PathBuf, process::Command};
 
+use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use mallow::{
     DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
@@ -86,7 +87,7 @@ enum Commands {
     },
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let diagnostic_config = diagnostic_config(&cli);
     let _tracing_guard = init_tracing(&cli, diagnostic_config.is_enabled());
@@ -96,15 +97,10 @@ fn main() {
         Commands::Disasm { input, output } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
 
-            match disassemble_bytecode_with_diagnostics(&bytecode, &diagnostics) {
-                Ok(d) => {
-                    let content = d.to_string();
-                    if let Err(e) = write_output(output, &content) {
-                        eprintln!("Error writing disassembly output: {e}");
-                    }
-                }
-                Err(e) => eprintln!("Error during disassembly: {}", e),
-            }
+            let chunk = disassemble_bytecode_with_diagnostics(&bytecode, &diagnostics)?;
+            let mut out = get_output(output)?;
+            chunk.dump(&mut out)?;
+            Ok(())
         }
         Commands::Decompile {
             input,
@@ -116,63 +112,42 @@ fn main() {
             diagnostics
                 .at(LogLevel::Info, LogTarget::Driver)
                 .line(0, format_args!("decompiling..."));
-            let code =
-                match decompile_bytecode_with_diagnostics(&bytecode, spill_locals, &diagnostics) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Error during decompilation: {}", e);
-                        return;
-                    }
-                };
+            let code = decompile_bytecode_with_diagnostics(&bytecode, spill_locals, &diagnostics)?;
 
-            if let Err(e) = write_output(output, &code) {
-                eprintln!("Error writing decompilation output: {e}");
-            }
+            let mut out = get_output(output)?;
+            out.write_all(code.as_bytes())?;
+            Ok(())
         }
         Commands::Roundtrip {
             input,
             output,
             spill_locals,
         } => {
-            let compile_out = match Command::new("luau-compile")
+            let compile_out = Command::new("luau-compile")
                 .arg("--binary")
                 .arg(input)
-                .output()
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    eprintln!("failed to spawn luau-compile: {e}");
-                    return;
-                }
-            };
+                .output()?;
 
-            if !compile_out.status.success() {
-                eprintln!("failed to compile: {:?}", &output);
-                return;
-            }
+            ensure!(
+                compile_out.status.success(),
+                "failed to compile: {:?}",
+                &output
+            );
 
-            let code = match decompile_bytecode_with_diagnostics(
+            let code = decompile_bytecode_with_diagnostics(
                 &compile_out.stdout,
                 spill_locals,
                 &diagnostics,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error during decompilation: {}", e);
-                    return;
-                }
-            };
+            )?;
 
-            if let Err(e) = write_output(output, &code) {
-                eprintln!("Error writing decompilation output: {e}");
-            }
+            let mut out = get_output(output)?;
+            out.write_all(code.as_bytes())?;
+            Ok(())
         }
         #[cfg(feature = "visualize")]
         Commands::Visualize { input, output } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
-            if let Err(e) = mallow::visualize_bytecode(&bytecode, output, &diagnostics) {
-                eprintln!("Error during visualization: {e}");
-            }
+            mallow::visualize_bytecode(&bytecode, output, &diagnostics)
         }
     }
 }
@@ -202,11 +177,9 @@ fn diagnostic_config(cli: &Cli) -> DiagnosticConfig {
     DiagnosticConfig::new(level, cli.log_target.iter().copied(), cli.log_proto.clone())
 }
 
-fn write_output(output: Option<PathBuf>, content: &str) -> std::io::Result<()> {
-    if let Some(path) = output {
-        std::fs::write(path, content)
-    } else {
-        println!("{content}");
-        Ok(())
+fn get_output(path: Option<PathBuf>) -> std::io::Result<Box<dyn std::io::Write>> {
+    match path {
+        Some(path) => Ok(Box::new(std::fs::File::create(path)?)),
+        None => Ok(Box::new(std::io::stdout())),
     }
 }

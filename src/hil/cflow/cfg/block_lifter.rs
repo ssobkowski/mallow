@@ -2,12 +2,13 @@ use std::collections::{HashMap, HashSet};
 
 use smallvec::SmallVec;
 
+use anyhow::{Context, Result, bail, ensure};
+
 use crate::{
     common::Spanned,
-    disasm::Proto,
+    disasm::Chunk,
     hil::{
         cflow::{common::RegSet, graph::GraphView, union_find::UnionFind},
-        common::{const_expr, decoded_count, reg_add, reg_range},
         ir::{HilExpr, HilStmt, PhiNode},
         lifter::{
             LiftContext, MultiRet, flush_multiret, lift,
@@ -15,7 +16,7 @@ use crate::{
         },
         visitor::{Visitor, VisitorMut},
     },
-    il::Count,
+    il::{ConstId, Count, Proto, reg_add, reg_range},
 };
 
 use super::{Block, BlockExit, Cond, CondRhs, RawBlock, RawBlockExit};
@@ -34,17 +35,17 @@ pub(super) struct BuildResult {
 /// are tightly coupled.
 pub(super) fn build_blocks<G: GraphView>(
     proto: &Proto,
-    all_protos: &[Proto],
+    chunk: &Chunk,
     raw_blocks: &[RawBlock],
     graph: &G,
-) -> BuildResult {
-    BlockBuilder::new(proto, all_protos, raw_blocks, graph).build()
+) -> Result<BuildResult> {
+    BlockBuilder::new(proto, chunk, raw_blocks, graph).build()
 }
 
 /// Mutable state for the SSA-backed CFG block lifting phase.
 struct BlockBuilder<'a, G: GraphView> {
     proto: &'a Proto,
-    all_protos: &'a [Proto],
+    chunk: &'a Chunk,
     raw_blocks: &'a [RawBlock],
     graph: &'a G,
     blocks: Vec<Block>,
@@ -55,16 +56,10 @@ struct BlockBuilder<'a, G: GraphView> {
 }
 
 impl<'a, G: GraphView> BlockBuilder<'a, G> {
-    /// Creates the phase state around immutable CFG inputs and fresh SSA state.
-    fn new(
-        proto: &'a Proto,
-        all_protos: &'a [Proto],
-        raw_blocks: &'a [RawBlock],
-        graph: &'a G,
-    ) -> Self {
+    fn new(proto: &'a Proto, chunk: &'a Chunk, raw_blocks: &'a [RawBlock], graph: &'a G) -> Self {
         Self {
             proto,
-            all_protos,
+            chunk,
             raw_blocks,
             graph,
             blocks: vec![Block::dummy(); raw_blocks.len()],
@@ -76,17 +71,17 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
     }
 
     /// Runs SSA-backed lifting through final symbol canonicalization.
-    fn build(mut self) -> BuildResult {
+    fn build(mut self) -> Result<BuildResult> {
         self.initialize_entry_symbols();
-        self.lift_blocks();
+        self.lift_blocks()?;
         self.collect_loop_carried_versions();
         self.finalize();
 
-        BuildResult {
+        Ok(BuildResult {
             blocks: self.blocks,
             params: self.params,
             upvalues: self.upvalues,
-        }
+        })
     }
 
     /// Seeds entry-block SSA state for parameters and declared upvalues.
@@ -105,25 +100,25 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
     }
 
     /// Lifts reachable raw blocks in reverse postorder.
-    fn lift_blocks(&mut self) {
+    fn lift_blocks(&mut self) -> Result<()> {
         for block_id in self.graph.reverse_post_order() {
-            self.lift_block(block_id);
+            self.lift_block(block_id)?;
         }
+        Ok(())
     }
 
     /// Lifts one raw block body and lowers its raw terminator into a HIL exit.
-    fn lift_block(&mut self, block_id: usize) {
+    fn lift_block(&mut self, block_id: usize) -> Result<()> {
         let raw_block = &self.raw_blocks[block_id];
         let (mut stmts, mut pending_multiret) = lift(LiftContext {
             instrs: &self.proto.instrs[raw_block.instr_range.clone()],
-            consts: &self.proto.consts,
-            parent_proto: self.proto,
-            protos: self.all_protos,
+            chunk: self.chunk,
+            proto: self.proto,
             ssa: &mut self.ssa,
             block_idx: block_id,
-        });
+        })?;
 
-        let exit = self.lower_exit(block_id, &mut stmts, &mut pending_multiret);
+        let exit = self.lower_exit(block_id, &mut stmts, &mut pending_multiret)?;
 
         debug_assert!(
             pending_multiret.is_none(),
@@ -133,6 +128,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
         let stmts = stmts.into_iter().map(|s| s.node).collect();
         self.blocks[block_id] = Block { stmts, exit };
         self.ssa.mark_filled(block_id);
+        Ok(())
     }
 
     /// Converts a raw terminator into a lifted exit, reading any needed SSA values.
@@ -141,7 +137,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
         block_id: usize,
         stmts: &mut Vec<Spanned<HilStmt>>,
         pending_multiret: &mut Option<MultiRet>,
-    ) -> BlockExit {
+    ) -> Result<BlockExit> {
         // Exit lowering has three distinct phases:
         //
         // 1. Flush a pending multiret before ordinary exit reads.
@@ -160,12 +156,12 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
             RawBlockExit::Jump(t) => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 self.apply_exit_writes(block_id, exit_writes);
-                BlockExit::Jump(*t)
+                Ok(BlockExit::Jump(*t))
             }
             RawBlockExit::Fallthrough(t) => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 self.apply_exit_writes(block_id, exit_writes);
-                BlockExit::Fallthrough(*t)
+                Ok(BlockExit::Fallthrough(*t))
             }
             RawBlockExit::CondJump {
                 cond,
@@ -173,13 +169,13 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                 else_block,
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
-                let cond = self.lower_cond(block_id, cond);
+                let cond = self.lower_cond(block_id, cond)?;
                 self.apply_exit_writes(block_id, exit_writes);
-                BlockExit::CondJump {
+                Ok(BlockExit::CondJump {
                     cond,
                     then_block: *then_block,
                     else_block: *else_block,
-                }
+                })
             }
             RawBlockExit::FornPrep {
                 base,
@@ -199,7 +195,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                 // This is a successor/body-block read. It must happen after exit_writes.
                 let var = self.ssa.read_reg(*body_block, reg_add(*base, 2));
 
-                BlockExit::FornPrep {
+                Ok(BlockExit::FornPrep {
                     base: *base,
                     body_block: *body_block,
                     exit_block: *exit_block,
@@ -207,7 +203,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                     start: HilExpr::Symbol(start),
                     end: HilExpr::Symbol(end),
                     step: HilExpr::Symbol(step),
-                }
+                })
             }
             RawBlockExit::FornLoop {
                 base,
@@ -216,11 +212,11 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 self.apply_exit_writes(block_id, exit_writes);
-                BlockExit::FornLoop {
+                Ok(BlockExit::FornLoop {
                     base: *base,
                     body_block: *body_block,
                     exit_block: *exit_block,
-                }
+                })
             }
             RawBlockExit::ForgPrep {
                 base,
@@ -234,12 +230,12 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                     HilExpr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 2))),
                 ];
                 self.apply_exit_writes(block_id, exit_writes);
-                BlockExit::ForgPrep {
+                Ok(BlockExit::ForgPrep {
                     base: *base,
                     body_block: *body_block,
                     exit_block: *exit_block,
                     exprs,
-                }
+                })
             }
             RawBlockExit::ForgLoop {
                 base,
@@ -249,7 +245,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 self.apply_exit_writes(block_id, exit_writes);
-                BlockExit::ForgLoop {
+                Ok(BlockExit::ForgLoop {
                     base: *base,
                     body_block: *body_block,
                     exit_block: *exit_block,
@@ -259,7 +255,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                                 .read_reg(*body_block, reg_add(reg_add(*base, 3), i as u8))
                         })
                         .collect(),
-                }
+                })
             }
             RawBlockExit::Return { base, count } => {
                 assert!(
@@ -267,7 +263,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                     "RETURN must not have synthetic exit writes: {exit_writes:?}"
                 );
 
-                match decoded_count(*count) {
+                match Count::from(*count) {
                     Count::Variadic => {
                         assert!(
                             exit_writes.is_empty(),
@@ -275,14 +271,14 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                         );
 
                         let Some(multiret) = pending_multiret.take() else {
-                            panic!("variadic return without pending multiret");
+                            bail!("variadic return without pending multiret");
                         };
 
-                        assert!(
+                        ensure!(
                             multiret.base >= *base,
                             "pending multiret base {} is before variadic return base {}",
-                            base,
                             multiret.base,
+                            base
                         );
 
                         let mut rets = SmallVec::new();
@@ -291,7 +287,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                         }
                         rets.push(multiret.expr.node);
 
-                        BlockExit::Return(rets)
+                        Ok(BlockExit::Return(rets))
                     }
                     Count::Number(n) => {
                         self.flush_pending_multiret(block_id, stmts, pending_multiret);
@@ -305,7 +301,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                             .map(|i| HilExpr::Symbol(self.ssa.read_reg(block_id, i)))
                             .collect();
 
-                        BlockExit::Return(rets)
+                        Ok(BlockExit::Return(rets))
                     }
                 }
             }
@@ -313,14 +309,20 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
     }
 
     /// Converts a raw register/constant condition into a HIL expression.
-    fn lower_cond(&mut self, block_id: usize, cond: &Cond) -> HilExpr {
-        match cond {
+    fn lower_cond(&mut self, block_id: usize, cond: &Cond) -> Result<HilExpr> {
+        Ok(match cond {
             Cond::Unary(reg) => HilExpr::Symbol(self.ssa.read_reg(block_id, *reg)),
             Cond::Binary { lhs, op, rhs } => {
                 let lhs = HilExpr::Symbol(self.ssa.read_reg(block_id, *lhs));
                 let rhs = match rhs {
                     CondRhs::Reg(reg) => HilExpr::Symbol(self.ssa.read_reg(block_id, *reg)),
-                    CondRhs::Const(idx) => const_expr(&self.proto.consts, *idx),
+                    CondRhs::Const(idx) => HilExpr::from_constant(
+                        self.proto
+                            .get_constant(ConstId(*idx))
+                            .with_context(|| format!("invalid constant id {idx}"))?,
+                        self.chunk,
+                        self.proto,
+                    )?,
                     CondRhs::Nil => HilExpr::Nil,
                     CondRhs::Bool(value) => HilExpr::Bool(*value),
                 };
@@ -331,7 +333,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                     rhs: Box::new(rhs),
                 }
             }
-        }
+        })
     }
 
     /// Materializes an unconsumed multiret before an exit reads registers.

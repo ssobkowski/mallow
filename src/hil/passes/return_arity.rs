@@ -27,7 +27,7 @@ impl ReturnCollector<'_> {
 
         match self
             .known
-            .get(*proto)
+            .get(proto.0 as usize)
             .copied()
             .flatten()
             .unwrap_or(ReturnArity::Unknown)
@@ -84,8 +84,8 @@ pub fn infer_all(functions: &mut [StructuredFunction]) {
 
             let inferred = collector.signal.unwrap_or(ReturnArity::Exact(0));
 
-            if known[fun.proto] != Some(inferred) {
-                known[fun.proto] = Some(inferred);
+            if known[fun.proto.0 as usize] != Some(inferred) {
+                known[fun.proto.0 as usize] = Some(inferred);
                 changed = true;
             }
         }
@@ -96,7 +96,7 @@ pub fn infer_all(functions: &mut [StructuredFunction]) {
     }
 
     for fun in functions {
-        fun.return_arity = known[fun.proto];
+        fun.return_arity = known[fun.proto.0 as usize];
     }
 }
 

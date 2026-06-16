@@ -8,14 +8,17 @@ mod logging;
 mod printer;
 mod scopes;
 
-pub use disasm::{DisasmError, Disassembly};
 pub use logging::{
     DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector, TracingGuard, init_tracing,
 };
 
+use anyhow::Result;
+
 use crate::{
+    disasm::Chunk,
     emitter::options::EmitterOptions,
     hil::StructuredFunction,
+    il::{BytecodeType, ProtoTypeInfo, TypeTag},
     logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget},
 };
 
@@ -30,7 +33,7 @@ pub struct DecompileOptions {
 }
 
 /// Disassembles Luau bytecode without emitting diagnostics.
-pub fn disassemble_bytecode(bytecode: &[u8]) -> Result<Disassembly, DisasmError> {
+pub fn disassemble_bytecode(bytecode: &[u8]) -> Result<Chunk> {
     disassemble_bytecode_with_diagnostics(bytecode, &Diagnostics::default())
 }
 
@@ -38,27 +41,122 @@ pub fn disassemble_bytecode(bytecode: &[u8]) -> Result<Disassembly, DisasmError>
 pub fn disassemble_bytecode_with_diagnostics(
     bytecode: &[u8],
     diagnostics: &Diagnostics,
-) -> Result<Disassembly, DisasmError> {
+) -> Result<Chunk> {
     let span = tracing::info_span!("disassemble", byte_len = bytecode.len());
     let _enter = span.enter();
 
     let info = diagnostics.at(DiagnosticLevel::Info, DiagnosticTarget::Driver);
     info.line(0, format_args!("disassembling..."));
 
-    let disassembly = disasm::disassemble(bytecode)?;
+    let chunk = disasm::disassemble(bytecode)?;
 
-    info.line(1, format_args!("LBC Version: {}", disassembly.version));
-    info.line(1, format_args!("Proto count: {}", disassembly.protos.len()));
-    info.line(1, format_args!("Entry: {}", disassembly.entry_proto));
+    info.line(1, format_args!("LBC Version: {}", chunk.version));
+    info.line(1, format_args!("Type Version: {}", chunk.types_version));
+    info.line(1, format_args!("Proto count: {}", chunk.protos.len()));
+    info.line(1, format_args!("Entry: {}", chunk.entry_proto));
+    dump_type_info(&chunk, &info);
 
-    Ok(disassembly)
+    Ok(chunk)
+}
+
+fn dump_type_info(chunk: &Chunk, info: &logging::DiagnosticSink<'_>) {
+    info.line(1, format_args!("Type info:"));
+
+    match &chunk.userdata_type_mappings {
+        None => info.line(2, format_args!("userdata mappings: <none>")),
+        Some(mappings) => {
+            info.line(2, format_args!("userdata mappings:"));
+            for mapping in mappings {
+                info.line(3, format_args!("[{}] {:?}", mapping.index, mapping.name));
+            }
+        }
+    }
+
+    for proto in &chunk.protos {
+        let type_info = &proto.type_info;
+        if type_info.function.is_none()
+            && type_info.upvalues.is_empty()
+            && type_info.locals.is_empty()
+        {
+            info.line(2, format_args!("proto {}: <none>", proto.id));
+            continue;
+        }
+
+        info.line(2, format_args!("proto {}:", proto.id));
+        dump_proto_type_info(type_info, chunk, info);
+    }
+}
+
+fn dump_proto_type_info(
+    type_info: &ProtoTypeInfo,
+    chunk: &Chunk,
+    info: &logging::DiagnosticSink<'_>,
+) {
+    if let Some(function) = &type_info.function {
+        let params = function
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, tag)| format!("R{i}: {}", format_type_tag(*tag, chunk)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        info.line(
+            3,
+            format_args!("function params({}): {}", function.num_params, params),
+        );
+    }
+
+    if !type_info.upvalues.is_empty() {
+        info.line(3, format_args!("upvalues:"));
+        for (index, tag) in type_info.upvalues.iter().enumerate() {
+            info.line(
+                4,
+                format_args!("U{index}: {}", format_type_tag(*tag, chunk)),
+            );
+        }
+    }
+
+    if !type_info.locals.is_empty() {
+        info.line(3, format_args!("locals/temporaries:"));
+        for local in &type_info.locals {
+            info.line(
+                4,
+                format_args!(
+                    "R{}: {} from {} to {}",
+                    local.register,
+                    format_type_tag(local.ty, chunk),
+                    local.start_pc,
+                    local.end_pc
+                ),
+            );
+        }
+    }
+}
+
+fn format_type_tag(tag: TypeTag, chunk: &Chunk) -> String {
+    let mut base = match tag.ty {
+        BytecodeType::TaggedUserdata(index) => chunk
+            .userdata_type_mappings
+            .as_ref()
+            .and_then(|mappings| {
+                mappings
+                    .iter()
+                    .find(|mapping| mapping.index == index)
+                    .map(|mapping| format!("{:?}", mapping.name))
+            })
+            .unwrap_or_else(|| format!("tagged-userdata[{index}]")),
+        _ => tag.ty.to_string(),
+    };
+
+    if tag.optional {
+        base.push('?');
+    }
+
+    base
 }
 
 /// Decompiles Luau bytecode into Luau source code.
-pub fn decompile_bytecode(
-    bytecode: &[u8],
-    options: DecompileOptions,
-) -> Result<String, DisasmError> {
+pub fn decompile_bytecode(bytecode: &[u8], options: DecompileOptions) -> Result<String> {
     let diagnostics = Diagnostics::new(options.diagnostics);
     decompile_bytecode_with_diagnostics(bytecode, options.spill_locals, &diagnostics)
 }
@@ -68,7 +166,7 @@ pub fn decompile_bytecode_with_diagnostics(
     bytecode: &[u8],
     spill_locals: bool,
     diagnostics: &Diagnostics,
-) -> Result<String, DisasmError> {
+) -> Result<String> {
     let span = tracing::info_span!(
         "decompile_bytecode",
         byte_len = bytecode.len(),
@@ -77,7 +175,7 @@ pub fn decompile_bytecode_with_diagnostics(
     let _enter = span.enter();
 
     let disassembled = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let diagnostics = diagnostics.with_entry_proto(disassembled.entry_proto as usize);
+    let diagnostics = diagnostics.with_entry_proto(disassembled.entry_proto.0);
 
     let mut functions: Vec<_> = {
         let span = tracing::info_span!("structure_protos", proto_count = disassembled.protos.len());
@@ -86,8 +184,8 @@ pub fn decompile_bytecode_with_diagnostics(
         disassembled
             .protos
             .iter()
-            .map(|proto| StructuredFunction::from_proto(proto, &disassembled.protos, &diagnostics))
-            .collect()
+            .map(|proto| StructuredFunction::from_proto(proto, &disassembled, &diagnostics))
+            .collect::<Result<_, _>>()?
     };
 
     diagnostics
@@ -103,11 +201,11 @@ pub fn decompile_bytecode_with_diagnostics(
         .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
         .line(0, format_args!("emitting AST..."));
     let ast = {
-        let span = tracing::info_span!("emit_ast", entry_proto = disassembled.entry_proto as usize);
+        let span = tracing::info_span!("emit_ast", entry_proto = disassembled.entry_proto.0);
         let _enter = span.enter();
         emitter::emit_ast(
             functions,
-            disassembled.entry_proto as usize,
+            disassembled.entry_proto.0 as usize,
             EmitterOptions { spill_locals },
         )
     };
@@ -134,22 +232,22 @@ pub fn visualize_bytecode(
     bytecode: &[u8],
     output: impl AsRef<std::path::Path>,
     diagnostics: &Diagnostics,
-) -> Result<(), DisasmError> {
+) -> Result<()> {
+    use crate::hil::cflow::{cfg::ControlFlowGraph, visualize::dump_cfgs};
+
     let span = tracing::info_span!("visualize_bytecode", byte_len = bytecode.len());
     let _enter = span.enter();
-
-    use crate::hil::cflow::{cfg::ControlFlowGraph, visualize::dump_cfgs};
 
     let disassembly = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
     let cfgs: Vec<_> = disassembly
         .protos
         .iter()
-        .map(|proto| ControlFlowGraph::from_proto(proto, &disassembly.protos))
-        .collect();
+        .map(|proto| ControlFlowGraph::from_proto(proto, &disassembly))
+        .collect::<Result<_, _>>()?;
 
     dump_cfgs(
         &cfgs,
-        disassembly.entry_proto as usize,
+        disassembly.entry_proto.0 as usize,
         output.as_ref().to_path_buf(),
     );
     Ok(())

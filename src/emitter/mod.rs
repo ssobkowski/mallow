@@ -22,6 +22,7 @@ use crate::{
         lifter::ssa::SymbolId,
         visitor::Visitor,
     },
+    il::ProtoId,
 };
 
 const MAX_LOCAL_COUNT: usize = 199;
@@ -472,7 +473,7 @@ impl Emitter {
 
         // If the closure has a debug_name, visit_stmt will emit a LocalFunction
         // which natively handles recursion in Luau.
-        if self.functions[*proto].debug_name.is_some() {
+        if self.functions[proto.0 as usize].debug_name.is_some() {
             return;
         }
 
@@ -498,11 +499,12 @@ impl Emitter {
                             // If value is a named closure, reserve its debug_name
                             // as the symbol name before declaring/symbol_expr.
                             if let HilExpr::Closure { proto, .. } = value {
-                                let debug_name = self.functions[*proto].debug_name.clone();
-                                if let Some(ref name) = debug_name {
+                                let debug_name =
+                                    self.functions[proto.0 as usize].debug_name.clone();
+                                if let Some(name) = debug_name {
                                     self.current_context_mut()
                                         .plan
-                                        .reserve_symbol_name_exact(*sym, name.clone().into());
+                                        .reserve_symbol_name_exact(*sym, name.into());
                                     named_closure = true;
                                 }
                             }
@@ -775,7 +777,6 @@ impl Emitter {
                 expr: Box::new(self.visit_expr(expr)),
             },
             HilExpr::Global(name) => Expr::Named(Identifier::new(name.clone())),
-            HilExpr::Import(import) => Expr::Named(Identifier::new(import.clone())),
             HilExpr::GetField { obj, field } => {
                 let base = Box::new(self.visit_expr(obj));
 
@@ -851,7 +852,8 @@ impl Emitter {
             .collect()
     }
 
-    fn visit_closure(&mut self, proto_idx: usize, captures: &[SymbolId]) -> Expr {
+    fn visit_closure(&mut self, proto_idx: ProtoId, captures: &[SymbolId]) -> Expr {
+        let proto_idx = proto_idx.0 as usize;
         let parent_bindings: Vec<_> = captures
             .iter()
             .map(|sym| {

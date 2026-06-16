@@ -207,7 +207,6 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
             }
         }
         HilExpr::Global(name) => visitor.visit_global(name),
-        HilExpr::Import(path) => visitor.visit_import(path),
         HilExpr::GetField { obj, .. } => visitor.visit_expr(obj),
         HilExpr::GetIndex { obj, index } => {
             visitor.visit_expr(obj);
@@ -376,7 +375,6 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut HilExpr
             }
         }
         HilExpr::Global(name) => visitor.visit_global(name),
-        HilExpr::Import(path) => visitor.visit_import(path),
         HilExpr::GetField { obj, .. } => visitor.visit_expr(obj),
         HilExpr::GetIndex { obj, index } => {
             visitor.visit_expr(obj);

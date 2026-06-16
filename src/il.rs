@@ -1,32 +1,110 @@
-#![allow(dead_code)]
+use std::{fmt, rc::Rc};
 
-use std::fmt;
-
+use anyhow::{Result, ensure};
 use smallvec::{SmallVec, smallvec};
 
-use crate::{
-    common::Spanned,
-    hil::common::{decoded_count, reg_range},
-};
+use crate::common::Spanned;
+
+/// An index into the constant table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConstId(pub u32);
+
+/// An index into the proto table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProtoId(pub u16);
+
+impl std::fmt::Display for ProtoId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// An index into the child proto table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChildProtoId(pub u16);
+
+/// An index into the string table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StringId(pub u32);
+
+/// An encoded import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImportPath(pub u32);
+
+impl ImportPath {
+    /// Returns an iterator over the [`ConstId`]s referenced by this import path.
+    #[inline]
+    pub fn const_ids(self) -> Result<impl Iterator<Item = ConstId>> {
+        let path = self.0;
+        let count = (path >> 30) as usize;
+        ensure!((1..=3).contains(&count), "invalid import path");
+
+        let ids = [
+            ConstId((path >> 20) & 0x3ff),
+            ConstId((path >> 10) & 0x3ff),
+            ConstId(path & 0x3ff),
+        ];
+
+        Ok(ids.into_iter().take(count))
+    }
+}
+
+/// A free-standing Luau string.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LuauString(pub Rc<[u8]>);
+
+impl LuauString {
+    /// Returns the byte-exact string contents stored in bytecode.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for LuauString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for &byte in self.as_bytes() {
+            write!(f, "{}", char::from(byte))?;
+        }
+        Ok(())
+    }
+}
 
 /// Represents the types of values that can be present in the constant table.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Constant {
     Nil,
     Boolean(bool),
-    // Function(Function), i don't have a function struct yet
     Number(f64),
-    String(String),
-    Import(u32),
-    Closure(u64),
-    /// A table constant, stored as a vector of indices into the constant table.
-    Table(Vec<usize>),
-    Vector {
-        x: f32,
-        y: f32,
-        z: f32,
-        w: f32,
-    },
+    String(StringId),
+    Import(ImportPath),
+    Table(Vec<ConstId>),
+    Closure(ProtoId),
+    Vector { x: f32, y: f32, z: f32, w: f32 },
+    TableWithConstants(Vec<(ConstId, ConstId)>),
+    Integer(i64),
+    // LBC10+
+    // ClassShape(Box<[u8]>),
+}
+
+impl Constant {
+    /// Returns the bytecode constant variant name for diagnostics.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Nil => "nil",
+            Self::Boolean(_) => "boolean",
+            Self::Number(_) => "number",
+            Self::String(_) => "string",
+            Self::Import(_) => "import",
+            Self::Table(_) => "table",
+            Self::Closure(_) => "closure",
+            Self::Vector { .. } => "vector",
+            Self::TableWithConstants(_) => "table-with-constants",
+            Self::Integer(_) => "integer",
+        }
+    }
 }
 
 /// Represents a Luau count.
@@ -34,6 +112,24 @@ pub enum Constant {
 pub enum Count {
     Number(u8),
     Variadic,
+}
+
+impl Count {
+    #[inline]
+    #[must_use]
+    pub const fn new(encoded: u8) -> Self {
+        match encoded {
+            0 => Count::Variadic,
+            n => Count::Number(n - 1),
+        }
+    }
+}
+
+impl From<u8> for Count {
+    #[inline]
+    fn from(encoded: u8) -> Self {
+        Count::new(encoded)
+    }
 }
 
 /// Represents a Luau instruction.
@@ -288,10 +384,11 @@ pub enum Instr {
 }
 
 impl Instr {
-    const LOP_COUNT: u8 = 83; // LOP__COUNT (not a valid opcode)
+    pub const LOP_COUNT: u8 = 83; // LOP__COUNT (not a valid opcode)
 
     /// Returns whether the given opcode requires an auxiliary register.
-    const fn opcode_requires_aux(opcode: u8) -> bool {
+    #[must_use]
+    pub const fn opcode_requires_aux(opcode: u8) -> bool {
         matches!(
             opcode,
             7 | 8
@@ -412,13 +509,13 @@ impl Instr {
 
             Instr::Call {
                 func, ret_count, ..
-            } => match decoded_count(*ret_count) {
+            } => match Count::from(*ret_count) {
                 Count::Number(n) => reg_range(*func, n).collect(),
                 // TODO: how do you even determine this?
                 Count::Variadic => smallvec![],
             },
 
-            Instr::GetVarArgs { dest, count } => match decoded_count(*count) {
+            Instr::GetVarArgs { dest, count } => match Count::from(*count) {
                 Count::Number(n) => reg_range(*dest, n).collect(),
                 Count::Variadic => unreachable!(),
             },
@@ -427,14 +524,13 @@ impl Instr {
         }
     }
 
-    fn new(value: u32, aux: Option<u32>) -> Result<Self, String> {
+    pub fn new(value: u32, aux: Option<u32>) -> Result<Self> {
         let opcode = (value & 0xff) as u8;
-        if opcode >= Self::LOP_COUNT {
-            return Err(format!(
-                "invalid Luau opcode {} in header word 0x{value:08x}",
-                opcode
-            ));
-        }
+        ensure!(
+            opcode < Self::LOP_COUNT,
+            "invalid Luau opcode {} in header word 0x{value:08x}",
+            opcode
+        );
 
         // ABC encoding
         let a = ((value >> 8) & 0xff) as u8;
@@ -779,12 +875,6 @@ impl Instr {
     }
 }
 
-impl From<u32> for Instr {
-    fn from(value: u32) -> Self {
-        Self::new(value, None).unwrap_or_else(|err| panic!("{err}"))
-    }
-}
-
 impl fmt::Display for Instr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -980,42 +1070,179 @@ impl fmt::Display for Instr {
     }
 }
 
-pub fn decode_stream_with_word_pcs(words: &[u32]) -> Vec<Spanned<Instr>> {
-    let mut out = Vec::new();
-    let mut pc = 0usize;
+#[derive(Debug, Clone)]
+pub struct LocalDebug {
+    pub name: StringId,
+    pub start_pc: usize,
+    pub end_pc: usize,
+    pub register: u8,
+}
 
-    while pc < words.len() {
-        let header_pc = pc;
-        let header = words[header_pc];
-        let opcode = (header & 0xff) as u8;
+/// A free-standing representation of value's type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BytecodeType {
+    Nil,
+    Boolean,
+    Number,
+    String,
+    Table,
+    Function,
+    Thread,
+    Userdata,
+    Vector,
+    Buffer,
+    Integer,
+    Any,
+    TaggedUserdata(u8),
+    Unknown(u8),
+}
 
-        if opcode >= Instr::LOP_COUNT {
-            panic!(
-                "invalid Luau opcode {} at word pc {} (0x{header:08x})",
-                opcode, header_pc
-            );
+impl BytecodeType {
+    const OPTIONAL: u8 = 0x80;
+
+    const fn from_byte(value: u8) -> Self {
+        match value & !Self::OPTIONAL {
+            0 => Self::Nil,
+            1 => Self::Boolean,
+            2 => Self::Number,
+            3 => Self::String,
+            4 => Self::Table,
+            5 => Self::Function,
+            6 => Self::Thread,
+            7 => Self::Userdata,
+            8 => Self::Vector,
+            9 => Self::Buffer,
+            10 => Self::Integer,
+            15 => Self::Any,
+            tag @ 64..=95 => Self::TaggedUserdata(tag - 64),
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+impl fmt::Display for BytecodeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Nil => write!(f, "nil"),
+            Self::Boolean => write!(f, "boolean"),
+            Self::Number => write!(f, "number"),
+            Self::String => write!(f, "string"),
+            Self::Table => write!(f, "table"),
+            Self::Function => write!(f, "function"),
+            Self::Thread => write!(f, "thread"),
+            Self::Userdata => write!(f, "userdata"),
+            Self::Vector => write!(f, "vector"),
+            Self::Buffer => write!(f, "buffer"),
+            Self::Integer => write!(f, "integer"),
+            Self::Any => write!(f, "any"),
+            Self::TaggedUserdata(index) => write!(f, "tagged-userdata[{index}]"),
+            Self::Unknown(value) => write!(f, "unknown-type({value})"),
+        }
+    }
+}
+
+/// A type tag of a symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeTag {
+    pub ty: BytecodeType,
+    pub optional: bool,
+    pub raw: u8,
+}
+
+impl TypeTag {
+    pub const fn from_byte(value: u8) -> Self {
+        Self {
+            ty: BytecodeType::from_byte(value),
+            optional: value & BytecodeType::OPTIONAL != 0,
+            raw: value,
+        }
+    }
+}
+
+impl fmt::Display for TypeTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.ty)?;
+
+        if self.optional {
+            write!(f, "?")?;
         }
 
-        let aux = if Instr::opcode_requires_aux(opcode) {
-            pc += 1;
-            if pc >= words.len() {
-                panic!(
-                    "truncated bytecode: opcode {} at word pc {} requires AUX word",
-                    opcode, header_pc
-                );
-            }
-            Some(words[pc])
-        } else {
-            None
-        };
+        Ok(())
+    }
+}
 
-        out.push(Spanned::new(
-            Instr::new(header, aux)
-                .unwrap_or_else(|_| panic!("failed to decode instruction at word pc {header_pc}")),
-            header_pc,
-        ));
-        pc += 1;
+#[derive(Debug, Default, Clone)]
+pub struct FunctionTypeInfo {
+    pub num_params: u8,
+    pub params: Vec<TypeTag>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalTypeInfo {
+    pub ty: TypeTag,
+    pub register: u8,
+    pub start_pc: usize,
+    pub end_pc: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ProtoTypeInfo {
+    pub function: Option<FunctionTypeInfo>,
+    pub upvalues: Vec<TypeTag>,
+    pub locals: Vec<LocalTypeInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserdataTypeMapping {
+    pub index: u8,
+    pub name: Option<StringId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Proto {
+    pub id: ProtoId,
+    pub max_stack_size: u8,
+    pub num_params: u8,
+    pub num_upvals: u8,
+    pub is_vararg: bool,
+    pub flags: u8,
+    pub type_info: ProtoTypeInfo,
+    pub instrs: Vec<Spanned<Instr>>,
+    pub consts: Vec<Constant>,
+    pub child_protos: Vec<ProtoId>,
+    pub debug_name: Option<StringId>,
+    pub locals: Vec<LocalDebug>,
+}
+
+impl Proto {
+    /// Resolves a constant by its index.
+    #[inline]
+    pub fn get_constant(&self, id: ConstId) -> Option<&Constant> {
+        self.consts.get(id.0 as usize)
     }
 
-    out
+    /// Resolves a proto by its index.
+    #[inline]
+    pub fn get_child_proto(&self, id: ChildProtoId) -> Option<ProtoId> {
+        self.child_protos.get(id.0 as usize).copied()
+    }
+}
+
+/// Adds an offset to a register.
+///
+/// # Panics
+///
+/// Panics if the register overflow occurs.
+pub const fn reg_add(reg: u8, offset: u8) -> u8 {
+    reg.checked_add(offset).expect("register overflow")
+}
+
+/// Returns an iterator over a range of registers.
+///
+/// # Panics
+///
+/// Panics if the register range overflow occurs.
+pub const fn reg_range(start: u8, count: u8) -> impl Iterator<Item = u8> {
+    let end = start.checked_add(count).expect("register range overflow");
+    start..end
 }

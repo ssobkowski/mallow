@@ -196,7 +196,7 @@ impl Analyzer {
     fn analyze(fun: &StructuredFunction) -> Self {
         let span = tracing::info_span!(
             "post_region_inlining_analyze",
-            proto = fun.proto,
+            proto = fun.proto.0,
             symbol_count = tracing::field::Empty,
             effect_count = tracing::field::Empty,
             position_count = tracing::field::Empty,
@@ -534,6 +534,7 @@ impl<'a> Inliner<'a> {
                                 || is_adjacent_assignment_consumer(
                                     &stmts[idx],
                                     sym,
+                                    &rhs,
                                     source_idx,
                                     idx,
                                 ))
@@ -939,7 +940,7 @@ impl<'a> Inliner<'a> {
         }
         if !rhs.is_pure()
             && !matches!(rhs, HilExpr::Symbol(_))
-            && !is_adjacent_assignment_consumer(&stmts[use_idx], sym, source_idx, use_idx)
+            && !is_adjacent_assignment_consumer(&stmts[use_idx], sym, rhs, source_idx, use_idx)
         {
             return false;
         }
@@ -1035,10 +1036,10 @@ impl<'a> Inliner<'a> {
         match fun {
             HilExpr::Closure { proto, .. } => self
                 .return_arities
-                .get(*proto)
+                .get(proto.0 as usize)
                 .copied()
                 .unwrap_or(ReturnArity::Unknown),
-            HilExpr::Global(name) | HilExpr::Import(name) => luau_global_arity(name),
+            HilExpr::Global(name) => luau_global_arity(name),
             HilExpr::Symbol(sym) => self
                 .analysis
                 .facts
@@ -1092,12 +1093,13 @@ fn can_substitute_in_stmt_context(stmt: &HilStmt, sym: SymbolId, rhs: &HilExpr) 
 fn can_substitute_in_expr_context(expr: &HilExpr, sym: SymbolId, rhs: &HilExpr) -> bool {
     rhs.is_pure()
         || matches!(rhs, HilExpr::Symbol(_))
-        || can_inline_effectful_at_expr_occurrence(expr, sym)
+        || can_inline_effectful_at_expr_occurrence(expr, sym, rhs)
 }
 
 fn is_adjacent_assignment_consumer(
     stmt: &HilStmt,
     sym: SymbolId,
+    rhs: &HilExpr,
     source_idx: usize,
     use_idx: usize,
 ) -> bool {
@@ -1108,15 +1110,17 @@ fn is_adjacent_assignment_consumer(
     !left.reads_symbol(&sym)
         && left.is_pure()
         && use_idx == source_idx + 1
-        && can_inline_effectful_at_expr_occurrence(value, sym)
+        && can_inline_effectful_at_expr_occurrence(value, sym, rhs)
 }
 
 fn is_call_statement_consumer(stmt: &HilStmt, sym: SymbolId, rhs: &HilExpr) -> bool {
     matches!(stmt, HilStmt::Call(expr) if can_substitute_in_expr_context(expr, sym, rhs))
 }
 
-fn can_inline_effectful_at_expr_occurrence(expr: &HilExpr, sym: SymbolId) -> bool {
-    count_symbol_reads_in_expr(expr, sym) == 1 && occurrence_has_no_prior_effect(expr, sym)
+fn can_inline_effectful_at_expr_occurrence(expr: &HilExpr, sym: SymbolId, rhs: &HilExpr) -> bool {
+    count_symbol_reads_in_expr(expr, sym) == 1
+        && occurrence_has_no_prior_effect(expr, sym)
+        && !occurrence_is_final_multiret_position(expr, sym, rhs)
 }
 
 fn occurrence_has_no_prior_effect(expr: &HilExpr, sym: SymbolId) -> bool {
@@ -1211,8 +1215,34 @@ fn occurrence_has_no_prior_effect(expr: &HilExpr, sym: SymbolId) -> bool {
         | HilExpr::Bool(_)
         | HilExpr::Closure { .. }
         | HilExpr::Global(_)
-        | HilExpr::Import(_)
         | HilExpr::VarArgs => false,
+    }
+}
+
+fn occurrence_is_final_multiret_position(expr: &HilExpr, sym: SymbolId, rhs: &HilExpr) -> bool {
+    if !matches!(
+        rhs,
+        HilExpr::Call { .. } | HilExpr::MethodCall { .. } | HilExpr::VarArgs
+    ) {
+        return false;
+    }
+
+    match expr {
+        HilExpr::Call { fun, args } => {
+            if fun.reads_symbol(&sym) {
+                return false;
+            }
+
+            args.last().is_some_and(|arg| arg.reads_symbol(&sym))
+        }
+        HilExpr::MethodCall { object, args, .. } => {
+            if object.reads_symbol(&sym) {
+                return false;
+            }
+
+            args.last().is_some_and(|arg| arg.reads_symbol(&sym))
+        }
+        _ => false,
     }
 }
 
@@ -1228,7 +1258,7 @@ pub fn run(fun: &mut StructuredFunction, return_arities: &[ReturnArity]) -> bool
         iteration += 1;
         let span = tracing::info_span!(
             "post_region_inlining_iteration",
-            proto = fun.proto,
+            proto = fun.proto.0,
             iteration,
             changed = tracing::field::Empty,
         );

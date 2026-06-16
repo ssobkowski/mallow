@@ -1,10 +1,13 @@
 use std::fmt::Display;
 
-use smol_str::SmolStr;
+use anyhow::{Context, Result, bail};
+use smol_str::{SmolStr, ToSmolStr};
 
 use crate::ast::{BinOp, UnOp};
 use crate::common::ToSpanned;
+use crate::disasm::Chunk;
 use crate::hil::lifter::ssa::SymbolId;
+use crate::il::{Constant, ImportPath, Proto, ProtoId};
 
 /// An expression in the high-level intermediate representation.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,13 +24,11 @@ pub enum HilExpr {
     Symbol(SymbolId),
     /// A closure literal and the proto/captures needed to rebuild nested functions.
     Closure {
-        proto: usize,
+        proto: ProtoId,
         captures: Vec<SymbolId>,
     },
     /// A global variable, identified by its name.
     Global(SmolStr),
-    /// A Luau import path, identified by its printable source name.
-    Import(SmolStr),
     /// A field access expression (`obj.field`).
     GetField { obj: Box<HilExpr>, field: SmolStr },
     /// An index access expression (`obj[index]`).
@@ -135,8 +136,7 @@ impl HilExpr {
             | HilExpr::String(_)
             | HilExpr::Bool(_)
             | HilExpr::Symbol(_)
-            | HilExpr::Global(_)
-            | HilExpr::Import(_) => true,
+            | HilExpr::Global(_) => true,
             HilExpr::GetField { obj, .. } => obj.is_pure(),
             HilExpr::GetIndex { obj, index } => obj.is_pure() && index.is_pure(),
             HilExpr::Unary { expr, .. } => expr.is_pure(),
@@ -205,6 +205,93 @@ impl HilExpr {
             other => HilExpr::not(other),
         }
     }
+
+    /// Returns the HIL expression corresponding to the given constant value.
+    pub fn from_constant(ct: &Constant, chunk: &Chunk, proto: &Proto) -> Result<Self> {
+        match ct {
+            Constant::Nil => Ok(Self::Nil),
+            Constant::Boolean(b) => Ok(Self::Bool(*b)),
+            Constant::Number(n) => Ok(Self::Number(*n)),
+            Constant::String(s) => Ok(Self::String(
+                chunk
+                    .get_string(*s)
+                    .with_context(|| format!("invalid string key {:?}", *s))?
+                    .to_string(),
+            )),
+            Constant::Import(i) => Self::import(*i, chunk, proto),
+            Constant::Table(consts) => {
+                let mut items = Vec::with_capacity(consts.len());
+                for const_id in consts {
+                    let value = proto.get_constant(*const_id).with_context(|| {
+                        format!("constant with key {:?} was not found", const_id)
+                    })?;
+                    items.push(HilTableItem::List(Self::from_constant(
+                        value, chunk, proto,
+                    )?));
+                }
+                Ok(Self::Table { items })
+            }
+            Constant::Closure(_) => bail!("constant closures aren't supported"),
+            Constant::Vector { x, y, z, w } => Ok({
+                Self::Call {
+                    fun: Box::new(Self::GetField {
+                        obj: Box::new(Self::Global("vector".into())),
+                        field: "create".into(),
+                    }),
+                    args: [*x as f64, *y as f64, *z as f64, *w as f64]
+                        .map(HilExpr::Number)
+                        .to_vec(),
+                }
+            }),
+            Constant::TableWithConstants(consts) => {
+                let mut items = Vec::with_capacity(consts.len());
+                for (key_id, value_id) in consts {
+                    let key = proto
+                        .get_constant(*key_id)
+                        .with_context(|| format!("constant with key {:?} was not found", key_id))?;
+                    let value = proto.get_constant(*value_id).with_context(|| {
+                        format!("constant with value {:?} was not found", value_id)
+                    })?;
+                    items.push(HilTableItem::Index(
+                        Self::from_constant(key, chunk, proto)?,
+                        Self::from_constant(value, chunk, proto)?,
+                    ));
+                }
+                Ok(Self::Table { items })
+            }
+            Constant::Integer(_) => todo!("integer expressions aren't implemented yet"),
+        }
+    }
+
+    /// Returns the access expression built from a packed import path.
+    pub fn import(path: ImportPath, chunk: &Chunk, proto: &Proto) -> Result<HilExpr> {
+        let mut names = Vec::new();
+
+        for id in path.const_ids()? {
+            let Some(Constant::String(string_id)) = proto.get_constant(id) else {
+                bail!("import path component {id:?} is not a string constant");
+            };
+
+            names.push(
+                chunk
+                    .get_string(*string_id)
+                    .with_context(|| format!("invalid import string id {string_id:?}"))?
+                    .to_smolstr(),
+            );
+        }
+
+        let first = names.remove(0);
+        let mut expr = HilExpr::Global(first);
+
+        for field in names {
+            expr = HilExpr::GetField {
+                obj: Box::new(expr),
+                field,
+            };
+        }
+
+        Ok(expr)
+    }
 }
 
 impl Display for HilExpr {
@@ -217,7 +304,6 @@ impl Display for HilExpr {
             HilExpr::Symbol(s) => write!(f, "v{}", s.index()),
             HilExpr::Closure { proto, .. } => write!(f, "<closure {}>", proto),
             HilExpr::Global(g) => write!(f, "{}", g),
-            HilExpr::Import(i) => write!(f, "import(\"{}\")", i),
             HilExpr::GetField { obj, field } => write!(f, "{}.{}", obj, field),
             HilExpr::GetIndex { obj, index } => write!(f, "{}[{}]", obj, index),
             HilExpr::Call { fun, args } => {

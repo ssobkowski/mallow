@@ -42,36 +42,39 @@ pub fn run(fns: &mut [StructuredFunction]) {
         .collect();
 
     for fun in fns {
-        let span = tracing::info_span!("post_region_function", proto = fun.proto);
+        let span = tracing::info_span!("post_region_function", proto = fun.proto.0);
         let _enter = span.enter();
         let mut iteration = 0;
 
         loop {
             iteration += 1;
+            let proto_index = fun.proto.0;
 
-            let mut changed = run_pass!(fun.proto, iteration, "inlining_post_region", {
+            let mut changed = run_pass!(proto_index, iteration, "inlining_post_region", {
                 inlining::run_post_region(fun, &return_arities)
             });
-            changed |= run_pass!(fun.proto, iteration, "tuple_assign", {
+            changed |= run_pass!(proto_index, iteration, "tuple_assign", {
                 tuple_assign::run(fun)
             });
-            changed |= run_pass!(fun.proto, iteration, "fold_tables", {
+            changed |= run_pass!(proto_index, iteration, "fold_tables", {
                 fold_tables::run(fun)
             });
-            changed |= run_pass!(fun.proto, iteration, "short_circuit", {
+            changed |= run_pass!(proto_index, iteration, "short_circuit", {
                 short_circuit::run(fun)
             });
-            changed |= run_pass!(fun.proto, iteration, "fold_bool_assign", {
+            changed |= run_pass!(proto_index, iteration, "fold_bool_assign", {
                 fold_bool_assign::run(fun)
             });
-            changed |= run_pass!(fun.proto, iteration, "continue_cleanup", {
+            changed |= run_pass!(proto_index, iteration, "continue_cleanup", {
                 continue_cleanup::run(fun)
             });
-            changed |= run_pass!(fun.proto, iteration, "terminator_cleanup", {
+            changed |= run_pass!(proto_index, iteration, "terminator_cleanup", {
                 terminator_cleanup::run(fun)
             });
-            changed |= run_pass!(fun.proto, iteration, "nested_ifs", { nested_ifs::run(fun) });
-            changed |= run_pass!(fun.proto, iteration, "normalize", { normalize::run(fun) });
+            changed |= run_pass!(proto_index, iteration, "nested_ifs", {
+                nested_ifs::run(fun)
+            });
+            changed |= run_pass!(proto_index, iteration, "normalize", { normalize::run(fun) });
 
             if !changed {
                 break;
