@@ -87,25 +87,6 @@ pub enum Constant {
                                                          // ClassShape(Box<[u8]>), // LBC10+
 }
 
-impl Constant {
-    /// Returns the bytecode constant variant name for diagnostics.
-    #[must_use]
-    pub const fn kind(&self) -> &'static str {
-        match self {
-            Self::Nil => "nil",
-            Self::Boolean(_) => "boolean",
-            Self::Number(_) => "number",
-            Self::String(_) => "string",
-            Self::Import(_) => "import",
-            Self::Table => "table",
-            Self::Closure(_) => "closure",
-            Self::Vector { .. } => "vector",
-            Self::TableWithConstants(_) => "table-with-constants",
-            Self::Integer(_) => "integer",
-        }
-    }
-}
-
 /// Represents a Luau count.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Count {
