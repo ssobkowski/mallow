@@ -249,7 +249,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
             // NAMECALL can consume through the following CALL, so this one needs
             // special handling / lookahead.
-            Instr::NameCall { .. } => true,
+            Instr::NameCall { .. } | Instr::NameCallUData { .. } => true,
 
             _ => false,
         }
@@ -341,6 +341,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     method,
                     ..
                 } => self.lift_namecall(*dest, *object, *method)?,
+                Instr::NameCallUData {
+                    dest,
+                    object,
+                    method,
+                    ..
+                } => self.lift_namecall(*dest, *object, u32::from(*method))?,
                 Instr::Call {
                     func,
                     arg_count,
@@ -355,6 +361,22 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 } => {
                     let sym = self.get_reg_symbol(*table);
                     let field = self.const_string(ConstId(*key))?;
+                    self.assign_reg(
+                        *dest,
+                        HilExpr::GetField {
+                            obj: Box::new(HilExpr::Symbol(sym)),
+                            field: field.to_smolstr(),
+                        },
+                    );
+                }
+                Instr::GetUDataKS {
+                    dest,
+                    userdata,
+                    key,
+                    ..
+                } => {
+                    let sym = self.get_reg_symbol(*userdata);
+                    let field = self.const_string(ConstId(u32::from(*key)))?;
                     self.assign_reg(
                         *dest,
                         HilExpr::GetField {
@@ -393,6 +415,20 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     self.assign(
                         HilExpr::GetField {
                             obj: Box::new(HilExpr::Symbol(table_sym)),
+                            field: field.to_smolstr(),
+                        },
+                        HilExpr::Symbol(value_sym),
+                    );
+                }
+                Instr::SetUDataKS {
+                    src, userdata, key, ..
+                } => {
+                    let userdata_sym = self.get_reg_symbol(*userdata);
+                    let value_sym = self.get_reg_symbol(*src);
+                    let field = self.const_string(ConstId(u32::from(*key)))?;
+                    self.assign(
+                        HilExpr::GetField {
+                            obj: Box::new(HilExpr::Symbol(userdata_sym)),
                             field: field.to_smolstr(),
                         },
                         HilExpr::Symbol(value_sym),

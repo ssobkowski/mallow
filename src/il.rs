@@ -361,10 +361,33 @@ pub enum Instr {
     IDiv { dest: u8, a: u8, b: u8 },
     /// dest = reg // const (integer division)
     IDivK { dest: u8, reg: u8, k: u8 },
+
+    // 83..85: atom-based userdata field access acceleration
+    /// Userdata field read with constant string key.
+    GetUDataKS {
+        dest: u8,
+        userdata: u8,
+        slot: u16,
+        key: u16,
+    },
+    /// Userdata field write with constant string key.
+    SetUDataKS {
+        src: u8,
+        userdata: u8,
+        slot: u16,
+        key: u16,
+    },
+    /// Userdata method call setup: dest+1 = object, dest = object\[method\]
+    NameCallUData {
+        dest: u8,
+        object: u8,
+        slot: u16,
+        method: u16,
+    },
 }
 
 impl Instr {
-    pub const LOP_COUNT: u8 = 83; // LOP__COUNT (not a valid opcode)
+    pub const LOP_COUNT: u8 = 86; // LOP__COUNT (not a valid opcode)
 
     /// Returns whether the given opcode requires an auxiliary register.
     #[must_use]
@@ -393,6 +416,9 @@ impl Instr {
                 | 78
                 | 79
                 | 80
+                | 83
+                | 84
+                | 85
         )
     }
 
@@ -442,6 +468,7 @@ impl Instr {
             | Instr::GetImport { dest: reg, .. }
             | Instr::GetTable { dest: reg, .. }
             | Instr::GetTableKS { dest: reg, .. }
+            | Instr::GetUDataKS { dest: reg, .. }
             | Instr::NewClosure { dest: reg, .. }
             | Instr::Add { dest: reg, .. }
             | Instr::Sub { dest: reg, .. }
@@ -529,6 +556,8 @@ impl Instr {
         let aux_a = (aux_word & 0xff) as u8;
         let aux_b = ((aux_word >> 8) & 0xff) as u8;
         let aux_kv = aux_word & 0x00ff_ffff;
+        let aux_kv16 = (aux_word & 0xffff) as u16;
+        let aux_slot = (aux_word >> 16) as u16;
         let aux_not = (aux_word >> 31) != 0;
 
         let instr = match opcode {
@@ -848,6 +877,24 @@ impl Instr {
                 reg: b,
                 k: c,
             },
+            83 => Instr::GetUDataKS {
+                dest: a,
+                userdata: b,
+                slot: aux_slot,
+                key: aux_kv16,
+            },
+            84 => Instr::SetUDataKS {
+                src: a,
+                userdata: b,
+                slot: aux_slot,
+                key: aux_kv16,
+            },
+            85 => Instr::NameCallUData {
+                dest: a,
+                object: b,
+                slot: aux_slot,
+                method: aux_kv16,
+            },
             _ => unreachable!("opcode range was validated"),
         };
 
@@ -886,6 +933,15 @@ impl fmt::Display for Instr {
             Instr::SetTableKS {
                 src, table, key, ..
             } => write!(f, "SETTABLEKS R{src} R{table} K{key}"),
+            Instr::GetUDataKS {
+                dest,
+                userdata,
+                key,
+                ..
+            } => write!(f, "GETUDATAKS R{dest} R{userdata} K{key}"),
+            Instr::SetUDataKS {
+                src, userdata, key, ..
+            } => write!(f, "SETUDATAKS R{src} R{userdata} K{key}"),
             Instr::GetTableN { dest, table, index } => {
                 write!(f, "GETTABLEN R{dest} R{table} {index}")
             }
@@ -899,6 +955,12 @@ impl fmt::Display for Instr {
                 method,
                 ..
             } => write!(f, "NAMECALL R{dest} R{object} K{method}"),
+            Instr::NameCallUData {
+                dest,
+                object,
+                method,
+                ..
+            } => write!(f, "NAMECALLUDATA R{dest} R{object} K{method}"),
 
             // calls, returns, branches
             Instr::Call {
