@@ -4,7 +4,7 @@
 
 a [Luau](https://luau.org) bytecode disassembler and decompiler.
 
-> **Note:** only Luau bytecode version 6 is supported.
+> **Note:** only Luau bytecode versions 5 through 8 are supported.
 
 ## Features
 

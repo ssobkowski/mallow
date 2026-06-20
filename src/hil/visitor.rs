@@ -3,7 +3,7 @@ use smol_str::SmolStr;
 use crate::hil::{
     StructuredFunction,
     cflow::region::RegionNode,
-    ir::{HilExpr, HilStmt, HilTableItem, PhiNode},
+    ir::{HilExpr, HilNumber, HilStmt, HilTableItem, PhiNode},
     lifter::ssa::SymbolId,
 };
 
@@ -43,7 +43,7 @@ pub trait Visitor {
 
     fn visit_symbol(&mut self, _sym: SymbolId) {}
 
-    fn visit_number(&mut self, _number: f64) {}
+    fn visit_number(&mut self, _number: HilNumber) {}
 
     fn visit_string(&mut self, _string: &str) {}
 
@@ -90,7 +90,7 @@ pub trait VisitorMut {
 
     fn visit_symbol(&mut self, _sym: &mut SymbolId) {}
 
-    fn visit_number(&mut self, _number: &mut f64) {}
+    fn visit_number(&mut self, _number: &mut HilNumber) {}
 
     fn visit_string(&mut self, _string: &mut String) {}
 

@@ -79,13 +79,12 @@ pub enum Constant {
     Number(f64),
     String(StringId),
     Import(ImportPath),
-    Table(Vec<ConstId>),
+    Table,
     Closure(ProtoId),
     Vector { x: f32, y: f32, z: f32, w: f32 },
-    TableWithConstants(Vec<(ConstId, ConstId)>),
-    Integer(i64),
-    // LBC10+
-    // ClassShape(Box<[u8]>),
+    TableWithConstants(Vec<(ConstId, Option<ConstId>)>), // LBC7+
+    Integer(i64),                                        // LBC8+
+                                                         // ClassShape(Box<[u8]>), // LBC10+
 }
 
 impl Constant {
@@ -98,7 +97,7 @@ impl Constant {
             Self::Number(_) => "number",
             Self::String(_) => "string",
             Self::Import(_) => "import",
-            Self::Table(_) => "table",
+            Self::Table => "table",
             Self::Closure(_) => "closure",
             Self::Vector { .. } => "vector",
             Self::TableWithConstants(_) => "table-with-constants",

@@ -19,7 +19,7 @@ impl SymbolStorage {
             SymbolStorage::Named(name) => Expr::Named(name),
             SymbolStorage::Spilled(SpillSlot { table, slot }) => Expr::Index {
                 base: Box::new(Expr::Named(table)),
-                index: Box::new(Expr::Literal(Literal::Number(slot as f64))),
+                index: Box::new(Expr::Literal(Literal::Float(slot as f64))),
             },
         }
     }

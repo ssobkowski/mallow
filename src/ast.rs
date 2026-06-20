@@ -248,8 +248,10 @@ pub enum Expr {
 pub enum Literal {
     /// `nil`.
     Nil,
-    /// Numeric literal.
-    Number(f64),
+    /// Luau integer literal.
+    Integer(i64),
+    /// Float literal.
+    Float(f64),
     /// String literal.
     String(SmolStr),
     /// Boolean literal.

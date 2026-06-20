@@ -9,13 +9,31 @@ use crate::disasm::Chunk;
 use crate::hil::lifter::ssa::SymbolId;
 use crate::il::{Constant, ImportPath, Proto, ProtoId};
 
+/// A numeric literal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HilNumber {
+    /// A 64-bit Luau integer literal.
+    Integer(i64),
+    /// A floating-point literal.
+    Float(f64),
+}
+
+impl std::fmt::Display for HilNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HilNumber::Integer(n) => write!(f, "{}i", n),
+            HilNumber::Float(n) => write!(f, "{}", n),
+        }
+    }
+}
+
 /// An expression in the high-level intermediate representation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HilExpr {
     /// The `nil` value.
     Nil,
     /// A numeric literal.
-    Number(f64),
+    Number(HilNumber),
     /// A string literal.
     String(String),
     /// A boolean literal.
@@ -211,7 +229,7 @@ impl HilExpr {
         match ct {
             Constant::Nil => Ok(Self::Nil),
             Constant::Boolean(b) => Ok(Self::Bool(*b)),
-            Constant::Number(n) => Ok(Self::Number(*n)),
+            Constant::Number(n) => Ok(Self::Number(HilNumber::Float(*n))),
             Constant::String(s) => Ok(Self::String(
                 chunk
                     .get_string(*s)
@@ -219,18 +237,7 @@ impl HilExpr {
                     .to_string(),
             )),
             Constant::Import(i) => Self::import(*i, chunk, proto),
-            Constant::Table(consts) => {
-                let mut items = Vec::with_capacity(consts.len());
-                for const_id in consts {
-                    let value = proto.get_constant(*const_id).with_context(|| {
-                        format!("constant with key {:?} was not found", const_id)
-                    })?;
-                    items.push(HilTableItem::List(Self::from_constant(
-                        value, chunk, proto,
-                    )?));
-                }
-                Ok(Self::Table { items })
-            }
+            Constant::Table => Ok(Self::Table { items: Vec::new() }),
             Constant::Closure(_) => bail!("constant closures aren't supported"),
             Constant::Vector { x, y, z, w } => Ok({
                 Self::Call {
@@ -238,14 +245,17 @@ impl HilExpr {
                         obj: Box::new(Self::Global("vector".into())),
                         field: "create".into(),
                     }),
-                    args: [*x as f64, *y as f64, *z as f64, *w as f64]
-                        .map(HilExpr::Number)
+                    args: [x, y, z, w]
+                        .map(|x| Self::Number(HilNumber::Float(*x as f64)))
                         .to_vec(),
                 }
             }),
             Constant::TableWithConstants(consts) => {
                 let mut items = Vec::with_capacity(consts.len());
                 for (key_id, value_id) in consts {
+                    let Some(value_id) = value_id else {
+                        continue;
+                    };
                     let key = proto
                         .get_constant(*key_id)
                         .with_context(|| format!("constant with key {:?} was not found", key_id))?;
@@ -259,7 +269,7 @@ impl HilExpr {
                 }
                 Ok(Self::Table { items })
             }
-            Constant::Integer(_) => todo!("integer expressions aren't implemented yet"),
+            Constant::Integer(n) => Ok(Self::Number(HilNumber::Integer(*n))),
         }
     }
 

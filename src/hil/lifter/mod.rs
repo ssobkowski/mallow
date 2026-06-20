@@ -12,7 +12,7 @@ use crate::{
     disasm::Chunk,
     hil::{
         cflow::graph::GraphView,
-        ir::{HilExpr, HilStmt},
+        ir::{HilExpr, HilNumber, HilStmt},
         lifter::{
             common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL},
             ssa::{Symbol, SymbolId},
@@ -281,7 +281,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 Instr::LoadNil { reg } => self.assign_reg(*reg, HilExpr::Nil),
                 Instr::LoadB { reg, value, .. } => self.assign_reg(*reg, HilExpr::Bool(*value)),
                 Instr::LoadN { reg, value } => {
-                    self.assign_reg(*reg, HilExpr::Number(*value as f64))
+                    self.assign_reg(*reg, HilExpr::Number(HilNumber::Float(*value as f64)))
                 }
                 Instr::LoadK { reg, index } => {
                     let value = self.const_expr(ConstId(*index as u32))?;
@@ -380,7 +380,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                         *dest,
                         HilExpr::GetIndex {
                             obj: Box::new(HilExpr::Symbol(sym)),
-                            index: Box::new(HilExpr::Number(*index as f64)),
+                            index: Box::new(HilExpr::Number(HilNumber::Float(*index as f64))),
                         },
                     );
                 }
@@ -404,7 +404,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     self.assign(
                         HilExpr::GetIndex {
                             obj: Box::new(HilExpr::Symbol(table_sym)),
-                            index: Box::new(HilExpr::Number(*index as f64)),
+                            index: Box::new(HilExpr::Number(HilNumber::Float(*index as f64))),
                         },
                         HilExpr::Symbol(value_sym),
                     );
@@ -464,7 +464,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                         HilExpr::Binary {
                             lhs: Box::new(HilExpr::Symbol(lhs_sym)),
                             op: binop_for_instr(&instr),
-                            rhs: Box::new(HilExpr::Number(num)),
+                            rhs: Box::new(HilExpr::Number(HilNumber::Float(num))),
                         },
                     );
                 }
@@ -481,7 +481,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     self.assign_reg(
                         *dest,
                         HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Number(num)),
+                            lhs: Box::new(HilExpr::Number(HilNumber::Float(num))),
                             op: binop_for_instr(&instr),
                             rhs: Box::new(HilExpr::Symbol(rhs_sym)),
                         },
@@ -519,9 +519,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     )
                 }
 
-                // Both variants produce an empty table that SETLIST fills in.
-                Instr::NewTable { dest, .. } | Instr::DupTable { dest, .. } => {
+                Instr::NewTable { dest, .. } => {
                     self.assign_reg(*dest, HilExpr::Table { items: Vec::new() });
+                }
+                Instr::DupTable { dest, k } => {
+                    let value = self.const_expr(ConstId(*k as u32))?;
+                    self.assign_reg(*dest, value);
                 }
 
                 Instr::SetList {

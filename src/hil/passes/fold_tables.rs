@@ -5,7 +5,7 @@
 
 use crate::hil::{
     StructuredFunction,
-    ir::{HilExpr, HilStmt, HilTableItem},
+    ir::{HilExpr, HilNumber, HilStmt, HilTableItem},
     visitor::VisitorMut,
 };
 
@@ -84,7 +84,8 @@ impl VisitorMut for Inliner {
                             let needs_index =
                                 (*base as usize).saturating_sub(array_items_size) != 1;
                             if needs_index {
-                                let index = HilExpr::Number(*base as f64 + i as f64);
+                                let index =
+                                    HilExpr::Number(HilNumber::Float(*base as f64 + i as f64));
                                 HilTableItem::Index(index, v.clone())
                             } else {
                                 HilTableItem::List(v.clone())

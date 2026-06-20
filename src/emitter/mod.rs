@@ -18,7 +18,7 @@ use crate::{
     hil::{
         StructuredFunction,
         cflow::region::RegionNode,
-        ir::{HilExpr, HilStmt, HilTableItem},
+        ir::{HilExpr, HilNumber, HilStmt, HilTableItem},
         lifter::ssa::SymbolId,
         visitor::Visitor,
     },
@@ -721,12 +721,12 @@ impl Emitter {
                                     }),
                                     args: vec![
                                         Expr::Named(temp_table_ident.clone()),
-                                        Expr::Literal(Literal::Number(1.0)),
+                                        Expr::Literal(Literal::Float(1.0)),
                                         Expr::Unary {
                                             op: UnOp::Length,
                                             expr: Box::new(Expr::Named(temp_table_ident)),
                                         },
-                                        Expr::Literal(Literal::Number(*index as f64)),
+                                        Expr::Literal(Literal::Float(*index as f64)),
                                         table_expr,
                                     ],
                                 },
@@ -738,7 +738,7 @@ impl Emitter {
                     let lhs = (base..base + values.len())
                         .map(|i| Expr::Index {
                             base: Box::new(table_expr.clone()),
-                            index: Box::new(Expr::Literal(Literal::Number(i as f64))),
+                            index: Box::new(Expr::Literal(Literal::Float(i as f64))),
                         })
                         .collect();
                     let rhs = values.iter().map(|v| self.visit_expr(v)).collect();
@@ -762,7 +762,10 @@ impl Emitter {
     fn visit_expr(&mut self, expr: &HilExpr) -> Expr {
         match expr {
             HilExpr::Nil => Expr::Literal(Literal::Nil),
-            HilExpr::Number(num) => Expr::Literal(Literal::Number(*num)),
+            HilExpr::Number(num) => match num {
+                HilNumber::Integer(i) => Expr::Literal(Literal::Integer(*i)),
+                HilNumber::Float(f) => Expr::Literal(Literal::Float(*f)),
+            },
             HilExpr::String(s) => Expr::Literal(Literal::String(s.into())),
             HilExpr::Bool(b) => Expr::Literal(Literal::Bool(*b)),
             HilExpr::Symbol(sym) => self.symbol_expr(*sym),

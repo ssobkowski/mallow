@@ -161,7 +161,7 @@ impl AstPrinter {
                 self.write(", ");
                 self.walk_expr(end, 0, Side::None);
                 if let Some(step) = step
-                    && !matches!(step, Expr::Literal(Literal::Number(1.0)))
+                    && !matches!(step, Expr::Literal(Literal::Float(1.0)))
                 {
                     self.write(", ");
                     self.walk_expr(step, 0, Side::None);
@@ -414,7 +414,14 @@ impl AstPrinter {
     fn write_literal(&mut self, lit: &Literal) {
         match lit {
             Literal::Nil => self.write("nil"),
-            Literal::Number(num) => {
+            Literal::Integer(num) => {
+                if *num == i64::MIN {
+                    self.write("(-9223372036854775807i - 1i)");
+                } else {
+                    self.write(&format!("{num}i"));
+                }
+            }
+            Literal::Float(num) => {
                 let rendered = if num.is_nan() {
                     "(0/0)".to_string()
                 } else if num.is_infinite() {
@@ -616,7 +623,30 @@ fn should_use_long_string(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_string, escaped_len, long_string_level, should_use_long_string};
+    use super::{escape_string, escaped_len, long_string_level, print, should_use_long_string};
+    use crate::ast::{Block, Expr, Literal, Stmt};
+
+    #[test]
+    fn prints_luau_integer_literals_with_suffix() {
+        let block = Block::with_stmts(vec![Stmt::Return {
+            values: vec![
+                Expr::Literal(Literal::Float(42.0)),
+                Expr::Literal(Literal::Integer(42)),
+                Expr::Literal(Literal::Integer(-42)),
+            ],
+        }]);
+
+        assert_eq!(print(&block, &[]), "return 42, 42i, -42i\n");
+    }
+
+    #[test]
+    fn prints_min_luau_integer_without_overflowing_positive_literal() {
+        let block = Block::with_stmts(vec![Stmt::Return {
+            values: vec![Expr::Literal(Literal::Integer(i64::MIN))],
+        }]);
+
+        assert_eq!(print(&block, &[]), "return (-9223372036854775807i - 1i)\n");
+    }
 
     #[test]
     fn escape_preserves_high_byte_values() {

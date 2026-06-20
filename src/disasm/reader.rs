@@ -88,8 +88,8 @@ impl<'b> BytecodeReader<'b> {
     pub fn read_chunk(&mut self) -> Result<Chunk> {
         let version = self.read::<u8>()?;
         ensure!(
-            version == 5 || version == 6,
-            "unsupported bytecode version {version}; expected version 5 or 6",
+            (5..=8).contains(&version),
+            "unsupported bytecode version {version}; expected version 5, 6, 7, or 8",
         );
 
         let types_version = self.read::<u8>()?;
@@ -214,12 +214,14 @@ impl<'b> BytecodeReader<'b> {
                 Ok(Constant::Import(ImportPath(path)))
             }
             5 => {
-                let len: usize = self.read_varint()?;
-                let mut keys = Vec::with_capacity(len);
+                let len = self.read_varint()?;
+                // Plain table constants only store template keys for DUPTABLE.
+                // The runtime initializes these keys with placeholders and real
+                // values are supplied by later SETTABLE/SETLIST instructions.
                 for _ in 0..len {
-                    keys.push(ConstId(self.read_varint()?));
+                    self.read_varint::<u32>()?;
                 }
-                Ok(Constant::Table(keys))
+                Ok(Constant::Table)
             }
             6 => Ok(Constant::Closure(ProtoId(self.read_varint()?))),
             7 => {
@@ -235,26 +237,32 @@ impl<'b> BytecodeReader<'b> {
                 })
             }
             8 => {
-                if version < 7 {
-                    bail!("constant {tag} not allowed in version {version}");
-                }
+                ensure!(
+                    version >= 7,
+                    "constant {tag} not allowed in version {version}"
+                );
 
                 let len: usize = self.read_varint()?;
                 let mut entries = Vec::with_capacity(len);
                 for _ in 0..len {
                     let key = ConstId(self.read_varint()?);
-                    let value = ConstId(self.read()?);
+                    let value = self.read::<i32>()?;
+                    let value = (value >= 0).then_some(ConstId(value as u32));
                     entries.push((key, value));
                 }
 
                 Ok(Constant::TableWithConstants(entries))
             }
             9 => {
-                if version < 8 {
-                    bail!("constant {tag} not allowed in version {version}");
-                }
+                ensure!(
+                    version >= 8,
+                    "constant {tag} not allowed in version {version}"
+                );
 
-                Ok(Constant::Integer(self.read_varint()?))
+                let is_negative = self.read::<u8>()? != 0;
+                let magnitude: u64 = self.read_varint()?;
+                let value = decode_integer_constant(is_negative, magnitude)?;
+                Ok(Constant::Integer(value))
             }
 
             other => bail!("unknown constant type {other} at byte {}", self.pos),
@@ -473,6 +481,24 @@ impl<'b> TypeReader<'b> {
         }
 
         Ok(FunctionTypeInfo { num_params, params })
+    }
+}
+
+#[inline]
+fn decode_integer_constant(is_negative: bool, magnitude: u64) -> Result<i64> {
+    if !is_negative {
+        return i64::try_from(magnitude).context("integer constant exceeds i64::MAX");
+    }
+
+    const MIN_MAGNITUDE: u64 = 1u64 << 63;
+    if magnitude > MIN_MAGNITUDE {
+        bail!("negative integer constant magnitude exceeds i64::MIN");
+    }
+
+    if magnitude == MIN_MAGNITUDE {
+        Ok(i64::MIN)
+    } else {
+        Ok(-(magnitude as i64))
     }
 }
 
