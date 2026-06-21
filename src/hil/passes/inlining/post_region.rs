@@ -7,7 +7,7 @@ use crate::hil::{
     cflow::region::RegionNode,
     ir::{HilExpr, HilStmt, HilTableItem, PhiNode},
     lifter::ssa::SymbolId,
-    passes::return_arity::luau_global_arity,
+    passes::return_arity::luau_libfunc_arity,
     visitor::{Visitor, walk_expr},
 };
 
@@ -1034,12 +1034,15 @@ impl<'a> Inliner<'a> {
 
     fn call_arity(&self, fun: &HilExpr) -> ReturnArity {
         match fun {
+            HilExpr::Global(_) => luau_libfunc_arity(fun),
+            HilExpr::GetField { obj, .. } if matches!(&**obj, HilExpr::Global(_)) => {
+                luau_libfunc_arity(fun)
+            }
             HilExpr::Closure { proto, .. } => self
                 .return_arities
                 .get(proto.0 as usize)
                 .copied()
                 .unwrap_or(ReturnArity::Unknown),
-            HilExpr::Global(name) => luau_global_arity(name),
             HilExpr::Symbol(sym) => self
                 .analysis
                 .facts
