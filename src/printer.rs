@@ -1,6 +1,7 @@
 use crate::{
-    ast::{BinOp, Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, UnOp},
+    ast::{BinOp, Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Typed, UnOp},
     common::escape_string,
+    hil::ty::{FunctionTypeParam, Type, TypeLiteral, TypePrecedence},
 };
 
 pub fn print(block: &Block, top_comments: &[String]) -> String {
@@ -123,12 +124,18 @@ impl AstPrinter {
             Stmt::If(if_stmt) => {
                 self.walk_if_stmt(if_stmt, true);
             }
-            Stmt::LocalFunction { name, params, body } => {
+            Stmt::LocalFunction {
+                name,
+                params,
+                body,
+                ty,
+            } => {
                 self.write("local function ");
                 self.write(name.as_str());
                 self.write("(");
                 self.write_params(params);
                 self.write(")");
+                self.write_type_annotation(ty.as_ref());
                 self.newline();
                 self.indent += 1;
                 self.walk_block(body);
@@ -138,7 +145,10 @@ impl AstPrinter {
             }
             Stmt::LocalDeclaration { names, values } => {
                 self.write("local ");
-                self.write_punctuated(names, ", ", |p, name| p.write(name.as_str()));
+                self.write_punctuated(names, ", ", |p, decl| {
+                    p.write(decl.as_ref().as_str());
+                    p.write_type_annotation(decl.ty());
+                });
                 if !values.is_empty() {
                     self.write(" = ");
                     self.write_punctuated(values, ", ", |p, value| {
@@ -404,11 +414,125 @@ impl AstPrinter {
         }
     }
 
-    fn write_params(&mut self, params: &[Parameter]) {
-        self.write_punctuated(params, ", ", |p, param| match param {
-            Parameter::Regular(name) => p.write(name.as_str()),
-            Parameter::Vararg => p.write("..."),
+    fn write_params(&mut self, params: &[Typed<Parameter>]) {
+        self.write_punctuated(params, ", ", |p, param| match param.as_ref() {
+            Parameter::Regular(ident) => {
+                p.write(ident.as_str());
+                p.write_type_annotation(param.ty());
+            }
+            Parameter::Vararg => {
+                p.write("...");
+                p.write_type_annotation(param.ty());
+            }
         });
+    }
+
+    fn write_type(&mut self, ty: &Type, parent_prec: TypePrecedence) {
+        let prec = ty.precedence();
+        let needs_parens = prec < parent_prec;
+
+        if needs_parens {
+            self.write("(");
+        }
+
+        match ty {
+            Type::Nil => self.write("nil"),
+            Type::String => self.write("string"),
+            Type::Number => self.write("number"),
+            Type::Boolean => self.write("boolean"),
+            Type::Table { key, value } => {
+                self.write("{ [");
+                self.write_type(key, TypePrecedence::Lowest);
+                self.write("]: ");
+                self.write_type(value, TypePrecedence::Lowest);
+                self.write(" }");
+            }
+            Type::Function {
+                generics,
+                params,
+                return_type,
+            } => {
+                if !generics.is_empty() {
+                    self.write("<");
+                    self.write_punctuated(generics, ", ", |p, generic| {
+                        p.write(generic);
+                    });
+                    self.write(">");
+                }
+                self.write("(");
+                self.write_punctuated(params, ", ", |p, param| match param {
+                    FunctionTypeParam::Type(ty) => p.write_type(ty, TypePrecedence::Lowest),
+                    FunctionTypeParam::Vararg(ty) => {
+                        p.write("...");
+                        p.write_type(ty, TypePrecedence::Lowest);
+                    }
+                });
+                self.write(") -> ");
+                if let Some(return_type) = return_type {
+                    self.write_type(return_type, TypePrecedence::Lowest);
+                } else {
+                    self.write_type(&Type::Unit, TypePrecedence::Lowest);
+                }
+            }
+            Type::Thread => self.write("thread"),
+            Type::Userdata => self.write("userdata"),
+            Type::Vector => self.write("vector"),
+            Type::Integer => self.write("integer"),
+            Type::Buffer => self.write("buffer"),
+            Type::Unknown => self.write("unknown"),
+            Type::Never => self.write("never"),
+            Type::Any => self.write("any"),
+            Type::Named(name) | Type::Generic(name) => self.write(name.as_str()),
+            Type::Unit => self.write("()"),
+            Type::Literal(literal) => self.write_type_literal(literal),
+            Type::Union(types) => {
+                self.write_punctuated(types, " | ", |p, ty| {
+                    p.write_type(ty, TypePrecedence::Union);
+                });
+            }
+            Type::Intersection(types) => {
+                self.write_punctuated(types, " & ", |p, ty| {
+                    p.write_type(ty, TypePrecedence::Intersection);
+                });
+            }
+            Type::Object(values) => {
+                self.write("{ ");
+                self.write_punctuated(values, ", ", |p, (name, ty)| {
+                    p.write(name.as_str());
+                    p.write(": ");
+                    p.write_type(ty, TypePrecedence::Lowest);
+                });
+                self.write(" }");
+            }
+            Type::WithMetatable { base, .. } => {
+                self.write_type(base, TypePrecedence::Lowest);
+            }
+            Type::Var(id) => {
+                self.write(&format!("_Type{}", id.index()));
+            }
+        }
+
+        if needs_parens {
+            self.write(")");
+        }
+    }
+
+    fn write_type_literal(&mut self, literal: &TypeLiteral) {
+        match literal {
+            TypeLiteral::String(value) => {
+                self.write("\"");
+                self.write(&escape_string(value));
+                self.write("\"");
+            }
+            TypeLiteral::Boolean(value) => self.write(if *value { "true" } else { "false" }),
+        }
+    }
+
+    fn write_type_annotation(&mut self, ty: Option<&Type>) {
+        if let Some(ty) = ty {
+            self.write(": ");
+            self.write_type(ty, TypePrecedence::Lowest);
+        }
     }
 
     fn write_literal(&mut self, lit: &Literal) {
@@ -450,29 +574,14 @@ impl AstPrinter {
         }
     }
 
-    /// Emits a Lua long string literal `[==[value]==]` at the given bracket level.
-    ///
-    /// Lua/Luau strips the very first newline that immediately follows the
-    /// opening bracket.  When the value itself starts with `\n` we emit an
-    /// extra one before the content so the round-trip is correct.
-    ///
-    /// The content and closing bracket are written directly to the output
-    /// buffer (bypassing the indent-injecting `write()`) because any
-    /// whitespace inside a long string is literal and must not be altered.
     fn write_long_string(&mut self, value: &str, level: usize) {
         let eq = "=".repeat(level);
-        // Opening bracket — goes through write() to pick up any pending indent.
         self.write(&format!("[{eq}["));
-        // If the value starts with '\n', Lua would strip it on read, so we
-        // emit one extra to compensate.
         if value.starts_with('\n') {
             self.out.push('\n');
         }
-        // Content goes verbatim; no indentation must be injected.
         self.out.push_str(value);
-        // Closing bracket immediately after the last byte of content.
         self.out.push_str(&format!("]{}]", eq));
-        // We are no longer at the start of a line.
         self.line_start = false;
     }
 
@@ -623,8 +732,25 @@ fn should_use_long_string(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_string, escaped_len, long_string_level, print, should_use_long_string};
+    use super::{
+        AstPrinter, escape_string, escaped_len, long_string_level, print, should_use_long_string,
+    };
     use crate::ast::{Block, Expr, Literal, Stmt};
+    use crate::hil::ty::{FunctionTypeParam, Type, TypePrecedence};
+
+    fn render_type(ty: &Type) -> String {
+        let mut printer = AstPrinter::new();
+        printer.write_type(ty, TypePrecedence::Lowest);
+        printer.finish()
+    }
+
+    fn unknown_function_type() -> Type {
+        Type::Function {
+            generics: Vec::new(),
+            params: vec![FunctionTypeParam::Vararg(Type::Unknown)],
+            return_type: Some(Box::new(Type::Unknown)),
+        }
+    }
 
     #[test]
     fn prints_luau_integer_literals_with_suffix() {
@@ -646,6 +772,34 @@ mod tests {
         }]);
 
         assert_eq!(print(&block, &[]), "return (-9223372036854775807i - 1i)\n");
+    }
+
+    #[test]
+    fn prints_optional_function_type_with_function_parenthesized() {
+        let ty = unknown_function_type().union(Type::Nil);
+
+        assert_eq!(render_type(&ty), "((...unknown) -> unknown) | nil");
+    }
+
+    #[test]
+    fn prints_function_return_union_without_changing_function_type() {
+        let ty = Type::Function {
+            generics: Vec::new(),
+            params: Vec::new(),
+            return_type: Some(Box::new(Type::Unknown.union(Type::Nil))),
+        };
+
+        assert_eq!(render_type(&ty), "() -> unknown | nil");
+    }
+
+    #[test]
+    fn prints_union_child_of_intersection_parenthesized() {
+        let ty = Type::Intersection(vec![
+            Type::Union(vec![Type::String, Type::Number]),
+            Type::Boolean,
+        ]);
+
+        assert_eq!(render_type(&ty), "(string | number) & boolean");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use crate::{
     ast::{
         Block, CompoundBinOp, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt,
-        TableItem, UnOp,
+        TableItem, Typed, UnOp,
     },
     common::is_valid_luau_identifier,
     emitter::{
@@ -147,7 +147,7 @@ impl Emitter {
             block.stmts.insert(
                 1 + self.contexts[self.current_ctx].anomalies.len(),
                 Stmt::LocalDeclaration {
-                    names: vec![table],
+                    names: vec![Typed::untyped(table)],
                     values: vec![Expr::Table { items: Vec::new() }],
                 },
             );
@@ -311,7 +311,7 @@ impl Emitter {
             let names: Vec<_> = hoisted
                 .iter()
                 .filter_map(|sym| match self.symbol_storage(*sym) {
-                    Some(SymbolStorage::Named(name)) => Some(name),
+                    Some(SymbolStorage::Named(name)) => Some(Typed::untyped(name)),
                     Some(SymbolStorage::Spilled(_)) | None => None,
                 })
                 .collect();
@@ -484,7 +484,7 @@ impl Emitter {
         self.declare_slot(slot);
         if let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym) {
             buf.push(Stmt::LocalDeclaration {
-                names: vec![name],
+                names: vec![Typed::untyped(name)],
                 values: Vec::new(),
             });
         }
@@ -532,7 +532,12 @@ impl Emitter {
                         && let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
                         && let Expr::AnonymousFunction { params, body } = right
                     {
-                        buf.push(Stmt::LocalFunction { name, params, body });
+                        buf.push(Stmt::LocalFunction {
+                            name,
+                            params,
+                            body,
+                            ty: None,
+                        });
                         return;
                     }
 
@@ -541,7 +546,7 @@ impl Emitter {
                         .expect("symbol was just declared in scope")
                     {
                         SymbolStorage::Named(name) => buf.push(Stmt::LocalDeclaration {
-                            names: vec![name],
+                            names: vec![Typed::untyped(name)],
                             values: vec![right],
                         }),
                         SymbolStorage::Spilled(_) => buf.push(Stmt::Assignment {
@@ -648,7 +653,7 @@ impl Emitter {
                     let names = storages
                         .into_iter()
                         .map(|storage| match storage {
-                            SymbolStorage::Named(name) => name,
+                            SymbolStorage::Named(name) => Typed::untyped(name),
                             SymbolStorage::Spilled(_) => unreachable!("guarded by all_named"),
                         })
                         .collect();
@@ -660,7 +665,7 @@ impl Emitter {
                 }
 
                 let temps: Vec<_> = (0..symbols.len())
-                    .map(|_| self.fresh_temp_local())
+                    .map(|_| Typed::untyped(self.fresh_temp_local()))
                     .collect();
                 buf.push(Stmt::LocalDeclaration {
                     names: temps.clone(),
@@ -670,10 +675,10 @@ impl Emitter {
                 for ((storage, was_declared), temp) in
                     storages.into_iter().zip(slot_was_declared).zip(temps)
                 {
-                    let rhs = vec![Expr::Named(temp)];
+                    let rhs = vec![Expr::Named(temp.as_ref().clone())];
                     match (storage, was_declared) {
                         (SymbolStorage::Named(name), false) => buf.push(Stmt::LocalDeclaration {
-                            names: vec![name],
+                            names: vec![Typed::untyped(name)],
                             values: rhs,
                         }),
                         (storage, true) | (storage @ SymbolStorage::Spilled(_), false) => {
@@ -706,7 +711,7 @@ impl Emitter {
                     buf.push(Stmt::Do {
                         body: Block::with_stmts(vec![
                             Stmt::LocalDeclaration {
-                                names: vec![temp_table_ident.clone()],
+                                names: vec![Typed::untyped(temp_table_ident.clone())],
                                 values: vec![Expr::Table {
                                     items: values
                                         .iter()
@@ -893,10 +898,10 @@ impl Emitter {
         let is_vararg = self.functions[proto_idx].is_vararg;
         let mut params: Vec<_> = param_symbols
             .into_iter()
-            .map(|sym| Parameter::Regular(self.get_symbol_name_for(child_ctx, sym)))
+            .map(|sym| Typed::untyped(Parameter::Regular(self.get_symbol_name_for(child_ctx, sym))))
             .collect();
         if is_vararg {
-            params.push(Parameter::Vararg);
+            params.push(Typed::untyped(Parameter::Vararg));
         }
 
         let body = self.visit_function(child_ctx);

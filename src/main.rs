@@ -70,13 +70,17 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Debug info level, passed as '-g<n>' to the Luau compiler.
+        /// Optimization level, passed as '-O<n>' to the Luau compiler.
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2))]
         opt_level: Option<u8>,
 
-        /// Optimization level, passed as '-O<n>' to the Luau compiler.
+        /// Debug info level, passed as '-g<n>' to the Luau compiler.
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2))]
         debug_level: Option<u8>,
+
+        /// Type info level, passed as '-t<n>' to the Luau compiler.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
+        type_level: Option<u8>,
 
         /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
         #[arg(long)]
@@ -131,6 +135,7 @@ fn main() -> Result<()> {
             output,
             opt_level,
             debug_level,
+            type_level,
             spill_locals,
         } => {
             let mut cmd = Command::new("luau-compile");
@@ -142,13 +147,16 @@ fn main() -> Result<()> {
             if let Some(debug_level) = debug_level {
                 cmd.arg(format!("-g{}", debug_level));
             }
+            if let Some(type_level) = type_level {
+                cmd.arg(format!("-t{}", type_level));
+            }
 
             let compile_out = cmd.output()?;
 
             ensure!(
                 compile_out.status.success(),
-                "failed to compile: {:?}",
-                &output
+                "failed to compile:\n{}",
+                String::from_utf8_lossy(&compile_out.stderr).trim()
             );
 
             let code = decompile_bytecode_with_diagnostics(

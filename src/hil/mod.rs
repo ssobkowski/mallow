@@ -2,6 +2,7 @@ pub mod cflow;
 pub mod ir;
 pub mod lifter;
 pub mod passes;
+pub mod ty;
 pub mod visitor;
 
 use anyhow::Result;

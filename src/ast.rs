@@ -2,6 +2,8 @@ use std::fmt::Display;
 
 use smol_str::SmolStr;
 
+use crate::hil::ty::Type;
+
 /// An identifier such as `foo`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct Identifier(pub SmolStr);
@@ -95,19 +97,21 @@ pub enum Stmt {
     },
     /// `if ... then ... [else ...] end`.
     If(If),
-    /// `local function name(params) body end`.
+    /// `local function name(params): type body end`.
     LocalFunction {
         /// Function name.
         name: Identifier,
         /// Function parameters.
-        params: Vec<Parameter>,
+        params: Vec<Typed<Parameter>>,
         /// Function body.
         body: Block,
+        /// Optional return type.
+        ty: Option<Type>,
     },
     /// `local a, b = ...`.
     LocalDeclaration {
-        /// Declared local names.
-        names: Vec<Identifier>,
+        /// Declared local names with optional types.
+        names: Vec<Typed<Identifier>>,
         /// Optional initial values.
         values: Vec<Expr>,
     },
@@ -214,7 +218,7 @@ pub enum Expr {
     /// Anonymous function expression.
     AnonymousFunction {
         /// Function parameters.
-        params: Vec<Parameter>,
+        params: Vec<Typed<Parameter>>,
         /// Function body.
         body: Block,
     },
@@ -272,10 +276,35 @@ pub enum TableItem {
 /// Function parameter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Parameter {
-    /// Regular parameter name.
+    /// Regular parameter name with an optional type.
     Regular(Identifier),
-    /// Vararg parameter (`...`).
+    /// Typed vararg parameter (`...`).
     Vararg,
+}
+
+/// A wrapper for a node with an optional type annotation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Typed<T> {
+    node: T,
+    ty: Option<Type>,
+}
+
+impl<T> Typed<T> {
+    pub const fn new(node: T, ty: Type) -> Self {
+        Self { node, ty: Some(ty) }
+    }
+
+    pub const fn untyped(node: T) -> Self {
+        Self { node, ty: None }
+    }
+
+    pub const fn as_ref(&self) -> &T {
+        &self.node
+    }
+
+    pub const fn ty(&self) -> Option<&Type> {
+        self.ty.as_ref()
+    }
 }
 
 /// Binary operator.
