@@ -70,6 +70,14 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
+        /// Debug info level, passed as '-g<n>' to the Luau compiler.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2))]
+        opt_level: Option<u8>,
+
+        /// Optimization level, passed as '-O<n>' to the Luau compiler.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2))]
+        debug_level: Option<u8>,
+
         /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
         #[arg(long)]
         spill_locals: bool,
@@ -121,12 +129,21 @@ fn main() -> Result<()> {
         Commands::Roundtrip {
             input,
             output,
+            opt_level,
+            debug_level,
             spill_locals,
         } => {
-            let compile_out = Command::new("luau-compile")
-                .arg("--binary")
-                .arg(input)
-                .output()?;
+            let mut cmd = Command::new("luau-compile");
+            cmd.arg("--binary");
+            cmd.arg(input);
+            if let Some(opt_level) = opt_level {
+                cmd.arg(format!("-O{}", opt_level));
+            }
+            if let Some(debug_level) = debug_level {
+                cmd.arg(format!("-g{}", debug_level));
+            }
+
+            let compile_out = cmd.output()?;
 
             ensure!(
                 compile_out.status.success(),
