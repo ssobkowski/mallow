@@ -335,20 +335,6 @@ impl BinOp {
         }
     }
 
-    /// Returns whether this binary operator is a compound operator.
-    pub const fn is_compound(&self) -> bool {
-        matches!(
-            self,
-            BinOp::Add
-                | BinOp::Sub
-                | BinOp::Mul
-                | BinOp::Div
-                | BinOp::IDiv
-                | BinOp::Mod
-                | BinOp::Pow
-        )
-    }
-
     /// Inverts this binary operator, if it is a comparison operator.
     ///
     /// Returns `None` for non-comparison operators.
@@ -422,18 +408,20 @@ impl Display for CompoundBinOp {
     }
 }
 
-impl From<BinOp> for CompoundBinOp {
-    fn from(op: BinOp) -> Self {
+impl TryFrom<BinOp> for CompoundBinOp {
+    type Error = ();
+
+    fn try_from(op: BinOp) -> Result<Self, Self::Error> {
         match op {
-            BinOp::Add => CompoundBinOp::Add,
-            BinOp::Sub => CompoundBinOp::Sub,
-            BinOp::Mul => CompoundBinOp::Mul,
-            BinOp::Div => CompoundBinOp::Div,
-            BinOp::IDiv => CompoundBinOp::IDiv,
-            BinOp::Mod => CompoundBinOp::Mod,
-            BinOp::Pow => CompoundBinOp::Pow,
-            BinOp::Concat => CompoundBinOp::Concat,
-            _ => unreachable!(),
+            BinOp::Add => Ok(CompoundBinOp::Add),
+            BinOp::Sub => Ok(CompoundBinOp::Sub),
+            BinOp::Mul => Ok(CompoundBinOp::Mul),
+            BinOp::Div => Ok(CompoundBinOp::Div),
+            BinOp::IDiv => Ok(CompoundBinOp::IDiv),
+            BinOp::Mod => Ok(CompoundBinOp::Mod),
+            BinOp::Pow => Ok(CompoundBinOp::Pow),
+            BinOp::Concat => Ok(CompoundBinOp::Concat),
+            _ => Err(()),
         }
     }
 }

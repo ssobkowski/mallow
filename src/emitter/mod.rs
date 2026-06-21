@@ -9,7 +9,10 @@ mod storage;
 use std::collections::HashSet;
 
 use crate::{
-    ast::{Block, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt, TableItem, UnOp},
+    ast::{
+        Block, CompoundBinOp, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt,
+        TableItem, UnOp,
+    },
     common::is_valid_luau_identifier,
     emitter::{
         collectors::ReadCollector, declarations::DeclarationState, options::EmitterOptions,
@@ -550,11 +553,11 @@ impl Emitter {
                     if let Expr::Binary { lhs, op, rhs } = &right
                         && left.is_pure()
                         && lhs.as_ref() == &left_expr
-                        && op.is_compound()
+                        && let Ok(compound_op) = CompoundBinOp::try_from(*op)
                     {
                         buf.push(Stmt::CompoundAssignment {
                             lhs: left_expr,
-                            op: (*op).into(),
+                            op: compound_op,
                             rhs: rhs.as_ref().clone(),
                         });
                         return;
