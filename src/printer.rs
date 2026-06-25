@@ -507,9 +507,6 @@ impl AstPrinter {
             Type::WithMetatable { base, .. } => {
                 self.write_type(base, TypePrecedence::Lowest);
             }
-            Type::Var(id) => {
-                self.write(&format!("_Type{}", id.index()));
-            }
         }
 
         if needs_parens {
@@ -732,6 +729,8 @@ fn should_use_long_string(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use smallvec::SmallVec;
+
     use super::{
         AstPrinter, escape_string, escaped_len, long_string_level, print, should_use_long_string,
     };
@@ -746,7 +745,7 @@ mod tests {
 
     fn unknown_function_type() -> Type {
         Type::Function {
-            generics: Vec::new(),
+            generics: SmallVec::new(),
             params: vec![FunctionTypeParam::Vararg(Type::Unknown)],
             return_type: Some(Box::new(Type::Unknown)),
         }
@@ -784,7 +783,7 @@ mod tests {
     #[test]
     fn prints_function_return_union_without_changing_function_type() {
         let ty = Type::Function {
-            generics: Vec::new(),
+            generics: SmallVec::new(),
             params: Vec::new(),
             return_type: Some(Box::new(Type::Unknown.union(Type::Nil))),
         };

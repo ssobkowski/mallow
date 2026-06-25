@@ -1223,8 +1223,8 @@ pub struct FunctionTypeInfo {
 pub struct LocalTypeInfo {
     pub ty: TypeTag,
     pub register: u8,
-    pub start_pc: usize,
-    pub end_pc: usize,
+    pub start_pc: u32,
+    pub end_pc: u32,
 }
 
 #[derive(Debug, Default, Clone)]

@@ -5,6 +5,7 @@ use id_arena::{Arena, Id};
 use crate::hil::{
     cflow::{cfg::Block, graph::GraphView},
     ir::{HilStmt, PhiNode},
+    ty::TypeId,
 };
 
 pub type SymbolId = Id<Symbol>;
@@ -13,6 +14,8 @@ pub type SymbolId = Id<Symbol>;
 pub struct Symbol {
     /// The original storage role this symbol represents.
     pub kind: SymbolKind,
+    /// Bytecode-provided type fact for this symbol, if one was available.
+    pub ty: Option<TypeId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,25 +45,34 @@ impl Symbol {
     pub const fn reg(reg: u8) -> Self {
         Self {
             kind: SymbolKind::Register(reg),
+            ty: None,
         }
     }
 
     pub const fn upval(index: u8) -> Self {
         Self {
             kind: SymbolKind::Upvalue(index),
+            ty: None,
         }
     }
 
     pub const fn captured_reg(reg: u8, generation: u16) -> Self {
         Self {
             kind: SymbolKind::CapturedRegister { reg, generation },
+            ty: None,
         }
     }
 
     pub const fn param(index: u8) -> Self {
         Self {
             kind: SymbolKind::Param(index),
+            ty: None,
         }
+    }
+
+    pub fn with_type(mut self, ty: Option<TypeId>) -> Self {
+        self.ty = ty;
+        self
     }
 }
 
@@ -229,7 +241,8 @@ impl<'a, G: GraphView> Ssa<'a, G> {
 
         let replacement = same.unwrap_or_else(|| {
             let kind = self.arena[phi_sym].kind;
-            self.arena.alloc(Symbol { kind })
+            let ty = self.arena[phi_sym].ty;
+            self.arena.alloc(Symbol { kind, ty })
         });
 
         self.phi_to_operands.remove(&phi_sym);

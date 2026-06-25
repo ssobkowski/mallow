@@ -14,6 +14,7 @@ use crate::{
             LiftContext, MultiRet, flush_multiret, lift,
             ssa::{Ssa as LifterSsa, Symbol, SymbolId, SymbolKind},
         },
+        ty::{ProtoTypeContext, TypeId, TypeStore},
         visitor::{Visitor, VisitorMut},
     },
     il::{ConstId, Count, Proto, reg_add, reg_range},
@@ -26,6 +27,8 @@ pub(super) struct BuildResult {
     pub blocks: Vec<Block>,
     pub params: Vec<SymbolId>,
     pub upvalues: Vec<SymbolId>,
+    pub symbol_types: HashMap<SymbolId, TypeId>,
+    pub type_store: TypeStore,
 }
 
 /// Lifts raw blocks into HIL blocks and resolves temporary SSA versions.
@@ -48,6 +51,8 @@ struct BlockBuilder<'a, G: GraphView> {
     chunk: &'a Chunk,
     raw_blocks: &'a [RawBlock],
     graph: &'a G,
+    type_store: TypeStore,
+    type_context: ProtoTypeContext,
     blocks: Vec<Block>,
     ssa: LifterSsa<'a, G>,
     params: Vec<SymbolId>,
@@ -57,11 +62,16 @@ struct BlockBuilder<'a, G: GraphView> {
 
 impl<'a, G: GraphView> BlockBuilder<'a, G> {
     fn new(proto: &'a Proto, chunk: &'a Chunk, raw_blocks: &'a [RawBlock], graph: &'a G) -> Self {
+        let mut type_store = TypeStore::new();
+        let type_context = ProtoTypeContext::from_proto(proto, chunk, &mut type_store);
+
         Self {
             proto,
             chunk,
             raw_blocks,
             graph,
+            type_store,
+            type_context,
             blocks: vec![Block::dummy(); raw_blocks.len()],
             ssa: LifterSsa::new(graph),
             params: Vec::with_capacity(proto.num_params as usize),
@@ -75,25 +85,31 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
         self.initialize_entry_symbols();
         self.lift_blocks()?;
         self.collect_loop_carried_versions();
-        self.finalize();
+        let symbol_types = self.finalize();
 
         Ok(BuildResult {
             blocks: self.blocks,
             params: self.params,
             upvalues: self.upvalues,
+            symbol_types,
+            type_store: self.type_store,
         })
     }
 
     /// Seeds entry-block SSA state for parameters and declared upvalues.
     fn initialize_entry_symbols(&mut self) {
         for i in 0..self.proto.num_params {
-            let sym = self.ssa.alloc_symbol(Symbol::param(i));
+            let sym = self
+                .ssa
+                .alloc_symbol(Symbol::param(i).with_type(self.type_context.param(i)));
             self.ssa.write_reg(0, i, sym);
             self.params.push(sym);
         }
 
         for i in 0..self.proto.num_upvals {
-            let sym = self.ssa.alloc_symbol(Symbol::upval(i));
+            let sym = self
+                .ssa
+                .alloc_symbol(Symbol::upval(i).with_type(self.type_context.upvalue(i)));
             self.ssa.write_upval(0, i, sym);
             self.upvalues.push(sym);
         }
@@ -114,6 +130,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
             instrs: &self.proto.instrs[raw_block.instr_range.clone()],
             chunk: self.chunk,
             proto: self.proto,
+            type_context: &self.type_context,
             ssa: &mut self.ssa,
             block_idx: block_id,
         })?;
@@ -152,15 +169,16 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
 
         let exit = &self.raw_blocks[block_id].exit;
         let exit_writes = &self.raw_blocks[block_id].exit_writes;
+        let exit_pc = self.raw_blocks[block_id].exit_pc;
         match exit {
             RawBlockExit::Jump(t) => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
-                self.apply_exit_writes(block_id, exit_writes);
+                self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::Jump(*t))
             }
             RawBlockExit::Fallthrough(t) => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
-                self.apply_exit_writes(block_id, exit_writes);
+                self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::Fallthrough(*t))
             }
             RawBlockExit::CondJump {
@@ -170,7 +188,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 let cond = self.lower_cond(block_id, cond)?;
-                self.apply_exit_writes(block_id, exit_writes);
+                self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::CondJump {
                     cond,
                     then_block: *then_block,
@@ -190,7 +208,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                 let step = self.ssa.read_reg(block_id, reg_add(*base, 1));
 
                 // These are terminator/edge writes.
-                self.apply_exit_writes(block_id, exit_writes);
+                self.apply_exit_writes(block_id, exit_pc, exit_writes);
 
                 // This is a successor/body-block read. It must happen after exit_writes.
                 let var = self.ssa.read_reg(*body_block, reg_add(*base, 2));
@@ -211,7 +229,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                 exit_block,
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
-                self.apply_exit_writes(block_id, exit_writes);
+                self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::FornLoop {
                     base: *base,
                     body_block: *body_block,
@@ -229,7 +247,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                     HilExpr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 1))),
                     HilExpr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 2))),
                 ];
-                self.apply_exit_writes(block_id, exit_writes);
+                self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::ForgPrep {
                     base: *base,
                     body_block: *body_block,
@@ -244,7 +262,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
                 result_count,
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
-                self.apply_exit_writes(block_id, exit_writes);
+                self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::ForgLoop {
                     base: *base,
                     body_block: *body_block,
@@ -420,8 +438,9 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
         written_regs
     }
 
-    /// Seals SSA, emits Phi nodes, and rewrites all symbols to canonical IDs.
-    fn finalize(&mut self) {
+    /// Seals SSA, emits Phi nodes, rewrites all symbols to canonical IDs, and
+    /// returns bytecode type facts keyed by those canonical symbols.
+    fn finalize(&mut self) -> HashMap<SymbolId, TypeId> {
         self.ssa.seal_blocks();
         self.ssa.finish(&mut self.blocks);
 
@@ -440,6 +459,20 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
         for sym in &mut self.upvalues {
             *sym = disjoint_set.find(self.ssa.resolve(*sym));
         }
+
+        self.ssa
+            .arena()
+            .iter()
+            .filter_map(|(id, symbol)| symbol.ty.map(|ty| (id, ty)))
+            .fold(HashMap::new(), |mut acc, (id, ty)| {
+                let canonical = disjoint_set.find(self.ssa.resolve(id));
+
+                acc.entry(canonical)
+                    .and_modify(|existing| *existing = self.type_store.union(*existing, ty))
+                    .or_insert(ty);
+
+                acc
+            })
     }
 
     /// Unions Phi targets with operands except for loop-preheader loop variables.
@@ -488,9 +521,10 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
     }
 
     /// Applies exit writes to the SSA block, writing each register in `exit_writes` to a fresh symbol.
-    fn apply_exit_writes(&mut self, block_id: usize, exit_writes: &[u8]) {
+    fn apply_exit_writes(&mut self, block_id: usize, exit_pc: Option<u32>, exit_writes: &[u8]) {
         for &reg in exit_writes {
-            let sym = self.ssa.alloc_symbol(Symbol::reg(reg));
+            let ty = exit_pc.and_then(|pc| self.type_context.local_at(reg, pc));
+            let sym = self.ssa.alloc_symbol(Symbol::reg(reg).with_type(ty));
             self.ssa.write_reg(block_id, reg, sym);
         }
     }

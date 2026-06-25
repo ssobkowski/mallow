@@ -433,7 +433,7 @@ impl<'b> TypeReader<'b> {
             let ty = self.read_type_tag()?;
             let register: u8 = self.reader.read()?;
             let start_pc = self.reader.read_varint()?;
-            let pc_len: usize = self.reader.read_varint()?;
+            let pc_len: u32 = self.reader.read_varint()?;
             locals.push(LocalTypeInfo {
                 ty,
                 register,

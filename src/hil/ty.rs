@@ -1,11 +1,10 @@
-use id_arena::Id;
+use id_arena::{Arena, Id};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::{
-    common::is_valid_luau_identifier,
     disasm::Chunk,
-    il::{BytecodeType, TypeTag},
+    il::{BytecodeType, Proto, TypeTag},
 };
 
 pub type TypeId = Id<Type>;
@@ -84,7 +83,7 @@ pub enum Type {
     /// The `function` type, described as `<generics>(params) -> return_type`.
     Function {
         /// The generics of the function, such as `<T, U>`.
-        generics: Vec<SmolStr>,
+        generics: SmallVec<[SmolStr; 3]>,
         /// The parameters of the function, such as `(number, string)`.
         params: Vec<FunctionTypeParam>,
         /// The return type of the function, such as `string`.
@@ -126,8 +125,6 @@ pub enum Type {
         base: Box<Type>,
         metatable: Metatable,
     },
-    /// A custom type with an identifier.
-    Var(TypeId),
 }
 
 impl Type {
@@ -146,7 +143,7 @@ impl Type {
                 value: Box::new(Self::Unknown),
             },
             BytecodeType::Function => Self::Function {
-                generics: Vec::new(),
+                generics: SmallVec::new(),
                 params: vec![FunctionTypeParam::Vararg(Self::Unknown)],
                 return_type: Some(Box::new(Self::Unknown)),
             },
@@ -166,10 +163,6 @@ impl Type {
                         .and_then(|name| chunk.get_string(name))
                         .map(|name| name.to_string())
                 })?;
-
-                if !is_valid_luau_identifier(&name) {
-                    return None;
-                }
 
                 Self::Named(name.into())
             }
@@ -273,6 +266,159 @@ impl Type {
             Type::WithMetatable { base, .. } => base.precedence(),
             _ => TypePrecedence::Primary,
         }
+    }
+
+    /// Returns whether a bytecode-derived type is useful enough to print as a
+    /// source annotation.
+    pub fn is_meaningful(&self) -> bool {
+        match self {
+            Type::Unknown | Type::Any => false,
+            Type::Table { key, value }
+                if matches!(key.as_ref(), Type::Unknown)
+                    && matches!(value.as_ref(), Type::Unknown) =>
+            {
+                false
+            }
+            Type::Function {
+                generics,
+                params,
+                return_type,
+            } if generics.is_empty()
+                && matches!(
+                    params.as_slice(),
+                    [FunctionTypeParam::Vararg(Type::Unknown)]
+                )
+                && matches!(return_type.as_deref(), Some(Type::Unknown)) =>
+            {
+                false
+            }
+            Type::Union(types) => types
+                .iter()
+                .filter(|ty| !matches!(ty, Type::Nil))
+                .any(Type::is_meaningful),
+            _ => true,
+        }
+    }
+}
+
+/// Owns Luau type nodes and exposes cheap handles for HIL metadata.
+#[derive(Debug, Clone, Default)]
+pub struct TypeStore {
+    arena: Arena<Type>,
+}
+
+impl TypeStore {
+    /// Creates an empty type store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stores a type and returns its stable handle.
+    pub fn alloc(&mut self, ty: Type) -> TypeId {
+        self.arena.alloc(ty)
+    }
+
+    /// Returns the type node for `id`.
+    pub fn get(&self, id: TypeId) -> &Type {
+        &self.arena[id]
+    }
+
+    /// Converts compact bytecode type information into a stored Luau type,
+    /// and inserts it into the arena.
+    pub fn from_bytecode_tag(&mut self, tag: TypeTag, chunk: &Chunk) -> Option<TypeId> {
+        Type::from_bytecode_tag(tag, chunk).map(|ty| self.alloc(ty))
+    }
+
+    /// Stores and returns the union of two existing type nodes.
+    pub fn union(&mut self, lhs: TypeId, rhs: TypeId) -> TypeId {
+        if lhs == rhs {
+            return lhs;
+        }
+
+        let merged = self.get(lhs).clone().union(self.get(rhs).clone());
+        self.alloc(merged)
+    }
+}
+
+/// A bytecode-provided local or temporary type tied to a physical register
+/// lifetime.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalTypeBinding {
+    pub ty: TypeId,
+    pub register: u8,
+    pub start_pc: u32,
+    pub end_pc: u32,
+}
+
+/// Type facts decoded from one proto's bytecode metadata.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProtoTypeContext {
+    params: Vec<Option<TypeId>>,
+    upvalues: Vec<Option<TypeId>>,
+    locals: Vec<LocalTypeBinding>,
+}
+
+impl ProtoTypeContext {
+    /// Builds a type context from the compact type records attached to `proto`.
+    pub fn from_proto(proto: &Proto, chunk: &Chunk, type_store: &mut TypeStore) -> Self {
+        let params = proto
+            .type_info
+            .function
+            .as_ref()
+            .map(|function| {
+                function
+                    .params
+                    .iter()
+                    .map(|tag| type_store.from_bytecode_tag(*tag, chunk))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let upvalues = proto
+            .type_info
+            .upvalues
+            .iter()
+            .map(|tag| type_store.from_bytecode_tag(*tag, chunk))
+            .collect();
+
+        let locals = proto
+            .type_info
+            .locals
+            .iter()
+            .filter_map(|local| {
+                let ty = type_store.from_bytecode_tag(local.ty, chunk)?;
+                Some(LocalTypeBinding {
+                    ty,
+                    register: local.register,
+                    start_pc: local.start_pc,
+                    end_pc: local.end_pc,
+                })
+            })
+            .collect();
+
+        Self {
+            params,
+            upvalues,
+            locals,
+        }
+    }
+
+    /// Returns the bytecode type for a function parameter, if one exists.
+    pub fn param(&self, index: u8) -> Option<TypeId> {
+        self.params.get(index as usize).copied().flatten()
+    }
+
+    /// Returns the bytecode type for an upvalue, if one exists.
+    pub fn upvalue(&self, index: u8) -> Option<TypeId> {
+        self.upvalues.get(index as usize).copied().flatten()
+    }
+
+    /// Returns the bytecode local/temporary type active for `register` at `pc`.
+    pub fn local_at(&self, register: u8, pc: u32) -> Option<TypeId> {
+        self.locals
+            .iter()
+            .find(|local| local.register == register && local.start_pc <= pc && pc < local.end_pc)
+            .map(|local| local.ty)
     }
 }
 

@@ -16,6 +16,7 @@ use crate::{
             region::{self, RegionNode},
         },
         lifter::ssa::SymbolId,
+        ty::Type,
     },
     il::{Proto, ProtoId},
     logging::{Diagnostics, LogLevel, LogTarget},
@@ -51,6 +52,11 @@ pub struct StructuredFunction {
 }
 
 impl StructuredFunction {
+    /// Returns the bytecode-provided type for a final HIL symbol.
+    pub fn symbol_type(&self, sym: SymbolId) -> Option<&Type> {
+        self.cfg.symbol_type(sym)
+    }
+
     pub fn from_proto(proto: &Proto, chunk: &Chunk, diagnostics: &Diagnostics) -> Result<Self> {
         let span = tracing::info_span!(
             "structure_proto",

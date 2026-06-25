@@ -1,7 +1,7 @@
 mod block_lifter;
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ops::Range,
 };
 
@@ -17,6 +17,7 @@ use crate::{
         cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
         ir::{HilExpr, HilStmt, PhiNode},
         lifter::ssa::SymbolId,
+        ty::{Type, TypeId, TypeStore},
     },
     il::{Instr, Proto, reg_add, reg_range},
 };
@@ -26,6 +27,8 @@ use crate::{
 pub struct RawBlock {
     /// The range of instructions indices that belong to this block, excluding the potential exit instruction.
     instr_range: Range<usize>,
+    /// Program counter for the instruction lowered as this block's exit.
+    exit_pc: Option<u32>,
     /// Registers written by an unlifted terminator instruction.
     exit_writes: SmallVec<[u8; 4]>,
     exit: RawBlockExit,
@@ -256,6 +259,8 @@ pub struct ControlFlowGraph {
 
     params: Vec<SymbolId>,
     upvalues: Vec<SymbolId>,
+    symbol_types: HashMap<SymbolId, TypeId>,
+    type_store: TypeStore,
 }
 
 impl ControlFlowGraph {
@@ -272,6 +277,8 @@ impl ControlFlowGraph {
             mut blocks,
             params,
             upvalues,
+            symbol_types,
+            type_store,
         } = block_lifter::build_blocks(proto, chunk, &raw_blocks, &graph)?;
 
         loop {
@@ -303,6 +310,8 @@ impl ControlFlowGraph {
             idoms,
             params,
             upvalues,
+            symbol_types,
+            type_store,
         };
         for i in 0..graph.blocks.len() {
             graph.unfold_phis(i);
@@ -418,6 +427,13 @@ impl ControlFlowGraph {
     /// Returns the list of upvalues of the function.
     pub fn upvalues(&self) -> &[SymbolId] {
         &self.upvalues
+    }
+
+    /// Returns the bytecode-provided type for a final HIL symbol.
+    pub fn symbol_type(&self, sym: SymbolId) -> Option<&Type> {
+        self.symbol_types
+            .get(&sym)
+            .map(|&type_id| self.type_store.get(type_id))
     }
 
     /// Returns a block by its index.
@@ -558,6 +574,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Result<Vec<
         };
 
         let exit_instr_idx = end.saturating_sub(1);
+        let exit_pc = exit_instr.map(|_| instrs[exit_instr_idx].pc);
         let exit = match exit_instr {
             Some(Instr::Return { base, count }) => RawBlockExit::Return { base, count },
             Some(Instr::Jump { offset }) | Some(Instr::JumpBack { offset }) => {
@@ -791,6 +808,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Result<Vec<
 
         raw_blocks.push(RawBlock {
             instr_range: start..body_end,
+            exit_pc,
             exit_writes,
             exit,
         });

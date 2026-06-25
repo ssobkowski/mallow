@@ -72,6 +72,12 @@ struct FunctionContext {
     anomalies: Vec<String>,
 }
 
+struct AssignManyTarget {
+    symbol: SymbolId,
+    storage: SymbolStorage,
+    slot_was_declared: bool,
+}
+
 struct Emitter {
     functions: Vec<StructuredFunction>,
     entry: usize,
@@ -168,6 +174,44 @@ impl Emitter {
         self.contexts[ctx_idx].plan.get_symbol_name(sym, is_param)
     }
 
+    fn typed_identifier_for(
+        &self,
+        proto_idx: usize,
+        sym: SymbolId,
+        name: Identifier,
+    ) -> Typed<Identifier> {
+        if let Some(ty) = self.functions[proto_idx]
+            .symbol_type(sym)
+            .filter(|ty| ty.is_meaningful())
+            .cloned()
+        {
+            Typed::new(name, ty)
+        } else {
+            Typed::untyped(name)
+        }
+    }
+
+    fn typed_identifier(&self, sym: SymbolId, name: Identifier) -> Typed<Identifier> {
+        self.typed_identifier_for(self.current_proto_idx(), sym, name)
+    }
+
+    fn typed_parameter_for(
+        &self,
+        proto_idx: usize,
+        sym: SymbolId,
+        parameter: Parameter,
+    ) -> Typed<Parameter> {
+        if let Some(ty) = self.functions[proto_idx]
+            .symbol_type(sym)
+            .filter(|ty| ty.is_meaningful())
+            .cloned()
+        {
+            Typed::new(parameter, ty)
+        } else {
+            Typed::untyped(parameter)
+        }
+    }
+
     fn bind_slot_to_symbol_name(&mut self, slot: usize, sym: SymbolId) {
         let proto_idx = self.current_context().proto_idx;
         let is_param = self.functions[proto_idx].params.contains(&sym);
@@ -200,6 +244,37 @@ impl Emitter {
 
     fn declare_slot(&mut self, slot: usize) {
         self.declarations.declare_slot(slot);
+    }
+
+    fn prepare_assign_many_targets(&mut self, symbols: Vec<SymbolId>) -> Vec<AssignManyTarget> {
+        for &sym in &symbols {
+            if !self.declarations.contains_symbol(&sym) {
+                self.declare_symbol(sym);
+            }
+        }
+
+        let mut targets = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            let storage = self
+                .symbol_storage(symbol)
+                .expect("assign-many symbols must exist in scope");
+            let slot = self
+                .declarations
+                .symbol_slot(&symbol)
+                .expect("assign-many symbols must exist in scope");
+            let slot_was_declared = self.declarations.contains_slot(slot);
+            if !slot_was_declared {
+                self.declare_slot(slot);
+            }
+
+            targets.push(AssignManyTarget {
+                symbol,
+                storage,
+                slot_was_declared,
+            });
+        }
+
+        targets
     }
 
     fn symbol_storage(&mut self, sym: SymbolId) -> Option<SymbolStorage> {
@@ -311,7 +386,7 @@ impl Emitter {
             let names: Vec<_> = hoisted
                 .iter()
                 .filter_map(|sym| match self.symbol_storage(*sym) {
-                    Some(SymbolStorage::Named(name)) => Some(Typed::untyped(name)),
+                    Some(SymbolStorage::Named(name)) => Some(self.typed_identifier(*sym, name)),
                     Some(SymbolStorage::Spilled(_)) | None => None,
                 })
                 .collect();
@@ -484,7 +559,7 @@ impl Emitter {
         self.declare_slot(slot);
         if let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym) {
             buf.push(Stmt::LocalDeclaration {
-                names: vec![Typed::untyped(name)],
+                names: vec![self.typed_identifier(*sym, name)],
                 values: Vec::new(),
             });
         }
@@ -546,7 +621,7 @@ impl Emitter {
                         .expect("symbol was just declared in scope")
                     {
                         SymbolStorage::Named(name) => buf.push(Stmt::LocalDeclaration {
-                            names: vec![Typed::untyped(name)],
+                            names: vec![self.typed_identifier(*sym, name)],
                             values: vec![right],
                         }),
                         SymbolStorage::Spilled(_) => buf.push(Stmt::Assignment {
@@ -598,62 +673,30 @@ impl Emitter {
                     })
                     .collect();
 
-                let was_declared: Vec<_> = symbols
-                    .iter()
-                    .map(|sym| self.declarations.contains_symbol(sym))
-                    .collect();
+                let targets = self.prepare_assign_many_targets(symbols);
 
-                for (sym, declared) in symbols.iter().zip(&was_declared) {
-                    if !declared {
-                        self.declare_symbol(*sym);
-                    }
-                }
-
-                let storages: Vec<_> = symbols
-                    .iter()
-                    .map(|sym| {
-                        self.symbol_storage(*sym)
-                            .expect("assign-many symbols must exist in scope")
-                    })
-                    .collect();
-
-                let slot_was_declared: Vec<_> = symbols
-                    .iter()
-                    .map(|sym| {
-                        let slot = self
-                            .declarations
-                            .symbol_slot(sym)
-                            .expect("assign-many symbols must exist in scope");
-                        self.declarations.contains_slot(slot)
-                    })
-                    .collect();
-                for (sym, declared) in symbols.iter().zip(&slot_was_declared) {
-                    if !declared {
-                        let slot = self
-                            .declarations
-                            .symbol_slot(sym)
-                            .expect("assign-many symbols must exist in scope");
-                        self.declare_slot(slot);
-                    }
-                }
-
-                let all_declared = slot_was_declared.iter().all(|declared| *declared);
+                let all_declared = targets.iter().all(|target| target.slot_was_declared);
                 if all_declared {
                     buf.push(Stmt::Assignment {
-                        lhs: storages.into_iter().map(|s| s.into_expr()).collect(),
+                        lhs: targets
+                            .into_iter()
+                            .map(|target| target.storage.into_expr())
+                            .collect(),
                         rhs: vec![right],
                     });
                     return;
                 }
 
-                let all_named = storages
+                let all_named = targets
                     .iter()
-                    .all(|storage| matches!(storage, SymbolStorage::Named(_)));
+                    .all(|target| matches!(target.storage, SymbolStorage::Named(_)));
                 if all_named {
-                    let names = storages
+                    let names = targets
                         .into_iter()
-                        .map(|storage| match storage {
-                            SymbolStorage::Named(name) => Typed::untyped(name),
+                        .map(|target| match target.storage {
+                            SymbolStorage::Named(name) => {
+                                self.typed_identifier(target.symbol, name)
+                            }
                             SymbolStorage::Spilled(_) => unreachable!("guarded by all_named"),
                         })
                         .collect();
@@ -664,7 +707,7 @@ impl Emitter {
                     return;
                 }
 
-                let temps: Vec<_> = (0..symbols.len())
+                let temps: Vec<_> = (0..targets.len())
                     .map(|_| Typed::untyped(self.fresh_temp_local()))
                     .collect();
                 buf.push(Stmt::LocalDeclaration {
@@ -672,13 +715,11 @@ impl Emitter {
                     values: vec![right],
                 });
 
-                for ((storage, was_declared), temp) in
-                    storages.into_iter().zip(slot_was_declared).zip(temps)
-                {
+                for (target, temp) in targets.into_iter().zip(temps) {
                     let rhs = vec![Expr::Named(temp.as_ref().clone())];
-                    match (storage, was_declared) {
+                    match (target.storage, target.slot_was_declared) {
                         (SymbolStorage::Named(name), false) => buf.push(Stmt::LocalDeclaration {
-                            names: vec![Typed::untyped(name)],
+                            names: vec![self.typed_identifier(target.symbol, name)],
                             values: rhs,
                         }),
                         (storage, true) | (storage @ SymbolStorage::Spilled(_), false) => {
@@ -898,7 +939,10 @@ impl Emitter {
         let is_vararg = self.functions[proto_idx].is_vararg;
         let mut params: Vec<_> = param_symbols
             .into_iter()
-            .map(|sym| Typed::untyped(Parameter::Regular(self.get_symbol_name_for(child_ctx, sym))))
+            .map(|sym| {
+                let name = self.get_symbol_name_for(child_ctx, sym);
+                self.typed_parameter_for(proto_idx, sym, Parameter::Regular(name))
+            })
             .collect();
         if is_vararg {
             params.push(Typed::untyped(Parameter::Vararg));

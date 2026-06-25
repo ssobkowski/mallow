@@ -17,6 +17,7 @@ use crate::{
             common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL},
             ssa::{Symbol, SymbolId},
         },
+        ty::ProtoTypeContext,
     },
     il::{
         ChildProtoId, ConstId, Constant, Count, ImportPath, Instr, LuauString, Proto, ProtoId,
@@ -87,6 +88,7 @@ pub struct LiftContext<'a, 'cfg, G: GraphView> {
     pub instrs: &'a [Spanned<Instr>],
     pub chunk: &'a Chunk,
     pub proto: &'a Proto,
+    pub type_context: &'a ProtoTypeContext,
     pub ssa: &'a mut Ssa<'cfg, G>,
     pub block_idx: usize,
 }
@@ -97,6 +99,7 @@ pub struct Lifter<'a, 'cfg, G: GraphView> {
     instrs: &'a [Spanned<Instr>],
     chunk: &'a Chunk,
     proto: &'a Proto,
+    type_context: &'a ProtoTypeContext,
 
     ssa: &'a mut Ssa<'cfg, G>,
     block_idx: usize,
@@ -115,6 +118,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             instrs: ctx.instrs,
             chunk: ctx.chunk,
             proto: ctx.proto,
+            type_context: ctx.type_context,
             ssa: ctx.ssa,
             block_idx: ctx.block_idx,
             stmts: Vec::new(),
@@ -203,7 +207,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         let symbol = match self.open_captured_ref[reg as usize] {
             Some(generation) => Symbol::captured_reg(reg, generation),
             None => Symbol::reg(reg),
-        };
+        }
+        .with_type(self.type_context.local_at(reg, self.current_pc()));
 
         let sym = self.ssa.alloc_symbol(symbol);
         self.ssa.write_reg(self.block_idx, reg, sym);
