@@ -2,6 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 /// A read-only view of a directed graph.
 pub trait GraphView {
+    type Item;
+
+    fn get(&self, node: usize) -> Option<&Self::Item>;
     fn entry(&self) -> usize;
     fn successors(&self, node: usize) -> &[usize];
     fn predecessors(&self, node: usize) -> &[usize];
@@ -99,6 +102,12 @@ pub trait GraphView {
 }
 
 impl<G: GraphView + ?Sized> GraphView for &G {
+    type Item = G::Item;
+
+    fn get(&self, node: usize) -> Option<&Self::Item> {
+        (**self).get(node)
+    }
+
     fn entry(&self) -> usize {
         (**self).entry()
     }
@@ -203,6 +212,12 @@ impl<G: SeseGraphView> Reversed<G> {
 }
 
 impl<G: SeseGraphView> GraphView for Reversed<G> {
+    type Item = G::Item;
+
+    fn get(&self, node: usize) -> Option<&Self::Item> {
+        self.0.get(node)
+    }
+
     fn entry(&self) -> usize {
         self.0.exit()
     }
@@ -253,6 +268,13 @@ impl<'a> AdjGraph<'a> {
 }
 
 impl GraphView for AdjGraph<'_> {
+    type Item = ();
+
+    fn get(&self, _: usize) -> Option<&Self::Item> {
+        // AdjGraph does not store node values
+        None
+    }
+
     fn entry(&self) -> usize {
         self.entry
     }
@@ -337,6 +359,12 @@ mod tests {
     }
 
     impl GraphView for SparseGraph {
+        type Item = ();
+
+        fn get(&self, node: usize) -> Option<&Self::Item> {
+            self.nodes.get(&node)
+        }
+
         fn entry(&self) -> usize {
             self.entry
         }

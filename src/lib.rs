@@ -16,20 +16,20 @@ use anyhow::Result;
 
 use crate::{
     disasm::Chunk,
-    emitter::options::EmitterOptions,
-    hil::StructuredFunction,
+    hil::{StructuredFunction, lifted::LiftedFunction},
     il::{BytecodeType, ProtoTypeInfo, TypeTag},
     logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget},
 };
 
 /// Options controlling bytecode decompilation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct DecompileOptions {
     /// Spill emitter-introduced locals into table storage when Luau's local limit
     /// is exceeded.
     pub spill_locals: bool,
-    /// Diagnostic output configuration.
-    pub diagnostics: DiagnosticConfig,
+    /// Emit conservative decompiler-inferred type annotations in addition to
+    /// bytecode-recovered type annotations.
+    pub infer_types: bool,
 }
 
 /// Disassembles Luau bytecode without emitting diagnostics.
@@ -157,36 +157,45 @@ fn format_type_tag(tag: TypeTag, chunk: &Chunk) -> String {
 
 /// Decompiles Luau bytecode into Luau source code.
 pub fn decompile_bytecode(bytecode: &[u8], options: DecompileOptions) -> Result<String> {
-    let diagnostics = Diagnostics::new(options.diagnostics);
-    decompile_bytecode_with_diagnostics(bytecode, options.spill_locals, &diagnostics)
+    decompile_bytecode_with_diagnostics(bytecode, options, &Diagnostics::default())
 }
 
 /// Decompiles Luau bytecode using an already constructed diagnostics context.
 pub fn decompile_bytecode_with_diagnostics(
     bytecode: &[u8],
-    spill_locals: bool,
+    options: DecompileOptions,
     diagnostics: &Diagnostics,
 ) -> Result<String> {
     let span = tracing::info_span!(
         "decompile_bytecode",
         byte_len = bytecode.len(),
-        spill_locals
+        spill_locals = options.spill_locals,
+        infer_types = options.infer_types,
     );
     let _enter = span.enter();
 
     let disassembled = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
     let diagnostics = diagnostics.with_entry_proto(disassembled.entry_proto.0);
 
-    let mut functions: Vec<_> = {
-        let span = tracing::info_span!("structure_protos", proto_count = disassembled.protos.len());
+    let mut lifted: Vec<_> = {
+        let span = tracing::info_span!("lift_protos", proto_count = disassembled.protos.len());
         let _enter = span.enter();
 
         disassembled
             .protos
             .iter()
-            .map(|proto| StructuredFunction::from_proto(proto, &disassembled, &diagnostics))
+            .map(|proto| LiftedFunction::from_proto(proto, &disassembled, &diagnostics))
             .collect::<Result<_, _>>()?
     };
+
+    if options.infer_types {
+        hil::ty2::inference::run(&mut lifted);
+    }
+
+    let mut functions: Vec<_> = lifted
+        .into_iter()
+        .map(|fun| StructuredFunction::from_lifted(fun, &diagnostics))
+        .collect::<Result<_, _>>()?;
 
     diagnostics
         .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
@@ -206,7 +215,8 @@ pub fn decompile_bytecode_with_diagnostics(
         emitter::emit_ast(
             functions,
             disassembled.entry_proto.0 as usize,
-            EmitterOptions { spill_locals },
+            options,
+            &diagnostics,
         )
     };
 
@@ -233,7 +243,7 @@ pub fn visualize_bytecode(
     output: impl AsRef<std::path::Path>,
     diagnostics: &Diagnostics,
 ) -> Result<()> {
-    use crate::hil::cflow::{cfg::ControlFlowGraph, visualize::dump_cfgs};
+    use crate::hil::{cflow::visualize::dump_cfgs, lifted::LiftedFunction};
 
     let span = tracing::info_span!("visualize_bytecode", byte_len = bytecode.len());
     let _enter = span.enter();
@@ -242,7 +252,9 @@ pub fn visualize_bytecode(
     let cfgs: Vec<_> = disassembly
         .protos
         .iter()
-        .map(|proto| ControlFlowGraph::from_proto(proto, &disassembly))
+        .map(|proto| {
+            LiftedFunction::from_proto(proto, &disassembly, diagnostics).map(|lifted| lifted.cfg)
+        })
         .collect::<Result<_, _>>()?;
 
     dump_cfgs(

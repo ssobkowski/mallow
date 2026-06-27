@@ -17,8 +17,10 @@ pub struct FunctionPlan {
     names: NamePlan,
     /// Maps HIL symbols to emitted source-local slots.
     locals: LocalPlan,
-    /// Slots for symbols that were not mentioned by the local planner but are
-    /// discovered during lowering, usually from defensive anomaly paths.
+    /// Fallback source-local slots allocated for symbols absent from the local
+    /// planner, usually from defensive anomaly paths.
+    fallback_slots: HashMap<SymbolId, usize>,
+    /// Next fallback source-local slot.
     next_fallback_slot: usize,
     /// Symbols that must remain named source locals even if their slot would
     /// otherwise be spillable, such as loop variables.
@@ -31,10 +33,12 @@ impl FunctionPlan {
     pub fn new(fun: &StructuredFunction) -> Self {
         let locals = LocalPlan::build(fun);
         let next_fallback_slot = locals.slot_count();
-        let forced_named_symbols = identity_named_symbols(&fun.params, &fun.upvalues);
+        let forced_named_symbols =
+            identity_named_symbols(&fun.symbols.params, &fun.symbols.upvalues);
         Self {
             names: NamePlan::new(),
             locals,
+            fallback_slots: HashMap::new(),
             next_fallback_slot,
             forced_named_symbols,
             inherited_spills: HashMap::new(),
@@ -66,8 +70,13 @@ impl FunctionPlan {
             return slot;
         }
 
+        if let Some(&slot) = self.fallback_slots.get(&sym) {
+            return slot;
+        }
+
         let slot = self.next_fallback_slot;
         self.next_fallback_slot += 1;
+        self.fallback_slots.insert(sym, slot);
         slot
     }
 
@@ -115,6 +124,30 @@ impl FunctionPlan {
     fn reserve_spill_table(&mut self) -> Identifier {
         self.names.reserve_spill_table()
     }
+
+    /// Returns every symbol that currently has an emitted source name.
+    pub fn emitted_name_map(&self) -> Vec<(SymbolId, Identifier)> {
+        let mut names = Vec::new();
+        for (sym, slot) in self
+            .locals
+            .symbol_slots()
+            .into_iter()
+            .chain(self.fallback_slots.iter().map(|(&sym, &slot)| (sym, slot)))
+        {
+            if let Some(name) = self.names.emitted_name_for(sym, slot) {
+                names.push((sym, name));
+            }
+        }
+
+        for (sym, name) in self.names.symbol_names() {
+            if !names.iter().any(|(mapped_sym, _)| *mapped_sym == sym) {
+                names.push((sym, name));
+            }
+        }
+
+        names.sort_by_key(|(sym, _)| sym.index());
+        names
+    }
 }
 
 fn identity_named_symbols(params: &[SymbolId], upvalues: &[SymbolId]) -> HashSet<SymbolId> {
@@ -137,6 +170,45 @@ mod tests {
         symbols
     }
 
+    fn empty_plan() -> FunctionPlan {
+        FunctionPlan {
+            names: NamePlan::new(),
+            locals: LocalPlan::default(),
+            fallback_slots: HashMap::new(),
+            next_fallback_slot: 0,
+            forced_named_symbols: HashSet::new(),
+            inherited_spills: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn fallback_symbol_reuses_slot_and_slot_name() {
+        let symbols = symbols(2);
+        let fallback = symbols[0];
+        let other_fallback = symbols[1];
+        let mut plan = empty_plan();
+
+        let slot = plan.symbol_slot(fallback);
+        let name = plan.get_slot_name(slot);
+
+        let repeated_slot = plan.symbol_slot(fallback);
+        assert_eq!(repeated_slot, slot);
+        assert_eq!(plan.get_slot_name(repeated_slot), name);
+        assert_ne!(plan.symbol_slot(other_fallback), slot);
+    }
+
+    #[test]
+    fn emitted_name_map_reports_slot_name_for_fallback_symbol() {
+        let symbols = symbols(1);
+        let fallback = symbols[0];
+        let mut plan = empty_plan();
+
+        let slot = plan.symbol_slot(fallback);
+        let name = plan.get_slot_name(slot);
+
+        assert_eq!(plan.emitted_name_map(), vec![(fallback, name)]);
+    }
+
     #[test]
     fn params_and_upvalues_do_not_spill() {
         let symbols = symbols(3);
@@ -146,6 +218,7 @@ mod tests {
         let mut plan = FunctionPlan {
             names: NamePlan::new(),
             locals: LocalPlan::default(),
+            fallback_slots: HashMap::new(),
             next_fallback_slot: 0,
             forced_named_symbols: identity_named_symbols(&[param], &[upvalue]),
             inherited_spills: HashMap::new(),

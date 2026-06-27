@@ -3,7 +3,7 @@ use std::{path::PathBuf, process::Command};
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use mallow::{
-    DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
+    DecompileOptions, DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
     decompile_bytecode_with_diagnostics, disassemble_bytecode_with_diagnostics,
 };
 
@@ -59,6 +59,10 @@ enum Commands {
         /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
         #[arg(long)]
         spill_locals: bool,
+
+        /// Emit conservative decompiler-inferred type annotations
+        #[arg(long)]
+        infer_types: bool,
     },
     /// Compile a Luau source file and decompile the resulting bytecode
     Roundtrip {
@@ -85,6 +89,10 @@ enum Commands {
         /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
         #[arg(long)]
         spill_locals: bool,
+
+        /// Emit conservative decompiler-inferred type annotations
+        #[arg(long)]
+        infer_types: bool,
     },
     /// Generate a control flow graph visualization for a bytecode file
     #[cfg(feature = "visualize")]
@@ -118,13 +126,21 @@ fn main() -> Result<()> {
             input,
             output,
             spill_locals,
+            infer_types,
         } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
 
             diagnostics
                 .at(LogLevel::Info, LogTarget::Driver)
                 .line(0, format_args!("decompiling..."));
-            let code = decompile_bytecode_with_diagnostics(&bytecode, spill_locals, &diagnostics)?;
+            let code = decompile_bytecode_with_diagnostics(
+                &bytecode,
+                DecompileOptions {
+                    spill_locals,
+                    infer_types,
+                },
+                &diagnostics,
+            )?;
 
             let mut out = get_output(output)?;
             out.write_all(code.as_bytes())?;
@@ -137,6 +153,7 @@ fn main() -> Result<()> {
             debug_level,
             type_level,
             spill_locals,
+            infer_types,
         } => {
             let mut cmd = Command::new("luau-compile");
             cmd.arg("--binary");
@@ -161,7 +178,10 @@ fn main() -> Result<()> {
 
             let code = decompile_bytecode_with_diagnostics(
                 &compile_out.stdout,
-                spill_locals,
+                DecompileOptions {
+                    spill_locals,
+                    infer_types,
+                },
                 &diagnostics,
             )?;
 

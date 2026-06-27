@@ -2,33 +2,121 @@ mod collectors;
 mod declarations;
 mod locals;
 mod name;
-pub mod options;
 mod plan;
 mod storage;
 
 use std::collections::HashSet;
 
+use smol_str::SmolStr;
+
 use crate::{
+    DecompileOptions,
     ast::{
         Block, CompoundBinOp, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt,
         TableItem, Typed, UnOp,
     },
     common::is_valid_luau_identifier,
     emitter::{
-        collectors::ReadCollector, declarations::DeclarationState, options::EmitterOptions,
-        plan::FunctionPlan, storage::SymbolStorage,
+        collectors::ReadCollector, declarations::DeclarationState, plan::FunctionPlan,
+        storage::SymbolStorage,
     },
     hil::{
         StructuredFunction,
         cflow::region::RegionNode,
         ir::{HilExpr, HilNumber, HilStmt, HilTableItem},
         lifter::ssa::SymbolId,
+        ty::{FunctionTypeParam, FunctionTypeReturn, Type},
         visitor::Visitor,
     },
     il::ProtoId,
+    logging::{Diagnostics, LogLevel, LogTarget},
 };
 
 const MAX_LOCAL_COUNT: usize = 199;
+
+/// Extracts the return annotation expected by `local function` syntax.
+///
+/// Symbol facts for a local function name may contain the full structural
+/// function type inferred for the closure. The AST node stores only the return
+/// annotation, so multi-return or unknown signatures are left unannotated here
+/// instead of printing the whole function type in return position.
+fn local_function_return_type(ty: &Type) -> Option<Type> {
+    let Type::Function { return_type, .. } = ty else {
+        return ty.is_meaningful().then(|| ty.clone());
+    };
+
+    let [return_ty] = return_type.as_slice() else {
+        return None;
+    };
+
+    let ty = match return_ty {
+        FunctionTypeReturn::Type(ty) | FunctionTypeReturn::Vararg(ty) => ty,
+    };
+
+    ty.is_meaningful().then(|| ty.clone())
+}
+
+/// Returns true when a local declaration's initializer already makes the type obvious.
+fn is_trivial_literal_annotation(ty: &Type, value: &Expr) -> bool {
+    matches!(
+        (ty, value),
+        (
+            Type::Number,
+            Expr::Literal(Literal::Integer(_) | Literal::Float(_))
+        ) | (Type::String, Expr::Literal(Literal::String(_)))
+            | (Type::Boolean, Expr::Literal(Literal::Bool(_)))
+    )
+}
+
+/// Collects generic names referenced by one emitted type annotation.
+fn collect_generic_names(ty: &Type, names: &mut HashSet<SmolStr>) {
+    match ty {
+        Type::Generic(name) => {
+            names.insert(name.clone());
+        }
+        Type::Table { fields, array } => {
+            for field in fields.values() {
+                collect_generic_names(field, names);
+            }
+            if let Some(array) = array {
+                collect_generic_names(&array.0, names);
+                collect_generic_names(&array.1, names);
+            }
+        }
+        Type::Function {
+            params,
+            return_type,
+            ..
+        } => {
+            for param in params {
+                match param {
+                    FunctionTypeParam::Type(ty) | FunctionTypeParam::Vararg(ty) => {
+                        collect_generic_names(ty, names);
+                    }
+                }
+            }
+            for returned in return_type {
+                match returned {
+                    FunctionTypeReturn::Type(ty) | FunctionTypeReturn::Vararg(ty) => {
+                        collect_generic_names(ty, names);
+                    }
+                }
+            }
+        }
+        Type::Union(types) | Type::Intersection(types) => {
+            for ty in types {
+                collect_generic_names(ty, names);
+            }
+        }
+        Type::WithMetatable { base, metatable } => {
+            collect_generic_names(base, names);
+            for (_, method) in metatable.iter() {
+                collect_generic_names(method, names);
+            }
+        }
+        _ => {}
+    }
+}
 
 #[derive(Default)]
 struct AssignCollector {
@@ -78,17 +166,18 @@ struct AssignManyTarget {
     slot_was_declared: bool,
 }
 
-struct Emitter {
+struct Emitter<'a> {
     functions: Vec<StructuredFunction>,
     entry: usize,
-    options: EmitterOptions,
+    options: DecompileOptions,
+    diagnostics: &'a Diagnostics,
 
     declarations: DeclarationState,
     contexts: Vec<FunctionContext>,
     current_ctx: usize,
 }
 
-impl Emitter {
+impl Emitter<'_> {
     fn visit_entry(&mut self) -> Block {
         let entry_ctx = self.create_context(self.entry);
         self.visit_function(entry_ctx)
@@ -116,18 +205,19 @@ impl Emitter {
         let fun = self.functions[proto_idx].clone();
 
         self.declarations.push_scope();
-        for &sym in fun.cfg.params() {
+        for &sym in &fun.symbols.params {
             let slot = self.declare_symbol(sym);
             self.bind_slot_to_symbol_name(slot, sym);
             self.declare_slot(slot);
         }
-        for &sym in fun.cfg.upvalues() {
+        for &sym in &fun.symbols.upvalues {
             let slot = self.declare_symbol(sym);
             self.bind_slot_to_symbol_name(slot, sym);
             self.declare_slot(slot);
         }
 
         let upvalue_str = fun
+            .symbols
             .upvalues
             .iter()
             .map(|u| self.get_symbol_name(u).0)
@@ -158,6 +248,8 @@ impl Emitter {
                 },
             );
         }
+        self.dump_symbol_names(ctx_idx, proto_idx);
+
         self.declarations.pop_scope();
 
         self.current_ctx = old_ctx;
@@ -170,7 +262,7 @@ impl Emitter {
 
     fn get_symbol_name_for(&mut self, ctx_idx: usize, sym: SymbolId) -> Identifier {
         let proto_idx = self.contexts[ctx_idx].proto_idx;
-        let is_param = self.functions[proto_idx].params.contains(&sym);
+        let is_param = self.functions[proto_idx].symbols.params.contains(&sym);
         self.contexts[ctx_idx].plan.get_symbol_name(sym, is_param)
     }
 
@@ -214,7 +306,7 @@ impl Emitter {
 
     fn bind_slot_to_symbol_name(&mut self, slot: usize, sym: SymbolId) {
         let proto_idx = self.current_context().proto_idx;
-        let is_param = self.functions[proto_idx].params.contains(&sym);
+        let is_param = self.functions[proto_idx].symbols.params.contains(&sym);
         self.current_context_mut()
             .plan
             .bind_slot_to_symbol_name(slot, sym, is_param);
@@ -226,6 +318,20 @@ impl Emitter {
 
     fn current_context_mut(&mut self) -> &mut FunctionContext {
         &mut self.contexts[self.current_ctx]
+    }
+
+    /// Dumps the final SymbolId-to-emitted-name map for one function context.
+    fn dump_symbol_names(&self, ctx_idx: usize, proto_idx: usize) {
+        let diagnostics = self.diagnostics.for_proto(proto_idx as u16);
+        let sink = diagnostics.at(LogLevel::Debug, LogTarget::Emitter);
+        sink.block("symbol names:", |sink| {
+            for (sym, name) in self.contexts[ctx_idx].plan.emitted_name_map() {
+                sink.line(
+                    1,
+                    format_args!("SymbolId({}) -> {}", sym.index(), name.as_str()),
+                );
+            }
+        });
     }
 
     fn fresh_temp_local(&mut self) -> Identifier {
@@ -596,7 +702,10 @@ impl Emitter {
                     }
                     _ => self.visit_expr(left),
                 };
-                let right = self.visit_expr(value);
+                let right = match value {
+                    HilExpr::Closure { proto, captures } => self.visit_closure(*proto, captures),
+                    _ => self.visit_expr(value),
+                };
 
                 if needs_declaration {
                     let HilExpr::Symbol(sym) = left else {
@@ -605,13 +714,20 @@ impl Emitter {
 
                     if named_closure
                         && let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
-                        && let Expr::AnonymousFunction { params, body } = right
+                        && let Expr::AnonymousFunction {
+                            generics,
+                            params,
+                            body,
+                        } = right
                     {
                         buf.push(Stmt::LocalFunction {
                             name,
+                            generics,
                             params,
                             body,
-                            ty: None,
+                            ty: self.functions[self.current_proto_idx()]
+                                .symbol_type(*sym)
+                                .and_then(local_function_return_type),
                         });
                         return;
                     }
@@ -620,10 +736,19 @@ impl Emitter {
                         .symbol_storage(*sym)
                         .expect("symbol was just declared in scope")
                     {
-                        SymbolStorage::Named(name) => buf.push(Stmt::LocalDeclaration {
-                            names: vec![self.typed_identifier(*sym, name)],
-                            values: vec![right],
-                        }),
+                        SymbolStorage::Named(name) => {
+                            let name =
+                                match self.functions[self.current_proto_idx()].symbol_type(*sym) {
+                                    Some(ty) if is_trivial_literal_annotation(ty, &right) => {
+                                        Typed::untyped(name)
+                                    }
+                                    _ => self.typed_identifier(*sym, name),
+                                };
+                            buf.push(Stmt::LocalDeclaration {
+                                names: vec![name],
+                                values: vec![right],
+                            });
+                        }
                         SymbolStorage::Spilled(_) => buf.push(Stmt::Assignment {
                             lhs: vec![left_expr],
                             rhs: vec![right],
@@ -904,8 +1029,17 @@ impl Emitter {
             .collect()
     }
 
+    /// Emits one closure with the best inferred parameter annotations available.
     fn visit_closure(&mut self, proto_idx: ProtoId, captures: &[SymbolId]) -> Expr {
         let proto_idx = proto_idx.0 as usize;
+        let mut generic_names = HashSet::new();
+        for symbol in &self.functions[proto_idx].symbols.params {
+            if let Some(ty) = self.functions[proto_idx].symbol_type(*symbol) {
+                collect_generic_names(ty, &mut generic_names);
+            }
+        }
+        let mut generics = generic_names.into_iter().collect::<Vec<_>>();
+        generics.sort();
         let parent_bindings: Vec<_> = captures
             .iter()
             .map(|sym| {
@@ -915,7 +1049,7 @@ impl Emitter {
             .collect();
 
         let child_ctx = self.create_context(proto_idx);
-        let child_upvalues = self.functions[proto_idx].upvalues.clone();
+        let child_upvalues = self.functions[proto_idx].symbols.upvalues.clone();
         for (i, binding) in parent_bindings.into_iter().enumerate() {
             if let Some(&child_upval_sym) = child_upvalues.get(i) {
                 match binding {
@@ -935,7 +1069,7 @@ impl Emitter {
 
         let old_declarations = std::mem::take(&mut self.declarations);
 
-        let param_symbols = self.functions[proto_idx].params.clone();
+        let param_symbols = self.functions[proto_idx].symbols.params.clone();
         let is_vararg = self.functions[proto_idx].is_vararg;
         let mut params: Vec<_> = param_symbols
             .into_iter()
@@ -952,19 +1086,25 @@ impl Emitter {
 
         self.declarations = old_declarations;
 
-        Expr::AnonymousFunction { params, body }
+        Expr::AnonymousFunction {
+            generics,
+            params,
+            body,
+        }
     }
 }
 
 pub fn emit_ast(
     functions: Vec<StructuredFunction>,
     entry: usize,
-    options: EmitterOptions,
+    options: DecompileOptions,
+    diagnostics: &Diagnostics,
 ) -> Block {
     let mut st = Emitter {
         functions,
         entry,
         options,
+        diagnostics,
         declarations: DeclarationState::new(),
         contexts: Vec::new(),
         current_ctx: 0,

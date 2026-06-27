@@ -2,7 +2,7 @@ use crate::hil::{
     StructuredFunction,
     ir::{HilExpr, HilStmt},
     lifter::ssa::SymbolId,
-    visitor::{VisitorMut, walk_block_mut},
+    visitor::{VisitorMut, walk_stmts_mut},
 };
 
 #[derive(Default)]
@@ -11,7 +11,7 @@ struct Rewriter {
 }
 
 impl Rewriter {
-    fn try_rewrite_block(&mut self, stmts: &mut Vec<HilStmt>) {
+    fn try_rewrite_stmts(&mut self, stmts: &mut Vec<HilStmt>) {
         let mut i = 0;
         while i < stmts.len() {
             let HilStmt::AssignMany { left, value } = &stmts[i] else {
@@ -85,9 +85,9 @@ impl Rewriter {
 }
 
 impl VisitorMut for Rewriter {
-    fn visit_block(&mut self, stmts: &mut Vec<HilStmt>) {
-        self.try_rewrite_block(stmts);
-        walk_block_mut(self, stmts);
+    fn visit_stmts(&mut self, stmts: &mut Vec<HilStmt>) {
+        self.try_rewrite_stmts(stmts);
+        walk_stmts_mut(self, stmts);
     }
 }
 

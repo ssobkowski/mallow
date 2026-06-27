@@ -1,7 +1,9 @@
+use smol_str::SmolStr;
+
 use crate::{
     ast::{BinOp, Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Typed, UnOp},
     common::escape_string,
-    hil::ty::{FunctionTypeParam, Type, TypeLiteral, TypePrecedence},
+    hil::ty::{FunctionTypeParam, FunctionTypeReturn, Type, TypeLiteral, TypePrecedence},
 };
 
 pub fn print(block: &Block, top_comments: &[String]) -> String {
@@ -126,12 +128,14 @@ impl AstPrinter {
             }
             Stmt::LocalFunction {
                 name,
+                generics,
                 params,
                 body,
                 ty,
             } => {
                 self.write("local function ");
                 self.write(name.as_str());
+                self.write_generics(generics);
                 self.write("(");
                 self.write_params(params);
                 self.write(")");
@@ -349,13 +353,19 @@ impl AstPrinter {
                     self.write(")");
                 }
             }
-            Expr::AnonymousFunction { params, body } => {
+            Expr::AnonymousFunction {
+                generics,
+                params,
+                body,
+            } => {
                 let prec = 1;
                 let needs_parens = prec < parent_prec;
                 if needs_parens {
                     self.write("(");
                 }
-                self.write("function(");
+                self.write("function");
+                self.write_generics(generics);
+                self.write("(");
                 self.write_params(params);
                 self.write(")");
                 self.newline();
@@ -427,6 +437,18 @@ impl AstPrinter {
         });
     }
 
+    /// Writes a generic parameter declaration when one is present.
+    fn write_generics(&mut self, generics: &[SmolStr]) {
+        if generics.is_empty() {
+            return;
+        }
+        self.write("<");
+        self.write_punctuated(generics, ", ", |printer, generic| {
+            printer.write(generic.as_str());
+        });
+        self.write(">");
+    }
+
     fn write_type(&mut self, ty: &Type, parent_prec: TypePrecedence) {
         let prec = ty.precedence();
         let needs_parens = prec < parent_prec;
@@ -440,11 +462,28 @@ impl AstPrinter {
             Type::String => self.write("string"),
             Type::Number => self.write("number"),
             Type::Boolean => self.write("boolean"),
-            Type::Table { key, value } => {
-                self.write("{ [");
-                self.write_type(key, TypePrecedence::Lowest);
-                self.write("]: ");
-                self.write_type(value, TypePrecedence::Lowest);
+            Type::Table { fields, array } => {
+                self.write("{ ");
+                let mut wrote = false;
+                if let Some(array) = array {
+                    let (key, value) = array.as_ref();
+                    self.write("[");
+                    self.write_type(key, TypePrecedence::Lowest);
+                    self.write("]: ");
+                    self.write_type(value, TypePrecedence::Lowest);
+                    wrote = true;
+                }
+                let mut fields: Vec<_> = fields.iter().collect();
+                fields.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+                for (name, ty) in fields {
+                    if wrote {
+                        self.write(", ");
+                    }
+                    self.write(name.as_str());
+                    self.write(": ");
+                    self.write_type(ty, TypePrecedence::Lowest);
+                    wrote = true;
+                }
                 self.write(" }");
             }
             Type::Function {
@@ -468,11 +507,13 @@ impl AstPrinter {
                     }
                 });
                 self.write(") -> ");
-                if let Some(return_type) = return_type {
-                    self.write_type(return_type, TypePrecedence::Lowest);
-                } else {
-                    self.write_type(&Type::Unit, TypePrecedence::Lowest);
-                }
+                self.write_punctuated(return_type, ", ", |p, return_type| match return_type {
+                    FunctionTypeReturn::Type(ty) => p.write_type(ty, TypePrecedence::Lowest),
+                    FunctionTypeReturn::Vararg(ty) => {
+                        p.write("...");
+                        p.write_type(ty, TypePrecedence::Lowest);
+                    }
+                });
             }
             Type::Thread => self.write("thread"),
             Type::Userdata => self.write("userdata"),
@@ -494,15 +535,6 @@ impl AstPrinter {
                 self.write_punctuated(types, " & ", |p, ty| {
                     p.write_type(ty, TypePrecedence::Intersection);
                 });
-            }
-            Type::Object(values) => {
-                self.write("{ ");
-                self.write_punctuated(values, ", ", |p, (name, ty)| {
-                    p.write(name.as_str());
-                    p.write(": ");
-                    p.write_type(ty, TypePrecedence::Lowest);
-                });
-                self.write(" }");
             }
             Type::WithMetatable { base, .. } => {
                 self.write_type(base, TypePrecedence::Lowest);
@@ -729,13 +761,13 @@ fn should_use_long_string(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use smallvec::SmallVec;
+    use std::collections::HashMap;
 
     use super::{
         AstPrinter, escape_string, escaped_len, long_string_level, print, should_use_long_string,
     };
     use crate::ast::{Block, Expr, Literal, Stmt};
-    use crate::hil::ty::{FunctionTypeParam, Type, TypePrecedence};
+    use crate::hil::ty::{FunctionTypeParam, FunctionTypeReturn, Type, TypePrecedence};
 
     fn render_type(ty: &Type) -> String {
         let mut printer = AstPrinter::new();
@@ -743,11 +775,27 @@ mod tests {
         printer.finish()
     }
 
+    #[test]
+    fn prints_table_type_with_array_descriptor_and_named_fields() {
+        let ty = Type::Table {
+            fields: HashMap::from([
+                ("zeta".into(), Type::Boolean),
+                ("alpha".into(), Type::String),
+            ]),
+            array: Some(Box::new((Type::String, Type::Number))),
+        };
+
+        assert_eq!(
+            render_type(&ty),
+            "{ [string]: number, alpha: string, zeta: boolean }"
+        );
+    }
+
     fn unknown_function_type() -> Type {
         Type::Function {
-            generics: SmallVec::new(),
+            generics: Vec::new(),
             params: vec![FunctionTypeParam::Vararg(Type::Unknown)],
-            return_type: Some(Box::new(Type::Unknown)),
+            return_type: vec![FunctionTypeReturn::Type(Type::Unknown)],
         }
     }
 
@@ -783,9 +831,9 @@ mod tests {
     #[test]
     fn prints_function_return_union_without_changing_function_type() {
         let ty = Type::Function {
-            generics: SmallVec::new(),
+            generics: Vec::new(),
             params: Vec::new(),
-            return_type: Some(Box::new(Type::Unknown.union(Type::Nil))),
+            return_type: vec![FunctionTypeReturn::Type(Type::Unknown.union(Type::Nil))],
         };
 
         assert_eq!(render_type(&ty), "() -> unknown | nil");

@@ -771,6 +771,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
     /// Emit the result of a CALL or NAMECALL depending on the return count.
     fn emit_call_result(&mut self, dest: u8, ret_count: u8, expr: HilExpr) {
+        assert!(
+            matches!(expr, HilExpr::Call { .. } | HilExpr::MethodCall { .. }),
+            "expected a call expression"
+        );
         match Count::from(ret_count) {
             Count::Number(0) => self.push(HilStmt::Call(expr)),
             Count::Number(1) => self.assign_reg(dest, expr),

@@ -636,7 +636,7 @@ impl LoopForest {
 
 /// A SESE region graph. Built on top of the control flow graph with its exit
 /// nodes tied to a single virtual exit.
-pub struct RegionGraph {
+struct RegionGraph {
     entry: usize,
     exit: usize,
     nodes: HashMap<usize, Shape>,
@@ -645,6 +645,12 @@ pub struct RegionGraph {
 }
 
 impl GraphView for RegionGraph {
+    type Item = Shape;
+
+    fn get(&self, node: usize) -> Option<&Self::Item> {
+        self.nodes.get(&node)
+    }
+
     fn entry(&self) -> usize {
         self.entry
     }

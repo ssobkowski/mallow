@@ -1,4 +1,4 @@
-use crate::hil::{StructuredFunction, cflow::cfg::ControlFlowGraph};
+use crate::hil::{StructuredFunction, cflow::cfg::ControlFlowGraph, lifted::FunctionSymbols};
 
 mod continue_cleanup;
 mod fold_bool_assign;
@@ -41,7 +41,7 @@ pub fn run(fns: &mut [StructuredFunction]) {
         })
         .collect();
 
-    for fun in fns {
+    for fun in &mut *fns {
         let span = tracing::info_span!("post_region_function", proto = fun.proto.0);
         let _enter = span.enter();
         let mut iteration = 0;
@@ -83,11 +83,11 @@ pub fn run(fns: &mut [StructuredFunction]) {
     }
 }
 
-pub(crate) fn run_pre_region(cfg: &mut ControlFlowGraph) -> bool {
+pub(crate) fn run_pre_region(cfg: &mut ControlFlowGraph, symbols: &FunctionSymbols) -> bool {
     let span = tracing::info_span!("inlining_pre_region", changed = tracing::field::Empty,);
     let _enter = span.enter();
 
-    let changed = inlining::run_pre_region(cfg);
+    let changed = inlining::run_pre_region(cfg, symbols);
     span.record("changed", changed);
     changed
 }

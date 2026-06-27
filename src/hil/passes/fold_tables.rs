@@ -15,7 +15,7 @@ struct Inliner {
 }
 
 impl VisitorMut for Inliner {
-    fn visit_block(&mut self, stmts: &mut Vec<HilStmt>) {
+    fn visit_stmts(&mut self, stmts: &mut Vec<HilStmt>) {
         let mut i = 0;
         while i < stmts.len() {
             let HilStmt::Assign {

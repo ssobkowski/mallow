@@ -135,4 +135,23 @@ impl NamePlan {
     pub fn spill_table(&self) -> Option<Identifier> {
         self.spill_table.clone()
     }
+
+    /// Returns the emitted name currently assigned to a symbol or its slot.
+    pub fn emitted_name_for(&self, sym: SymbolId, slot: usize) -> Option<Identifier> {
+        self.symbol_names
+            .get(&sym)
+            .or_else(|| self.slot_names.get(&slot))
+            .cloned()
+    }
+
+    /// Returns every symbol with a directly reserved emitted name.
+    pub fn symbol_names(&self) -> Vec<(SymbolId, Identifier)> {
+        let mut names: Vec<_> = self
+            .symbol_names
+            .iter()
+            .map(|(&sym, name)| (sym, name.clone()))
+            .collect();
+        names.sort_by_key(|(sym, _)| sym.index());
+        names
+    }
 }

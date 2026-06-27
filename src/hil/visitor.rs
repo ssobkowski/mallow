@@ -2,7 +2,11 @@ use smol_str::SmolStr;
 
 use crate::hil::{
     StructuredFunction,
-    cflow::region::RegionNode,
+    cflow::{
+        cfg::{Block, BlockExit},
+        graph::GraphView,
+        region::RegionNode,
+    },
     ir::{HilExpr, HilNumber, HilStmt, HilTableItem, PhiNode},
     lifter::ssa::SymbolId,
 };
@@ -13,12 +17,31 @@ pub trait Visitor {
         walk_function(self, fun);
     }
 
+    // note to self: if I ever need dyn Visitor, force `Self: Sized` here
+    fn visit_graph(&mut self, graph: impl GraphView<Item = Block>) {
+        let order = graph
+            .reverse_post_order()
+            .into_iter()
+            .map(|node| graph.get(node).expect("this block should exist"));
+        for block in order {
+            self.visit_block(block);
+        }
+    }
+
     fn visit_region(&mut self, region: &RegionNode) {
         walk_region(self, region);
     }
 
-    fn visit_block(&mut self, stmts: &[HilStmt]) {
-        walk_block(self, stmts);
+    fn visit_block(&mut self, block: &Block) {
+        walk_block(self, block);
+    }
+
+    fn visit_block_exit(&mut self, exit: &BlockExit) {
+        walk_block_exit(self, exit);
+    }
+
+    fn visit_stmts(&mut self, stmts: &[HilStmt]) {
+        walk_stmts(self, stmts);
     }
 
     fn visit_stmt(&mut self, stmt: &HilStmt) {
@@ -64,8 +87,16 @@ pub trait VisitorMut {
         walk_region_mut(self, region);
     }
 
-    fn visit_block(&mut self, stmts: &mut Vec<HilStmt>) {
-        walk_block_mut(self, stmts);
+    fn visit_block(&mut self, block: &mut Block) {
+        walk_block_mut(self, block);
+    }
+
+    fn visit_block_exit(&mut self, exit: &mut BlockExit) {
+        walk_block_exit_mut(self, exit);
+    }
+
+    fn visit_stmts(&mut self, stmts: &mut Vec<HilStmt>) {
+        walk_stmts_mut(self, stmts);
     }
 
     fn visit_stmt(&mut self, stmt: &mut HilStmt) {
@@ -108,7 +139,7 @@ pub fn walk_function<V: Visitor + ?Sized>(visitor: &mut V, fun: &StructuredFunct
 pub fn walk_region<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode) {
     match node {
         RegionNode::BasicBlock { stmts } => {
-            visitor.visit_block(stmts);
+            visitor.visit_stmts(stmts);
         }
         RegionNode::Sequence { nodes } => {
             for n in nodes {
@@ -165,7 +196,51 @@ pub fn walk_region<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode) {
     }
 }
 
-pub fn walk_block<V: Visitor + ?Sized>(visitor: &mut V, stmts: &[HilStmt]) {
+pub fn walk_block<V: Visitor + ?Sized>(visitor: &mut V, block: &Block) {
+    visitor.visit_stmts(block.stmts());
+    visitor.visit_block_exit(block.exit());
+}
+
+pub fn walk_block_exit<V: Visitor + ?Sized>(visitor: &mut V, exit: &BlockExit) {
+    match exit {
+        BlockExit::CondJump { cond, .. } => visitor.visit_expr(cond),
+        BlockExit::FornPrep {
+            var,
+            start,
+            end,
+            step,
+            ..
+        } => {
+            visitor.visit_symbol(*var);
+            visitor.visit_expr(start);
+            visitor.visit_expr(end);
+            visitor.visit_expr(step);
+        }
+        BlockExit::FornLoop { .. } => {
+            // this block carries no valuable info
+        }
+        BlockExit::ForgPrep { exprs, .. } => {
+            for expr in exprs {
+                visitor.visit_expr(expr);
+            }
+        }
+        BlockExit::ForgLoop { vars, .. } => {
+            for var in vars {
+                visitor.visit_symbol(*var);
+            }
+        }
+        BlockExit::Return(values) => {
+            for value in values {
+                visitor.visit_expr(value);
+            }
+        }
+        BlockExit::Jump(_) | BlockExit::Fallthrough(_) => {
+            // [design limitation] - visitor carries no cfg context, so it cannot jump to the blocks on its own.
+        }
+    }
+}
+
+pub fn walk_stmts<V: Visitor + ?Sized>(visitor: &mut V, stmts: &[HilStmt]) {
     for stmt in stmts {
         visitor.visit_stmt(stmt);
     }
@@ -276,7 +351,7 @@ pub fn walk_function_mut<V: VisitorMut + ?Sized>(visitor: &mut V, fun: &mut Stru
 pub fn walk_region_mut<V: VisitorMut + ?Sized>(visitor: &mut V, node: &mut RegionNode) {
     match node {
         RegionNode::BasicBlock { stmts } => {
-            visitor.visit_block(stmts);
+            visitor.visit_stmts(stmts);
         }
         RegionNode::Sequence { nodes } => {
             for n in nodes {
@@ -333,7 +408,53 @@ pub fn walk_region_mut<V: VisitorMut + ?Sized>(visitor: &mut V, node: &mut Regio
     }
 }
 
-pub fn walk_block_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmts: &mut Vec<HilStmt>) {
+pub fn walk_block_mut<V: VisitorMut + ?Sized>(visitor: &mut V, block: &mut Block) {
+    for stmt in block.stmts_mut() {
+        visitor.visit_stmt(stmt);
+    }
+    visitor.visit_block_exit(block.exit_mut());
+}
+
+pub fn walk_block_exit_mut<V: VisitorMut + ?Sized>(visitor: &mut V, exit: &mut BlockExit) {
+    match exit {
+        BlockExit::CondJump { cond, .. } => visitor.visit_expr(cond),
+        BlockExit::FornPrep {
+            var,
+            start,
+            end,
+            step,
+            ..
+        } => {
+            visitor.visit_symbol(var);
+            visitor.visit_expr(start);
+            visitor.visit_expr(end);
+            visitor.visit_expr(step);
+        }
+        BlockExit::FornLoop { .. } => {
+            // this block carries no valuable info
+        }
+        BlockExit::ForgPrep { exprs, .. } => {
+            for expr in exprs {
+                visitor.visit_expr(expr);
+            }
+        }
+        BlockExit::ForgLoop { vars, .. } => {
+            for var in vars {
+                visitor.visit_symbol(var);
+            }
+        }
+        BlockExit::Return(values) => {
+            for value in values {
+                visitor.visit_expr(value);
+            }
+        }
+        BlockExit::Jump(_) | BlockExit::Fallthrough(_) => {
+            // [design limitation] - visitor carries no cfg context, so it cannot jump to the blocks on its own.
+        }
+    }
+}
+
+pub fn walk_stmts_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmts: &mut Vec<HilStmt>) {
     for stmt in stmts {
         visitor.visit_stmt(stmt);
     }

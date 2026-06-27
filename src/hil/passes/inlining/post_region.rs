@@ -204,10 +204,10 @@ impl Analyzer {
         let _enter = span.enter();
 
         let mut analyzer = Self::default();
-        for param in &fun.params {
+        for param in &fun.symbols.params {
             analyzer.facts.entry(*param).or_default().poisoned = true;
         }
-        for upvalue in &fun.upvalues {
+        for upvalue in &fun.symbols.upvalues {
             analyzer.facts.entry(*upvalue).or_default().poisoned = true;
         }
         analyzer.visit_region(&fun.root);

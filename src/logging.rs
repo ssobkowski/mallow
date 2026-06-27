@@ -34,6 +34,7 @@ pub enum LogTarget {
     Hil,
     Cfg,
     Region,
+    Emitter,
 }
 
 impl LogTarget {
@@ -43,6 +44,7 @@ impl LogTarget {
             LogTarget::Hil => "hil",
             LogTarget::Cfg => "cfg",
             LogTarget::Region => "region",
+            LogTarget::Emitter => "emit",
         }
     }
 }

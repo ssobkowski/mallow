@@ -1,24 +1,26 @@
 pub mod cflow;
 pub mod ir;
+pub mod lifted;
 pub mod lifter;
 pub mod passes;
 pub mod ty;
+pub mod ty2;
 pub mod visitor;
 
 use anyhow::Result;
 
 use crate::{
-    disasm::Chunk,
     hil::{
         cflow::{
             cfg::ControlFlowGraph,
             graph::GraphView,
             region::{self, RegionNode},
         },
+        lifted::{FunctionSymbols, FunctionTypes, LiftedFunction},
         lifter::ssa::SymbolId,
         ty::Type,
     },
-    il::{Proto, ProtoId},
+    il::ProtoId,
     logging::{Diagnostics, LogLevel, LogTarget},
 };
 
@@ -42,87 +44,60 @@ impl ReturnArity {
 pub struct StructuredFunction {
     pub proto: ProtoId,
     pub debug_name: Option<String>,
-    pub cfg: ControlFlowGraph,
     pub root: RegionNode,
 
-    pub params: Vec<SymbolId>,
-    pub upvalues: Vec<SymbolId>,
+    pub symbols: FunctionSymbols,
+    pub types: FunctionTypes,
     pub is_vararg: bool,
     pub return_arity: Option<ReturnArity>,
 }
 
 impl StructuredFunction {
-    /// Returns the bytecode-provided type for a final HIL symbol.
+    /// Returns the best available type for a final HIL symbol.
     pub fn symbol_type(&self, sym: SymbolId) -> Option<&Type> {
-        self.cfg.symbol_type(sym)
+        self.types.symbol_type(sym)
     }
 
-    pub fn from_proto(proto: &Proto, chunk: &Chunk, diagnostics: &Diagnostics) -> Result<Self> {
-        let span = tracing::info_span!(
-            "structure_proto",
-            proto = proto.id.0,
-            instr_count = proto.instrs.len(),
-            param_count = proto.num_params,
-            upvalue_count = proto.num_upvals,
-        );
-        let _enter = span.enter();
-
-        let diagnostics = diagnostics.for_proto(proto.id.0);
+    pub fn from_lifted(mut lifted: LiftedFunction, diagnostics: &Diagnostics) -> Result<Self> {
+        let diagnostics = diagnostics.for_proto(lifted.proto.0);
         let info = diagnostics.at(LogLevel::Info, LogTarget::Hil);
 
-        info.line(
-            0,
-            format_args!("{} params, {} upvalues", proto.num_params, proto.num_upvals),
-        );
-
-        info.line(1, format_args!("building cfg..."));
-        let mut cfg = {
-            let span = tracing::info_span!("build_cfg", proto = proto.id.0);
-            let _enter = span.enter();
-            ControlFlowGraph::from_proto(proto, chunk)?
-        };
+        lifted.cfg.unfold_phis();
 
         info.line(1, format_args!("running pre-region passes..."));
         let pre_region_changed = {
             let span = tracing::info_span!(
                 "pre_region_passes",
-                proto = proto.id.0,
+                proto = lifted.proto.0,
                 changed = tracing::field::Empty,
             );
             let _enter = span.enter();
-            let changed = passes::run_pre_region(&mut cfg);
+            let changed = passes::run_pre_region(&mut lifted.cfg, &lifted.symbols);
             span.record("changed", changed);
             changed
         };
         if pre_region_changed {
-            let span = tracing::info_span!("simplify_conditions", proto = proto.id.0);
+            let span = tracing::info_span!("simplify_conditions", proto = lifted.proto.0);
             let _enter = span.enter();
-            cfg.simplify_conditions();
+            lifted.cfg.simplify_conditions();
         }
 
-        dump_cfg(&cfg, &diagnostics);
+        dump_cfg(&lifted.cfg, &diagnostics);
 
         info.line(1, format_args!("structuring region..."));
         let root = {
-            let span = tracing::info_span!("structure_region", proto = proto.id.0);
+            let span = tracing::info_span!("structure_region", proto = lifted.proto.0);
             let _enter = span.enter();
-            region::structure(&cfg, &diagnostics)
+            region::structure(&lifted.cfg, &diagnostics)
         };
 
-        let params = cfg.params().to_vec();
-        let upvalues = cfg.upvalues().to_vec();
-
         Ok(Self {
-            proto: proto.id,
-            debug_name: proto
-                .debug_name
-                .and_then(|id| chunk.get_string(id))
-                .map(|s| s.to_string()),
-            cfg,
+            proto: lifted.proto,
+            debug_name: lifted.debug_name,
             root,
-            params,
-            upvalues,
-            is_vararg: proto.is_vararg,
+            symbols: lifted.symbols,
+            types: lifted.types,
+            is_vararg: lifted.is_vararg,
             return_arity: None,
         })
     }

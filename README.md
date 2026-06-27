@@ -103,6 +103,18 @@ mallow roundtrip -i <source.luau>
 mallow visualize -i <bytecode> -o <output.html>
 ```
 
+### Type Inference
+
+Luau by default does not include any type info in the bytecode, unless compiled with the `-t1` flag. `-O2` may keep some function param types, if the compiler deems them beneficial to the runtime; but those are can only be trivial types, like `number` or `string` - no unions, named userdata, table types etc.
+
+mallow has a custom type inference engine, that recovers both factual bytecode types (if present), and non-trivial types that can't be inferred naturally by native tools like `luau-analyze` or various LSPs. Due to the inherent nature of this indeterminable problem, this is gated behind a `--infer-types` flag. This flag can only be used with the `decompile` or `roundtrip` command.
+
+Example output with type inference (`fib.luau`):
+
+```luau
+[TODO]
+```
+
 ## Testing
 
 Tests live in `tests/cases`. Each case is compiled with the Luau compiler, decompiled, and both versions are executed - stdout is compared for semantic equivalence rather than source text matching. Before running tests, make sure your compiler version emits a supported bytecode version.

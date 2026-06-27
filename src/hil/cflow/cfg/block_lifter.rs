@@ -12,7 +12,7 @@ use crate::{
         ir::{HilExpr, HilStmt, PhiNode},
         lifter::{
             LiftContext, MultiRet, flush_multiret, lift,
-            ssa::{Ssa as LifterSsa, Symbol, SymbolId, SymbolKind},
+            ssa::{Ssa, Symbol, SymbolId, SymbolKind},
         },
         ty::{ProtoTypeContext, TypeId, TypeStore},
         visitor::{Visitor, VisitorMut},
@@ -36,17 +36,17 @@ pub(super) struct BuildResult {
 /// This phase owns the mutable SSA algorithm because block lifting, synthetic
 /// terminator writes, loop-carried repairs, and final symbol canonicalization
 /// are tightly coupled.
-pub(super) fn build_blocks<G: GraphView>(
+pub(super) fn lift_blocks<G: GraphView>(
     proto: &Proto,
     chunk: &Chunk,
     raw_blocks: &[RawBlock],
     graph: &G,
 ) -> Result<BuildResult> {
-    BlockBuilder::new(proto, chunk, raw_blocks, graph).build()
+    BlockLifter::new(proto, chunk, raw_blocks, graph).build()
 }
 
 /// Mutable state for the SSA-backed CFG block lifting phase.
-struct BlockBuilder<'a, G: GraphView> {
+struct BlockLifter<'a, G: GraphView> {
     proto: &'a Proto,
     chunk: &'a Chunk,
     raw_blocks: &'a [RawBlock],
@@ -54,15 +54,15 @@ struct BlockBuilder<'a, G: GraphView> {
     type_store: TypeStore,
     type_context: ProtoTypeContext,
     blocks: Vec<Block>,
-    ssa: LifterSsa<'a, G>,
+    ssa: Ssa<'a, G>,
     params: Vec<SymbolId>,
     upvalues: Vec<SymbolId>,
     loop_carried_versions: Vec<(SymbolId, SymbolId)>,
 }
 
-impl<'a, G: GraphView> BlockBuilder<'a, G> {
+impl<'a, G: GraphView> BlockLifter<'a, G> {
     fn new(proto: &'a Proto, chunk: &'a Chunk, raw_blocks: &'a [RawBlock], graph: &'a G) -> Self {
-        let mut type_store = TypeStore::new();
+        let mut type_store = TypeStore::default();
         let type_context = ProtoTypeContext::from_proto(proto, chunk, &mut type_store);
 
         Self {
@@ -73,7 +73,7 @@ impl<'a, G: GraphView> BlockBuilder<'a, G> {
             type_store,
             type_context,
             blocks: vec![Block::dummy(); raw_blocks.len()],
-            ssa: LifterSsa::new(graph),
+            ssa: Ssa::new(graph),
             params: Vec::with_capacity(proto.num_params as usize),
             upvalues: Vec::with_capacity(proto.num_upvals as usize),
             loop_carried_versions: Vec::new(),
@@ -549,7 +549,7 @@ where
 /// Rewrites all SSA temporary symbols in lifted blocks to their canonical IDs.
 fn resolve_ssa_symbols<G: GraphView>(
     blocks: &mut [Block],
-    ssa: &LifterSsa<'_, G>,
+    ssa: &Ssa<'_, G>,
     djs: &mut UnionFind<SymbolId>,
 ) {
     let mut resolver = SymbolResolver { ssa, djs };
@@ -563,7 +563,7 @@ fn resolve_ssa_symbols<G: GraphView>(
 
 /// Visitor that canonicalizes every symbol reference it sees.
 struct SymbolResolver<'ssa, 'cfg, 'uf, G: GraphView> {
-    ssa: &'ssa LifterSsa<'cfg, G>,
+    ssa: &'ssa Ssa<'cfg, G>,
     djs: &'uf mut UnionFind<SymbolId>,
 }
 
@@ -624,7 +624,7 @@ fn visit_block_exit_symbols_mut<V: VisitorMut + ?Sized>(exit: &mut BlockExit, vi
 }
 
 /// Builds a lookup from SSA symbols to their original physical register.
-fn symbol_register_map<G: GraphView>(ssa: &LifterSsa<'_, G>) -> HashMap<SymbolId, u8> {
+fn symbol_register_map<G: GraphView>(ssa: &Ssa<'_, G>) -> HashMap<SymbolId, u8> {
     ssa.arena()
         .iter()
         .filter_map(|(id, sym)| match sym.kind {
@@ -786,7 +786,7 @@ fn compute_live_in_registers<G: GraphView>(
     blocks: &[Block],
     raw_blocks: &[RawBlock],
     graph: &G,
-    ssa: &LifterSsa<'_, G>,
+    ssa: &Ssa<'_, G>,
 ) -> Vec<RegSet> {
     let reg_of = symbol_register_map(ssa);
 

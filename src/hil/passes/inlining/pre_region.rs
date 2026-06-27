@@ -5,6 +5,7 @@ use crate::{
         cflow::cfg::{Block, BlockExit, ControlFlowGraph},
         cflow::graph::GraphView,
         ir::{HilExpr, HilStmt},
+        lifted::FunctionSymbols,
         lifter::ssa::SymbolId,
         visitor::{Visitor, walk_expr},
     },
@@ -124,7 +125,7 @@ impl Analyzer {
 }
 
 impl Visitor for Analyzer {
-    fn visit_block(&mut self, stmts: &[HilStmt]) {
+    fn visit_stmts(&mut self, stmts: &[HilStmt]) {
         for stmt in stmts {
             match &stmt {
                 HilStmt::Assign {
@@ -179,15 +180,18 @@ impl Visitor for Analyzer {
 }
 
 impl Analyzer {
-    pub fn analyze_cfg(cfg: &ControlFlowGraph) -> Scope<SymbolId, SymbolFacts> {
+    pub fn analyze_cfg(
+        cfg: &ControlFlowGraph,
+        symbols: &FunctionSymbols,
+    ) -> Scope<SymbolId, SymbolFacts> {
         let span = tracing::info_span!("pre_region_inlining_analyze", block_count = cfg.len(),);
         let _enter = span.enter();
 
         let mut analyzer = Analyzer::default();
-        analyzer.seed_symbols(cfg.params(), cfg.upvalues());
+        analyzer.seed_symbols(&symbols.params, &symbols.upvalues);
 
         for block in cfg.blocks() {
-            analyzer.visit_block(block.stmts());
+            analyzer.visit_stmts(block.stmts());
             analyzer.visit_cfg_exit(block.exit());
         }
 
@@ -473,7 +477,7 @@ fn kill_lvalues(stmt: &HilStmt, available: &mut HashMap<SymbolId, HilExpr>) {
     });
 }
 
-pub fn run(cfg: &mut ControlFlowGraph) -> bool {
+pub fn run(cfg: &mut ControlFlowGraph, symbols: &FunctionSymbols) -> bool {
     let mut changed = false;
     let mut iteration = 0;
     loop {
@@ -485,7 +489,7 @@ pub fn run(cfg: &mut ControlFlowGraph) -> bool {
         );
         let _enter = span.enter();
 
-        let facts = Analyzer::analyze_cfg(cfg);
+        let facts = Analyzer::analyze_cfg(cfg, symbols);
         let mut inliner = Inliner::with_facts(facts);
         inliner.visit_cfg(cfg);
         span.record("changed", inliner.was_changed);

@@ -101,6 +101,8 @@ pub enum Stmt {
     LocalFunction {
         /// Function name.
         name: Identifier,
+        /// Generic parameters declared by the function.
+        generics: Vec<SmolStr>,
         /// Function parameters.
         params: Vec<Typed<Parameter>>,
         /// Function body.
@@ -217,6 +219,8 @@ pub enum Expr {
     },
     /// Anonymous function expression.
     AnonymousFunction {
+        /// Generic parameters declared by the function expression.
+        generics: Vec<SmolStr>,
         /// Function parameters.
         params: Vec<Typed<Parameter>>,
         /// Function body.

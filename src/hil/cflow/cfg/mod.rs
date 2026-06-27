@@ -17,7 +17,7 @@ use crate::{
         cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
         ir::{HilExpr, HilStmt, PhiNode},
         lifter::ssa::SymbolId,
-        ty::{Type, TypeId, TypeStore},
+        ty::{TypeId, TypeStore},
     },
     il::{Instr, Proto, reg_add, reg_range},
 };
@@ -256,69 +256,72 @@ pub struct ControlFlowGraph {
     successors: Vec<Vec<usize>>,
     predecessors: Vec<Vec<usize>>,
     idoms: DominatorTree,
+}
 
-    params: Vec<SymbolId>,
-    upvalues: Vec<SymbolId>,
-    symbol_types: HashMap<SymbolId, TypeId>,
-    type_store: TypeStore,
+pub struct CfgBuild {
+    pub cfg: ControlFlowGraph,
+    pub params: Vec<SymbolId>,
+    pub upvalues: Vec<SymbolId>,
+    pub symbol_types: HashMap<SymbolId, TypeId>,
+    pub type_store: TypeStore,
+}
+
+pub fn build_from_proto(proto: &Proto, chunk: &Chunk) -> Result<CfgBuild> {
+    let instrs = proto.instrs.as_slice();
+
+    let entries = find_block_entries(instrs)?;
+    let raw_blocks = build_raw_blocks(&entries, instrs)?;
+
+    let (successors, predecessors) = build_graph(raw_blocks.iter().map(|b| b.exit.targets()));
+    let graph = AdjGraph::new(0, &successors, &predecessors);
+
+    let block_lifter::BuildResult {
+        mut blocks,
+        params,
+        upvalues,
+        symbol_types,
+        type_store,
+    } = block_lifter::lift_blocks(proto, chunk, &raw_blocks, &graph)?;
+
+    loop {
+        let changed_cond = fold_truthy_cond_jumps(&mut blocks);
+        let changed_jump = thread_jumps(&mut blocks);
+        if !changed_cond && !changed_jump {
+            break;
+        }
+    }
+
+    loop {
+        let (_, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
+        let changed = fold_condition_chains(&mut blocks, &predecessors);
+
+        if !changed {
+            break;
+        }
+    }
+
+    // Rebuild after folding
+    let (successors, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
+    let idoms = AdjGraph::new(0, &successors, &predecessors).build_idoms();
+
+    let cfg = ControlFlowGraph {
+        blocks,
+        entry_block: 0,
+        successors,
+        predecessors,
+        idoms,
+    };
+
+    Ok(CfgBuild {
+        cfg,
+        params,
+        upvalues,
+        symbol_types,
+        type_store,
+    })
 }
 
 impl ControlFlowGraph {
-    pub fn from_proto(proto: &Proto, chunk: &Chunk) -> Result<Self> {
-        let instrs = proto.instrs.as_slice();
-
-        let entries = find_block_entries(instrs)?;
-        let raw_blocks = build_raw_blocks(&entries, instrs)?;
-
-        let (successors, predecessors) = build_graph(raw_blocks.iter().map(|b| b.exit.targets()));
-        let graph = AdjGraph::new(0, &successors, &predecessors);
-
-        let block_lifter::BuildResult {
-            mut blocks,
-            params,
-            upvalues,
-            symbol_types,
-            type_store,
-        } = block_lifter::build_blocks(proto, chunk, &raw_blocks, &graph)?;
-
-        loop {
-            let changed_cond = fold_truthy_cond_jumps(&mut blocks);
-            let changed_jump = thread_jumps(&mut blocks);
-            if !changed_cond && !changed_jump {
-                break;
-            }
-        }
-
-        loop {
-            let (_, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
-            let changed = fold_condition_chains(&mut blocks, &predecessors);
-
-            if !changed {
-                break;
-            }
-        }
-
-        // Rebuild after folding
-        let (successors, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
-        let idoms = AdjGraph::new(0, &successors, &predecessors).build_idoms();
-
-        let mut graph = Self {
-            blocks,
-            entry_block: 0,
-            successors,
-            predecessors,
-            idoms,
-            params,
-            upvalues,
-            symbol_types,
-            type_store,
-        };
-        for i in 0..graph.blocks.len() {
-            graph.unfold_phis(i);
-        }
-        Ok(graph)
-    }
-
     /// Re-runs CFG-level simplifications that depend on block bodies being empty.
     ///
     /// Pre-region passes can remove temporary condition assignments, which exposes
@@ -352,7 +355,7 @@ impl ControlFlowGraph {
     /// Unfolds Phi Nodes into assign statements inserted at appropriate locations.
     ///
     /// This should be ran after the graph metadata has been computed.
-    fn unfold_phis(&mut self, block_idx: usize) {
+    fn unfold_phis_in_block(&mut self, block_idx: usize) {
         let Some(idom) = self.idoms.idom(block_idx) else {
             // This block has no immediate dominator, we can't emit the phi node
             // target declaration anywhere.
@@ -419,41 +422,40 @@ impl ControlFlowGraph {
         }
     }
 
-    /// Returns the list of parameters of the function.
-    pub fn params(&self) -> &[SymbolId] {
-        &self.params
-    }
-
-    /// Returns the list of upvalues of the function.
-    pub fn upvalues(&self) -> &[SymbolId] {
-        &self.upvalues
-    }
-
-    /// Returns the bytecode-provided type for a final HIL symbol.
-    pub fn symbol_type(&self, sym: SymbolId) -> Option<&Type> {
-        self.symbol_types
-            .get(&sym)
-            .map(|&type_id| self.type_store.get(type_id))
-    }
-
     /// Returns a block by its index.
+    #[inline]
     pub fn get(&self, idx: usize) -> &Block {
         debug_assert!(self.contains_node(idx));
         &self.blocks[idx]
     }
 
     /// Returns an iterator over all blocks in the CFG.
+    #[inline]
     pub fn blocks(&self) -> impl Iterator<Item = &Block> + '_ {
         self.blocks.iter()
     }
 
     /// Returns a mutable iterator over all blocks in the CFG.
+    #[inline]
     pub fn blocks_mut(&mut self) -> impl Iterator<Item = &mut Block> + '_ {
         self.blocks.iter_mut()
+    }
+
+    /// Unfolds all phi nodes in the CFG.
+    pub fn unfold_phis(&mut self) {
+        for i in 0..self.blocks.len() {
+            self.unfold_phis_in_block(i);
+        }
     }
 }
 
 impl GraphView for ControlFlowGraph {
+    type Item = Block;
+
+    fn get(&self, node: usize) -> Option<&Self::Item> {
+        self.blocks.get(node)
+    }
+
     fn entry(&self) -> usize {
         self.entry_block
     }
