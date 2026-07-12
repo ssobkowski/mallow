@@ -474,7 +474,7 @@ impl AstPrinter {
                     wrote = true;
                 }
                 let mut fields: Vec<_> = fields.iter().collect();
-                fields.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+                fields.sort_unstable_by_key(|(lhs, _)| *lhs);
                 for (name, ty) in fields {
                     if wrote {
                         self.write(", ");

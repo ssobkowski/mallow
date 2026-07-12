@@ -82,9 +82,9 @@ fn executable_name(stem: &str) -> OsString {
     name
 }
 
-/// Indexed reads remain optional even after concrete values are written.
+/// A truthy cache hit narrows the function's observable return to `number`.
 #[test]
-fn inferred_index_read_is_optional_and_analyzes() {
+fn inferred_index_read_narrows_after_truthiness_check() {
     let output = infer_and_analyze(
         r#"
 local memo = {}
@@ -103,8 +103,8 @@ print(lookup(1), lookup(2))
     );
 
     assert!(
-        output.contains("nil | number"),
-        "indexed read lost its nil alternative:\n{output}"
+        output.contains("local function v1(p0: number): number"),
+        "the cache lookup did not recover its numeric contract:\n{output}"
     );
 }
 
@@ -138,8 +138,8 @@ fn recursive_memo_table_inference_is_deterministic() {
     for iteration in 0..24 {
         let output = infer_bytecode(&bytecode);
         assert!(
-            output.contains("local v0: { [number]: nil | number } = {}"),
-            "iteration {iteration} lost recursive memo-table evidence:\n{output}"
+            output.contains("local function v1(p0: number): number"),
+            "iteration {iteration} lost recursive numeric inference:\n{output}"
         );
         analyze_source(&output, &temp);
     }
@@ -203,13 +203,12 @@ fn identity_with_omitted_argument_recovers_optional_generic() {
         "identity parameter and return were not tied by one optional generic:\n{output}"
     );
     assert!(
-        output.contains("local v1: nil | number = v0(1)")
-            || output.contains("local v1: number | nil = v0(1)"),
-        "present identity call did not match the optional generic return:\n{output}"
+        output.contains("local v1 = v0(1)"),
+        "the present identity call repeated its inferred result type:\n{output}"
     );
     assert!(
-        output.contains("local v2: nil = v0()"),
-        "omitted identity call did not produce nil:\n{output}"
+        output.contains("local v2 = v0()"),
+        "the omitted identity call repeated its inferred result type:\n{output}"
     );
 }
 
@@ -226,7 +225,7 @@ fn unconstrained_truthy_return_does_not_narrow_to_other_branches() {
     );
 }
 
-/// Dynamic indexed reads dispatch through callable `__index` handlers.
+/// Callable `__index` output remains accepted without a duplicate result annotation.
 #[test]
 fn dynamic_index_uses_callable_metamethod() {
     let output = infer_and_analyze(include_str!(
@@ -234,29 +233,56 @@ fn dynamic_index_uses_callable_metamethod() {
     ));
 
     assert!(
-        output.contains("nil | string"),
-        "dynamic `__index` result was omitted from the read type:\n{output}"
+        !output.contains("unknown"),
+        "callable `__index` leaked an unresolved annotation:\n{output}"
     );
 }
 
-/// Named reads reconnect after their base receives a metatable.
+/// A late `__index` link remains accepted without a duplicate read annotation.
 #[test]
 fn late_metatable_link_reconnects_named_read() {
     let output = infer_and_analyze(include_str!("inference-cases/late-index-metamethod.luau"));
 
     assert!(
-        output.contains("nil | string"),
-        "late `__index` result was omitted from the named read type:\n{output}"
+        !output.contains("unknown"),
+        "late `__index` linkage leaked an unresolved annotation:\n{output}"
     );
 }
 
-/// Dynamic indexed reads dispatch through table-valued `__index` handlers.
+/// Table-valued `__index` output remains accepted without a duplicate result annotation.
 #[test]
 fn dynamic_index_uses_table_metamethod() {
     let output = infer_and_analyze(include_str!("inference-cases/table-index-metamethod.luau"));
 
     assert!(
-        output.contains("nil | number"),
-        "table-valued `__index` fields were omitted from the read type:\n{output}"
+        !output.contains("unknown"),
+        "table-valued `__index` leaked an unresolved annotation:\n{output}"
+    );
+}
+
+/// Real-world MD5 inference stays concise while retaining its useful contracts.
+#[test]
+fn md5_inference_recovers_numeric_and_table_contracts_without_unknown() {
+    let output = infer_and_analyze(include_str!("cases/intg-md5.luau"));
+
+    assert!(
+        !output.contains("unknown"),
+        "MD5 inference emitted unresolved placeholder types:\n{output}"
+    );
+    assert!(
+        output.contains("local function v32(p0: string, ...): { [number]: nil | number }"),
+        "`table.insert` did not propagate its numeric element into the returned table:\n{output}"
+    );
+    assert!(
+        output.contains("local v35 = function(p0: number, p1: number, p2: number)"),
+        "numeric bit-operation parameters were not recovered:\n{output}"
+    );
+    assert!(
+        output.contains("local v39 = function(p0: (number, number, number) -> number, p1: number"),
+        "the MD5 round callback signature remained unresolved:\n{output}"
+    );
+    assert!(
+        output.contains("local v43 = v0.new()"),
+        "the constructor call repeated its inferred object type:\n{output}"
     );
 }

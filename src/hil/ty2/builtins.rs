@@ -7,47 +7,6 @@ use crate::hil::{
     ty::{FunctionTypeParam, FunctionTypeReturn, Type, TypeLiteral},
 };
 
-/// Names installed in the Luau global builtin environment.
-const GLOBAL_NAMES: &[&str] = &[
-    "require",
-    "getfenv",
-    "_G",
-    "_VERSION",
-    "gcinfo",
-    "print",
-    "type",
-    "typeof",
-    "assert",
-    "error",
-    "tostring",
-    "tonumber",
-    "rawequal",
-    "rawget",
-    "rawset",
-    "rawlen",
-    "setmetatable",
-    "setfenv",
-    "ipairs",
-    "pcall",
-    "xpcall",
-    "select",
-    "loadstring",
-    "newproxy",
-    "unpack",
-    "bit32",
-    "math",
-    "os",
-    "coroutine",
-    "table",
-    "debug",
-    "utf8",
-    "buffer",
-    "vector",
-    "integer",
-    "class",
-    "types",
-];
-
 /// Immutable builtin type schemes allocated once for an inference session.
 #[derive(Debug)]
 pub struct BuiltinEnvironment {
@@ -67,6 +26,74 @@ pub enum BuiltinPath {
         /// Field selected from the namespace.
         field: SmolStr,
     },
+}
+
+/// One argument source used by a builtin indexed-write effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BuiltinIndex {
+    /// Uses the argument at this zero-based call position.
+    Argument(usize),
+    /// Synthesizes the numeric array index used by append-like operations.
+    Number,
+}
+
+/// A heap effect attached to one builtin call shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BuiltinCallEffect {
+    /// Writes one value into an indexed table slot.
+    SetIndex {
+        /// Zero-based argument containing the mutated table.
+        table_argument: usize,
+        /// Source of the written index.
+        index: BuiltinIndex,
+        /// Zero-based argument containing the written value.
+        value_argument: usize,
+    },
+    /// Attaches one metatable and returns the base table.
+    SetMetatable {
+        /// Zero-based argument containing the base table.
+        table_argument: usize,
+        /// Zero-based argument containing the metatable.
+        metatable_argument: usize,
+    },
+}
+
+impl BuiltinPath {
+    /// Returns the heap effect for this builtin and fixed call arity.
+    pub(super) fn call_effect(&self, argument_count: usize) -> Option<BuiltinCallEffect> {
+        match (self, argument_count) {
+            (Self::Global(name), 2..) if name == "setmetatable" => {
+                Some(BuiltinCallEffect::SetMetatable {
+                    table_argument: 0,
+                    metatable_argument: 1,
+                })
+            }
+            (Self::Global(name), 3..) if name == "rawset" => Some(BuiltinCallEffect::SetIndex {
+                table_argument: 0,
+                index: BuiltinIndex::Argument(1),
+                value_argument: 2,
+            }),
+            (Self::NamespaceField { namespace, field }, 2)
+                if namespace == "table" && field == "insert" =>
+            {
+                Some(BuiltinCallEffect::SetIndex {
+                    table_argument: 0,
+                    index: BuiltinIndex::Number,
+                    value_argument: 1,
+                })
+            }
+            (Self::NamespaceField { namespace, field }, 3)
+                if namespace == "table" && field == "insert" =>
+            {
+                Some(BuiltinCallEffect::SetIndex {
+                    table_argument: 0,
+                    index: BuiltinIndex::Argument(1),
+                    value_argument: 2,
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 impl BuiltinPath {
@@ -333,59 +360,89 @@ macro_rules! namespace_types {
     };
 }
 
-/// Builds one global type scheme from Luau's embedded builtin definitions.
-// luau/Analysis/src/EmbeddedBuiltinDefinitions.cpp
-fn global_type(name: &SmolStr) -> Option<Type> {
-    Some(match name.as_str() {
-        "require" => ty!(any),
-        "getfenv" => ty!(fn(any) -> { string => any }),
-        "_G" => ty!(any),
-        "_VERSION" => ty!(string),
-        "gcinfo" => ty!(fn() -> number),
-        "print" => ty!(fn<T>(@T) -> unit),
-        "type" | "typeof" => ty!(fn<T>(T) -> string),
-        "assert" => ty!(fn<T>(T, string?) -> T),
-        "error" => ty!(fn<T>(T, number?) -> never),
-        "tostring" => ty!(fn<T>(T) -> string),
-        "tonumber" => ty!(fn<T>(T, number?) -> number?),
-        "rawequal" => ty!(fn<A, B>(A, B) -> boolean),
-        "rawget" => ty!(fn<K, V>({ K => V }, K) -> V?),
-        "rawset" => ty!(fn<K, V>({ K => V }, K, V) -> { K => V }),
-        "rawlen" => ty!(fn<K, V>({ K => V } | string) -> number),
-        "setmetatable" => ty!(fn<T, M>(T, M) -> T),
-        "setfenv" => {
-            ty!(fn<T, R>(number | (fn(@T) -> @R), { string => any }) -> (fn(@T) -> @R)?)
-        }
-        "ipairs" => {
-            ty!(fn<V>({ number => V }) -> (
-                fn({ number => V }, number) -> (number?, V),
-                { number => V },
-                number
-            ))
-        }
-        "pcall" => ty!(fn<A, R>(fn(@A) -> @R, @A) -> (boolean, @R)),
-        "xpcall" => ty!(fn<E, A, R1, R2>(fn(@A) -> @R1, fn(E) -> @R2, @A) -> (boolean, @R1)),
-        "select" => ty!(fn<A>(string | number, @A) -> @any),
-        "loadstring" => ty!(fn<A>(string, string?) -> ((fn(@A) -> any)?, string?)),
-        "newproxy" => ty!(fn(boolean?) -> any),
-        "unpack" => ty!(fn<V>({ number => V }, number?, number?) -> @V),
+/// Declares the flat table of global builtin names and their type schemes.
+/// Expands to both `GLOBAL_NAMES` (the flattened list of installed names)
+/// and `global_type` (the name -> type scheme lookup) from a single source
+/// of truth, so a name can never be listed in one without appearing, with
+/// its type, in the other.
+macro_rules! global_types {
+    ($($($name:literal)|+ => $ty:expr),* $(,)?) => {
+        /// Names installed in the Luau global builtin environment.
+        const GLOBAL_NAMES: &[&str] = &[$($($name),+),*];
 
-        "bit32" => bit32_type(),
-        "math" => math_type(),
-        "os" => os_type(),
-        "coroutine" => coroutine_type(),
-        "table" => table_type(),
-        "debug" => debug_type(),
-        "utf8" => utf8_type(),
-        "buffer" => buffer_type(),
-        "vector" => vector_type(),
-        "integer" => integer_type(),
-        "class" => class_type(),
-        "types" => types_type(),
-
-        _ => return None,
-    })
+        /// Builds one global type scheme from Luau's embedded builtin definitions.
+        // luau/Analysis/src/EmbeddedBuiltinDefinitions.cpp
+        fn global_type(name: &SmolStr) -> Option<Type> {
+            Some(match name.as_str() {
+                $($($name)|+ => $ty,)*
+                _ => return None,
+            })
+        }
+    };
 }
+
+global_types! {
+    "getfenv" => ty!(fn(any) -> { string => any }),
+    "_G" => ty!(any),
+    "_VERSION" => ty!(string),
+    "gcinfo" => ty!(fn() -> number),
+    "print" => ty!(fn<T>(@T) -> unit),
+    "type" | "typeof" => ty!(fn<T>(T) -> string),
+    "assert" => ty!(fn<T>(T, string?) -> T),
+    "error" => ty!(fn<T>(T, number?) -> never),
+    "tostring" => ty!(fn<T>(T) -> string),
+    "tonumber" => ty!(fn<T>(T, number?) -> number?),
+    "rawequal" => ty!(fn<A, B>(A, B) -> boolean),
+    "rawget" => ty!(fn<K, V>({ K => V }, K) -> V?),
+    "rawset" => ty!(fn<K, V>({ K => V }, K, V) -> { K => V }),
+    "rawlen" => ty!(fn<K, V>({ K => V } | string) -> number),
+    "setmetatable" => ty!(fn<T, M>(T, M) -> T),
+    "setfenv" => ty!(fn<T, R>(number | (fn(@T) -> @R), { string => any }) -> (fn(@T) -> @R)?),
+    "ipairs" => ty!(fn<V>({ number => V }) -> (
+        fn({ number => V }, number) -> (number?, V),
+        { number => V },
+        number
+    )),
+    "pcall" => ty!(fn<A, R>(fn(@A) -> @R, @A) -> (boolean, @R)),
+    "xpcall" => ty!(fn<E, A, R1, R2>(fn(@A) -> @R1, fn(E) -> @R2, @A) -> (boolean, @R1)),
+    "select" => ty!(fn<A>(string | number, @A) -> @any),
+    "loadstring" => ty!(fn<A>(string, string?) -> ((fn(@A) -> any)?, string?)),
+    "newproxy" => ty!(fn(boolean?) -> any),
+    "unpack" => ty!(fn<V>({ number => V }, number?, number?) -> @V),
+    "string" => string_type(),
+
+    "bit32" => bit32_type(),
+    "math" => math_type(),
+    "os" => os_type(),
+    "coroutine" => coroutine_type(),
+    "table" => table_type(),
+    "debug" => debug_type(),
+    "utf8" => utf8_type(),
+    "buffer" => buffer_type(),
+    "vector" => vector_type(),
+    "integer" => integer_type(),
+    "class" => class_type(),
+    "types" => types_type(),
+}
+namespace_types!(string_type, string_field_type {
+    "byte" => ty!(fn(string, number?, number?) -> @number),
+    "char" => ty!(fn(@number) -> string),
+    "find" => ty!(fn(string, string, number?, boolean?) -> (number?, number?, @string)),
+    "format" => ty!(fn(string, @any) -> string),
+    "gmatch" => ty!(fn(string, string) -> (fn() -> @string)),
+    "gsub" => ty!(fn(string, string, any, number?) -> (string, number)),
+    "len" => ty!(fn(string) -> number),
+    "lower" => ty!(fn(string) -> string),
+    "match" => ty!(fn(string, string, number?) -> @string),
+    "pack" => ty!(fn(string, @any) -> string),
+    "packsize" => ty!(fn(string) -> number),
+    "rep" => ty!(fn(string, number, string?) -> string),
+    "reverse" => ty!(fn(string) -> string),
+    "split" => ty!(fn(string, string?) -> { number => string }),
+    "sub" => ty!(fn(string, number, number?) -> string),
+    "unpack" => ty!(fn(string, string, number?) -> @any),
+    "upper" => ty!(fn(string) -> string),
+});
 
 namespace_types!(bit32_type, bit32_field_type {
     "band" => ty!(fn(@number) -> number),

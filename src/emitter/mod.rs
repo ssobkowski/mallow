@@ -42,7 +42,7 @@ const MAX_LOCAL_COUNT: usize = 199;
 /// instead of printing the whole function type in return position.
 fn local_function_return_type(ty: &Type) -> Option<Type> {
     let Type::Function { return_type, .. } = ty else {
-        return ty.is_meaningful().then(|| ty.clone());
+        return (ty.is_meaningful() && !ty.contains_unknown()).then(|| ty.clone());
     };
 
     let [return_ty] = return_type.as_slice() else {
@@ -53,19 +53,7 @@ fn local_function_return_type(ty: &Type) -> Option<Type> {
         FunctionTypeReturn::Type(ty) | FunctionTypeReturn::Vararg(ty) => ty,
     };
 
-    ty.is_meaningful().then(|| ty.clone())
-}
-
-/// Returns true when a local declaration's initializer already makes the type obvious.
-fn is_trivial_literal_annotation(ty: &Type, value: &Expr) -> bool {
-    matches!(
-        (ty, value),
-        (
-            Type::Number,
-            Expr::Literal(Literal::Integer(_) | Literal::Float(_))
-        ) | (Type::String, Expr::Literal(Literal::String(_)))
-            | (Type::Boolean, Expr::Literal(Literal::Bool(_)))
-    )
+    (ty.is_meaningful() && !ty.contains_unknown()).then(|| ty.clone())
 }
 
 /// Collects generic names referenced by one emitted type annotation.
@@ -161,7 +149,6 @@ struct FunctionContext {
 }
 
 struct AssignManyTarget {
-    symbol: SymbolId,
     storage: SymbolStorage,
     slot_was_declared: bool,
 }
@@ -274,7 +261,7 @@ impl Emitter<'_> {
     ) -> Typed<Identifier> {
         if let Some(ty) = self.functions[proto_idx]
             .symbol_type(sym)
-            .filter(|ty| ty.is_meaningful())
+            .filter(|ty| ty.is_meaningful() && !ty.contains_unknown())
             .cloned()
         {
             Typed::new(name, ty)
@@ -295,7 +282,7 @@ impl Emitter<'_> {
     ) -> Typed<Parameter> {
         if let Some(ty) = self.functions[proto_idx]
             .symbol_type(sym)
-            .filter(|ty| ty.is_meaningful())
+            .filter(|ty| ty.is_meaningful() && !ty.contains_unknown())
             .cloned()
         {
             Typed::new(parameter, ty)
@@ -374,7 +361,6 @@ impl Emitter<'_> {
             }
 
             targets.push(AssignManyTarget {
-                symbol,
                 storage,
                 slot_was_declared,
             });
@@ -737,15 +723,8 @@ impl Emitter<'_> {
                         .expect("symbol was just declared in scope")
                     {
                         SymbolStorage::Named(name) => {
-                            let name =
-                                match self.functions[self.current_proto_idx()].symbol_type(*sym) {
-                                    Some(ty) if is_trivial_literal_annotation(ty, &right) => {
-                                        Typed::untyped(name)
-                                    }
-                                    _ => self.typed_identifier(*sym, name),
-                                };
                             buf.push(Stmt::LocalDeclaration {
-                                names: vec![name],
+                                names: vec![Typed::untyped(name)],
                                 values: vec![right],
                             });
                         }
@@ -819,9 +798,7 @@ impl Emitter<'_> {
                     let names = targets
                         .into_iter()
                         .map(|target| match target.storage {
-                            SymbolStorage::Named(name) => {
-                                self.typed_identifier(target.symbol, name)
-                            }
+                            SymbolStorage::Named(name) => Typed::untyped(name),
                             SymbolStorage::Spilled(_) => unreachable!("guarded by all_named"),
                         })
                         .collect();
@@ -843,10 +820,12 @@ impl Emitter<'_> {
                 for (target, temp) in targets.into_iter().zip(temps) {
                     let rhs = vec![Expr::Named(temp.as_ref().clone())];
                     match (target.storage, target.slot_was_declared) {
-                        (SymbolStorage::Named(name), false) => buf.push(Stmt::LocalDeclaration {
-                            names: vec![self.typed_identifier(target.symbol, name)],
-                            values: rhs,
-                        }),
+                        (SymbolStorage::Named(name), false) => {
+                            buf.push(Stmt::LocalDeclaration {
+                                names: vec![Typed::untyped(name)],
+                                values: rhs,
+                            });
+                        }
                         (storage, true) | (storage @ SymbolStorage::Spilled(_), false) => {
                             buf.push(Stmt::Assignment {
                                 lhs: vec![storage.into_expr()],

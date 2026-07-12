@@ -16,7 +16,6 @@ use crate::{
 pub type TypeId = Id<Type>;
 
 /// A Luau type literal.
-#[allow(dead_code, reason = "literal type support is part of the type model")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeLiteral {
     String(String),
@@ -24,10 +23,6 @@ pub enum TypeLiteral {
 }
 
 /// A Luau metamethod.
-#[allow(
-    dead_code,
-    reason = "the type model represents Luau forms before every form is inferred"
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Metamethod {
     Index,
@@ -130,13 +125,9 @@ pub struct Metatable {
     // Most metatables relevant to one inferred operation expose very few methods.
     // Sparse storage avoids reserving one recursive `Option<Type>` for every
     // possible metamethod while retaining deterministic linear lookup at this size.
-    methods: Vec<(Metamethod, Box<Type>)>,
+    methods: Vec<(Metamethod, Type)>,
 }
 
-#[allow(
-    dead_code,
-    reason = "metatable construction is exposed for later inference stages"
-)]
 impl Metatable {
     /// Creates an empty metatable type descriptor.
     pub fn new() -> Self {
@@ -146,34 +137,24 @@ impl Metatable {
     /// Adds or replaces a metamethod type.
     pub fn insert(&mut self, method: Metamethod, ty: Type) {
         if let Some((_, existing)) = self.methods.iter_mut().find(|(m, _)| *m == method) {
-            **existing = ty;
+            *existing = ty;
             return;
         }
 
-        self.methods.push((method, Box::new(ty)));
+        self.methods.push((method, ty));
         self.methods.sort_by_key(|(method, _)| *method as u8);
     }
 
     /// Creates a metatable descriptor with one method already defined.
+    #[cfg(test)]
     pub fn with_method(mut self, method: Metamethod, ty: Type) -> Self {
         self.insert(method, ty);
         self
     }
 
-    /// Returns the surface type for the given metamethod, if one is defined.
-    #[inline]
-    pub fn get(&self, method: Metamethod) -> Option<&Type> {
-        self.methods
-            .iter()
-            .find(|(m, _)| *m == method)
-            .map(|(_, ty)| ty.as_ref())
-    }
-
     /// Returns every modeled metamethod and its owned surface type.
     pub fn iter(&self) -> impl Iterator<Item = (Metamethod, &Type)> {
-        self.methods
-            .iter()
-            .map(|(method, ty)| (*method, ty.as_ref()))
+        self.methods.iter().map(|(method, ty)| (*method, ty))
     }
 }
 
@@ -194,10 +175,6 @@ pub enum FunctionTypeReturn {
 }
 
 /// A Luau type.
-#[allow(
-    dead_code,
-    reason = "the type model represents Luau forms before every form is inferred"
-)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum Type {
     /// The `nil` type.
@@ -538,6 +515,45 @@ impl Type {
         match self {
             Self::Nil => true,
             Self::Union(types) => types.iter().any(Self::accepts_nil),
+            _ => false,
+        }
+    }
+
+    /// Returns whether any printable component is still the broad `unknown` type.
+    pub fn contains_unknown(&self) -> bool {
+        match self {
+            Self::Unknown => true,
+            Self::Table { fields, array } => {
+                fields.values().any(Self::contains_unknown)
+                    || array.as_ref().is_some_and(|array| {
+                        let (key, value) = array.as_ref();
+                        key.contains_unknown() || value.contains_unknown()
+                    })
+            }
+            Self::Function {
+                params,
+                return_type,
+                ..
+            } => {
+                params.iter().any(|param| match param {
+                    FunctionTypeParam::Type(ty) | FunctionTypeParam::Vararg(ty) => {
+                        ty.contains_unknown()
+                    }
+                }) || return_type.iter().any(|returned| match returned {
+                    FunctionTypeReturn::Type(ty) | FunctionTypeReturn::Vararg(ty) => {
+                        ty.contains_unknown()
+                    }
+                })
+            }
+            Self::Union(types) | Self::Intersection(types) => {
+                types.iter().any(Self::contains_unknown)
+            }
+            Self::WithMetatable { base, metatable } => {
+                base.contains_unknown()
+                    || metatable
+                        .iter()
+                        .any(|(_, method)| method.contains_unknown())
+            }
             _ => false,
         }
     }

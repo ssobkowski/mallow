@@ -26,7 +26,7 @@ use crate::{
         lifter::ssa::SymbolId,
         ty::{FunctionTypeParam, FunctionTypeReturn, Metamethod, Type, TypeLiteral},
         ty2::{
-            builtins::{BuiltinEnvironment, BuiltinPath},
+            builtins::{BuiltinCallEffect, BuiltinEnvironment, BuiltinIndex, BuiltinPath},
             types::{MonoType, MonoTypeId, TypeArena, TypePack},
         },
         visitor::{Visitor, walk_expr},
@@ -181,7 +181,7 @@ impl CollectedConstraint {
             Self::FieldCall { args, returns, .. } => {
                 args.iter().any(
                     |argument| matches!(argument, CollectedCallArgument::Value(value) if *value == slot),
-                ) || returns.iter().any(|value| *value == slot)
+                ) || returns.contains(&slot)
             }
         }
     }
@@ -1422,6 +1422,11 @@ enum SolverConstraint {
         /// Optional destination receiving the base value.
         result: Option<InferenceVarId>,
     },
+    /// Observes values stored in a table after excluding deletion-by-`nil`.
+    NonNilFrom {
+        /// Written value whose `nil` alternative does not remain stored.
+        source: InferenceVarId,
+    },
     /// Observes a source variable after excluding concrete scheme alternatives.
     GenericFrom {
         /// Argument variable supplying generic evidence.
@@ -1469,6 +1474,33 @@ struct DeferredRefinement {
     source: InferenceVarId,
     /// Branch restriction used to derive the fallback type.
     truthiness: Truthiness,
+}
+/// One operator overload resolved only after concrete identity propagation settles.
+#[derive(Debug, Clone, Copy)]
+enum DeferredOperator {
+    /// Defaults an otherwise unconstrained arithmetic operation to numbers.
+    Arithmetic {
+        /// Left operand.
+        lhs: InferenceVarId,
+        /// Right operand.
+        rhs: InferenceVarId,
+        /// Produced result.
+        result: InferenceVarId,
+    },
+    /// Narrows a comparison from the concrete primitive used by either side.
+    Comparison {
+        /// Left operand.
+        lhs: InferenceVarId,
+        /// Right operand.
+        rhs: InferenceVarId,
+    },
+    /// Defaults an otherwise unconstrained negation to numeric negation.
+    UnaryMinus {
+        /// Negated operand.
+        operand: InferenceVarId,
+        /// Produced result.
+        result: InferenceVarId,
+    },
 }
 
 /// Deduplicating FIFO work queue for inference variables.
@@ -1548,6 +1580,10 @@ struct TypeSolver<'a> {
     deferred_refinements: HashMap<usize, DeferredRefinement>,
     /// Refinement records whose producer-free fallback has run once.
     activated_refinement_fallbacks: HashSet<usize>,
+    /// Operators waiting for primitive fallback after identity propagation.
+    deferred_operators: HashMap<usize, DeferredOperator>,
+    /// Operator records whose primitive fallback decision has run once.
+    activated_operator_fallbacks: HashSet<usize>,
     /// Next stable constraint identity.
     next_constraint_id: usize,
 }
@@ -1586,6 +1622,8 @@ impl<'a> TypeSolver<'a> {
             activated_dynamic_fields: HashSet::new(),
             deferred_refinements: HashMap::new(),
             activated_refinement_fallbacks: HashSet::new(),
+            deferred_operators: HashMap::new(),
+            activated_operator_fallbacks: HashSet::new(),
             next_constraint_id: 0,
         };
 
@@ -1822,7 +1860,8 @@ impl<'a> TypeSolver<'a> {
             SolverConstraint::FlowFrom(source)
             | SolverConstraint::Equal(source)
             | SolverConstraint::RefinedFrom { source, .. }
-            | SolverConstraint::GenericFrom { source, .. } => depend_on(*source),
+            | SolverConstraint::GenericFrom { source, .. }
+            | SolverConstraint::NonNilFrom { source } => depend_on(*source),
             SolverConstraint::SetIndex { index, value }
             | SolverConstraint::GetIndex { index, value } => {
                 depend_on(*index);
@@ -1863,9 +1902,13 @@ impl<'a> TypeSolver<'a> {
     fn solve(&mut self) {
         loop {
             self.drain_queue();
-            if !self.activate_deferred_refinements() {
-                break;
+            if self.activate_deferred_operators() {
+                continue;
             }
+            if self.activate_deferred_refinements() {
+                continue;
+            }
+            break;
         }
     }
 
@@ -1877,6 +1920,98 @@ impl<'a> TypeSolver<'a> {
                 self.apply(variable, record);
             }
             self.activate_calls(variable);
+        }
+    }
+
+    /// Activates primitive operator defaults after table and closure identities settle.
+    fn activate_deferred_operators(&mut self) -> bool {
+        let mut deferred: Vec<_> = std::mem::take(&mut self.deferred_operators)
+            .into_iter()
+            .collect();
+        deferred.sort_by_key(|(constraint_id, _)| *constraint_id);
+        let mut activated = false;
+        for (constraint_id, operator) in deferred {
+            if !self.activated_operator_fallbacks.insert(constraint_id) {
+                continue;
+            }
+            let primitives = self.types.primitives();
+            match operator {
+                DeferredOperator::Arithmetic { lhs, rhs, result }
+                    if self.can_default_to(lhs, primitives.number)
+                        && self.can_default_to(rhs, primitives.number) =>
+                {
+                    self.require(lhs, primitives.number);
+                    self.require(rhs, primitives.number);
+                    self.observe(result, primitives.number);
+                    activated = true;
+                }
+                DeferredOperator::Comparison { lhs, rhs } => {
+                    let narrowed = if self.produced_is_subtype(lhs, primitives.number)
+                        && self.can_default_to(rhs, primitives.number)
+                        || self.produced_is_subtype(rhs, primitives.number)
+                            && self.can_default_to(lhs, primitives.number)
+                    {
+                        Some(primitives.number)
+                    } else if self.produced_is_subtype(lhs, primitives.string)
+                        && self.can_default_to(rhs, primitives.string)
+                        || self.produced_is_subtype(rhs, primitives.string)
+                            && self.can_default_to(lhs, primitives.string)
+                    {
+                        Some(primitives.string)
+                    } else {
+                        None
+                    };
+                    if let Some(ty) = narrowed {
+                        self.require(lhs, ty);
+                        self.require(rhs, ty);
+                        activated = true;
+                    }
+                }
+                DeferredOperator::UnaryMinus { operand, result }
+                    if self.can_default_to(operand, primitives.number) =>
+                {
+                    self.require(operand, primitives.number);
+                    self.observe(result, primitives.number);
+                    activated = true;
+                }
+                _ => {}
+            }
+        }
+        activated
+    }
+
+    /// Returns whether unresolved evidence can conservatively default to `primitive`.
+    fn can_default_to(&self, variable: InferenceVarId, primitive: MonoTypeId) -> bool {
+        let facts = &self.variables[variable];
+        if !facts.tables.is_empty() || !facts.closures.is_empty() || !facts.builtins.is_empty() {
+            return false;
+        }
+        self.lower_defaults_to(facts.lower, primitive)
+    }
+
+    /// Returns whether `lower` differs from `primitive` only by nil or dynamic evidence.
+    fn lower_defaults_to(&self, lower: MonoTypeId, primitive: MonoTypeId) -> bool {
+        match self.types.get(lower) {
+            MonoType::Never | MonoType::Nil | MonoType::Unknown | MonoType::Any => true,
+            MonoType::Union(members) => members
+                .iter()
+                .all(|member| self.lower_defaults_to(*member, primitive)),
+            _ => self.types.is_subtype(lower, primitive),
+        }
+    }
+
+    /// Returns whether a variable produces only values inside `primitive`.
+    fn produced_is_subtype(&self, variable: InferenceVarId, primitive: MonoTypeId) -> bool {
+        self.produced_type(variable)
+            .is_some_and(|produced| self.types.is_subtype(produced, primitive))
+    }
+
+    /// Records one operator fallback unless its final decision already ran.
+    fn defer_operator(&mut self, constraint_id: usize, operator: DeferredOperator) {
+        if !self.activated_operator_fallbacks.contains(&constraint_id) {
+            self.deferred_operators
+                .entry(constraint_id)
+                .or_insert(operator);
         }
     }
 
@@ -1945,6 +2080,7 @@ impl<'a> TypeSolver<'a> {
                 self.apply_unary(record.id, variable, op, result);
             }
             SolverConstraint::Call { args, returns } => {
+                self.infer_callable_requirement(variable, &args, &returns);
                 self.apply_callable_monotype(variable, &args, &returns);
                 self.connect_call_metamethod(variable, &args, &returns);
                 self.activate_calls(variable);
@@ -1962,6 +2098,14 @@ impl<'a> TypeSolver<'a> {
             }
             SolverConstraint::SetMetatable { metatable, result } => {
                 self.apply_set_metatable(variable, metatable, result);
+            }
+            SolverConstraint::NonNilFrom { source } => {
+                if let Some(source_ty) = self.evidence_type(source) {
+                    let stored_ty = self
+                        .types
+                        .exclude(source_ty, &[self.types.primitives().nil]);
+                    self.observe(variable, stored_ty);
+                }
             }
             SolverConstraint::GenericFrom { source, excluded } => {
                 if let Some(source_ty) = self.evidence_type(source) {
@@ -2186,7 +2330,7 @@ impl TypeSolver<'_> {
             let key_target = self.tables[table].keys;
             let value_target = self.tables[table].values;
             self.add_constraint(key_target, SolverConstraint::FlowFrom(index));
-            self.add_constraint(value_target, SolverConstraint::FlowFrom(value));
+            self.add_constraint(value_target, SolverConstraint::NonNilFrom { source: value });
             self.table_changed(table);
         }
     }
@@ -2468,7 +2612,7 @@ impl TypeSolver<'_> {
     /// Applies conservative builtin overloads and then known metamethods.
     fn apply_binary(
         &mut self,
-        _constraint_id: usize,
+        constraint_id: usize,
         lhs: InferenceVarId,
         op: BinOp,
         rhs: InferenceVarId,
@@ -2485,6 +2629,7 @@ impl TypeSolver<'_> {
                     self.operator_domain(&[primitives.number, primitives.string, primitives.table]);
                 self.require(lhs, accepted);
                 self.require(rhs, accepted);
+                self.defer_operator(constraint_id, DeferredOperator::Comparison { lhs, rhs });
             }
             BinOp::And => {
                 if let Some(lhs_ty) = self.evidence_type(lhs) {
@@ -2528,6 +2673,10 @@ impl TypeSolver<'_> {
                 if let Some(ty) = self.arithmetic_result(lhs, op, rhs) {
                     self.observe(result, ty);
                 }
+                self.defer_operator(
+                    constraint_id,
+                    DeferredOperator::Arithmetic { lhs, rhs, result },
+                );
                 if let Ok(method) = Metamethod::try_from(op) {
                     self.connect_binary_metamethod(lhs, rhs, result, method);
                 }
@@ -2538,7 +2687,7 @@ impl TypeSolver<'_> {
     /// Applies conservative builtin unary operations and known metamethods.
     fn apply_unary(
         &mut self,
-        _constraint_id: usize,
+        constraint_id: usize,
         operand: InferenceVarId,
         op: UnOp,
         result: InferenceVarId,
@@ -2560,6 +2709,10 @@ impl TypeSolver<'_> {
                         self.observe(result, primitives.vector);
                     }
                 }
+                self.defer_operator(
+                    constraint_id,
+                    DeferredOperator::UnaryMinus { operand, result },
+                );
                 self.connect_unary_metamethod(operand, result, Metamethod::Unm);
             }
             UnOp::Length => {
@@ -2862,8 +3015,10 @@ impl TypeSolver<'_> {
         let param_types: Vec<_> = params
             .into_iter()
             .map(|parameter| {
-                let variable = self.variable_for_slot(TypeSlot::Symbol(proto, parameter));
-                self.resolved_type(variable, visiting)
+                let slot = TypeSlot::Symbol(proto, parameter);
+                let variable = self.variable_for_slot(slot);
+                self.parameter_upper_bound(slot, variable)
+                    .or_else(|| self.resolved_type(variable, visiting))
                     .unwrap_or(self.types.primitives().unknown)
             })
             .collect();
@@ -2876,7 +3031,8 @@ impl TypeSolver<'_> {
         let return_types: Vec<_> = (0..return_count)
             .map(|index| {
                 let variable = self.variable_for_slot(TypeSlot::Return(proto, index));
-                self.resolved_type(variable, visiting)
+                self.compatible_upper_bound(variable)
+                    .or_else(|| self.resolved_type(variable, visiting))
                     .unwrap_or(self.types.primitives().unknown)
             })
             .collect();
@@ -2888,6 +3044,30 @@ impl TypeSolver<'_> {
             .intern(MonoType::FunctionSignature { params, returns })
     }
 
+    /// Returns a precise consumer bound when producer mismatch is only nil or dynamic.
+    fn compatible_upper_bound(&self, variable: InferenceVarId) -> Option<MonoTypeId> {
+        let facts = &self.variables[variable];
+        (self.types.is_emittable_upper_bound(facts.upper)
+            && self.can_default_to(variable, facts.upper))
+        .then_some(facts.upper)
+    }
+
+    /// Returns a body's precise parameter requirement when call evidence is only dynamic.
+    fn parameter_upper_bound(
+        &self,
+        slot: TypeSlot,
+        variable: InferenceVarId,
+    ) -> Option<MonoTypeId> {
+        let TypeSlot::Symbol(proto, symbol) = slot else {
+            return None;
+        };
+        let function = self.functions.get(proto.0 as usize)?;
+        if !function.symbols.params.contains(&symbol) {
+            return None;
+        }
+        self.compatible_upper_bound(variable)
+    }
+
     /// Resolves one durable symbol into an owned source type.
     fn resolved_symbol_type(&mut self, slot: TypeSlot) -> Option<Type> {
         let variable = *self.variables_by_slot.get(&slot)?;
@@ -2895,7 +3075,9 @@ impl TypeSolver<'_> {
             let closures = &self.variables[variable].closures;
             (closures.len() == 1).then(|| *closures.iter().next().expect("one closure exists"))
         };
-        let ty = self.resolved_type(variable, &mut HashSet::new())?;
+        let ty = self
+            .parameter_upper_bound(slot, variable)
+            .or_else(|| self.resolved_type(variable, &mut HashSet::new()))?;
         let mut ty = self.types.to_surface(ty);
         if let TypeSlot::Symbol(proto, symbol) = slot
             && let Some(parameter) = self.generic_parameter_type(proto, symbol, &ty)
@@ -3284,18 +3466,63 @@ impl TypeSolver<'_> {
         }
     }
 
+    /// Applies the mutable heap semantics attached to one builtin call.
+    fn apply_builtin_effect(&mut self, call: &CallSite, effect: BuiltinCallEffect) {
+        match effect {
+            BuiltinCallEffect::SetIndex {
+                table_argument,
+                index,
+                value_argument,
+            } => {
+                let Some(&table) = call.args.get(table_argument) else {
+                    return;
+                };
+                let Some(&value) = call.args.get(value_argument) else {
+                    return;
+                };
+                let index = match index {
+                    BuiltinIndex::Argument(argument) => {
+                        let Some(&index) = call.args.get(argument) else {
+                            return;
+                        };
+                        index
+                    }
+                    BuiltinIndex::Number => {
+                        let index = self.fresh_variable();
+                        self.add_constraint(
+                            index,
+                            SolverConstraint::Observe(self.types.primitives().number),
+                        );
+                        index
+                    }
+                };
+                self.add_constraint(table, SolverConstraint::SetIndex { index, value });
+            }
+            BuiltinCallEffect::SetMetatable {
+                table_argument,
+                metatable_argument,
+            } => {
+                let Some(&table) = call.args.get(table_argument) else {
+                    return;
+                };
+                let Some(&metatable) = call.args.get(metatable_argument) else {
+                    return;
+                };
+                self.add_constraint(
+                    table,
+                    SolverConstraint::SetMetatable {
+                        metatable,
+                        result: call.returns.first().copied(),
+                    },
+                );
+            }
+        }
+    }
+
     /// Instantiates one builtin scheme at one callsite.
     fn instantiate_builtin(&mut self, call: &CallSite, path: &BuiltinPath) {
-        if matches!(path, BuiltinPath::Global(name) if name == "setmetatable")
-            && call.args.len() >= 2
-        {
-            self.add_constraint(
-                call.args[0],
-                SolverConstraint::SetMetatable {
-                    metatable: call.args[1],
-                    result: call.returns.first().copied(),
-                },
-            );
+        if let Some(effect) = path.call_effect(call.args.len()) {
+            self.apply_builtin_effect(call, effect);
         }
         let Some(scheme) = self.builtins.get_path(path).cloned() else {
             return;
@@ -3439,6 +3666,25 @@ impl TypeSolver<'_> {
                     self.add_constraint(*generic, SolverConstraint::FlowFrom(argument));
                 }
             }
+            Type::Table { fields, array } => {
+                let tables: Vec<_> = self.variables[argument].tables.iter().copied().collect();
+                for table in tables {
+                    if let Some(array) = array {
+                        let (key_pattern, value_pattern) = array.as_ref();
+                        let keys = self.tables[table].keys;
+                        let values = self.tables[table].values;
+                        self.bind_argument_pattern(keys, key_pattern, generics);
+                        self.bind_argument_pattern(values, value_pattern, generics);
+                    }
+
+                    let mut fields: Vec<_> = fields.iter().collect();
+                    fields.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+                    for (name, pattern) in fields {
+                        let value = self.table_field_variable(table, name.clone(), false);
+                        self.bind_argument_pattern(value, pattern, generics);
+                    }
+                }
+            }
             Type::Union(members) => {
                 let generic_members: Vec<_> = members
                     .iter()
@@ -3535,6 +3781,61 @@ impl TypeSolver<'_> {
                 self.observe(*target, returned);
             }
         }
+    }
+
+    /// Infers a callable upper bound from one otherwise dynamic callsite.
+    fn infer_callable_requirement(
+        &mut self,
+        callee: InferenceVarId,
+        args: &[InferenceVarId],
+        returns: &[InferenceVarId],
+    ) {
+        let facts = &self.variables[callee];
+        if !facts.tables.is_empty() || !facts.closures.is_empty() || !facts.builtins.is_empty() {
+            return;
+        }
+        if !matches!(
+            self.types.get(facts.lower),
+            MonoType::Never | MonoType::Unknown | MonoType::Any
+        ) {
+            return;
+        }
+        let Some(params) = args
+            .iter()
+            .map(|argument| self.callsite_bound_type(*argument))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        let Some(returns) = returns
+            .iter()
+            .map(|returned| self.callsite_bound_type(*returned))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        let params = self.types.intern_pack(TypePack {
+            head: params,
+            tail: None,
+        });
+        let returns = self.types.intern_pack(TypePack {
+            head: returns,
+            tail: None,
+        });
+        let signature = self
+            .types
+            .intern(MonoType::FunctionSignature { params, returns });
+        self.require(callee, signature);
+    }
+
+    /// Returns the precise produced or required type available at one call slot.
+    fn callsite_bound_type(&self, variable: InferenceVarId) -> Option<MonoTypeId> {
+        if let Some(candidate) = self.candidate_type(variable) {
+            return Some(candidate);
+        }
+        let upper = self.variables[variable].upper;
+        (self.types.is_emittable_upper_bound(upper) && self.can_default_to(variable, upper))
+            .then_some(upper)
     }
 
     /// Applies one unique monomorphic signature found in the callee's lower bound.
