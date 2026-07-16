@@ -51,12 +51,12 @@ pub enum Expr {
     /// An index access expression (`obj[index]`).
     GetIndex { obj: Box<Expr>, index: Box<Expr> },
     /// A function call expression (`fun(args...)`).
-    Call { fun: Box<Expr>, args: Vec<Expr> },
+    Call { fun: Box<Expr>, args: ValuePack },
     /// A method call expression (`obj:method(args...)`).
     MethodCall {
         object: Box<Expr>,
         method: SmolStr,
-        args: Vec<Expr>,
+        args: ValuePack,
     },
     /// A binary expression.
     Binary {
@@ -132,7 +132,7 @@ impl Expr {
                     || else_expr.reads_symbol(sym)
             }
             Expr::Table { items } => items.iter().any(|item| match item {
-                TableItem::List(expr) => expr.reads_symbol(sym),
+                TableItem::List(values) => values.iter().any(|value| value.reads_symbol(sym)),
                 TableItem::Index(key, value) => key.reads_symbol(sym) || value.reads_symbol(sym),
             }),
             _ => false,
@@ -170,6 +170,14 @@ impl Expr {
         matches!(
             self,
             Expr::Nil | Expr::Number(_) | Expr::String(_) | Expr::Bool(_)
+        )
+    }
+
+    /// Returns whether multivalue evaluation may produce more than one value.
+    pub const fn can_produce_multiple_values(&self) -> bool {
+        matches!(
+            self,
+            Expr::Call { .. } | Expr::MethodCall { .. } | Expr::VarArgs
         )
     }
 
@@ -237,9 +245,11 @@ impl Expr {
                         obj: Box::new(Self::Global("vector".into())),
                         field: "create".into(),
                     }),
-                    args: [x, y, z, w]
-                        .map(|x| Self::Number(Number::Float(*x as f64)))
-                        .to_vec(),
+                    args: ValuePack::Fixed(
+                        [x, y, z, w]
+                            .map(|x| Self::Number(Number::Float(*x as f64)))
+                            .to_vec(),
+                    ),
                 }
             }),
             Constant::TableWithConstants(consts) => {
@@ -308,29 +318,13 @@ impl Display for Expr {
             Expr::Global(g) => write!(f, "{}", g),
             Expr::GetField { obj, field } => write!(f, "{}.{}", obj, field),
             Expr::GetIndex { obj, index } => write!(f, "{}[{}]", obj, index),
-            Expr::Call { fun, args } => {
-                write!(f, "call {}(", fun)?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", arg)?;
-                }
-                write!(f, ")")
-            }
+            Expr::Call { fun, args } => write!(f, "call {}({})", fun, args),
             Expr::MethodCall {
                 object,
                 method,
                 args,
             } => {
-                write!(f, "call {}:{}(", object, method)?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", arg)?;
-                }
-                write!(f, ")")
+                write!(f, "call {}:{}({})", object, method, args)
             }
             Expr::Binary { lhs, op, rhs } => write!(f, "{} {} {}", lhs, op, rhs),
             Expr::Unary { op, expr } => {
@@ -359,11 +353,111 @@ impl Display for Expr {
     }
 }
 
+/// A sequence of values produced by a Luau expression list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValuePack {
+    /// A sequence with exactly this many values. Every expression is adjusted to one value.
+    Fixed(Vec<Expr>),
+    /// A fixed prefix followed by every value produced by `tail`.
+    Open {
+        /// Expressions adjusted to exactly one value each.
+        head: Vec<Expr>,
+        /// Final expression evaluated in multivalue context.
+        tail: Box<Expr>,
+    },
+}
+
+impl ValuePack {
+    /// Returns an empty fixed value pack.
+    pub const fn empty() -> Self {
+        Self::Fixed(Vec::new())
+    }
+
+    /// Returns every expression in evaluation order.
+    pub fn iter(&self) -> impl Iterator<Item = &Expr> {
+        let (head, tail) = match self {
+            Self::Fixed(values) => (values.as_slice(), None),
+            Self::Open { head, tail } => (head.as_slice(), Some(tail.as_ref())),
+        };
+        head.iter().chain(tail)
+    }
+
+    /// Returns every expression mutably in evaluation order.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Expr> {
+        let (head, tail) = match self {
+            Self::Fixed(values) => (values.as_mut_slice(), None),
+            Self::Open { head, tail } => (head.as_mut_slice(), Some(tail.as_mut())),
+        };
+        head.iter_mut().chain(tail)
+    }
+
+    /// Returns the expressions adjusted to exactly one value each.
+    pub fn head(&self) -> &[Expr] {
+        match self {
+            Self::Fixed(values) => values,
+            Self::Open { head, .. } => head,
+        }
+    }
+
+    /// Returns the final expression evaluated in multivalue context.
+    pub fn tail(&self) -> Option<&Expr> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Open { tail, .. } => Some(tail),
+        }
+    }
+
+    /// Returns whether the pack ends with an expression evaluated in multivalue context.
+    pub const fn is_open(&self) -> bool {
+        matches!(self, Self::Open { .. })
+    }
+
+    /// Returns the exact number of produced values when the pack is fixed.
+    pub fn fixed_len(&self) -> Option<usize> {
+        match self {
+            Self::Fixed(values) => Some(values.len()),
+            Self::Open { .. } => None,
+        }
+    }
+}
+
+impl Display for ValuePack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    if index + 1 == values.len() && value.can_produce_multiple_values() {
+                        write!(f, "({})", value)?;
+                    } else {
+                        write!(f, "{}", value)?;
+                    }
+                }
+            }
+            Self::Open { head, tail } => {
+                for (index, value) in head.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", value)?;
+                }
+                if !head.is_empty() {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", tail)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// An entry in the table constructor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableItem {
-    /// An array-part value, e.g., `value` in `{ value }`
-    List(Expr),
+    /// Array-part values produced by an expression list.
+    List(ValuePack),
     /// A generic expression-keyed dictionary value, e.g., `[key] = value`
     Index(Expr, Expr),
 }
@@ -380,13 +474,12 @@ pub enum Stmt {
     /// An assignment statement, like `foo = 123`.
     Assign { left: Expr, value: Expr },
     /// A multi-variable assignment statement, like `a, b = returns_tuple()`.
-    AssignMany { left: Vec<Expr>, value: Expr },
+    AssignMany { left: Vec<Expr>, values: ValuePack },
     /// A bulk array write lowered from `SETLIST`.
     SetList {
         table: SymbolId,
         index: u32,
-        values: Vec<Expr>,
-        has_variadic_tail: bool,
+        values: ValuePack,
     },
     /// A call statement.
     Call(Expr),
@@ -398,37 +491,26 @@ impl Display for Stmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Stmt::Assign { left, value } => write!(f, "{} = {}", left, value),
-            Stmt::AssignMany { left, value } => {
+            Stmt::AssignMany { left, values } => {
                 for (i, lv) in left.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
                     write!(f, "{}", lv)?;
                 }
-                write!(f, " = {}", value)
+                write!(f, " = {}", values)
             }
             Stmt::SetList {
                 table,
                 index,
                 values,
-                has_variadic_tail,
             } => {
-                write!(
-                    f,
-                    "setlist v{}[{}..{}] = [",
-                    table.index(),
-                    index,
-                    *index as usize + values.len()
-                )?;
-                for (i, v) in values.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", v)?;
+                write!(f, "setlist v{}[{}..", table.index(), index)?;
+                if let Some(length) = values.fixed_len() {
+                    write!(f, "{}", *index as usize + length)?;
                 }
-                if *has_variadic_tail {
-                    write!(f, ", ...")?;
-                }
+                write!(f, "] = [")?;
+                write!(f, "{}", values)?;
                 write!(f, "]")
             }
             Stmt::Call(expr) => write!(f, "{}", expr),

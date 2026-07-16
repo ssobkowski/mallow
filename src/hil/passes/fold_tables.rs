@@ -67,28 +67,36 @@ impl VisitorMut for Inliner {
                         table,
                         index: base,
                         values,
-                        has_variadic_tail,
                     } if table == target_table => {
-                        let array_items_size = items_to_add
+                        let Some(array_items_size) = items_to_add
                             .iter()
                             .chain(original_items.iter())
-                            .filter(|item| matches!(item, TableItem::List(_)))
-                            .count();
+                            .try_fold(0usize, |count, item| match item {
+                                TableItem::List(values) => Some(count + values.fixed_len()?),
+                                TableItem::Index(_, _) => Some(count),
+                            })
+                        else {
+                            break;
+                        };
+
+                        let is_contiguous = *base as usize == array_items_size + 1;
+                        if values.is_open() && !is_contiguous {
+                            break;
+                        }
 
                         stmts_to_remove.push(j);
-                        items_to_add.extend(values.iter().enumerate().map(|(i, v)| {
-                            // If the base relative to how many array items are in the table is 1,
-                            // then we can continue building the array. If not, we must explicitly
-                            // index it.
-                            let needs_index =
-                                (*base as usize).saturating_sub(array_items_size) != 1;
-                            if needs_index {
+                        if is_contiguous {
+                            items_to_add.push(TableItem::List(values.clone()));
+                        } else {
+                            items_to_add.extend(values.iter().enumerate().map(|(i, value)| {
                                 let index = Expr::Number(Number::Float(*base as f64 + i as f64));
-                                TableItem::Index(index, v.clone())
-                            } else {
-                                TableItem::List(v.clone())
-                            }
-                        }));
+                                TableItem::Index(index, value.clone())
+                            }));
+                        }
+
+                        if values.is_open() {
+                            break;
+                        }
                     }
                     _ => break,
                 }

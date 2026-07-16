@@ -1,14 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use smallvec::SmallVec;
-
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
     disasm::Chunk,
     hil::{
         cflow::{common::RegSet, graph::GraphView, union_find::UnionFind},
-        ir::{Expr, PhiNode, Stmt},
+        ir::{Expr, PhiNode, Stmt, ValuePack},
         lifter::{
             LiftContext, MultiRet, flush_multiret, lift,
             ssa::{Ssa, Symbol, SymbolId, SymbolKind},
@@ -297,13 +295,15 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                             base
                         );
 
-                        let mut rets = SmallVec::new();
+                        let mut head = Vec::new();
                         for i in *base..multiret.base {
-                            rets.push(Expr::Symbol(self.ssa.read_reg(block_id, i)));
+                            head.push(Expr::Symbol(self.ssa.read_reg(block_id, i)));
                         }
-                        rets.push(multiret.expr);
 
-                        Ok(BlockExit::Return(rets))
+                        Ok(BlockExit::Return(ValuePack::Open {
+                            head,
+                            tail: Box::new(multiret.expr),
+                        }))
                     }
                     Count::Number(n) => {
                         self.flush_pending_multiret(block_id, stmts, pending_multiret);
@@ -313,9 +313,11 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                             "fixed return should not have synthetic exit writes"
                         );
 
-                        let rets = reg_range(*base, n)
-                            .map(|i| Expr::Symbol(self.ssa.read_reg(block_id, i)))
-                            .collect();
+                        let rets = ValuePack::Fixed(
+                            reg_range(*base, n)
+                                .map(|i| Expr::Symbol(self.ssa.read_reg(block_id, i)))
+                                .collect(),
+                        );
 
                         Ok(BlockExit::Return(rets))
                     }
@@ -555,7 +557,7 @@ fn resolve_ssa_symbols<G: GraphView>(
         for stmt in &mut block.stmts {
             resolver.visit_stmt(stmt);
         }
-        visit_block_exit_symbols_mut(&mut block.exit, &mut resolver);
+        resolver.visit_block_exit(&mut block.exit);
     }
 }
 
@@ -584,43 +586,6 @@ impl<G: GraphView> VisitorMut for SymbolResolver<'_, '_, '_, G> {
     }
 }
 
-/// Visits symbols embedded in CFG exits, which are outside the generic HIL tree.
-fn visit_block_exit_symbols_mut<V: VisitorMut + ?Sized>(exit: &mut BlockExit, visitor: &mut V) {
-    match exit {
-        BlockExit::CondJump { cond, .. } => {
-            visitor.visit_expr(cond);
-        }
-        BlockExit::FornPrep {
-            var,
-            start,
-            end,
-            step,
-            ..
-        } => {
-            visitor.visit_symbol(var);
-            visitor.visit_expr(start);
-            visitor.visit_expr(end);
-            visitor.visit_expr(step);
-        }
-        BlockExit::ForgPrep { exprs, .. } => {
-            for expr in exprs {
-                visitor.visit_expr(expr);
-            }
-        }
-        BlockExit::ForgLoop { vars, .. } => {
-            for var in vars {
-                visitor.visit_symbol(var);
-            }
-        }
-        BlockExit::Return(values) => {
-            for value in values {
-                visitor.visit_expr(value);
-            }
-        }
-        BlockExit::Jump(_) | BlockExit::Fallthrough(_) | BlockExit::FornLoop { .. } => {}
-    }
-}
-
 /// Builds a lookup from SSA symbols to their original physical register.
 fn symbol_register_map<G: GraphView>(ssa: &Ssa<'_, G>) -> HashMap<SymbolId, u8> {
     ssa.arena()
@@ -640,6 +605,30 @@ struct RegUseCollector<'a, 'b> {
 }
 
 impl Visitor for RegUseCollector<'_, '_> {
+    /// Records exit operands that are reads while ignoring loop-produced definitions.
+    fn visit_block_exit(&mut self, exit: &BlockExit) {
+        match exit {
+            BlockExit::CondJump { cond, .. } => self.visit_expr(cond),
+            BlockExit::FornPrep {
+                start, end, step, ..
+            } => {
+                self.visit_expr(start);
+                self.visit_expr(end);
+                self.visit_expr(step);
+            }
+            BlockExit::ForgPrep { exprs, .. } => {
+                for expr in exprs {
+                    self.visit_expr(expr);
+                }
+            }
+            BlockExit::Return(values) => self.visit_value_pack(values),
+            BlockExit::Jump(_)
+            | BlockExit::Fallthrough(_)
+            | BlockExit::FornLoop { .. }
+            | BlockExit::ForgLoop { .. } => {}
+        }
+    }
+
     fn visit_symbol(&mut self, sym: SymbolId) {
         if let Some(&reg) = self.reg_of.get(&sym)
             && !self.seen_defs.contains(reg)
@@ -706,8 +695,8 @@ impl Visitor for RegUseDefCollector<'_, '_, '_> {
                 self.visit_expr(value);
                 self.visit_lvalue_def(left);
             }
-            Stmt::AssignMany { left, value } => {
-                self.visit_expr(value);
+            Stmt::AssignMany { left, values } => {
+                self.visit_value_pack(values);
                 for lvalue in left {
                     self.visit_lvalue_def(lvalue);
                 }
@@ -715,9 +704,7 @@ impl Visitor for RegUseDefCollector<'_, '_, '_> {
             Stmt::Call(expr) => self.visit_expr(expr),
             Stmt::SetList { table, values, .. } => {
                 self.note_use(*table);
-                for value in values {
-                    self.visit_expr(value);
-                }
+                self.visit_value_pack(values);
             }
             Stmt::Phi(phi) => self.note_def(phi.target),
         }
@@ -731,52 +718,12 @@ fn collect_exit_reg_uses(
     uses: &mut RegSet,
     seen_defs: &RegSet,
 ) {
-    match exit {
-        BlockExit::CondJump { cond, .. } => {
-            RegUseCollector {
-                reg_of,
-                uses,
-                seen_defs,
-            }
-            .visit_expr(cond);
-        }
-        BlockExit::FornPrep {
-            start, end, step, ..
-        } => {
-            let mut collector = RegUseCollector {
-                reg_of,
-                uses,
-                seen_defs,
-            };
-            collector.visit_expr(start);
-            collector.visit_expr(end);
-            collector.visit_expr(step);
-        }
-        BlockExit::ForgPrep { exprs, .. } => {
-            let mut collector = RegUseCollector {
-                reg_of,
-                uses,
-                seen_defs,
-            };
-            for expr in exprs {
-                collector.visit_expr(expr);
-            }
-        }
-        BlockExit::Return(values) => {
-            let mut collector = RegUseCollector {
-                reg_of,
-                uses,
-                seen_defs,
-            };
-            for value in values {
-                collector.visit_expr(value);
-            }
-        }
-        BlockExit::Jump(_)
-        | BlockExit::Fallthrough(_)
-        | BlockExit::FornLoop { .. }
-        | BlockExit::ForgLoop { .. } => {}
+    RegUseCollector {
+        reg_of,
+        uses,
+        seen_defs,
     }
+    .visit_block_exit(exit);
 }
 
 /// Computes the registers each lifted block needs on entry.

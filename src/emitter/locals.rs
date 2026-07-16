@@ -5,7 +5,7 @@ use crate::{
     hil::{
         StructuredFunction,
         cflow::region::RegionNode,
-        ir::{Expr, Stmt},
+        ir::{Expr, Stmt, ValuePack},
         lifter::ssa::SymbolId,
         ty::Type,
         visitor::{Visitor, walk_expr},
@@ -159,6 +159,13 @@ impl LifetimeAnalysis {
     fn pin_expr_captures(&mut self, expr: &Expr) {
         self.pinned.extend(CaptureCollector::collect_in(expr));
     }
+
+    /// Pins captures and records the reads and writes of one value-pack event.
+    fn record_value_pack_event(&mut self, values: &ValuePack, writes: HashSet<SymbolId>) {
+        self.pinned
+            .extend(CaptureCollector::collect_in_value_pack(values));
+        self.record_event(ReadCollector::in_value_pack(values), writes);
+    }
 }
 
 impl Visitor for LifetimeAnalysis {
@@ -216,20 +223,12 @@ impl Visitor for LifetimeAnalysis {
             }
             RegionNode::GenericFor { vars, exprs, body } => {
                 self.pinned.extend(vars.iter().copied());
-                for expr in exprs {
-                    self.pin_expr_captures(expr);
-                }
-                let reads = exprs.iter().flat_map(ReadCollector::in_expr).collect();
-                self.record_event(reads, vars.into_iter().copied().collect());
+                self.record_value_pack_event(exprs, vars.iter().copied().collect());
                 self.visit_region(body);
             }
             RegionNode::Continue | RegionNode::Break => {}
             RegionNode::Return { values } => {
-                for value in values {
-                    self.pin_expr_captures(value);
-                }
-                let reads = values.iter().flat_map(ReadCollector::in_expr).collect();
-                self.record_event(reads, HashSet::new());
+                self.record_value_pack_event(values, HashSet::new());
             }
         }
     }
@@ -242,18 +241,18 @@ impl Visitor for LifetimeAnalysis {
                 let writes = symbol_lvalue(left).into_iter().collect();
                 self.record_event(reads, writes);
             }
-            Stmt::AssignMany { left, value } => {
-                self.pin_expr_captures(value);
+            Stmt::AssignMany { left, values } => {
                 let mut reads = ReadCollector::in_exprs(left);
-                reads.extend(ReadCollector::in_expr(value));
+                reads.extend(ReadCollector::in_value_pack(values));
                 let writes = left.iter().filter_map(symbol_lvalue).collect();
+                self.pinned
+                    .extend(CaptureCollector::collect_in_value_pack(values));
                 self.record_event(reads, writes);
             }
             Stmt::SetList { table, values, .. } => {
-                for value in values {
-                    self.pin_expr_captures(value);
-                }
-                let mut reads = ReadCollector::in_exprs(values);
+                self.pinned
+                    .extend(CaptureCollector::collect_in_value_pack(values));
+                let mut reads = ReadCollector::in_value_pack(values);
                 reads.insert(*table);
                 self.record_event(reads, HashSet::new());
             }
@@ -392,6 +391,13 @@ impl CaptureCollector {
     fn collect_in(expr: &Expr) -> HashSet<SymbolId> {
         let mut collector = Self::default();
         collector.visit_expr(expr);
+        collector.captures
+    }
+
+    /// Collects every closure capture nested in one value pack.
+    fn collect_in_value_pack(values: &ValuePack) -> HashSet<SymbolId> {
+        let mut collector = Self::default();
+        collector.visit_value_pack(values);
         collector.captures
     }
 }

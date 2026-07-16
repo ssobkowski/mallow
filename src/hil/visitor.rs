@@ -7,7 +7,7 @@ use crate::hil::{
         graph::GraphView,
         region::RegionNode,
     },
-    ir::{Expr, Number, PhiNode, Stmt, TableItem},
+    ir::{Expr, Number, PhiNode, Stmt, TableItem, ValuePack},
     lifter::ssa::SymbolId,
 };
 
@@ -50,6 +50,11 @@ pub trait Visitor {
 
     fn visit_expr(&mut self, expr: &Expr) {
         walk_expr(self, expr);
+    }
+
+    /// Visits every expression in one value pack.
+    fn visit_value_pack(&mut self, values: &ValuePack) {
+        walk_value_pack(self, values);
     }
 
     fn visit_lvalue_expr(&mut self, expr: &Expr) {
@@ -105,6 +110,11 @@ pub trait VisitorMut {
 
     fn visit_expr(&mut self, expr: &mut Expr) {
         walk_expr_mut(self, expr);
+    }
+
+    /// Visits every expression in one mutable value pack.
+    fn visit_value_pack(&mut self, values: &mut ValuePack) {
+        walk_value_pack_mut(self, values);
     }
 
     fn visit_lvalue_expr(&mut self, expr: &mut Expr) {
@@ -179,9 +189,7 @@ pub fn walk_region<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode) {
             visitor.visit_region(body);
         }
         RegionNode::GenericFor { body, vars, exprs } => {
-            for expr in exprs {
-                visitor.visit_expr(expr);
-            }
+            visitor.visit_value_pack(exprs);
             for var in vars {
                 visitor.visit_symbol(*var);
             }
@@ -189,9 +197,7 @@ pub fn walk_region<V: Visitor + ?Sized>(visitor: &mut V, node: &RegionNode) {
         }
         RegionNode::Continue | RegionNode::Break => {}
         RegionNode::Return { values } => {
-            for value in values {
-                visitor.visit_expr(value);
-            }
+            visitor.visit_value_pack(values);
         }
     }
 }
@@ -230,9 +236,7 @@ pub fn walk_block_exit<V: Visitor + ?Sized>(visitor: &mut V, exit: &BlockExit) {
             }
         }
         BlockExit::Return(values) => {
-            for value in values {
-                visitor.visit_expr(value);
-            }
+            visitor.visit_value_pack(values);
         }
         BlockExit::Jump(_) | BlockExit::Fallthrough(_) => {
             // [design limitation] - visitor carries no cfg context, so it cannot jump to the blocks on its own.
@@ -252,17 +256,15 @@ pub fn walk_stmt<V: Visitor + ?Sized>(visitor: &mut V, stmt: &Stmt) {
             visitor.visit_lvalue_expr(left);
             visitor.visit_expr(value);
         }
-        Stmt::AssignMany { left, value } => {
+        Stmt::AssignMany { left, values } => {
             for lvalue in left {
                 visitor.visit_lvalue_expr(lvalue);
             }
-            visitor.visit_expr(value);
+            visitor.visit_value_pack(values);
         }
         Stmt::SetList { table, values, .. } => {
             visitor.visit_symbol(*table);
-            for value in values {
-                visitor.visit_expr(value);
-            }
+            visitor.visit_value_pack(values);
         }
         Stmt::Call(expr) => visitor.visit_expr(expr),
         Stmt::Phi(phi) => visitor.visit_phi(phi),
@@ -289,15 +291,11 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
         }
         Expr::Call { fun, args } => {
             visitor.visit_expr(fun);
-            for arg in args {
-                visitor.visit_expr(arg);
-            }
+            visitor.visit_value_pack(args);
         }
         Expr::MethodCall { object, args, .. } => {
             visitor.visit_expr(object);
-            for arg in args {
-                visitor.visit_expr(arg);
-            }
+            visitor.visit_value_pack(args);
         }
         Expr::Binary { lhs, rhs, .. } => {
             visitor.visit_expr(lhs);
@@ -333,9 +331,16 @@ pub fn walk_lvalue_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
     }
 }
 
+/// Walks every expression in a value pack in evaluation order.
+pub fn walk_value_pack<V: Visitor + ?Sized>(visitor: &mut V, values: &ValuePack) {
+    for value in values.iter() {
+        visitor.visit_expr(value);
+    }
+}
+
 pub fn walk_table_item<V: Visitor + ?Sized>(visitor: &mut V, item: &TableItem) {
     match item {
-        TableItem::List(expr) => visitor.visit_expr(expr),
+        TableItem::List(values) => visitor.visit_value_pack(values),
         TableItem::Index(key, value) => {
             visitor.visit_expr(key);
             visitor.visit_expr(value);
@@ -391,9 +396,7 @@ pub fn walk_region_mut<V: VisitorMut + ?Sized>(visitor: &mut V, node: &mut Regio
             visitor.visit_region(body);
         }
         RegionNode::GenericFor { body, vars, exprs } => {
-            for expr in exprs {
-                visitor.visit_expr(expr);
-            }
+            visitor.visit_value_pack(exprs);
             for var in vars {
                 visitor.visit_symbol(var);
             }
@@ -401,9 +404,7 @@ pub fn walk_region_mut<V: VisitorMut + ?Sized>(visitor: &mut V, node: &mut Regio
         }
         RegionNode::Continue | RegionNode::Break => {}
         RegionNode::Return { values } => {
-            for value in values {
-                visitor.visit_expr(value);
-            }
+            visitor.visit_value_pack(values);
         }
     }
 }
@@ -444,9 +445,7 @@ pub fn walk_block_exit_mut<V: VisitorMut + ?Sized>(visitor: &mut V, exit: &mut B
             }
         }
         BlockExit::Return(values) => {
-            for value in values {
-                visitor.visit_expr(value);
-            }
+            visitor.visit_value_pack(values);
         }
         BlockExit::Jump(_) | BlockExit::Fallthrough(_) => {
             // [design limitation] - visitor carries no cfg context, so it cannot jump to the blocks on its own.
@@ -466,17 +465,15 @@ pub fn walk_stmt_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmt: &mut Stmt) {
             visitor.visit_lvalue_expr(left);
             visitor.visit_expr(value);
         }
-        Stmt::AssignMany { left, value } => {
+        Stmt::AssignMany { left, values } => {
             for lvalue in left {
                 visitor.visit_lvalue_expr(lvalue);
             }
-            visitor.visit_expr(value);
+            visitor.visit_value_pack(values);
         }
         Stmt::SetList { table, values, .. } => {
             visitor.visit_symbol(table);
-            for value in values {
-                visitor.visit_expr(value);
-            }
+            visitor.visit_value_pack(values);
         }
         Stmt::Call(expr) => visitor.visit_expr(expr),
         Stmt::Phi(phi) => visitor.visit_phi(phi),
@@ -503,15 +500,11 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut Expr) {
         }
         Expr::Call { fun, args } => {
             visitor.visit_expr(fun);
-            for arg in args {
-                visitor.visit_expr(arg);
-            }
+            visitor.visit_value_pack(args);
         }
         Expr::MethodCall { object, args, .. } => {
             visitor.visit_expr(object);
-            for arg in args {
-                visitor.visit_expr(arg);
-            }
+            visitor.visit_value_pack(args);
         }
         Expr::Binary { lhs, rhs, .. } => {
             visitor.visit_expr(lhs);
@@ -547,9 +540,16 @@ pub fn walk_lvalue_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut 
     }
 }
 
+/// Walks every expression in a mutable value pack in evaluation order.
+pub fn walk_value_pack_mut<V: VisitorMut + ?Sized>(visitor: &mut V, values: &mut ValuePack) {
+    for value in values.iter_mut() {
+        visitor.visit_expr(value);
+    }
+}
+
 pub fn walk_table_item_mut<V: VisitorMut + ?Sized>(visitor: &mut V, item: &mut TableItem) {
     match item {
-        TableItem::List(expr) => visitor.visit_expr(expr),
+        TableItem::List(values) => visitor.visit_value_pack(values),
         TableItem::Index(key, value) => {
             visitor.visit_expr(key);
             visitor.visit_expr(value);

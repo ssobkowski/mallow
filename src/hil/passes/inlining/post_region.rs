@@ -1,11 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use smallvec::{SmallVec, smallvec};
-
 use crate::hil::{
     ReturnArity, StructuredFunction,
     cflow::region::RegionNode,
-    ir::{Expr, PhiNode, Stmt, TableItem},
+    ir::{Expr, PhiNode, Stmt, TableItem, ValuePack},
     lifter::ssa::SymbolId,
     passes::return_arity::luau_libfunc_arity,
     visitor::{Visitor, walk_expr},
@@ -98,18 +96,16 @@ impl Visitor for StmtSummary {
                 }
                 self.visit_expr(value);
             }
-            Stmt::AssignMany { left, value } => {
+            Stmt::AssignMany { left, values } => {
                 for expr in left {
                     if !matches!(expr, Expr::Symbol(_)) {
                         self.visit_expr(expr);
                     }
                 }
-                self.visit_expr(value);
+                self.visit_value_pack(values);
             }
             Stmt::SetList { values, .. } => {
-                for value in values {
-                    self.visit_expr(value);
-                }
+                self.visit_value_pack(values);
             }
             Stmt::Call(expr) => {
                 self.visit_expr(expr);
@@ -137,7 +133,7 @@ impl Visitor for StmtSummary {
 #[derive(Debug, Clone)]
 struct TupleSource {
     targets: Vec<SymbolId>,
-    value: Expr,
+    values: ValuePack,
     write_pos: usize,
 }
 
@@ -243,12 +239,12 @@ impl Analyzer {
             .note_plain_write(pos, rhs);
     }
 
-    fn note_tuple_assignment(&mut self, targets: &[SymbolId], value: &Expr) {
-        self.visit_expr(value);
+    fn note_tuple_assignment(&mut self, targets: &[SymbolId], values: &ValuePack) {
+        self.visit_value_pack(values);
         let pos = self.alloc_pos();
         let source = TupleSource {
             targets: targets.to_vec(),
-            value: value.clone(),
+            values: values.clone(),
             write_pos: pos,
         };
         for target in targets {
@@ -280,7 +276,7 @@ impl Visitor for Analyzer {
                 self.visit_lvalue_write(left);
                 self.visit_expr(value);
             }
-            Stmt::AssignMany { left, value } => {
+            Stmt::AssignMany { left, values } => {
                 let targets: Vec<_> = left
                     .iter()
                     .filter_map(|expr| match expr {
@@ -290,18 +286,16 @@ impl Visitor for Analyzer {
                     .collect();
 
                 if targets.len() == left.len() {
-                    self.note_tuple_assignment(&targets, value);
+                    self.note_tuple_assignment(&targets, values);
                 } else {
                     for lvalue in left {
                         self.visit_lvalue_write(lvalue);
                     }
-                    self.visit_expr(value);
+                    self.visit_value_pack(values);
                 }
             }
             Stmt::SetList { table, values, .. } => {
-                for value in values {
-                    self.visit_expr(value);
-                }
+                self.visit_value_pack(values);
                 let pos = self.note_write(*table);
                 self.note_effect_at(pos);
             }
@@ -665,7 +659,7 @@ impl<'a> Inliner<'a> {
         self.remove_stmts(source_stmts, &removable);
     }
 
-    fn inline_return(&mut self, stmts: &mut Vec<Stmt>, values: &mut SmallVec<[Expr; 3]>) {
+    fn inline_return(&mut self, stmts: &mut Vec<Stmt>, values: &mut ValuePack) {
         self.stats.inline_return_calls += 1;
         if self.try_inline_tuple_return(stmts, values) {
             return;
@@ -720,12 +714,11 @@ impl<'a> Inliner<'a> {
         self.remove_stmts(stmts, &removable);
     }
 
-    fn try_inline_tuple_return(
-        &mut self,
-        stmts: &mut Vec<Stmt>,
-        values: &mut SmallVec<[Expr; 3]>,
-    ) -> bool {
-        let Some(targets) = values
+    fn try_inline_tuple_return(&mut self, stmts: &mut Vec<Stmt>, values: &mut ValuePack) -> bool {
+        let ValuePack::Fixed(returned) = values else {
+            return false;
+        };
+        let Some(targets) = returned
             .iter()
             .map(|expr| match expr {
                 Expr::Symbol(sym) => Some(*sym),
@@ -742,24 +735,26 @@ impl<'a> Inliner<'a> {
         if !self.can_inline_tuple(&source, targets.len()) {
             return false;
         }
-        if self.expr_arity(&source.value) != ReturnArity::Exact(targets.len()) {
+        if self.value_pack_arity(&source.values) != ReturnArity::Exact(targets.len()) {
             return false;
         }
 
-        values.clear();
-        values.push(source.value);
+        *values = source.values;
         stmts.remove(idx);
         self.stats.direct_statement_removals += 1;
         self.changed = true;
         true
     }
 
-    fn inline_generic_for(&mut self, stmts: &mut Vec<Stmt>, exprs: &mut SmallVec<[Expr; 3]>) {
+    fn inline_generic_for(&mut self, stmts: &mut Vec<Stmt>, exprs: &mut ValuePack) {
         if self.inline_plain_exprs(stmts, exprs) {
             return;
         }
 
-        let Some(targets) = exprs
+        let ValuePack::Fixed(expressions) = exprs else {
+            return;
+        };
+        let Some(targets) = expressions
             .iter()
             .map(|expr| match expr {
                 Expr::Symbol(sym) => Some(*sym),
@@ -776,24 +771,20 @@ impl<'a> Inliner<'a> {
         if !self.can_inline_tuple(&source, targets.len()) {
             return;
         }
-        let ReturnArity::Exact(arity) = self.expr_arity(&source.value) else {
+        let ReturnArity::Exact(arity) = self.value_pack_arity(&source.values) else {
             return;
         };
         if arity > targets.len() || targets.len() > 3 {
             return;
         }
 
-        *exprs = smallvec![source.value];
+        *exprs = source.values;
         stmts.remove(idx);
         self.stats.direct_statement_removals += 1;
         self.changed = true;
     }
 
-    fn inline_plain_exprs(
-        &mut self,
-        stmts: &mut Vec<Stmt>,
-        exprs: &mut SmallVec<[Expr; 3]>,
-    ) -> bool {
+    fn inline_plain_exprs(&mut self, stmts: &mut Vec<Stmt>, exprs: &mut ValuePack) -> bool {
         let mut removable = HashSet::new();
         for expr in exprs.iter_mut() {
             let Expr::Symbol(sym) = expr else {
@@ -855,7 +846,7 @@ impl<'a> Inliner<'a> {
         }
 
         stmts.iter().enumerate().find_map(|(idx, stmt)| match stmt {
-            Stmt::AssignMany { left, value } => {
+            Stmt::AssignMany { left, values } => {
                 let source_targets: Vec<_> = left
                     .iter()
                     .filter_map(|expr| match expr {
@@ -874,7 +865,7 @@ impl<'a> Inliner<'a> {
                         idx,
                         TupleSource {
                             targets: source_targets,
-                            value: value.clone(),
+                            values: values.clone(),
                             write_pos,
                         },
                     ))
@@ -969,7 +960,7 @@ impl<'a> Inliner<'a> {
         if source
             .targets
             .iter()
-            .any(|target| source.value.reads_symbol(target))
+            .any(|target| source.values.iter().any(|value| value.reads_symbol(target)))
         {
             return false;
         }
@@ -984,10 +975,10 @@ impl<'a> Inliner<'a> {
             let Some(tuple) = &fact.tuple else {
                 return false;
             };
-            if tuple.targets != source.targets || tuple.value != source.value {
+            if tuple.targets != source.targets || tuple.values != source.values {
                 return false;
             }
-            if !self.can_move_rhs(fact, &source.value) {
+            if !self.can_move_value_pack(fact, &source.values) {
                 return false;
             }
         }
@@ -1017,6 +1008,30 @@ impl<'a> Inliner<'a> {
         rhs.is_pure() || !self.has_effect_between_positions(write_pos, read_pos)
     }
 
+    /// Returns whether a value pack can move from its write to its only reads.
+    fn can_move_value_pack(&self, fact: &SymbolFacts, values: &ValuePack) -> bool {
+        let Some(write_pos) = fact.write_pos else {
+            return false;
+        };
+        let Some(read_pos) = fact.read_positions.iter().copied().max() else {
+            return false;
+        };
+        let sources: HashSet<_> = values.iter().flat_map(expr_read_symbols).collect();
+        for source in sources {
+            let Some(source_fact) = self.analysis.facts.get(&source) else {
+                return false;
+            };
+            if positions_contain_in_range(&source_fact.write_positions, write_pos + 1, read_pos) {
+                return false;
+            }
+            if source_fact.poisoned && self.has_effect_between_positions(write_pos, read_pos) {
+                return false;
+            }
+        }
+
+        values.iter().all(Expr::is_pure) || !self.has_effect_between_positions(write_pos, read_pos)
+    }
+
     fn has_effect_between_positions(&self, write_pos: usize, read_pos: usize) -> bool {
         positions_contain_in_range(&self.analysis.effect_positions, write_pos + 1, read_pos)
     }
@@ -1026,6 +1041,17 @@ impl<'a> Inliner<'a> {
             Expr::Call { fun, .. } => self.call_arity(fun),
             Expr::MethodCall { .. } | Expr::VarArgs => ReturnArity::Unknown,
             _ => ReturnArity::Exact(1),
+        }
+    }
+
+    /// Returns the number of values produced by one HIL value pack when known.
+    fn value_pack_arity(&self, values: &ValuePack) -> ReturnArity {
+        match values {
+            ValuePack::Fixed(values) => ReturnArity::Exact(values.len()),
+            ValuePack::Open { head, tail } => match self.expr_arity(tail) {
+                ReturnArity::Exact(tail) => ReturnArity::Exact(head.len() + tail),
+                ReturnArity::Unknown => ReturnArity::Unknown,
+            },
         }
     }
 
@@ -1078,8 +1104,8 @@ fn plain_assignment(stmt: &Stmt) -> Option<(SymbolId, &Expr)> {
 fn stmt_has_effect(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Assign { left, value } => !left.is_pure() || !value.is_pure(),
-        Stmt::AssignMany { left, value } => {
-            left.iter().any(|left| !left.is_pure()) || !value.is_pure()
+        Stmt::AssignMany { left, values } => {
+            left.iter().any(|left| !left.is_pure()) || values.iter().any(|value| !value.is_pure())
         }
         Stmt::SetList { .. } | Stmt::Call(_) => true,
         Stmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
@@ -1140,12 +1166,7 @@ fn occurrence_has_no_prior_effect(expr: &Expr, sym: SymbolId) -> bool {
             } else if !fun.is_pure() {
                 false
             } else {
-                args.iter()
-                    .position(|arg| arg.reads_symbol(&sym))
-                    .is_some_and(|idx| {
-                        args[..idx].iter().all(Expr::is_pure)
-                            && occurrence_has_no_prior_effect(&args[idx], sym)
-                    })
+                value_pack_occurrence_has_no_prior_effect(args, sym)
             }
         }
         Expr::MethodCall { object, args, .. } => {
@@ -1154,12 +1175,7 @@ fn occurrence_has_no_prior_effect(expr: &Expr, sym: SymbolId) -> bool {
             } else if !object.is_pure() {
                 false
             } else {
-                args.iter()
-                    .position(|arg| arg.reads_symbol(&sym))
-                    .is_some_and(|idx| {
-                        args[..idx].iter().all(Expr::is_pure)
-                            && occurrence_has_no_prior_effect(&args[idx], sym)
-                    })
+                value_pack_occurrence_has_no_prior_effect(args, sym)
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
@@ -1187,17 +1203,17 @@ fn occurrence_has_no_prior_effect(expr: &Expr, sym: SymbolId) -> bool {
         }
         Expr::Table { items } => {
             let Some(idx) = items.iter().position(|item| match item {
-                TableItem::List(expr) => expr.reads_symbol(&sym),
+                TableItem::List(values) => values.iter().any(|value| value.reads_symbol(&sym)),
                 TableItem::Index(key, value) => key.reads_symbol(&sym) || value.reads_symbol(&sym),
             }) else {
                 return false;
             };
 
             items[..idx].iter().all(|item| match item {
-                TableItem::List(expr) => expr.is_pure(),
+                TableItem::List(values) => values.iter().all(Expr::is_pure),
                 TableItem::Index(key, value) => key.is_pure() && value.is_pure(),
             }) && match &items[idx] {
-                TableItem::List(expr) => occurrence_has_no_prior_effect(expr, sym),
+                TableItem::List(values) => value_pack_occurrence_has_no_prior_effect(values, sym),
                 TableItem::Index(key, value) => {
                     if key.reads_symbol(&sym) {
                         occurrence_has_no_prior_effect(key, sym)
@@ -1231,17 +1247,29 @@ fn occurrence_is_final_multiret_position(expr: &Expr, sym: SymbolId, rhs: &Expr)
                 return false;
             }
 
-            args.last().is_some_and(|arg| arg.reads_symbol(&sym))
+            args.tail().is_some_and(|arg| arg.reads_symbol(&sym))
         }
         Expr::MethodCall { object, args, .. } => {
             if object.reads_symbol(&sym) {
                 return false;
             }
 
-            args.last().is_some_and(|arg| arg.reads_symbol(&sym))
+            args.tail().is_some_and(|arg| arg.reads_symbol(&sym))
         }
         _ => false,
     }
+}
+
+/// Returns whether a symbol occurrence in a value pack precedes every effectful expression.
+fn value_pack_occurrence_has_no_prior_effect(values: &ValuePack, sym: SymbolId) -> bool {
+    let mut prior_expressions_are_pure = true;
+    for value in values.iter() {
+        if value.reads_symbol(&sym) {
+            return prior_expressions_are_pure && occurrence_has_no_prior_effect(value, sym);
+        }
+        prior_expressions_are_pure &= value.is_pure();
+    }
+    false
 }
 
 fn positions_contain_in_range(positions: &[usize], start: usize, end: usize) -> bool {

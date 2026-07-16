@@ -605,7 +605,7 @@ impl Emitter<'_> {
                         _ => unreachable!("generic-for variables cannot be spilled"),
                     })
                     .collect();
-                let exprs = exprs.iter().map(|expr| self.visit_expr(expr)).collect();
+                let exprs = self.visit_value_pack(exprs);
                 let body = self.visit_region(body);
                 buf.push(ast::Stmt::GenericFor { vars, exprs, body });
 
@@ -615,7 +615,7 @@ impl Emitter<'_> {
             RegionNode::Break => buf.push(ast::Stmt::Break),
             RegionNode::Return { values } => {
                 buf.push(ast::Stmt::Return {
-                    values: values.iter().map(|expr| self.visit_expr(expr)).collect(),
+                    values: self.visit_value_pack(values),
                 });
             }
         }
@@ -754,17 +754,14 @@ impl Emitter<'_> {
                     });
                 }
             }
-            hil::Stmt::AssignMany { left, value } => {
-                let right = self.visit_expr(value);
+            hil::Stmt::AssignMany { left, values } => {
+                let right = self.visit_value_pack(values);
                 if left
                     .iter()
                     .any(|lvalue| !matches!(lvalue, hil::Expr::Symbol(_)))
                 {
                     let lhs = left.iter().map(|lvalue| self.visit_expr(lvalue)).collect();
-                    buf.push(ast::Stmt::Assignment {
-                        lhs,
-                        rhs: vec![right],
-                    });
+                    buf.push(ast::Stmt::Assignment { lhs, rhs: right });
                     return;
                 }
 
@@ -787,7 +784,7 @@ impl Emitter<'_> {
                             .into_iter()
                             .map(|target| target.storage.into_expr())
                             .collect(),
-                        rhs: vec![right],
+                        rhs: right,
                     });
                     return;
                 }
@@ -805,7 +802,7 @@ impl Emitter<'_> {
                         .collect();
                     buf.push(ast::Stmt::LocalDeclaration {
                         names,
-                        values: vec![right],
+                        values: right,
                     });
                     return;
                 }
@@ -815,7 +812,7 @@ impl Emitter<'_> {
                     .collect();
                 buf.push(ast::Stmt::LocalDeclaration {
                     names: temps.clone(),
-                    values: vec![right],
+                    values: right,
                 });
 
                 for (target, temp) in targets.into_iter().zip(temps) {
@@ -840,10 +837,9 @@ impl Emitter<'_> {
                 table,
                 index,
                 values,
-                has_variadic_tail,
             } => {
                 let table_expr = self.visit_expr(&hil::Expr::Symbol(*table));
-                if *has_variadic_tail {
+                if values.is_open() {
                     // The idea is that if we have a variadic tail, we can't simply assign
                     // a tuple to a single index (t[k] = a, b)
                     //
@@ -859,11 +855,10 @@ impl Emitter<'_> {
                             ast::Stmt::LocalDeclaration {
                                 names: vec![ast::Typed::untyped(temp_table_ident.clone())],
                                 values: vec![ast::Expr::Table {
-                                    items: values
-                                        .iter()
-                                        .map(|v| ast::TableItem::Implicit {
-                                            value: self.visit_expr(v),
-                                        })
+                                    items: self
+                                        .visit_value_pack(values)
+                                        .into_iter()
+                                        .map(|v| ast::TableItem::Implicit { value: v })
                                         .collect(),
                                 }],
                             },
@@ -891,13 +886,16 @@ impl Emitter<'_> {
                     });
                 } else {
                     let base = *index as usize;
-                    let lhs = (base..base + values.len())
+                    let length = values
+                        .fixed_len()
+                        .expect("the open SetList branch returned above");
+                    let lhs = (base..base + length)
                         .map(|i| ast::Expr::Index {
                             base: Box::new(table_expr.clone()),
                             index: Box::new(ast::Expr::Literal(ast::Literal::Float(i as f64))),
                         })
                         .collect();
-                    let rhs = values.iter().map(|v| self.visit_expr(v)).collect();
+                    let rhs = self.visit_value_pack(values);
 
                     buf.push(ast::Stmt::Assignment { lhs, rhs });
                 }
@@ -957,7 +955,7 @@ impl Emitter<'_> {
             },
             hil::Expr::Call { fun, args } => ast::Expr::FunctionCall {
                 func: Box::new(self.visit_expr(fun)),
-                args: args.iter().map(|expr| self.visit_expr(expr)).collect(),
+                args: self.visit_value_pack(args),
             },
             hil::Expr::MethodCall {
                 object,
@@ -966,7 +964,7 @@ impl Emitter<'_> {
             } => ast::Expr::MethodCall {
                 object: Box::new(self.visit_expr(object)),
                 method: ast::Identifier::new(method.clone()),
-                args: args.iter().map(|expr| self.visit_expr(expr)).collect(),
+                args: self.visit_value_pack(args),
             },
             hil::Expr::IfElse {
                 condition,
@@ -984,31 +982,68 @@ impl Emitter<'_> {
         }
     }
 
+    /// Emits a HIL value pack as a source expression list.
+    fn visit_value_pack(&mut self, values: &hil::ValuePack) -> Vec<ast::Expr> {
+        match values {
+            hil::ValuePack::Fixed(values) => {
+                let last = values.len().checked_sub(1);
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let value_can_produce_multiple_values = value.can_produce_multiple_values();
+                        let value = self.visit_expr(value);
+                        if Some(index) == last && value_can_produce_multiple_values {
+                            ast::Expr::Parenthesized(Box::new(value))
+                        } else {
+                            value
+                        }
+                    })
+                    .collect()
+            }
+            hil::ValuePack::Open { head, tail } => {
+                let mut values = Vec::with_capacity(head.len() + 1);
+                values.extend(head.iter().map(|value| self.visit_expr(value)));
+                values.push(self.visit_expr(tail));
+                values
+            }
+        }
+    }
+
     fn visit_table_items(&mut self, items: &[hil::TableItem]) -> Vec<ast::TableItem> {
-        items
-            .iter()
-            .map(|item| match item {
-                hil::TableItem::List(expr) => ast::TableItem::Implicit {
-                    value: self.visit_expr(expr),
-                },
+        let mut emitted = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            match item {
+                hil::TableItem::List(values) => {
+                    debug_assert!(
+                        !values.is_open() || index + 1 == items.len(),
+                        "an open table value pack must be the final table item"
+                    );
+                    emitted.extend(
+                        self.visit_value_pack(values)
+                            .into_iter()
+                            .map(|value| ast::TableItem::Implicit { value }),
+                    );
+                }
                 hil::TableItem::Index(key, value) => {
                     let value = self.visit_expr(value);
                     if let hil::Expr::String(s) = key
                         && is_valid_luau_identifier(s)
                     {
-                        ast::TableItem::Named {
+                        emitted.push(ast::TableItem::Named {
                             name: ast::Identifier::new(s.clone()),
                             value,
-                        }
+                        });
                     } else {
-                        ast::TableItem::Indexed {
+                        emitted.push(ast::TableItem::Indexed {
                             index: self.visit_expr(key),
                             value,
-                        }
+                        });
                     }
                 }
-            })
-            .collect()
+            }
+        }
+        emitted
     }
 
     /// Emits one closure with the best inferred parameter annotations available.

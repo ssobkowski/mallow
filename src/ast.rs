@@ -193,6 +193,8 @@ pub enum Expr {
         /// Operand expression.
         expr: Box<Expr>,
     },
+    /// An explicitly parenthesized expression.
+    Parenthesized(Box<Expr>),
     /// Function call expression.
     FunctionCall {
         /// Callee expression.

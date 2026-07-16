@@ -58,9 +58,10 @@ fn build_label(idx: usize, block: &Block, is_entry: bool) -> NodeLabel {
             true,
         )),
         BlockExit::FornLoop { .. } => lines.push(("forn_loop".into(), true)),
-        BlockExit::ForgPrep { exprs, .. } => {
-            lines.push((format!("for {}", join_display(exprs, ", ")), true))
-        }
+        BlockExit::ForgPrep { exprs, .. } => lines.push((
+            format!("for {}, {}, {}", exprs[0], exprs[1], exprs[2]),
+            true,
+        )),
         BlockExit::ForgLoop { vars, .. } => lines.push((
             format!(
                 "forg_loop {}",
@@ -68,9 +69,7 @@ fn build_label(idx: usize, block: &Block, is_entry: bool) -> NodeLabel {
             ),
             true,
         )),
-        BlockExit::Return(vals) => {
-            lines.push((format!("return {}", join_display(vals, ", ")), false))
-        }
+        BlockExit::Return(vals) => lines.push((format!("return {}", vals), false)),
         _ => {}
     }
 

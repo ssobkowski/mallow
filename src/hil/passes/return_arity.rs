@@ -1,7 +1,7 @@
 use crate::hil::{
     ReturnArity, StructuredFunction,
     cflow::region::RegionNode,
-    ir::Expr,
+    ir::{Expr, ValuePack},
     visitor::{Visitor, walk_region},
 };
 
@@ -37,19 +37,17 @@ impl ReturnCollector<'_> {
         }
     }
 
-    fn values_arity(&self, values: &[Expr]) -> ReturnArity {
-        let Some((tail, prefix)) = values.split_last() else {
-            return ReturnArity::Exact(0);
-        };
-
-        let tail_arity = self.expr_arity(tail);
-        match tail_arity {
-            ReturnArity::Exact(n) => ReturnArity::Exact(prefix.len() + n),
-            ReturnArity::Unknown => ReturnArity::Unknown,
+    fn values_arity(&self, values: &ValuePack) -> ReturnArity {
+        match values {
+            ValuePack::Fixed(values) => ReturnArity::Exact(values.len()),
+            ValuePack::Open { head, tail } => match self.expr_arity(tail) {
+                ReturnArity::Exact(tail) => ReturnArity::Exact(head.len() + tail),
+                ReturnArity::Unknown => ReturnArity::Unknown,
+            },
         }
     }
 
-    fn observe_return(&mut self, values: &[Expr]) {
+    fn observe_return(&mut self, values: &ValuePack) {
         let curr = self.values_arity(values);
         self.signal = Some(match self.signal {
             Some(prev) => prev.merge(curr),

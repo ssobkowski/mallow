@@ -14,7 +14,7 @@ impl Rewriter {
     fn try_rewrite_stmts(&mut self, stmts: &mut Vec<Stmt>) {
         let mut i = 0;
         while i < stmts.len() {
-            let Stmt::AssignMany { left, value } = &stmts[i] else {
+            let Stmt::AssignMany { left, values } = &stmts[i] else {
                 i += 1;
                 continue;
             };
@@ -71,10 +71,10 @@ impl Rewriter {
                 continue;
             }
 
-            let rhs = value.clone();
+            let rhs = values.clone();
             stmts[i] = Stmt::AssignMany {
                 left: tuple_lvalues,
-                value: rhs,
+                values: rhs,
             };
 
             stmts.drain(i + 1..i + 1 + consumed);
@@ -106,8 +106,9 @@ fn is_safe_tuple_lvalue_target(target: &Expr, tuple_symbols: &[SymbolId]) -> boo
 fn stmt_mentions_symbol(stmt: &Stmt, sym: SymbolId) -> bool {
     match stmt {
         Stmt::Assign { left, value } => left.reads_symbol(&sym) || value.reads_symbol(&sym),
-        Stmt::AssignMany { left, value } => {
-            left.iter().any(|lvalue| lvalue.reads_symbol(&sym)) || value.reads_symbol(&sym)
+        Stmt::AssignMany { left, values } => {
+            left.iter().any(|lvalue| lvalue.reads_symbol(&sym))
+                || values.iter().any(|value| value.reads_symbol(&sym))
         }
         Stmt::SetList { table, values, .. } => {
             *table == sym || values.iter().any(|expr| expr.reads_symbol(&sym))

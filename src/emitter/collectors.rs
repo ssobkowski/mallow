@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::hil::{
     cflow::region::RegionNode,
-    ir::Expr,
+    ir::{Expr, ValuePack},
     lifter::ssa::SymbolId,
     visitor::{Visitor, walk_expr},
 };
@@ -32,6 +32,13 @@ impl ReadCollector {
         for expr in exprs {
             collector.visit_expr(expr);
         }
+        collector.symbols
+    }
+
+    /// Collects every symbol read by one value pack.
+    pub fn in_value_pack(values: &ValuePack) -> HashSet<SymbolId> {
+        let mut collector = ReadCollector::default();
+        collector.visit_value_pack(values);
         collector.symbols
     }
 }

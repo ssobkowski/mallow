@@ -286,6 +286,11 @@ impl AstPrinter {
                     self.write(")");
                 }
             }
+            Expr::Parenthesized(expr) => {
+                self.write("(");
+                self.walk_expr(expr, 0, Side::None);
+                self.write(")");
+            }
             Expr::FunctionCall { func, args } => {
                 let prec = 9;
                 let needs_parens = prec < parent_prec;
@@ -508,6 +513,10 @@ impl AstPrinter {
                     }
                 });
                 self.write(") -> ");
+                let parenthesized_returns = return_type.len() > 1;
+                if parenthesized_returns {
+                    self.write("(");
+                }
                 self.write_punctuated(return_type, ", ", |p, return_type| match return_type {
                     FunctionTypeReturn::Type(ty) => p.write_type(ty, TypePrecedence::Lowest),
                     FunctionTypeReturn::Vararg(ty) => {
@@ -515,6 +524,9 @@ impl AstPrinter {
                         p.write_type(ty, TypePrecedence::Lowest);
                     }
                 });
+                if parenthesized_returns {
+                    self.write(")");
+                }
             }
             Type::Thread => self.write("thread"),
             Type::Userdata => self.write("userdata"),

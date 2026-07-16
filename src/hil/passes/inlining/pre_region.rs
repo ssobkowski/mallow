@@ -115,9 +115,7 @@ impl Analyzer {
                 }
             }
             BlockExit::Return(values) => {
-                for value in values {
-                    self.visit_expr(value);
-                }
+                self.visit_value_pack(values);
             }
             BlockExit::Jump(_) | BlockExit::Fallthrough(_) | BlockExit::FornLoop { .. } => {}
         }
@@ -136,7 +134,7 @@ impl Visitor for Analyzer {
                     self.visit_expr(value);
                     continue;
                 }
-                Stmt::AssignMany { left, value } => {
+                Stmt::AssignMany { left, values } => {
                     // Block all tuple-assigns from being inlined. This can only be done in the
                     // post region inlining pass.
                     let symbols = left.iter().filter_map(|lv| {
@@ -150,7 +148,7 @@ impl Visitor for Analyzer {
                         self.disqualify_written_symbol(*sym);
                     }
 
-                    self.visit_expr(value);
+                    self.visit_value_pack(values);
                     continue;
                 }
                 _ => {
@@ -413,12 +411,10 @@ fn substitute_in_stmt_rvalues(
     // `kill_lvalues`, because reads and writes in one statement have different
     // ordering semantics for this local dataflow pass.
     match stmt {
-        Stmt::Assign { value, .. } | Stmt::AssignMany { value, .. } => {
-            substitute_available_expr(value, available, removable)
-        }
-        Stmt::SetList { values, .. } => {
+        Stmt::Assign { value, .. } => substitute_available_expr(value, available, removable),
+        Stmt::AssignMany { values, .. } | Stmt::SetList { values, .. } => {
             let mut stats = SubstitutionStats::default();
-            for value in values {
+            for value in values.iter_mut() {
                 stats.add(substitute_available_expr(value, available, removable));
             }
             stats

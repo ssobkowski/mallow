@@ -13,7 +13,7 @@ use crate::{
     disasm::Chunk,
     hil::{
         cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
-        ir::{Expr, PhiNode, Stmt},
+        ir::{Expr, PhiNode, Stmt, ValuePack},
         lifter::ssa::SymbolId,
         ty::{TypeId, TypeStore},
     },
@@ -114,7 +114,7 @@ impl Block {
     pub fn dummy() -> Self {
         Self {
             stmts: Vec::new(),
-            exit: BlockExit::Return(SmallVec::new()),
+            exit: BlockExit::Return(ValuePack::empty()),
         }
     }
 
@@ -177,6 +177,7 @@ pub enum BlockExit {
         base: u8,
         body_block: usize,
         exit_block: usize,
+        /// Iterator, state, and initial-control expressions required by Luau bytecode.
         exprs: [Expr; 3],
     },
     ForgLoop {
@@ -185,7 +186,7 @@ pub enum BlockExit {
         exit_block: usize,
         vars: SmallVec<[SymbolId; 3]>,
     },
-    Return(SmallVec<[Expr; 3]>),
+    Return(ValuePack),
 }
 
 impl BlockExit {

@@ -168,9 +168,7 @@ impl VisitorMut for ContinueCleanup {
                 self.simplify_loop_body(body);
             }
             RegionNode::GenericFor { vars, exprs, body } => {
-                for expr in exprs {
-                    self.visit_expr(expr);
-                }
+                self.visit_value_pack(exprs);
                 for var in vars {
                     self.visit_symbol(var);
                 }

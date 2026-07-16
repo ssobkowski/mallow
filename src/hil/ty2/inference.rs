@@ -590,8 +590,13 @@ impl<'a> ConstraintCollector<'a> {
                     } => {
                         definitions.insert(*symbol, value.clone());
                     }
-                    Stmt::AssignMany { left, value } => {
-                        if let Some(Expr::Symbol(symbol)) = left.first() {
+                    Stmt::AssignMany { left, values } => {
+                        // TODO(value-packs): This is a temporary compile bridge. Definition
+                        // recovery still assumes one expression supplies the assignment, so a
+                        // fixed pack with several expressions and every open-tail result after
+                        // the first are absent from alias provenance.
+                        let value = values.head().first().or_else(|| values.tail());
+                        if let (Some(Expr::Symbol(symbol)), Some(value)) = (left.first(), value) {
                             definitions.insert(*symbol, value.clone());
                         }
                     }
@@ -757,36 +762,43 @@ impl<'a> ConstraintCollector<'a> {
                 }
                 self.update_construction_after_assignment(left, value);
             }
-            Stmt::AssignMany { left, value } => {
-                if matches!(value, Expr::Call { .. } | Expr::MethodCall { .. }) {
-                    let returns = left
-                        .iter()
-                        .map(|lvalue| self.synthetic_for_lvalue(lvalue, false))
-                        .collect();
-                    self.collect_call(value, returns);
-                } else if let Some((first, rest)) = left.split_first() {
-                    let value = self.collect_expression(value);
-                    self.assign_lvalue(first, value, false);
-                    for lvalue in rest {
-                        let nil = self.synthetic_slot();
-                        self.program
-                            .push(nil, CollectedConstraint::Observe(Type::Nil));
-                        self.assign_lvalue(lvalue, nil, false);
+            Stmt::AssignMany { left, values } => {
+                // TODO(value-packs): This is a temporary compile bridge. The old collector
+                // models only one expression as the producer of a multi-assignment. Treating the
+                // first pack expression that way ignores later fixed expressions, and a non-call
+                // open tail still becomes one value followed by synthetic `nil` values.
+                let value = values.head().first().or_else(|| values.tail());
+                if let Some(value) = value {
+                    if matches!(value, Expr::Call { .. } | Expr::MethodCall { .. }) {
+                        let returns = left
+                            .iter()
+                            .map(|lvalue| self.synthetic_for_lvalue(lvalue, false))
+                            .collect();
+                        self.collect_call(value, returns);
+                    } else if let Some((first, rest)) = left.split_first() {
+                        let value = self.collect_expression(value);
+                        self.assign_lvalue(first, value, false);
+                        for lvalue in rest {
+                            let nil = self.synthetic_slot();
+                            self.program
+                                .push(nil, CollectedConstraint::Observe(Type::Nil));
+                            self.assign_lvalue(lvalue, nil, false);
+                        }
                     }
                 }
-                self.constructions.invalidate_expression(value);
+                for value in values.iter() {
+                    self.constructions.invalidate_expression(value);
+                }
                 for lvalue in left {
                     self.invalidate_noninitializing_lvalue(lvalue);
                 }
             }
-            Stmt::SetList {
-                table,
-                values,
-                has_variadic_tail,
-                ..
-            } => {
+            Stmt::SetList { table, values, .. } => {
                 let table = self.symbol_slot(*table);
-                for value in values {
+                // TODO(value-packs): This is a temporary compile bridge. Iteration collapses
+                // an open tail to its first result, while the unconstrained slot below stands in
+                // for every remaining result without preserving their positional relationships.
+                for value in values.iter() {
                     let index = self.synthetic_slot();
                     self.program
                         .push(index, CollectedConstraint::Observe(Type::Number));
@@ -794,13 +806,13 @@ impl<'a> ConstraintCollector<'a> {
                     self.program
                         .push(table, CollectedConstraint::SetIndex { index, value });
                 }
-                if *has_variadic_tail {
+                if values.is_open() {
                     let index = self.synthetic_slot();
                     let value = self.synthetic_slot();
                     self.program
                         .push(table, CollectedConstraint::SetIndex { index, value });
                 }
-                for value in values {
+                for value in values.iter() {
                     self.constructions.invalidate_expression(value);
                 }
             }
@@ -919,6 +931,9 @@ impl<'a> ConstraintCollector<'a> {
     fn collect_call(&mut self, expression: &Expr, returns: Vec<TypeSlot>) {
         match expression {
             Expr::Call { fun, args } => {
+                // TODO(value-packs): This is a temporary compile bridge. `Call` constraints
+                // contain only fixed argument slots, so iterating an open argument pack treats
+                // its tail expression as one argument and loses subsequent multiret values.
                 if let Some(callee) = self.resolve_field_access(fun) {
                     let object = self.symbol_read_slot(callee.object);
                     let field_arguments: Vec<_> = args
@@ -988,7 +1003,10 @@ impl<'a> ConstraintCollector<'a> {
                         value: callee,
                     },
                 );
-                let mut call_args = Vec::with_capacity(args.len() + 1);
+                // TODO(value-packs): This is a temporary compile bridge. Method-call
+                // constraints flatten an open tail to one fixed argument for the same reason as
+                // ordinary calls above.
+                let mut call_args = Vec::with_capacity(args.iter().count() + 1);
                 call_args.push(object);
                 call_args.extend(
                     args.iter()
@@ -1128,13 +1146,18 @@ impl<'a> ConstraintCollector<'a> {
                 self.program.push(table, CollectedConstraint::NewTable(key));
                 for item in items {
                     match item {
-                        TableItem::List(value) => {
-                            let index = self.synthetic_slot();
-                            self.program
-                                .push(index, CollectedConstraint::Observe(Type::Number));
-                            let value = self.collect_expression(value);
-                            self.program
-                                .push(table, CollectedConstraint::SetIndex { index, value });
+                        TableItem::List(values) => {
+                            // TODO(value-packs): This is a temporary compile bridge. An open
+                            // constructor item contributes only the first result of its tail
+                            // expression because table constraints cannot consume a type pack.
+                            for value in values.iter() {
+                                let index = self.synthetic_slot();
+                                self.program
+                                    .push(index, CollectedConstraint::Observe(Type::Number));
+                                let value = self.collect_expression(value);
+                                self.program
+                                    .push(table, CollectedConstraint::SetIndex { index, value });
+                            }
                         }
                         TableItem::Index(Expr::String(field), value) => {
                             let value = self.collect_expression(value);
@@ -1228,7 +1251,10 @@ impl<'a> ConstraintCollector<'a> {
                 self.collect_expression(cond);
             }
             BlockExit::Return(values) => {
-                self.return_lengths.push(values.len());
+                // TODO(value-packs): This is a temporary compile bridge. An open return tail
+                // is counted as one fixed result, so forwarded calls and varargs lose every
+                // result after the first until return constraints carry an actual type pack.
+                self.return_lengths.push(values.iter().count());
                 for (index, value) in values.iter().enumerate() {
                     // A bare formal in return position is the only parameter use
                     // exempt from opacity tracking; all nested expressions consume it.

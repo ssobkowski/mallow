@@ -8,7 +8,7 @@ use crate::{
             cfg::{BlockExit, ControlFlowGraph},
             graph::{DominatorTree, GraphView, Reversed, SeseGraphView},
         },
-        ir::{Expr, Stmt},
+        ir::{Expr, Stmt, ValuePack},
         lifter::ssa::SymbolId,
     },
     logging::{Diagnostics, LogLevel, LogTarget},
@@ -35,7 +35,7 @@ enum Shape {
     /// A structured continue split.
     Continue,
     /// A structured return split.
-    Return(SmallVec<[Expr; 3]>),
+    Return(ValuePack),
     /// A virtual exit split.
     VirtualExit,
 }
@@ -74,7 +74,7 @@ pub enum RegionNode {
     /// A structured generic `for` loop.
     GenericFor {
         vars: SmallVec<[SymbolId; 3]>,
-        exprs: SmallVec<[Expr; 3]>,
+        exprs: ValuePack,
         body: Box<RegionNode>,
     },
     /// Explicit `continue` edge for a loop.
@@ -82,7 +82,7 @@ pub enum RegionNode {
     /// Explicit `break` edge from a loop body.
     Break,
     /// Explicit return.
-    Return { values: SmallVec<[Expr; 3]> },
+    Return { values: ValuePack },
 }
 
 impl RegionNode {
@@ -200,7 +200,7 @@ enum LoopKind {
     /// for \[vars\] in \[exprs\]
     GenericFor {
         vars: SmallVec<[SymbolId; 3]>,
-        exprs: [Expr; 3],
+        exprs: ValuePack,
         body: usize,
         exit: usize,
     },
@@ -1611,7 +1611,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
 
                 return LoopKind::GenericFor {
                     vars: vars.clone(),
-                    exprs: exprs.clone(),
+                    exprs: ValuePack::Fixed(exprs.to_vec()),
                     body: *body_block,
                     exit: *exit_block,
                 };
@@ -2028,7 +2028,7 @@ impl Shape {
                 },
                 LoopKind::GenericFor { vars, exprs, .. } => RegionNode::GenericFor {
                     vars,
-                    exprs: exprs.into(),
+                    exprs,
                     body: Box::new(shape.body.lower(cfg)),
                 },
                 LoopKind::Infinite { .. } => RegionNode::While {

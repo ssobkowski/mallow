@@ -10,7 +10,7 @@ use crate::{
     disasm::Chunk,
     hil::{
         cflow::graph::GraphView,
-        ir::{Expr, Number, Stmt},
+        ir::{Expr, Number, Stmt, ValuePack},
         lifter::{
             common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL},
             ssa::{Symbol, SymbolId},
@@ -622,7 +622,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                         let left = self.alloc_regs(*dest, n);
                         self.push(Stmt::AssignMany {
                             left,
-                            value: Expr::VarArgs,
+                            values: ValuePack::Open {
+                                head: Vec::new(),
+                                tail: Box::new(Expr::VarArgs),
+                            },
                         });
                     }
                 },
@@ -661,16 +664,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
     fn lift_call(&mut self, func: u8, arg_count: u8, ret_count: u8) {
         let first_arg = reg_add(func, 1);
         let args = match Count::from(arg_count) {
-            Count::Number(argc) => {
-                if argc > 0 {
-                    self.read_regs(first_arg, argc)
-                } else {
-                    Vec::new()
-                }
-            }
+            Count::Number(argc) => ValuePack::Fixed(self.read_regs(first_arg, argc)),
             Count::Variadic => self.take_variadic_from(first_arg).unwrap_or_else(|| {
                 debug_assert!(false, "variadic CALL without pending multiret");
-                Vec::new()
+                ValuePack::empty()
             }),
         };
         let call = Expr::Call {
@@ -730,9 +727,11 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         }
 
         let args = match Count::from(arg_count) {
-            Count::Number(argc) if argc > 1 => self.read_regs(first_arg, argc - 1),
-            Count::Variadic => variadic_args.unwrap_or_default(),
-            _ => Vec::new(),
+            Count::Number(argc) if argc > 1 => {
+                ValuePack::Fixed(self.read_regs(first_arg, argc - 1))
+            }
+            Count::Variadic => variadic_args.unwrap_or_else(ValuePack::empty),
+            _ => ValuePack::empty(),
         };
 
         let method_call = Expr::MethodCall {
@@ -745,15 +744,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
     }
 
     fn lift_setlist(&mut self, table: u8, base: u8, count: u8, index: u32) {
-        let (values, has_variadic_tail) = match Count::from(count) {
-            Count::Number(n) => (self.read_regs(base, n), false),
-            Count::Variadic => (
-                self.take_variadic_from(base).unwrap_or_else(|| {
-                    debug_assert!(false, "variadic call without pending multiret");
-                    Vec::new()
-                }),
-                true,
-            ),
+        let values = match Count::from(count) {
+            Count::Number(n) => ValuePack::Fixed(self.read_regs(base, n)),
+            Count::Variadic => self.take_variadic_from(base).unwrap_or_else(|| {
+                debug_assert!(false, "variadic call without pending multiret");
+                ValuePack::empty()
+            }),
         };
 
         let table_sym = self.get_reg_symbol(table);
@@ -761,7 +757,6 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             table: table_sym,
             index,
             values,
-            has_variadic_tail,
         });
     }
 
@@ -776,7 +771,13 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             Count::Number(1) => self.assign_reg(dest, expr),
             Count::Number(n) => {
                 let left = self.alloc_regs(dest, n);
-                self.push(Stmt::AssignMany { left, value: expr });
+                self.push(Stmt::AssignMany {
+                    left,
+                    values: ValuePack::Open {
+                        head: Vec::new(),
+                        tail: Box::new(expr),
+                    },
+                });
             }
             Count::Variadic => {
                 debug_assert!(self.pending_multiret.is_none());
@@ -805,10 +806,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         Ok(())
     }
 
-    /// Build a variadic argument list from the pending multiret starting no
-    /// later than `first`. The result is a fixed-prefix of `Expr::Reg`
-    /// values followed by the multiret expression.
-    fn take_variadic_from(&mut self, first: u8) -> Option<Vec<Expr>> {
+    /// Builds an open value pack from the pending multiret starting no later than `first`.
+    fn take_variadic_from(&mut self, first: u8) -> Option<ValuePack> {
         if self
             .pending_multiret
             .as_ref()
@@ -817,9 +816,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             return None;
         }
         let MultiRet { base, expr } = self.pending_multiret.take().unwrap();
-        let mut args = self.read_regs(first, base - first);
-        args.push(expr);
-        Some(args)
+        Some(ValuePack::Open {
+            head: self.read_regs(first, base - first),
+            tail: Box::new(expr),
+        })
     }
 
     /// Consume `count` CAPTURE instructions immediately following the current
