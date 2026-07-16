@@ -5,7 +5,7 @@ use crate::{
     hil::{
         StructuredFunction,
         cflow::region::RegionNode,
-        ir::{HilExpr, HilStmt},
+        ir::{Expr, Stmt},
         lifter::ssa::SymbolId,
         ty::Type,
         visitor::{Visitor, walk_expr},
@@ -137,7 +137,7 @@ impl LifetimeAnalysis {
         }
     }
 
-    fn record_expr_event(&mut self, expr: &HilExpr) {
+    fn record_expr_event(&mut self, expr: &Expr) {
         self.pin_expr_captures(expr);
         self.record_event(ReadCollector::in_expr(expr), HashSet::new());
     }
@@ -156,7 +156,7 @@ impl LifetimeAnalysis {
         self.events.push(Event { writes });
     }
 
-    fn pin_expr_captures(&mut self, expr: &HilExpr) {
+    fn pin_expr_captures(&mut self, expr: &Expr) {
         self.pinned.extend(CaptureCollector::collect_in(expr));
     }
 }
@@ -234,22 +234,22 @@ impl Visitor for LifetimeAnalysis {
         }
     }
 
-    fn visit_stmt(&mut self, stmt: &HilStmt) {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            HilStmt::Assign { left, value } => {
+            Stmt::Assign { left, value } => {
                 self.pin_expr_captures(value);
                 let reads = ReadCollector::in_exprs([left, value]);
                 let writes = symbol_lvalue(left).into_iter().collect();
                 self.record_event(reads, writes);
             }
-            HilStmt::AssignMany { left, value } => {
+            Stmt::AssignMany { left, value } => {
                 self.pin_expr_captures(value);
                 let mut reads = ReadCollector::in_exprs(left);
                 reads.extend(ReadCollector::in_expr(value));
                 let writes = left.iter().filter_map(symbol_lvalue).collect();
                 self.record_event(reads, writes);
             }
-            HilStmt::SetList { table, values, .. } => {
+            Stmt::SetList { table, values, .. } => {
                 for value in values {
                     self.pin_expr_captures(value);
                 }
@@ -257,8 +257,8 @@ impl Visitor for LifetimeAnalysis {
                 reads.insert(*table);
                 self.record_event(reads, HashSet::new());
             }
-            HilStmt::Call(expr) => self.record_expr_event(expr),
-            HilStmt::Phi(_) => unreachable!(),
+            Stmt::Call(expr) => self.record_expr_event(expr),
+            Stmt::Phi(_) => unreachable!(),
         }
     }
 }
@@ -375,8 +375,8 @@ impl SlotAllocator {
     }
 }
 
-fn symbol_lvalue(expr: &HilExpr) -> Option<SymbolId> {
-    if let HilExpr::Symbol(sym) = expr {
+fn symbol_lvalue(expr: &Expr) -> Option<SymbolId> {
+    if let Expr::Symbol(sym) = expr {
         Some(*sym)
     } else {
         None
@@ -389,7 +389,7 @@ struct CaptureCollector {
 }
 
 impl CaptureCollector {
-    fn collect_in(expr: &HilExpr) -> HashSet<SymbolId> {
+    fn collect_in(expr: &Expr) -> HashSet<SymbolId> {
         let mut collector = Self::default();
         collector.visit_expr(expr);
         collector.captures
@@ -397,8 +397,8 @@ impl CaptureCollector {
 }
 
 impl Visitor for CaptureCollector {
-    fn visit_expr(&mut self, expr: &HilExpr) {
-        if let HilExpr::Closure { captures, .. } = expr {
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Expr::Closure { captures, .. } = expr {
             self.captures.extend(captures.iter().copied());
         }
 

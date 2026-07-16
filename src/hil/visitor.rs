@@ -7,7 +7,7 @@ use crate::hil::{
         graph::GraphView,
         region::RegionNode,
     },
-    ir::{HilExpr, HilNumber, HilStmt, HilTableItem, PhiNode},
+    ir::{Expr, Number, PhiNode, Stmt, TableItem},
     lifter::ssa::SymbolId,
 };
 
@@ -40,23 +40,23 @@ pub trait Visitor {
         walk_block_exit(self, exit);
     }
 
-    fn visit_stmts(&mut self, stmts: &[HilStmt]) {
+    fn visit_stmts(&mut self, stmts: &[Stmt]) {
         walk_stmts(self, stmts);
     }
 
-    fn visit_stmt(&mut self, stmt: &HilStmt) {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
         walk_stmt(self, stmt);
     }
 
-    fn visit_expr(&mut self, expr: &HilExpr) {
+    fn visit_expr(&mut self, expr: &Expr) {
         walk_expr(self, expr);
     }
 
-    fn visit_lvalue_expr(&mut self, expr: &HilExpr) {
+    fn visit_lvalue_expr(&mut self, expr: &Expr) {
         walk_lvalue_expr(self, expr);
     }
 
-    fn visit_table_item(&mut self, item: &HilTableItem) {
+    fn visit_table_item(&mut self, item: &TableItem) {
         walk_table_item(self, item);
     }
 
@@ -66,7 +66,7 @@ pub trait Visitor {
 
     fn visit_symbol(&mut self, _sym: SymbolId) {}
 
-    fn visit_number(&mut self, _number: HilNumber) {}
+    fn visit_number(&mut self, _number: Number) {}
 
     fn visit_string(&mut self, _string: &str) {}
 
@@ -95,23 +95,23 @@ pub trait VisitorMut {
         walk_block_exit_mut(self, exit);
     }
 
-    fn visit_stmts(&mut self, stmts: &mut Vec<HilStmt>) {
+    fn visit_stmts(&mut self, stmts: &mut Vec<Stmt>) {
         walk_stmts_mut(self, stmts);
     }
 
-    fn visit_stmt(&mut self, stmt: &mut HilStmt) {
+    fn visit_stmt(&mut self, stmt: &mut Stmt) {
         walk_stmt_mut(self, stmt);
     }
 
-    fn visit_expr(&mut self, expr: &mut HilExpr) {
+    fn visit_expr(&mut self, expr: &mut Expr) {
         walk_expr_mut(self, expr);
     }
 
-    fn visit_lvalue_expr(&mut self, expr: &mut HilExpr) {
+    fn visit_lvalue_expr(&mut self, expr: &mut Expr) {
         walk_lvalue_expr_mut(self, expr);
     }
 
-    fn visit_table_item(&mut self, item: &mut HilTableItem) {
+    fn visit_table_item(&mut self, item: &mut TableItem) {
         walk_table_item_mut(self, item);
     }
 
@@ -121,7 +121,7 @@ pub trait VisitorMut {
 
     fn visit_symbol(&mut self, _sym: &mut SymbolId) {}
 
-    fn visit_number(&mut self, _number: &mut HilNumber) {}
+    fn visit_number(&mut self, _number: &mut Number) {}
 
     fn visit_string(&mut self, _string: &mut String) {}
 
@@ -240,71 +240,71 @@ pub fn walk_block_exit<V: Visitor + ?Sized>(visitor: &mut V, exit: &BlockExit) {
     }
 }
 
-pub fn walk_stmts<V: Visitor + ?Sized>(visitor: &mut V, stmts: &[HilStmt]) {
+pub fn walk_stmts<V: Visitor + ?Sized>(visitor: &mut V, stmts: &[Stmt]) {
     for stmt in stmts {
         visitor.visit_stmt(stmt);
     }
 }
 
-pub fn walk_stmt<V: Visitor + ?Sized>(visitor: &mut V, stmt: &HilStmt) {
+pub fn walk_stmt<V: Visitor + ?Sized>(visitor: &mut V, stmt: &Stmt) {
     match stmt {
-        HilStmt::Assign { left, value } => {
+        Stmt::Assign { left, value } => {
             visitor.visit_lvalue_expr(left);
             visitor.visit_expr(value);
         }
-        HilStmt::AssignMany { left, value } => {
+        Stmt::AssignMany { left, value } => {
             for lvalue in left {
                 visitor.visit_lvalue_expr(lvalue);
             }
             visitor.visit_expr(value);
         }
-        HilStmt::SetList { table, values, .. } => {
+        Stmt::SetList { table, values, .. } => {
             visitor.visit_symbol(*table);
             for value in values {
                 visitor.visit_expr(value);
             }
         }
-        HilStmt::Call(expr) => visitor.visit_expr(expr),
-        HilStmt::Phi(phi) => visitor.visit_phi(phi),
+        Stmt::Call(expr) => visitor.visit_expr(expr),
+        Stmt::Phi(phi) => visitor.visit_phi(phi),
     }
 }
 
-pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
+pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
     match expr {
-        HilExpr::Nil | HilExpr::VarArgs => {}
-        HilExpr::Number(number) => visitor.visit_number(*number),
-        HilExpr::String(string) => visitor.visit_string(string),
-        HilExpr::Bool(value) => visitor.visit_bool(*value),
-        HilExpr::Symbol(symbol) => visitor.visit_symbol(*symbol),
-        HilExpr::Closure { captures, .. } => {
+        Expr::Nil | Expr::VarArgs => {}
+        Expr::Number(number) => visitor.visit_number(*number),
+        Expr::String(string) => visitor.visit_string(string),
+        Expr::Bool(value) => visitor.visit_bool(*value),
+        Expr::Symbol(symbol) => visitor.visit_symbol(*symbol),
+        Expr::Closure { captures, .. } => {
             for (index, capture) in captures.iter().enumerate() {
                 visitor.visit_capture(index, *capture);
             }
         }
-        HilExpr::Global(name) => visitor.visit_global(name),
-        HilExpr::GetField { obj, .. } => visitor.visit_expr(obj),
-        HilExpr::GetIndex { obj, index } => {
+        Expr::Global(name) => visitor.visit_global(name),
+        Expr::GetField { obj, .. } => visitor.visit_expr(obj),
+        Expr::GetIndex { obj, index } => {
             visitor.visit_expr(obj);
             visitor.visit_expr(index);
         }
-        HilExpr::Call { fun, args } => {
+        Expr::Call { fun, args } => {
             visitor.visit_expr(fun);
             for arg in args {
                 visitor.visit_expr(arg);
             }
         }
-        HilExpr::MethodCall { object, args, .. } => {
+        Expr::MethodCall { object, args, .. } => {
             visitor.visit_expr(object);
             for arg in args {
                 visitor.visit_expr(arg);
             }
         }
-        HilExpr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } => {
             visitor.visit_expr(lhs);
             visitor.visit_expr(rhs);
         }
-        HilExpr::Unary { expr, .. } => visitor.visit_expr(expr),
-        HilExpr::IfElse {
+        Expr::Unary { expr, .. } => visitor.visit_expr(expr),
+        Expr::IfElse {
             condition,
             then_expr,
             else_expr,
@@ -313,7 +313,7 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
             visitor.visit_expr(then_expr);
             visitor.visit_expr(else_expr);
         }
-        HilExpr::Table { items } => {
+        Expr::Table { items } => {
             for item in items {
                 visitor.visit_table_item(item);
             }
@@ -321,11 +321,11 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
     }
 }
 
-pub fn walk_lvalue_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
+pub fn walk_lvalue_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
     match expr {
-        HilExpr::Symbol(symbol) => visitor.visit_symbol(*symbol),
-        HilExpr::GetField { obj, .. } => visitor.visit_expr(obj),
-        HilExpr::GetIndex { obj, index } => {
+        Expr::Symbol(symbol) => visitor.visit_symbol(*symbol),
+        Expr::GetField { obj, .. } => visitor.visit_expr(obj),
+        Expr::GetIndex { obj, index } => {
             visitor.visit_expr(obj);
             visitor.visit_expr(index);
         }
@@ -333,10 +333,10 @@ pub fn walk_lvalue_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &HilExpr) {
     }
 }
 
-pub fn walk_table_item<V: Visitor + ?Sized>(visitor: &mut V, item: &HilTableItem) {
+pub fn walk_table_item<V: Visitor + ?Sized>(visitor: &mut V, item: &TableItem) {
     match item {
-        HilTableItem::List(expr) => visitor.visit_expr(expr),
-        HilTableItem::Index(key, value) => {
+        TableItem::List(expr) => visitor.visit_expr(expr),
+        TableItem::Index(key, value) => {
             visitor.visit_expr(key);
             visitor.visit_expr(value);
         }
@@ -454,71 +454,71 @@ pub fn walk_block_exit_mut<V: VisitorMut + ?Sized>(visitor: &mut V, exit: &mut B
     }
 }
 
-pub fn walk_stmts_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmts: &mut Vec<HilStmt>) {
+pub fn walk_stmts_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmts: &mut Vec<Stmt>) {
     for stmt in stmts {
         visitor.visit_stmt(stmt);
     }
 }
 
-pub fn walk_stmt_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmt: &mut HilStmt) {
+pub fn walk_stmt_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmt: &mut Stmt) {
     match stmt {
-        HilStmt::Assign { left, value } => {
+        Stmt::Assign { left, value } => {
             visitor.visit_lvalue_expr(left);
             visitor.visit_expr(value);
         }
-        HilStmt::AssignMany { left, value } => {
+        Stmt::AssignMany { left, value } => {
             for lvalue in left {
                 visitor.visit_lvalue_expr(lvalue);
             }
             visitor.visit_expr(value);
         }
-        HilStmt::SetList { table, values, .. } => {
+        Stmt::SetList { table, values, .. } => {
             visitor.visit_symbol(table);
             for value in values {
                 visitor.visit_expr(value);
             }
         }
-        HilStmt::Call(expr) => visitor.visit_expr(expr),
-        HilStmt::Phi(phi) => visitor.visit_phi(phi),
+        Stmt::Call(expr) => visitor.visit_expr(expr),
+        Stmt::Phi(phi) => visitor.visit_phi(phi),
     }
 }
 
-pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut HilExpr) {
+pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut Expr) {
     match expr {
-        HilExpr::Nil | HilExpr::VarArgs => {}
-        HilExpr::Number(number) => visitor.visit_number(number),
-        HilExpr::String(string) => visitor.visit_string(string),
-        HilExpr::Bool(value) => visitor.visit_bool(value),
-        HilExpr::Symbol(symbol) => visitor.visit_symbol(symbol),
-        HilExpr::Closure { captures, .. } => {
+        Expr::Nil | Expr::VarArgs => {}
+        Expr::Number(number) => visitor.visit_number(number),
+        Expr::String(string) => visitor.visit_string(string),
+        Expr::Bool(value) => visitor.visit_bool(value),
+        Expr::Symbol(symbol) => visitor.visit_symbol(symbol),
+        Expr::Closure { captures, .. } => {
             for (index, capture) in captures.iter_mut().enumerate() {
                 visitor.visit_capture(index, capture);
             }
         }
-        HilExpr::Global(name) => visitor.visit_global(name),
-        HilExpr::GetField { obj, .. } => visitor.visit_expr(obj),
-        HilExpr::GetIndex { obj, index } => {
+        Expr::Global(name) => visitor.visit_global(name),
+        Expr::GetField { obj, .. } => visitor.visit_expr(obj),
+        Expr::GetIndex { obj, index } => {
             visitor.visit_expr(obj);
             visitor.visit_expr(index);
         }
-        HilExpr::Call { fun, args } => {
+        Expr::Call { fun, args } => {
             visitor.visit_expr(fun);
             for arg in args {
                 visitor.visit_expr(arg);
             }
         }
-        HilExpr::MethodCall { object, args, .. } => {
+        Expr::MethodCall { object, args, .. } => {
             visitor.visit_expr(object);
             for arg in args {
                 visitor.visit_expr(arg);
             }
         }
-        HilExpr::Binary { lhs, rhs, .. } => {
+        Expr::Binary { lhs, rhs, .. } => {
             visitor.visit_expr(lhs);
             visitor.visit_expr(rhs);
         }
-        HilExpr::Unary { expr, .. } => visitor.visit_expr(expr),
-        HilExpr::IfElse {
+        Expr::Unary { expr, .. } => visitor.visit_expr(expr),
+        Expr::IfElse {
             condition,
             then_expr,
             else_expr,
@@ -527,7 +527,7 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut HilExpr
             visitor.visit_expr(then_expr);
             visitor.visit_expr(else_expr);
         }
-        HilExpr::Table { items } => {
+        Expr::Table { items } => {
             for item in items {
                 visitor.visit_table_item(item);
             }
@@ -535,11 +535,11 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut HilExpr
     }
 }
 
-pub fn walk_lvalue_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut HilExpr) {
+pub fn walk_lvalue_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut Expr) {
     match expr {
-        HilExpr::Symbol(symbol) => visitor.visit_symbol(symbol),
-        HilExpr::GetField { obj, .. } => visitor.visit_expr(obj),
-        HilExpr::GetIndex { obj, index } => {
+        Expr::Symbol(symbol) => visitor.visit_symbol(symbol),
+        Expr::GetField { obj, .. } => visitor.visit_expr(obj),
+        Expr::GetIndex { obj, index } => {
             visitor.visit_expr(obj);
             visitor.visit_expr(index);
         }
@@ -547,10 +547,10 @@ pub fn walk_lvalue_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut 
     }
 }
 
-pub fn walk_table_item_mut<V: VisitorMut + ?Sized>(visitor: &mut V, item: &mut HilTableItem) {
+pub fn walk_table_item_mut<V: VisitorMut + ?Sized>(visitor: &mut V, item: &mut TableItem) {
     match item {
-        HilTableItem::List(expr) => visitor.visit_expr(expr),
-        HilTableItem::Index(key, value) => {
+        TableItem::List(expr) => visitor.visit_expr(expr),
+        TableItem::Index(key, value) => {
             visitor.visit_expr(key);
             visitor.visit_expr(value);
         }

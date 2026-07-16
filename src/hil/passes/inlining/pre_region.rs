@@ -4,7 +4,7 @@ use crate::{
     hil::{
         cflow::cfg::{Block, BlockExit, ControlFlowGraph},
         cflow::graph::GraphView,
-        ir::{HilExpr, HilStmt},
+        ir::{Expr, Stmt},
         lifted::FunctionSymbols,
         lifter::ssa::SymbolId,
         visitor::{Visitor, walk_expr},
@@ -21,7 +21,7 @@ pub struct SymbolFacts {
     /// If true, this symbol is disqualified from pure CFG inlining.
     pub disqualified: bool,
     /// The expression assigned by the symbol's only plain assignment, if known.
-    pub rhs: Option<HilExpr>,
+    pub rhs: Option<Expr>,
 }
 
 impl SymbolFacts {
@@ -31,7 +31,7 @@ impl SymbolFacts {
     }
 
     /// Creates facts for a plain `sym = rhs` assignment.
-    pub fn assigned(rhs: HilExpr) -> Self {
+    pub fn assigned(rhs: Expr) -> Self {
         Self {
             writes: 1,
             reads: 0,
@@ -63,7 +63,7 @@ impl Analyzer {
         // value this just allows us to skip bindings like `v{N} = p{N}`.
         for param in params {
             self.facts
-                .declare(*param, SymbolFacts::assigned(HilExpr::Symbol(*param)));
+                .declare(*param, SymbolFacts::assigned(Expr::Symbol(*param)));
         }
 
         for upvalue in upvalues {
@@ -71,7 +71,7 @@ impl Analyzer {
         }
     }
 
-    fn note_plain_assignment(&mut self, sym: SymbolId, rhs: &HilExpr) {
+    fn note_plain_assignment(&mut self, sym: SymbolId, rhs: &Expr) {
         let fact = self.facts.entry(sym).or_insert_with(SymbolFacts::unknown);
         fact.writes += 1;
         fact.rhs = Some(rhs.clone());
@@ -125,22 +125,22 @@ impl Analyzer {
 }
 
 impl Visitor for Analyzer {
-    fn visit_stmts(&mut self, stmts: &[HilStmt]) {
+    fn visit_stmts(&mut self, stmts: &[Stmt]) {
         for stmt in stmts {
             match &stmt {
-                HilStmt::Assign {
-                    left: HilExpr::Symbol(sym),
+                Stmt::Assign {
+                    left: Expr::Symbol(sym),
                     value,
                 } => {
                     self.note_plain_assignment(*sym, value);
                     self.visit_expr(value);
                     continue;
                 }
-                HilStmt::AssignMany { left, value } => {
+                Stmt::AssignMany { left, value } => {
                     // Block all tuple-assigns from being inlined. This can only be done in the
                     // post region inlining pass.
                     let symbols = left.iter().filter_map(|lv| {
-                        if let HilExpr::Symbol(sym) = lv {
+                        if let Expr::Symbol(sym) = lv {
                             Some(sym)
                         } else {
                             None
@@ -160,8 +160,8 @@ impl Visitor for Analyzer {
         }
     }
 
-    fn visit_expr(&mut self, expr: &HilExpr) {
-        if let HilExpr::Symbol(sym) = expr
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Expr::Symbol(sym) = expr
             && let Some(fact) = self.facts.get_mut(sym)
         {
             fact.reads += 1;
@@ -278,7 +278,7 @@ impl Inliner {
         );
     }
 
-    fn is_inline_candidate(&self, sym: SymbolId, rhs: &HilExpr) -> bool {
+    fn is_inline_candidate(&self, sym: SymbolId, rhs: &Expr) -> bool {
         let Some(fact) = self.facts.get(&sym) else {
             return false;
         };
@@ -291,7 +291,7 @@ impl Inliner {
             // A symbol can be inlined only when its value is stable for the whole function.
             // Otherwise a copied temporary can capture an old value and become wrong after
             // substitutions, for example when doing a swap via a temporary.
-            HilExpr::Symbol(sym) => self
+            Expr::Symbol(sym) => self
                 .facts
                 .get(sym)
                 .is_some_and(|v| !v.disqualified && v.writes == 1),
@@ -299,7 +299,7 @@ impl Inliner {
         }
     }
 
-    fn inline_block(&mut self, stmts: &mut Vec<HilStmt>) -> bool {
+    fn inline_block(&mut self, stmts: &mut Vec<Stmt>) -> bool {
         self.stats.blocks_visited += 1;
         self.stats.statements_visited += stmts.len();
         let mut available = HashMap::new();
@@ -313,8 +313,8 @@ impl Inliner {
             self.stats.successful_substitutions += substitution_stats.successes;
             kill_lvalues(stmt, &mut available);
 
-            if let HilStmt::Assign {
-                left: HilExpr::Symbol(sym),
+            if let Stmt::Assign {
+                left: Expr::Symbol(sym),
                 value,
             } = stmt
                 && self.is_inline_candidate(*sym, value)
@@ -332,8 +332,8 @@ impl Inliner {
         stmts.retain(|stmt| {
             let remove = matches!(
                 stmt,
-                HilStmt::Assign {
-                    left: HilExpr::Symbol(sym),
+                Stmt::Assign {
+                    left: Expr::Symbol(sym),
                     ..
                 } if removable.contains(sym)
             );
@@ -356,8 +356,8 @@ impl Inliner {
         let mut removable = HashSet::new();
 
         for stmt in block.stmts().iter().rev() {
-            let HilStmt::Assign {
-                left: HilExpr::Symbol(sym),
+            let Stmt::Assign {
+                left: Expr::Symbol(sym),
                 value,
             } = stmt
             else {
@@ -391,8 +391,8 @@ impl Inliner {
         block.stmts_mut().retain(|stmt| {
             !matches!(
                 stmt,
-                HilStmt::Assign {
-                    left: HilExpr::Symbol(sym),
+                Stmt::Assign {
+                    left: Expr::Symbol(sym),
                     ..
                 } if removable.contains(sym)
             )
@@ -405,32 +405,32 @@ impl Inliner {
 }
 
 fn substitute_in_stmt_rvalues(
-    stmt: &mut HilStmt,
-    available: &HashMap<SymbolId, HilExpr>,
+    stmt: &mut Stmt,
+    available: &HashMap<SymbolId, Expr>,
     removable: &mut HashSet<SymbolId>,
 ) -> SubstitutionStats {
     // Only rvalues are rewritten. Lvalues are handled separately by
     // `kill_lvalues`, because reads and writes in one statement have different
     // ordering semantics for this local dataflow pass.
     match stmt {
-        HilStmt::Assign { value, .. } | HilStmt::AssignMany { value, .. } => {
+        Stmt::Assign { value, .. } | Stmt::AssignMany { value, .. } => {
             substitute_available_expr(value, available, removable)
         }
-        HilStmt::SetList { values, .. } => {
+        Stmt::SetList { values, .. } => {
             let mut stats = SubstitutionStats::default();
             for value in values {
                 stats.add(substitute_available_expr(value, available, removable));
             }
             stats
         }
-        HilStmt::Call(expr) => substitute_available_expr(expr, available, removable),
-        HilStmt::Phi(_) => SubstitutionStats::default(),
+        Stmt::Call(expr) => substitute_available_expr(expr, available, removable),
+        Stmt::Phi(_) => SubstitutionStats::default(),
     }
 }
 
 fn substitute_available_expr(
-    expr: &mut HilExpr,
-    available: &HashMap<SymbolId, HilExpr>,
+    expr: &mut Expr,
+    available: &HashMap<SymbolId, Expr>,
     removable: &mut HashSet<SymbolId>,
 ) -> SubstitutionStats {
     let mut stats = SubstitutionStats::default();
@@ -460,7 +460,7 @@ fn substitute_available_expr(
     stats
 }
 
-fn kill_lvalues(stmt: &HilStmt, available: &mut HashMap<SymbolId, HilExpr>) {
+fn kill_lvalues(stmt: &Stmt, available: &mut HashMap<SymbolId, Expr>) {
     let written = stmt_written_symbols(stmt);
     if written.is_empty() {
         return;

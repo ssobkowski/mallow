@@ -1,9 +1,10 @@
 use smol_str::SmolStr;
 
 use crate::{
-    ast::{BinOp, Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Typed, UnOp},
+    ast::{Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Typed},
     common::escape_string,
     hil::ty::{FunctionTypeParam, FunctionTypeReturn, Type, TypeLiteral, TypePrecedence},
+    operator::{BinOp, UnOp},
 };
 
 pub fn print(block: &Block, top_comments: &[String]) -> String {

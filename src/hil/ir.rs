@@ -3,37 +3,36 @@ use std::fmt::Display;
 use anyhow::{Context, Result, bail};
 use smol_str::{SmolStr, ToSmolStr};
 
-use crate::ast::{BinOp, UnOp};
-use crate::common::ToSpanned;
 use crate::disasm::Chunk;
 use crate::hil::lifter::ssa::SymbolId;
 use crate::il::{Constant, ImportPath, Proto, ProtoId};
+use crate::operator::{BinOp, UnOp};
 
 /// A numeric literal.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HilNumber {
+pub enum Number {
     /// A 64-bit Luau integer literal.
     Integer(i64),
     /// A floating-point literal.
     Float(f64),
 }
 
-impl std::fmt::Display for HilNumber {
+impl std::fmt::Display for Number {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HilNumber::Integer(n) => write!(f, "{}i", n),
-            HilNumber::Float(n) => write!(f, "{}", n),
+            Number::Integer(n) => write!(f, "{}i", n),
+            Number::Float(n) => write!(f, "{}", n),
         }
     }
 }
 
 /// An expression in the high-level intermediate representation.
 #[derive(Debug, Clone, PartialEq)]
-pub enum HilExpr {
+pub enum Expr {
     /// The `nil` value.
     Nil,
     /// A numeric literal.
-    Number(HilNumber),
+    Number(Number),
     /// A string literal.
     String(String),
     /// A boolean literal.
@@ -48,68 +47,62 @@ pub enum HilExpr {
     /// A global variable, identified by its name.
     Global(SmolStr),
     /// A field access expression (`obj.field`).
-    GetField { obj: Box<HilExpr>, field: SmolStr },
+    GetField { obj: Box<Expr>, field: SmolStr },
     /// An index access expression (`obj[index]`).
-    GetIndex {
-        obj: Box<HilExpr>,
-        index: Box<HilExpr>,
-    },
+    GetIndex { obj: Box<Expr>, index: Box<Expr> },
     /// A function call expression (`fun(args...)`).
-    Call {
-        fun: Box<HilExpr>,
-        args: Vec<HilExpr>,
-    },
+    Call { fun: Box<Expr>, args: Vec<Expr> },
     /// A method call expression (`obj:method(args...)`).
     MethodCall {
-        object: Box<HilExpr>,
+        object: Box<Expr>,
         method: SmolStr,
-        args: Vec<HilExpr>,
+        args: Vec<Expr>,
     },
     /// A binary expression.
     Binary {
-        lhs: Box<HilExpr>,
+        lhs: Box<Expr>,
         op: BinOp,
-        rhs: Box<HilExpr>,
+        rhs: Box<Expr>,
     },
     /// An unary expression.
-    Unary { op: UnOp, expr: Box<HilExpr> },
+    Unary { op: UnOp, expr: Box<Expr> },
     /// A Luau if-expression (`if cond then a else b`).
     IfElse {
-        condition: Box<HilExpr>,
-        then_expr: Box<HilExpr>,
-        else_expr: Box<HilExpr>,
+        condition: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
     },
     /// A table constructor with a list of implicit values.
-    Table { items: Vec<HilTableItem> },
+    Table { items: Vec<TableItem> },
     /// Vararg expression (`...`).
     VarArgs,
 }
 
-impl HilExpr {
-    /// Returns a new [`HilExpr::Binary`] expression with the given operands,
+impl Expr {
+    /// Returns a new [`Expr::Binary`] expression with the given operands,
     /// and the [`BinOp::And`] operator.
-    pub fn and(lhs: HilExpr, rhs: HilExpr) -> Self {
-        HilExpr::Binary {
+    pub fn and(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Binary {
             lhs: Box::new(lhs),
             op: BinOp::And,
             rhs: Box::new(rhs),
         }
     }
 
-    /// Returns a new [`HilExpr::Binary`] expression with the given operands,
+    /// Returns a new [`Expr::Binary`] expression with the given operands,
     /// and the [`BinOp::Or`] operator.
-    pub fn or(lhs: HilExpr, rhs: HilExpr) -> Self {
-        HilExpr::Binary {
+    pub fn or(lhs: Expr, rhs: Expr) -> Self {
+        Expr::Binary {
             lhs: Box::new(lhs),
             op: BinOp::Or,
             rhs: Box::new(rhs),
         }
     }
 
-    /// Returns a new [`HilExpr::Unary`] expression with the given operand and the
+    /// Returns a new [`Expr::Unary`] expression with the given operand and the
     /// [`UnOp::Not`] operator.
-    pub fn not(expr: HilExpr) -> Self {
-        HilExpr::Unary {
+    pub fn not(expr: Expr) -> Self {
+        Expr::Unary {
             op: UnOp::Not,
             expr: Box::new(expr),
         }
@@ -118,18 +111,18 @@ impl HilExpr {
     /// Returns whether this expressions reads a given symbol.
     pub fn reads_symbol(&self, sym: &SymbolId) -> bool {
         match self {
-            HilExpr::Symbol(s) => s == sym,
-            HilExpr::GetField { obj, .. } => obj.reads_symbol(sym),
-            HilExpr::GetIndex { obj, index } => obj.reads_symbol(sym) || index.reads_symbol(sym),
-            HilExpr::Call { fun, args } => {
+            Expr::Symbol(s) => s == sym,
+            Expr::GetField { obj, .. } => obj.reads_symbol(sym),
+            Expr::GetIndex { obj, index } => obj.reads_symbol(sym) || index.reads_symbol(sym),
+            Expr::Call { fun, args } => {
                 fun.reads_symbol(sym) || args.iter().any(|arg| arg.reads_symbol(sym))
             }
-            HilExpr::MethodCall { object, args, .. } => {
+            Expr::MethodCall { object, args, .. } => {
                 object.reads_symbol(sym) || args.iter().any(|arg| arg.reads_symbol(sym))
             }
-            HilExpr::Binary { lhs, rhs, .. } => lhs.reads_symbol(sym) || rhs.reads_symbol(sym),
-            HilExpr::Unary { expr, .. } => expr.reads_symbol(sym),
-            HilExpr::IfElse {
+            Expr::Binary { lhs, rhs, .. } => lhs.reads_symbol(sym) || rhs.reads_symbol(sym),
+            Expr::Unary { expr, .. } => expr.reads_symbol(sym),
+            Expr::IfElse {
                 condition,
                 then_expr,
                 else_expr,
@@ -138,9 +131,9 @@ impl HilExpr {
                     || then_expr.reads_symbol(sym)
                     || else_expr.reads_symbol(sym)
             }
-            HilExpr::Table { items } => items.iter().any(|item| match item {
-                HilTableItem::List(expr) => expr.reads_symbol(sym),
-                HilTableItem::Index(key, value) => key.reads_symbol(sym) || value.reads_symbol(sym),
+            Expr::Table { items } => items.iter().any(|item| match item {
+                TableItem::List(expr) => expr.reads_symbol(sym),
+                TableItem::Index(key, value) => key.reads_symbol(sym) || value.reads_symbol(sym),
             }),
             _ => false,
         }
@@ -149,26 +142,26 @@ impl HilExpr {
     /// Returns whether this expression is pure, i.e. it does not have any side effects.
     pub const fn is_pure(&self) -> bool {
         match self {
-            HilExpr::Nil
-            | HilExpr::Number(_)
-            | HilExpr::String(_)
-            | HilExpr::Bool(_)
-            | HilExpr::Symbol(_)
-            | HilExpr::Global(_) => true,
-            HilExpr::GetField { obj, .. } => obj.is_pure(),
-            HilExpr::GetIndex { obj, index } => obj.is_pure() && index.is_pure(),
-            HilExpr::Unary { expr, .. } => expr.is_pure(),
-            HilExpr::Binary { lhs, rhs, .. } => lhs.is_pure() && rhs.is_pure(),
-            HilExpr::IfElse {
+            Expr::Nil
+            | Expr::Number(_)
+            | Expr::String(_)
+            | Expr::Bool(_)
+            | Expr::Symbol(_)
+            | Expr::Global(_) => true,
+            Expr::GetField { obj, .. } => obj.is_pure(),
+            Expr::GetIndex { obj, index } => obj.is_pure() && index.is_pure(),
+            Expr::Unary { expr, .. } => expr.is_pure(),
+            Expr::Binary { lhs, rhs, .. } => lhs.is_pure() && rhs.is_pure(),
+            Expr::IfElse {
                 condition,
                 then_expr,
                 else_expr,
             } => condition.is_pure() && then_expr.is_pure() && else_expr.is_pure(),
-            HilExpr::Closure { .. }
-            | HilExpr::Call { .. }
-            | HilExpr::MethodCall { .. }
-            | HilExpr::Table { .. }
-            | HilExpr::VarArgs => false,
+            Expr::Closure { .. }
+            | Expr::Call { .. }
+            | Expr::MethodCall { .. }
+            | Expr::Table { .. }
+            | Expr::VarArgs => false,
         }
     }
 
@@ -176,7 +169,7 @@ impl HilExpr {
     pub const fn is_literal(&self) -> bool {
         matches!(
             self,
-            HilExpr::Nil | HilExpr::Number(_) | HilExpr::String(_) | HilExpr::Bool(_)
+            Expr::Nil | Expr::Number(_) | Expr::String(_) | Expr::Bool(_)
         )
     }
 
@@ -186,12 +179,11 @@ impl HilExpr {
     /// and `None` for values that are not determinable at compile time.
     pub const fn truthiness(&self) -> Option<bool> {
         match self {
-            HilExpr::Nil => Some(false),
-            HilExpr::Bool(value) => Some(*value),
-            HilExpr::Number(_)
-            | HilExpr::String(_)
-            | HilExpr::Closure { .. }
-            | HilExpr::Table { .. } => Some(true),
+            Expr::Nil => Some(false),
+            Expr::Bool(value) => Some(*value),
+            Expr::Number(_) | Expr::String(_) | Expr::Closure { .. } | Expr::Table { .. } => {
+                Some(true)
+            }
             _ => None,
         }
     }
@@ -201,26 +193,26 @@ impl HilExpr {
     /// Ordered comparisons are wrapped in `not` instead of being converted to
     /// the opposite comparison because values such as NaN make those forms
     /// observably different.
-    pub fn invert(self) -> HilExpr {
+    pub fn invert(self) -> Expr {
         match self {
-            HilExpr::Bool(b) => HilExpr::Bool(!b),
-            HilExpr::Binary {
+            Expr::Bool(b) => Expr::Bool(!b),
+            Expr::Binary {
                 lhs,
                 op: op @ (BinOp::Eq | BinOp::Ne),
                 rhs,
             } => {
                 let inverted = op.invert().expect("equality operators are invertible");
-                HilExpr::Binary {
+                Expr::Binary {
                     lhs: Box::new(*lhs),
                     op: inverted,
                     rhs: Box::new(*rhs),
                 }
             }
-            HilExpr::Unary {
+            Expr::Unary {
                 op: UnOp::Not,
                 expr: inner,
             } => *inner,
-            other => HilExpr::not(other),
+            other => Expr::not(other),
         }
     }
 
@@ -229,7 +221,7 @@ impl HilExpr {
         match ct {
             Constant::Nil => Ok(Self::Nil),
             Constant::Boolean(b) => Ok(Self::Bool(*b)),
-            Constant::Number(n) => Ok(Self::Number(HilNumber::Float(*n))),
+            Constant::Number(n) => Ok(Self::Number(Number::Float(*n))),
             Constant::String(s) => Ok(Self::String(
                 chunk
                     .get_string(*s)
@@ -246,7 +238,7 @@ impl HilExpr {
                         field: "create".into(),
                     }),
                     args: [x, y, z, w]
-                        .map(|x| Self::Number(HilNumber::Float(*x as f64)))
+                        .map(|x| Self::Number(Number::Float(*x as f64)))
                         .to_vec(),
                 }
             }),
@@ -262,19 +254,19 @@ impl HilExpr {
                     let value = proto.get_constant(*value_id).with_context(|| {
                         format!("constant with value {:?} was not found", value_id)
                     })?;
-                    items.push(HilTableItem::Index(
+                    items.push(TableItem::Index(
                         Self::from_constant(key, chunk, proto)?,
                         Self::from_constant(value, chunk, proto)?,
                     ));
                 }
                 Ok(Self::Table { items })
             }
-            Constant::Integer(n) => Ok(Self::Number(HilNumber::Integer(*n))),
+            Constant::Integer(n) => Ok(Self::Number(Number::Integer(*n))),
         }
     }
 
     /// Returns the access expression built from a packed import path.
-    pub fn import(path: ImportPath, chunk: &Chunk, proto: &Proto) -> Result<HilExpr> {
+    pub fn import(path: ImportPath, chunk: &Chunk, proto: &Proto) -> Result<Expr> {
         let mut names = Vec::new();
 
         for id in path.const_ids()? {
@@ -291,10 +283,10 @@ impl HilExpr {
         }
 
         let first = names.remove(0);
-        let mut expr = HilExpr::Global(first);
+        let mut expr = Expr::Global(first);
 
         for field in names {
-            expr = HilExpr::GetField {
+            expr = Expr::GetField {
                 obj: Box::new(expr),
                 field,
             };
@@ -304,19 +296,19 @@ impl HilExpr {
     }
 }
 
-impl Display for HilExpr {
+impl Display for Expr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HilExpr::Nil => write!(f, "nil"),
-            HilExpr::Number(n) => write!(f, "{}", n),
-            HilExpr::String(s) => write!(f, "\"{}\"", s),
-            HilExpr::Bool(b) => write!(f, "{}", b),
-            HilExpr::Symbol(s) => write!(f, "v{}", s.index()),
-            HilExpr::Closure { proto, .. } => write!(f, "<closure {}>", proto),
-            HilExpr::Global(g) => write!(f, "{}", g),
-            HilExpr::GetField { obj, field } => write!(f, "{}.{}", obj, field),
-            HilExpr::GetIndex { obj, index } => write!(f, "{}[{}]", obj, index),
-            HilExpr::Call { fun, args } => {
+            Expr::Nil => write!(f, "nil"),
+            Expr::Number(n) => write!(f, "{}", n),
+            Expr::String(s) => write!(f, "\"{}\"", s),
+            Expr::Bool(b) => write!(f, "{}", b),
+            Expr::Symbol(s) => write!(f, "v{}", s.index()),
+            Expr::Closure { proto, .. } => write!(f, "<closure {}>", proto),
+            Expr::Global(g) => write!(f, "{}", g),
+            Expr::GetField { obj, field } => write!(f, "{}.{}", obj, field),
+            Expr::GetIndex { obj, index } => write!(f, "{}[{}]", obj, index),
+            Expr::Call { fun, args } => {
                 write!(f, "call {}(", fun)?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
@@ -326,7 +318,7 @@ impl Display for HilExpr {
                 }
                 write!(f, ")")
             }
-            HilExpr::MethodCall {
+            Expr::MethodCall {
                 object,
                 method,
                 args,
@@ -340,40 +332,40 @@ impl Display for HilExpr {
                 }
                 write!(f, ")")
             }
-            HilExpr::Binary { lhs, op, rhs } => write!(f, "{} {} {}", lhs, op, rhs),
-            HilExpr::Unary { op, expr } => {
+            Expr::Binary { lhs, op, rhs } => write!(f, "{} {} {}", lhs, op, rhs),
+            Expr::Unary { op, expr } => {
                 if op == &UnOp::Not {
                     write!(f, "not ({})", expr)
                 } else {
                     write!(f, "{}{}", op, expr)
                 }
             }
-            HilExpr::IfElse {
+            Expr::IfElse {
                 condition,
                 then_expr,
                 else_expr,
             } => {
                 write!(f, "if {} then {} else {}", condition, then_expr, else_expr)
             }
-            HilExpr::Table { items } => {
+            Expr::Table { items } => {
                 if items.is_empty() {
                     write!(f, "{{}}")
                 } else {
                     unimplemented!()
                 }
             }
-            HilExpr::VarArgs => write!(f, "..."),
+            Expr::VarArgs => write!(f, "..."),
         }
     }
 }
 
 /// An entry in the table constructor.
 #[derive(Debug, Clone, PartialEq)]
-pub enum HilTableItem {
+pub enum TableItem {
     /// An array-part value, e.g., `value` in `{ value }`
-    List(HilExpr),
+    List(Expr),
     /// A generic expression-keyed dictionary value, e.g., `[key] = value`
-    Index(HilExpr, HilExpr),
+    Index(Expr, Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -384,29 +376,29 @@ pub struct PhiNode {
 
 /// A statement in the high-level intermediate representation.
 #[derive(Debug, Clone)]
-pub enum HilStmt {
+pub enum Stmt {
     /// An assignment statement, like `foo = 123`.
-    Assign { left: HilExpr, value: HilExpr },
+    Assign { left: Expr, value: Expr },
     /// A multi-variable assignment statement, like `a, b = returns_tuple()`.
-    AssignMany { left: Vec<HilExpr>, value: HilExpr },
+    AssignMany { left: Vec<Expr>, value: Expr },
     /// A bulk array write lowered from `SETLIST`.
     SetList {
         table: SymbolId,
         index: u32,
-        values: Vec<HilExpr>,
+        values: Vec<Expr>,
         has_variadic_tail: bool,
     },
     /// A call statement.
-    Call(HilExpr),
+    Call(Expr),
     /// A "Phi-Node", used for merging symbols between region blocks.
     Phi(PhiNode),
 }
 
-impl Display for HilStmt {
+impl Display for Stmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HilStmt::Assign { left, value } => write!(f, "{} = {}", left, value),
-            HilStmt::AssignMany { left, value } => {
+            Stmt::Assign { left, value } => write!(f, "{} = {}", left, value),
+            Stmt::AssignMany { left, value } => {
                 for (i, lv) in left.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -415,7 +407,7 @@ impl Display for HilStmt {
                 }
                 write!(f, " = {}", value)
             }
-            HilStmt::SetList {
+            Stmt::SetList {
                 table,
                 index,
                 values,
@@ -439,11 +431,8 @@ impl Display for HilStmt {
                 }
                 write!(f, "]")
             }
-            HilStmt::Call(expr) => write!(f, "{}", expr),
-            HilStmt::Phi(_) => Ok(()),
+            Stmt::Call(expr) => write!(f, "{}", expr),
+            Stmt::Phi(_) => Ok(()),
         }
     }
 }
-
-impl ToSpanned for HilExpr {}
-impl ToSpanned for HilStmt {}

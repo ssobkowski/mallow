@@ -8,14 +8,14 @@
 //! because it changes the structure of the IR rather than canonicalizing it.
 
 use crate::{
-    ast::BinOp,
     hil::{
         StructuredFunction,
         cflow::region::RegionNode,
-        ir::{HilExpr, HilStmt},
+        ir::{Expr, Stmt},
         lifter::ssa::SymbolId,
         visitor::{VisitorMut, walk_region_mut},
     },
+    operator::BinOp,
 };
 
 #[derive(Default)]
@@ -53,8 +53,8 @@ fn fold_short_circuit_assignments(nodes: &mut Vec<RegionNode>) -> bool {
         }
 
         let folded = match op {
-            BinOp::And => HilExpr::and(value, fallback),
-            BinOp::Or => HilExpr::or(value, fallback),
+            BinOp::And => Expr::and(value, fallback),
+            BinOp::Or => Expr::or(value, fallback),
             _ => unreachable!("short-circuit assignment only folds logical operators"),
         };
         replace_trailing_assignment_value(&mut nodes[index], folded);
@@ -65,7 +65,7 @@ fn fold_short_circuit_assignments(nodes: &mut Vec<RegionNode>) -> bool {
     changed
 }
 
-fn trailing_symbol_assignment(node: &RegionNode) -> Option<(SymbolId, HilExpr)> {
+fn trailing_symbol_assignment(node: &RegionNode) -> Option<(SymbolId, Expr)> {
     if let RegionNode::Sequence { nodes } = node
         && let [node] = nodes.as_slice()
     {
@@ -75,17 +75,17 @@ fn trailing_symbol_assignment(node: &RegionNode) -> Option<(SymbolId, HilExpr)> 
     let RegionNode::BasicBlock { stmts } = node else {
         return None;
     };
-    let HilStmt::Assign { left, value } = stmts.last()? else {
+    let Stmt::Assign { left, value } = stmts.last()? else {
         return None;
     };
-    let HilExpr::Symbol(sym) = left else {
+    let Expr::Symbol(sym) = left else {
         return None;
     };
 
     Some((*sym, value.clone()))
 }
 
-fn replace_trailing_assignment_value(node: &mut RegionNode, value: HilExpr) {
+fn replace_trailing_assignment_value(node: &mut RegionNode, value: Expr) {
     if let RegionNode::Sequence { nodes } = node
         && let [node] = nodes.as_mut_slice()
     {
@@ -96,7 +96,7 @@ fn replace_trailing_assignment_value(node: &mut RegionNode, value: HilExpr) {
     let RegionNode::BasicBlock { stmts } = node else {
         unreachable!("caller checked that this node has a trailing assignment");
     };
-    let Some(HilStmt::Assign {
+    let Some(Stmt::Assign {
         value: old_value, ..
     }) = stmts.last_mut()
     else {
@@ -105,7 +105,7 @@ fn replace_trailing_assignment_value(node: &mut RegionNode, value: HilExpr) {
     *old_value = value;
 }
 
-fn guarded_fallback_assignment(node: &RegionNode, sym: SymbolId) -> Option<(BinOp, HilExpr)> {
+fn guarded_fallback_assignment(node: &RegionNode, sym: SymbolId) -> Option<(BinOp, Expr)> {
     let RegionNode::If {
         condition,
         then_branch,
@@ -115,9 +115,9 @@ fn guarded_fallback_assignment(node: &RegionNode, sym: SymbolId) -> Option<(BinO
         return None;
     };
 
-    let op = if condition == &HilExpr::Symbol(sym).invert() {
+    let op = if condition == &Expr::Symbol(sym).invert() {
         BinOp::Or
-    } else if condition == &HilExpr::Symbol(sym) {
+    } else if condition == &Expr::Symbol(sym) {
         BinOp::And
     } else {
         return None;
@@ -126,7 +126,7 @@ fn guarded_fallback_assignment(node: &RegionNode, sym: SymbolId) -> Option<(BinO
     single_symbol_assignment(then_branch, sym).map(|value| (op, value))
 }
 
-fn single_symbol_assignment(node: &RegionNode, sym: SymbolId) -> Option<HilExpr> {
+fn single_symbol_assignment(node: &RegionNode, sym: SymbolId) -> Option<Expr> {
     if let RegionNode::Sequence { nodes } = node
         && let [node] = nodes.as_slice()
     {
@@ -136,10 +136,10 @@ fn single_symbol_assignment(node: &RegionNode, sym: SymbolId) -> Option<HilExpr>
     let RegionNode::BasicBlock { stmts } = node else {
         return None;
     };
-    let [HilStmt::Assign { left, value }] = stmts.as_slice() else {
+    let [Stmt::Assign { left, value }] = stmts.as_slice() else {
         return None;
     };
-    (left == &HilExpr::Symbol(sym)).then(|| value.clone())
+    (left == &Expr::Symbol(sym)).then(|| value.clone())
 }
 
 pub fn run(fun: &mut StructuredFunction) -> bool {
@@ -155,16 +155,16 @@ mod tests {
 
     use id_arena::Arena;
 
-    fn assign(sym: SymbolId, value: HilExpr) -> RegionNode {
+    fn assign(sym: SymbolId, value: Expr) -> RegionNode {
         RegionNode::BasicBlock {
-            stmts: vec![HilStmt::Assign {
-                left: HilExpr::Symbol(sym),
+            stmts: vec![Stmt::Assign {
+                left: Expr::Symbol(sym),
                 value,
             }],
         }
     }
 
-    fn guard(condition: HilExpr, sym: SymbolId, value: HilExpr) -> RegionNode {
+    fn guard(condition: Expr, sym: SymbolId, value: Expr) -> RegionNode {
         RegionNode::If {
             condition,
             then_branch: Box::new(assign(sym, value)),
@@ -172,11 +172,11 @@ mod tests {
         }
     }
 
-    fn folded_assignment_value(nodes: &[RegionNode]) -> &HilExpr {
+    fn folded_assignment_value(nodes: &[RegionNode]) -> &Expr {
         let [RegionNode::BasicBlock { stmts }] = nodes else {
             panic!("expected one folded basic block");
         };
-        let [HilStmt::Assign { value, .. }] = stmts.as_slice() else {
+        let [Stmt::Assign { value, .. }] = stmts.as_slice() else {
             panic!("expected one folded assignment");
         };
         value
@@ -186,31 +186,31 @@ mod tests {
     fn folds_or_assignment_guard() {
         let mut symbols: Arena<Symbol> = Arena::new();
         let target = symbols.alloc(Symbol::reg(0));
-        let lhs = HilExpr::Symbol(symbols.alloc(Symbol::reg(1)));
-        let rhs = HilExpr::Symbol(symbols.alloc(Symbol::reg(2)));
+        let lhs = Expr::Symbol(symbols.alloc(Symbol::reg(1)));
+        let rhs = Expr::Symbol(symbols.alloc(Symbol::reg(2)));
         let mut nodes = vec![
             assign(target, lhs.clone()),
-            guard(HilExpr::Symbol(target).invert(), target, rhs.clone()),
+            guard(Expr::Symbol(target).invert(), target, rhs.clone()),
         ];
 
         assert!(fold_short_circuit_assignments(&mut nodes));
         assert_eq!(nodes.len(), 1);
-        assert_eq!(folded_assignment_value(&nodes), &HilExpr::or(lhs, rhs));
+        assert_eq!(folded_assignment_value(&nodes), &Expr::or(lhs, rhs));
     }
 
     #[test]
     fn folds_and_assignment_guard() {
         let mut symbols: Arena<Symbol> = Arena::new();
         let target = symbols.alloc(Symbol::reg(0));
-        let lhs = HilExpr::Symbol(symbols.alloc(Symbol::reg(1)));
-        let rhs = HilExpr::Symbol(symbols.alloc(Symbol::reg(2)));
+        let lhs = Expr::Symbol(symbols.alloc(Symbol::reg(1)));
+        let rhs = Expr::Symbol(symbols.alloc(Symbol::reg(2)));
         let mut nodes = vec![
             assign(target, lhs.clone()),
-            guard(HilExpr::Symbol(target), target, rhs.clone()),
+            guard(Expr::Symbol(target), target, rhs.clone()),
         ];
 
         assert!(fold_short_circuit_assignments(&mut nodes));
         assert_eq!(nodes.len(), 1);
-        assert_eq!(folded_assignment_value(&nodes), &HilExpr::and(lhs, rhs));
+        assert_eq!(folded_assignment_value(&nodes), &Expr::and(lhs, rhs));
     }
 }

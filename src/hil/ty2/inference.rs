@@ -18,10 +18,9 @@ use id_arena::{Arena, Id};
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::{
-    ast::{BinOp, UnOp},
     hil::{
         cflow::cfg::BlockExit,
-        ir::{HilExpr, HilStmt, HilTableItem},
+        ir::{Expr, Stmt, TableItem},
         lifted::LiftedFunction,
         lifter::ssa::SymbolId,
         ty::{FunctionTypeParam, FunctionTypeReturn, Metamethod, Type, TypeLiteral},
@@ -32,6 +31,7 @@ use crate::{
         visitor::{Visitor, walk_expr},
     },
     il::ProtoId,
+    operator::{BinOp, UnOp},
 };
 
 /// Durable key for an inference variable discovered while collecting HIL.
@@ -266,7 +266,7 @@ struct ExpressionSymbolCollector {
 
 impl ExpressionSymbolCollector {
     /// Returns every symbol read or captured by `expression`.
-    fn collect(expression: &HilExpr) -> HashSet<SymbolId> {
+    fn collect(expression: &Expr) -> HashSet<SymbolId> {
         let mut collector = Self::default();
         collector.visit_expr(expression);
         collector.symbols
@@ -285,7 +285,7 @@ impl Visitor for ExpressionSymbolCollector {
     }
 
     /// Delegates recursive expression traversal to the shared HIL walker.
-    fn visit_expr(&mut self, expression: &HilExpr) {
+    fn visit_expr(&mut self, expression: &Expr) {
         walk_expr(self, expression);
     }
 }
@@ -321,7 +321,7 @@ impl TableConstructionTracker {
     }
 
     /// Returns whether an expression reads any alias of `symbol`'s construction.
-    fn expression_reads(&self, expression: &HilExpr, symbol: SymbolId) -> bool {
+    fn expression_reads(&self, expression: &Expr, symbol: SymbolId) -> bool {
         let Some(root) = self.root(symbol) else {
             return false;
         };
@@ -332,7 +332,7 @@ impl TableConstructionTracker {
     }
 
     /// Invalidates every active construction read or captured by `expression`.
-    fn invalidate_expression(&mut self, expression: &HilExpr) {
+    fn invalidate_expression(&mut self, expression: &Expr) {
         let roots: Vec<_> = ExpressionSymbolCollector::collect(expression)
             .into_iter()
             .filter_map(|symbol| self.root(symbol))
@@ -529,7 +529,7 @@ struct ConstraintCollector<'a> {
     /// Block-local table allocations that have not escaped before initialization.
     constructions: TableConstructionTracker,
     /// Unique SSA definitions used to recover value provenance at calls.
-    definitions: HashMap<SymbolId, HilExpr>,
+    definitions: HashMap<SymbolId, Expr>,
     /// Symbols backed by nonlocal upvalue storage rather than private SSA locals.
     upvalues: HashSet<SymbolId>,
 }
@@ -579,19 +579,19 @@ impl<'a> ConstraintCollector<'a> {
     }
 
     /// Collects direct symbol definitions from the SSA graph.
-    fn collect_definitions(function: &LiftedFunction) -> HashMap<SymbolId, HilExpr> {
+    fn collect_definitions(function: &LiftedFunction) -> HashMap<SymbolId, Expr> {
         let mut definitions = HashMap::new();
         for block in function.cfg.blocks() {
             for statement in block.stmts() {
                 match statement {
-                    HilStmt::Assign {
-                        left: HilExpr::Symbol(symbol),
+                    Stmt::Assign {
+                        left: Expr::Symbol(symbol),
                         value,
                     } => {
                         definitions.insert(*symbol, value.clone());
                     }
-                    HilStmt::AssignMany { left, value } => {
-                        if let Some(HilExpr::Symbol(symbol)) = left.first() {
+                    Stmt::AssignMany { left, value } => {
+                        if let Some(Expr::Symbol(symbol)) = left.first() {
                             definitions.insert(*symbol, value.clone());
                         }
                     }
@@ -671,14 +671,14 @@ impl<'a> ConstraintCollector<'a> {
     }
 
     /// Recognizes a direct symbol truthiness test, optionally under `not`.
-    fn condition_symbol(condition: &HilExpr) -> Option<(SymbolId, Truthiness)> {
+    fn condition_symbol(condition: &Expr) -> Option<(SymbolId, Truthiness)> {
         match condition {
-            HilExpr::Symbol(symbol) => Some((*symbol, Truthiness::Truthy)),
-            HilExpr::Unary {
+            Expr::Symbol(symbol) => Some((*symbol, Truthiness::Truthy)),
+            Expr::Unary {
                 op: UnOp::Not,
                 expr,
             } => match expr.as_ref() {
-                HilExpr::Symbol(symbol) => Some((*symbol, Truthiness::Falsy)),
+                Expr::Symbol(symbol) => Some((*symbol, Truthiness::Falsy)),
                 _ => None,
             },
             _ => None,
@@ -744,11 +744,11 @@ impl<'a> ConstraintCollector<'a> {
     }
 
     /// Collects one statement and its value-flow effects.
-    fn collect_statement(&mut self, statement: &HilStmt) {
+    fn collect_statement(&mut self, statement: &Stmt) {
         match statement {
-            HilStmt::Assign { left, value } => {
+            Stmt::Assign { left, value } => {
                 let definite = self.initializes_active_field(left, value);
-                if matches!(value, HilExpr::Call { .. } | HilExpr::MethodCall { .. }) {
+                if matches!(value, Expr::Call { .. } | Expr::MethodCall { .. }) {
                     let result = self.synthetic_for_lvalue(left, definite);
                     self.collect_call(value, vec![result]);
                 } else {
@@ -757,8 +757,8 @@ impl<'a> ConstraintCollector<'a> {
                 }
                 self.update_construction_after_assignment(left, value);
             }
-            HilStmt::AssignMany { left, value } => {
-                if matches!(value, HilExpr::Call { .. } | HilExpr::MethodCall { .. }) {
+            Stmt::AssignMany { left, value } => {
+                if matches!(value, Expr::Call { .. } | Expr::MethodCall { .. }) {
                     let returns = left
                         .iter()
                         .map(|lvalue| self.synthetic_for_lvalue(lvalue, false))
@@ -779,7 +779,7 @@ impl<'a> ConstraintCollector<'a> {
                     self.invalidate_noninitializing_lvalue(lvalue);
                 }
             }
-            HilStmt::SetList {
+            Stmt::SetList {
                 table,
                 values,
                 has_variadic_tail,
@@ -804,11 +804,11 @@ impl<'a> ConstraintCollector<'a> {
                     self.constructions.invalidate_expression(value);
                 }
             }
-            HilStmt::Call(call) => {
+            Stmt::Call(call) => {
                 self.collect_call(call, Vec::new());
                 self.constructions.invalidate_expression(call);
             }
-            HilStmt::Phi(phi) => {
+            Stmt::Phi(phi) => {
                 let target = self.symbol_slot(phi.target);
                 for &(_, operand) in &phi.operands {
                     let operand = self.symbol_slot(operand);
@@ -820,32 +820,32 @@ impl<'a> ConstraintCollector<'a> {
     }
 
     /// Returns whether a named-field write is definite constructor initialization.
-    fn initializes_active_field(&self, lvalue: &HilExpr, value: &HilExpr) -> bool {
-        let HilExpr::GetField { obj, .. } = lvalue else {
+    fn initializes_active_field(&self, lvalue: &Expr, value: &Expr) -> bool {
+        let Expr::GetField { obj, .. } = lvalue else {
             return false;
         };
-        let HilExpr::Symbol(table) = obj.as_ref() else {
+        let Expr::Symbol(table) = obj.as_ref() else {
             return false;
         };
         self.constructions.is_active(*table) && !self.constructions.expression_reads(value, *table)
     }
 
     /// Updates block-local construction state after one ordinary assignment.
-    fn update_construction_after_assignment(&mut self, lvalue: &HilExpr, value: &HilExpr) {
+    fn update_construction_after_assignment(&mut self, lvalue: &Expr, value: &Expr) {
         match (lvalue, value) {
-            (HilExpr::Symbol(target), HilExpr::Table { .. }) => {
+            (Expr::Symbol(target), Expr::Table { .. }) => {
                 self.constructions.invalidate_expression(value);
                 if !self.upvalues.contains(target) {
                     self.constructions.start(*target);
                 }
             }
-            (HilExpr::Symbol(target), HilExpr::Symbol(source))
+            (Expr::Symbol(target), Expr::Symbol(source))
                 if !self.upvalues.contains(target)
                     && self.constructions.alias(*target, *source) => {}
-            (HilExpr::GetField { obj, .. }, _) | (HilExpr::GetIndex { obj, .. }, _) if matches!(obj.as_ref(), HilExpr::Symbol(table) if self.constructions.is_active(*table)) =>
+            (Expr::GetField { obj, .. }, _) | (Expr::GetIndex { obj, .. }, _) if matches!(obj.as_ref(), Expr::Symbol(table) if self.constructions.is_active(*table)) =>
             {
                 self.constructions.invalidate_expression(value);
-                if let HilExpr::GetIndex { index, .. } = lvalue {
+                if let Expr::GetIndex { index, .. } = lvalue {
                     self.constructions.invalidate_expression(index);
                 }
             }
@@ -857,10 +857,10 @@ impl<'a> ConstraintCollector<'a> {
     }
 
     /// Invalidates construction values read by a non-initializing lvalue.
-    fn invalidate_noninitializing_lvalue(&mut self, lvalue: &HilExpr) {
+    fn invalidate_noninitializing_lvalue(&mut self, lvalue: &Expr) {
         match lvalue {
-            HilExpr::GetField { obj, .. } => self.constructions.invalidate_expression(obj),
-            HilExpr::GetIndex { obj, index } => {
+            Expr::GetField { obj, .. } => self.constructions.invalidate_expression(obj),
+            Expr::GetIndex { obj, index } => {
                 self.constructions.invalidate_expression(obj);
                 self.constructions.invalidate_expression(index);
             }
@@ -869,16 +869,16 @@ impl<'a> ConstraintCollector<'a> {
     }
 
     /// Creates a call destination and wires it to an arbitrary lvalue.
-    fn synthetic_for_lvalue(&mut self, lvalue: &HilExpr, definite: bool) -> TypeSlot {
+    fn synthetic_for_lvalue(&mut self, lvalue: &Expr, definite: bool) -> TypeSlot {
         let result = self.synthetic_slot();
         self.assign_lvalue(lvalue, result, definite);
         result
     }
 
     /// Adds assignment relations for one supported HIL lvalue.
-    fn assign_lvalue(&mut self, lvalue: &HilExpr, value: TypeSlot, definite: bool) {
+    fn assign_lvalue(&mut self, lvalue: &Expr, value: TypeSlot, definite: bool) {
         match lvalue {
-            HilExpr::Symbol(symbol) => {
+            Expr::Symbol(symbol) => {
                 let target = self.symbol_slot(*symbol);
                 if matches!(value, TypeSlot::Symbol(_, _)) {
                     self.program.push(target, CollectedConstraint::Equal(value));
@@ -887,7 +887,7 @@ impl<'a> ConstraintCollector<'a> {
                         .push(target, CollectedConstraint::FlowFrom(value));
                 }
             }
-            HilExpr::GetField { obj, field } => {
+            Expr::GetField { obj, field } => {
                 let object = self.collect_expression(obj);
                 self.program.push(
                     object,
@@ -898,7 +898,7 @@ impl<'a> ConstraintCollector<'a> {
                     },
                 );
             }
-            HilExpr::GetIndex { obj, index } => {
+            Expr::GetIndex { obj, index } => {
                 let object = self.collect_expression(obj);
                 let index = self.collect_expression(index);
                 self.program
@@ -916,9 +916,9 @@ impl<'a> ConstraintCollector<'a> {
     }
 
     /// Collects one call expression using caller-provided return destinations.
-    fn collect_call(&mut self, expression: &HilExpr, returns: Vec<TypeSlot>) {
+    fn collect_call(&mut self, expression: &Expr, returns: Vec<TypeSlot>) {
         match expression {
-            HilExpr::Call { fun, args } => {
+            Expr::Call { fun, args } => {
                 if let Some(callee) = self.resolve_field_access(fun) {
                     let object = self.symbol_read_slot(callee.object);
                     let field_arguments: Vec<_> = args
@@ -974,7 +974,7 @@ impl<'a> ConstraintCollector<'a> {
                 self.program
                     .push(callee, CollectedConstraint::Call { args, returns });
             }
-            HilExpr::MethodCall {
+            Expr::MethodCall {
                 object,
                 method,
                 args,
@@ -1007,22 +1007,22 @@ impl<'a> ConstraintCollector<'a> {
     }
 
     /// Resolves one named-field read through direct SSA definitions and copies.
-    fn resolve_field_access(&self, expression: &HilExpr) -> Option<ResolvedFieldAccess> {
+    fn resolve_field_access(&self, expression: &Expr) -> Option<ResolvedFieldAccess> {
         self.resolve_field_access_inner(expression, &mut HashSet::new())
     }
 
     /// Recursively resolves a field read while rejecting malformed definition cycles.
     fn resolve_field_access_inner(
         &self,
-        expression: &HilExpr,
+        expression: &Expr,
         visiting: &mut HashSet<SymbolId>,
     ) -> Option<ResolvedFieldAccess> {
         match expression {
-            HilExpr::GetField { obj, field } => Some(ResolvedFieldAccess {
+            Expr::GetField { obj, field } => Some(ResolvedFieldAccess {
                 object: self.resolve_alias_expression(obj, &mut HashSet::new())?,
                 field: field.clone(),
             }),
-            HilExpr::Symbol(symbol) if visiting.insert(*symbol) => self
+            Expr::Symbol(symbol) if visiting.insert(*symbol) => self
                 .definitions
                 .get(symbol)
                 .and_then(|definition| self.resolve_field_access_inner(definition, visiting)),
@@ -1033,10 +1033,10 @@ impl<'a> ConstraintCollector<'a> {
     /// Resolves a direct symbol expression through SSA copy definitions.
     fn resolve_alias_expression(
         &self,
-        expression: &HilExpr,
+        expression: &Expr,
         visiting: &mut HashSet<SymbolId>,
     ) -> Option<SymbolId> {
-        let HilExpr::Symbol(symbol) = expression else {
+        let Expr::Symbol(symbol) = expression else {
             return None;
         };
         self.resolve_alias_symbol(*symbol, visiting)
@@ -1052,7 +1052,7 @@ impl<'a> ConstraintCollector<'a> {
             return None;
         }
         match self.definitions.get(&symbol) {
-            Some(HilExpr::Symbol(source)) => self.resolve_alias_symbol(*source, visiting),
+            Some(Expr::Symbol(source)) => self.resolve_alias_symbol(*source, visiting),
             _ => Some(symbol),
         }
     }
@@ -1061,7 +1061,7 @@ impl<'a> ConstraintCollector<'a> {
     ///
     /// This is intentionally recursive rather than a `Visitor`: each child must
     /// return a distinct inference slot to its parent relation.
-    fn collect_expression(&mut self, expression: &HilExpr) -> TypeSlot {
+    fn collect_expression(&mut self, expression: &Expr) -> TypeSlot {
         if let Some(path) = BuiltinPath::from_expr(expression)
             && self.builtins.get_path(&path).is_some()
         {
@@ -1071,25 +1071,25 @@ impl<'a> ConstraintCollector<'a> {
         }
 
         match expression {
-            HilExpr::Symbol(symbol) => {
+            Expr::Symbol(symbol) => {
                 if self.parameters.contains(symbol) {
                     self.non_return_parameter_uses.insert(*symbol);
                 }
                 self.symbol_read_slot(*symbol)
             }
-            HilExpr::Nil => {
+            Expr::Nil => {
                 let slot = self.synthetic_slot();
                 self.program
                     .push(slot, CollectedConstraint::Observe(Type::Nil));
                 slot
             }
-            HilExpr::Number(_) => {
+            Expr::Number(_) => {
                 let slot = self.synthetic_slot();
                 self.program
                     .push(slot, CollectedConstraint::Observe(Type::Number));
                 slot
             }
-            HilExpr::String(value) => {
+            Expr::String(value) => {
                 let slot = self.synthetic_slot();
                 self.program.push(
                     slot,
@@ -1097,7 +1097,7 @@ impl<'a> ConstraintCollector<'a> {
                 );
                 slot
             }
-            HilExpr::Bool(value) => {
+            Expr::Bool(value) => {
                 let slot = self.synthetic_slot();
                 self.program.push(
                     slot,
@@ -1105,7 +1105,7 @@ impl<'a> ConstraintCollector<'a> {
                 );
                 slot
             }
-            HilExpr::Closure { proto, captures } => {
+            Expr::Closure { proto, captures } => {
                 let slot = self.synthetic_slot();
                 self.program
                     .push(slot, CollectedConstraint::Closure(*proto));
@@ -1121,14 +1121,14 @@ impl<'a> ConstraintCollector<'a> {
                 }
                 slot
             }
-            HilExpr::Global(_) | HilExpr::VarArgs => self.synthetic_slot(),
-            HilExpr::Table { items } => {
+            Expr::Global(_) | Expr::VarArgs => self.synthetic_slot(),
+            Expr::Table { items } => {
                 let table = self.synthetic_slot();
                 let key = self.table_key();
                 self.program.push(table, CollectedConstraint::NewTable(key));
                 for item in items {
                     match item {
-                        HilTableItem::List(value) => {
+                        TableItem::List(value) => {
                             let index = self.synthetic_slot();
                             self.program
                                 .push(index, CollectedConstraint::Observe(Type::Number));
@@ -1136,7 +1136,7 @@ impl<'a> ConstraintCollector<'a> {
                             self.program
                                 .push(table, CollectedConstraint::SetIndex { index, value });
                         }
-                        HilTableItem::Index(HilExpr::String(field), value) => {
+                        TableItem::Index(Expr::String(field), value) => {
                             let value = self.collect_expression(value);
                             self.program.push(
                                 table,
@@ -1147,7 +1147,7 @@ impl<'a> ConstraintCollector<'a> {
                                 },
                             );
                         }
-                        HilTableItem::Index(index, value) => {
+                        TableItem::Index(index, value) => {
                             let index = self.collect_expression(index);
                             let value = self.collect_expression(value);
                             self.program
@@ -1157,12 +1157,12 @@ impl<'a> ConstraintCollector<'a> {
                 }
                 table
             }
-            HilExpr::Call { .. } | HilExpr::MethodCall { .. } => {
+            Expr::Call { .. } | Expr::MethodCall { .. } => {
                 let result = self.synthetic_slot();
                 self.collect_call(expression, vec![result]);
                 result
             }
-            HilExpr::Binary { lhs, op, rhs } => {
+            Expr::Binary { lhs, op, rhs } => {
                 let lhs = self.collect_expression(lhs);
                 let rhs = self.collect_expression(rhs);
                 let result = self.synthetic_slot();
@@ -1176,14 +1176,14 @@ impl<'a> ConstraintCollector<'a> {
                 );
                 result
             }
-            HilExpr::Unary { op, expr } => {
+            Expr::Unary { op, expr } => {
                 let operand = self.collect_expression(expr);
                 let result = self.synthetic_slot();
                 self.program
                     .push(operand, CollectedConstraint::Unary { op: *op, result });
                 result
             }
-            HilExpr::GetField { obj, field } => {
+            Expr::GetField { obj, field } => {
                 let object = self.collect_expression(obj);
                 let value = self.synthetic_slot();
                 self.program.push(
@@ -1195,7 +1195,7 @@ impl<'a> ConstraintCollector<'a> {
                 );
                 value
             }
-            HilExpr::GetIndex { obj, index } => {
+            Expr::GetIndex { obj, index } => {
                 let object = self.collect_expression(obj);
                 let index = self.collect_expression(index);
                 let value = self.synthetic_slot();
@@ -1203,7 +1203,7 @@ impl<'a> ConstraintCollector<'a> {
                     .push(object, CollectedConstraint::GetIndex { index, value });
                 value
             }
-            HilExpr::IfElse {
+            Expr::IfElse {
                 condition,
                 then_expr,
                 else_expr,
@@ -1233,7 +1233,7 @@ impl<'a> ConstraintCollector<'a> {
                     // A bare formal in return position is the only parameter use
                     // exempt from opacity tracking; all nested expressions consume it.
                     let value = match value {
-                        HilExpr::Symbol(symbol) if self.parameters.contains(symbol) => {
+                        Expr::Symbol(symbol) if self.parameters.contains(symbol) => {
                             self.symbol_read_slot(*symbol)
                         }
                         _ => self.collect_expression(value),
@@ -3678,7 +3678,7 @@ impl TypeSolver<'_> {
                     }
 
                     let mut fields: Vec<_> = fields.iter().collect();
-                    fields.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+                    fields.sort_by_key(|(lhs, _)| *lhs);
                     for (name, pattern) in fields {
                         let value = self.table_field_variable(table, name.clone(), false);
                         self.bind_argument_pattern(value, pattern, generics);
@@ -4289,7 +4289,7 @@ mod tests {
         solver.add_constraint(
             base,
             SolverConstraint::Binary {
-                op: crate::ast::BinOp::Add,
+                op: crate::operator::BinOp::Add,
                 rhs,
                 result,
             },

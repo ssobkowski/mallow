@@ -5,13 +5,13 @@
 //! 3. Simplify pattern `not (a == b)` into `a ~= b`.
 
 use crate::{
-    ast::{BinOp, UnOp},
     hil::{
         StructuredFunction,
         cflow::region::RegionNode,
-        ir::HilExpr,
+        ir::Expr,
         visitor::{VisitorMut, walk_region_mut},
     },
+    operator::{BinOp, UnOp},
 };
 
 #[derive(Default)]
@@ -37,8 +37,8 @@ impl VisitorMut for Normalizer {
         walk_region_mut(self, region);
     }
 
-    fn visit_expr(&mut self, expr: &mut HilExpr) {
-        if let HilExpr::Binary { lhs, op, rhs } = expr
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        if let Expr::Binary { lhs, op, rhs } = expr
             && let Some(flipped) = op.flip()
             && lhs.is_literal()
             && !rhs.is_literal()
@@ -48,19 +48,19 @@ impl VisitorMut for Normalizer {
             self.changed = true;
         }
 
-        if let HilExpr::Unary {
+        if let Expr::Unary {
             op: un_op,
             expr: inner,
         } = expr
             && *un_op == UnOp::Not
-            && let HilExpr::Binary {
+            && let Expr::Binary {
                 op: bin_op,
                 lhs,
                 rhs,
             } = inner.as_mut()
             && *bin_op == BinOp::Eq
         {
-            *expr = HilExpr::Binary {
+            *expr = Expr::Binary {
                 lhs: Box::new(lhs.as_ref().clone()),
                 op: BinOp::Ne,
                 rhs: Box::new(rhs.as_ref().clone()),

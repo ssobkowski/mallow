@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::hil::{
     cflow::region::RegionNode,
-    ir::{HilExpr, HilStmt, PhiNode},
+    ir::{Expr, PhiNode, Stmt},
     lifter::ssa::SymbolId,
     visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut},
 };
@@ -13,8 +13,8 @@ struct SymbolReadSet {
 }
 
 impl Visitor for SymbolReadSet {
-    fn visit_expr(&mut self, expr: &HilExpr) {
-        if let HilExpr::Symbol(sym) = expr {
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Expr::Symbol(sym) = expr {
             self.reads.insert(*sym);
             return;
         }
@@ -39,8 +39,8 @@ impl SymbolReadCounter {
 }
 
 impl Visitor for SymbolReadCounter {
-    fn visit_expr(&mut self, expr: &HilExpr) {
-        if let HilExpr::Symbol(sym) = expr
+    fn visit_expr(&mut self, expr: &Expr) {
+        if let Expr::Symbol(sym) = expr
             && *sym == self.sym
         {
             self.count += 1;
@@ -57,7 +57,7 @@ impl Visitor for SymbolReadCounter {
 
 struct SymbolReplacer<'a> {
     sym: SymbolId,
-    replacement: &'a HilExpr,
+    replacement: &'a Expr,
     change_count: usize,
 }
 
@@ -66,8 +66,8 @@ impl VisitorMut for SymbolReplacer<'_> {
         unreachable!("phi nodes should have been unfolded at this point")
     }
 
-    fn visit_expr(&mut self, expr: &mut HilExpr) {
-        if let HilExpr::Symbol(sym) = expr
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        if let Expr::Symbol(sym) = expr
             && *sym == self.sym
         {
             *expr = self.replacement.clone();
@@ -80,7 +80,7 @@ impl VisitorMut for SymbolReplacer<'_> {
 }
 
 /// Collects every symbol expression reached by the normal expression visitor.
-pub(super) fn expr_read_symbols(expr: &HilExpr) -> HashSet<SymbolId> {
+pub(super) fn expr_read_symbols(expr: &Expr) -> HashSet<SymbolId> {
     let mut reads = SymbolReadSet::default();
     reads.visit_expr(expr);
     reads.reads
@@ -94,14 +94,14 @@ pub(super) fn region_read_symbols(region: &RegionNode) -> HashSet<SymbolId> {
 }
 
 /// Counts the number of times a symbol is read in an expression.
-pub(super) fn count_symbol_reads_in_expr(expr: &HilExpr, sym: SymbolId) -> usize {
+pub(super) fn count_symbol_reads_in_expr(expr: &Expr, sym: SymbolId) -> usize {
     let mut counter = SymbolReadCounter::new(sym);
     counter.visit_expr(expr);
     counter.count
 }
 
 /// Counts the number of times a symbol is read in a statement.
-pub(super) fn count_symbol_reads_in_stmt(stmt: &HilStmt, sym: SymbolId) -> usize {
+pub(super) fn count_symbol_reads_in_stmt(stmt: &Stmt, sym: SymbolId) -> usize {
     let mut counter = SymbolReadCounter::new(sym);
     counter.visit_stmt(stmt);
     counter.count
@@ -109,11 +109,7 @@ pub(super) fn count_symbol_reads_in_stmt(stmt: &HilStmt, sym: SymbolId) -> usize
 
 /// Replaces all occurrences of a symbol in an expression with a replacement.
 /// Returns the number of replacements made.
-pub(super) fn replace_symbol_in_expr(
-    expr: &mut HilExpr,
-    sym: SymbolId,
-    replacement: &HilExpr,
-) -> usize {
+pub(super) fn replace_symbol_in_expr(expr: &mut Expr, sym: SymbolId, replacement: &Expr) -> usize {
     let mut replacer = SymbolReplacer {
         sym,
         replacement,
@@ -125,11 +121,7 @@ pub(super) fn replace_symbol_in_expr(
 
 /// Replaces all occurrences of a symbol in a statement with a replacement.
 /// Returns the number of replacements made.
-pub(super) fn replace_symbol_in_stmt(
-    stmt: &mut HilStmt,
-    sym: SymbolId,
-    replacement: &HilExpr,
-) -> usize {
+pub(super) fn replace_symbol_in_stmt(stmt: &mut Stmt, sym: SymbolId, replacement: &Expr) -> usize {
     let mut replacer = SymbolReplacer {
         sym,
         replacement,
@@ -140,37 +132,37 @@ pub(super) fn replace_symbol_in_stmt(
 }
 
 /// Returns the set of symbols written by a statement.
-pub(super) fn stmt_written_symbols(stmt: &HilStmt) -> HashSet<SymbolId> {
+pub(super) fn stmt_written_symbols(stmt: &Stmt) -> HashSet<SymbolId> {
     match stmt {
-        HilStmt::Assign {
-            left: HilExpr::Symbol(sym),
+        Stmt::Assign {
+            left: Expr::Symbol(sym),
             ..
         } => HashSet::from([*sym]),
-        HilStmt::Assign { .. } => HashSet::new(),
-        HilStmt::AssignMany { left, .. } => left
+        Stmt::Assign { .. } => HashSet::new(),
+        Stmt::AssignMany { left, .. } => left
             .iter()
             .filter_map(|lvalue| match lvalue {
-                HilExpr::Symbol(sym) => Some(*sym),
+                Expr::Symbol(sym) => Some(*sym),
                 _ => None,
             })
             .collect(),
-        HilStmt::SetList { table, .. } => HashSet::from([*table]),
-        HilStmt::Call(_) => HashSet::new(),
-        HilStmt::Phi(_) => {
+        Stmt::SetList { table, .. } => HashSet::from([*table]),
+        Stmt::Call(_) => HashSet::new(),
+        Stmt::Phi(_) => {
             unreachable!("phi nodes should have been unfolded at this point")
         }
     }
 }
 
 /// Returns whether a statement writes a given symbol.
-pub(super) fn stmt_writes_symbol(stmt: &HilStmt, sym: SymbolId) -> bool {
+pub(super) fn stmt_writes_symbol(stmt: &Stmt, sym: SymbolId) -> bool {
     match stmt {
-        HilStmt::Assign { left, .. } => matches!(left, HilExpr::Symbol(target) if *target == sym),
-        HilStmt::AssignMany { left, .. } => left
+        Stmt::Assign { left, .. } => matches!(left, Expr::Symbol(target) if *target == sym),
+        Stmt::AssignMany { left, .. } => left
             .iter()
-            .any(|left| matches!(left, HilExpr::Symbol(target) if *target == sym)),
-        HilStmt::SetList { table, .. } => *table == sym,
-        HilStmt::Call(_) => false,
-        HilStmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
+            .any(|left| matches!(left, Expr::Symbol(target) if *target == sym)),
+        Stmt::SetList { table, .. } => *table == sym,
+        Stmt::Call(_) => false,
+        Stmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
     }
 }

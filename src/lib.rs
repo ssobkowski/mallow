@@ -5,6 +5,7 @@ mod emitter;
 mod hil;
 mod il;
 mod logging;
+mod operator;
 mod printer;
 mod scopes;
 

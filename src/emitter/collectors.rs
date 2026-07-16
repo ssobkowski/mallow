@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::hil::{
     cflow::region::RegionNode,
-    ir::HilExpr,
+    ir::Expr,
     lifter::ssa::SymbolId,
     visitor::{Visitor, walk_expr},
 };
@@ -21,13 +21,13 @@ impl ReadCollector {
         collector.symbols
     }
 
-    pub fn in_expr(expr: &HilExpr) -> HashSet<SymbolId> {
+    pub fn in_expr(expr: &Expr) -> HashSet<SymbolId> {
         let mut collector = ReadCollector::default();
         collector.visit_expr(expr);
         collector.symbols
     }
 
-    pub fn in_exprs<'a, I: IntoIterator<Item = &'a HilExpr>>(exprs: I) -> HashSet<SymbolId> {
+    pub fn in_exprs<'a, I: IntoIterator<Item = &'a Expr>>(exprs: I) -> HashSet<SymbolId> {
         let mut collector = ReadCollector::default();
         for expr in exprs {
             collector.visit_expr(expr);
@@ -39,11 +39,11 @@ impl ReadCollector {
 impl Visitor for ReadCollector {
     /// Override lvalue traversal so that plain symbol write targets are *not* collected as reads.
     /// Sub-expressions of compound lvalues (`t[k]`, `t.field`) are still traversed as reads.
-    fn visit_lvalue_expr(&mut self, expr: &HilExpr) {
+    fn visit_lvalue_expr(&mut self, expr: &Expr) {
         match expr {
-            HilExpr::Symbol(_) => {}
-            HilExpr::GetField { obj, .. } => self.visit_expr(obj),
-            HilExpr::GetIndex { obj, index } => {
+            Expr::Symbol(_) => {}
+            Expr::GetField { obj, .. } => self.visit_expr(obj),
+            Expr::GetIndex { obj, index } => {
                 self.visit_expr(obj);
                 self.visit_expr(index);
             }

@@ -64,8 +64,8 @@ impl Chunk {
             }
 
             writeln!(w, "  Instructions:")?;
-            for sd in &proto.instrs {
-                writeln!(w, "    {}: {}", sd.pc, sd.node)?;
+            for decoded in &proto.instrs {
+                writeln!(w, "    {}: {}", decoded.word_pc, decoded.instr)?;
             }
 
             writeln!(w)?;

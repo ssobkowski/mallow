@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use smol_str::SmolStr;
 
 use crate::hil::{
-    ir::HilExpr,
+    ir::Expr,
     ty::{FunctionTypeParam, FunctionTypeReturn, Type, TypeLiteral},
 };
 
@@ -99,11 +99,11 @@ impl BuiltinPath {
 impl BuiltinPath {
     /// Recognizes a syntactic builtin path without allocating its type.
     #[must_use]
-    pub fn from_expr(expr: &HilExpr) -> Option<Self> {
+    pub fn from_expr(expr: &Expr) -> Option<Self> {
         match expr {
-            HilExpr::Global(name) => Some(Self::Global(name.clone())),
-            HilExpr::GetField { obj, field } => {
-                let HilExpr::Global(namespace) = obj.as_ref() else {
+            Expr::Global(name) => Some(Self::Global(name.clone())),
+            Expr::GetField { obj, field } => {
+                let Expr::Global(namespace) = obj.as_ref() else {
                     return None;
                 };
                 Some(Self::NamespaceField {

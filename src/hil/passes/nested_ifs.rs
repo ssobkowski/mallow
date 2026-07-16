@@ -8,7 +8,7 @@
 use crate::hil::{
     StructuredFunction,
     cflow::region::RegionNode,
-    ir::HilExpr,
+    ir::Expr,
     visitor::{VisitorMut, walk_region_mut},
 };
 
@@ -49,7 +49,7 @@ fn fold_nested_if(region: &mut RegionNode) -> bool {
         return false;
     };
 
-    *condition = HilExpr::and(condition.clone(), inner_condition.clone());
+    *condition = Expr::and(condition.clone(), inner_condition.clone());
     *then_branch = std::mem::replace(inner_then, Box::new(RegionNode::empty()));
     true
 }

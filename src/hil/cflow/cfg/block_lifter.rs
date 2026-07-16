@@ -5,11 +5,10 @@ use smallvec::SmallVec;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
-    common::Spanned,
     disasm::Chunk,
     hil::{
         cflow::{common::RegSet, graph::GraphView, union_find::UnionFind},
-        ir::{HilExpr, HilStmt, PhiNode},
+        ir::{Expr, PhiNode, Stmt},
         lifter::{
             LiftContext, MultiRet, flush_multiret, lift,
             ssa::{Ssa, Symbol, SymbolId, SymbolKind},
@@ -142,7 +141,6 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             "non-variadic exit lowering must consume or flush pending multiret"
         );
 
-        let stmts = stmts.into_iter().map(|s| s.node).collect();
         self.blocks[block_id] = Block { stmts, exit };
         self.ssa.mark_filled(block_id);
         Ok(())
@@ -152,7 +150,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     fn lower_exit(
         &mut self,
         block_id: usize,
-        stmts: &mut Vec<Spanned<HilStmt>>,
+        stmts: &mut Vec<Stmt>,
         pending_multiret: &mut Option<MultiRet>,
     ) -> Result<BlockExit> {
         // Exit lowering has three distinct phases:
@@ -218,9 +216,9 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                     body_block: *body_block,
                     exit_block: *exit_block,
                     var,
-                    start: HilExpr::Symbol(start),
-                    end: HilExpr::Symbol(end),
-                    step: HilExpr::Symbol(step),
+                    start: Expr::Symbol(start),
+                    end: Expr::Symbol(end),
+                    step: Expr::Symbol(step),
                 })
             }
             RawBlockExit::FornLoop {
@@ -243,9 +241,9 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 let exprs = [
-                    HilExpr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 0))),
-                    HilExpr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 1))),
-                    HilExpr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 2))),
+                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 0))),
+                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 1))),
+                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 2))),
                 ];
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::ForgPrep {
@@ -301,9 +299,9 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
 
                         let mut rets = SmallVec::new();
                         for i in *base..multiret.base {
-                            rets.push(HilExpr::Symbol(self.ssa.read_reg(block_id, i)));
+                            rets.push(Expr::Symbol(self.ssa.read_reg(block_id, i)));
                         }
-                        rets.push(multiret.expr.node);
+                        rets.push(multiret.expr);
 
                         Ok(BlockExit::Return(rets))
                     }
@@ -316,7 +314,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                         );
 
                         let rets = reg_range(*base, n)
-                            .map(|i| HilExpr::Symbol(self.ssa.read_reg(block_id, i)))
+                            .map(|i| Expr::Symbol(self.ssa.read_reg(block_id, i)))
                             .collect();
 
                         Ok(BlockExit::Return(rets))
@@ -327,25 +325,25 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     }
 
     /// Converts a raw register/constant condition into a HIL expression.
-    fn lower_cond(&mut self, block_id: usize, cond: &Cond) -> Result<HilExpr> {
+    fn lower_cond(&mut self, block_id: usize, cond: &Cond) -> Result<Expr> {
         Ok(match cond {
-            Cond::Unary(reg) => HilExpr::Symbol(self.ssa.read_reg(block_id, *reg)),
+            Cond::Unary(reg) => Expr::Symbol(self.ssa.read_reg(block_id, *reg)),
             Cond::Binary { lhs, op, rhs } => {
-                let lhs = HilExpr::Symbol(self.ssa.read_reg(block_id, *lhs));
+                let lhs = Expr::Symbol(self.ssa.read_reg(block_id, *lhs));
                 let rhs = match rhs {
-                    CondRhs::Reg(reg) => HilExpr::Symbol(self.ssa.read_reg(block_id, *reg)),
-                    CondRhs::Const(idx) => HilExpr::from_constant(
+                    CondRhs::Reg(reg) => Expr::Symbol(self.ssa.read_reg(block_id, *reg)),
+                    CondRhs::Const(idx) => Expr::from_constant(
                         self.proto
                             .get_constant(ConstId(*idx))
                             .with_context(|| format!("invalid constant id {idx}"))?,
                         self.chunk,
                         self.proto,
                     )?,
-                    CondRhs::Nil => HilExpr::Nil,
-                    CondRhs::Bool(value) => HilExpr::Bool(*value),
+                    CondRhs::Nil => Expr::Nil,
+                    CondRhs::Bool(value) => Expr::Bool(*value),
                 };
 
-                HilExpr::Binary {
+                Expr::Binary {
                     lhs: Box::new(lhs),
                     op: *op,
                     rhs: Box::new(rhs),
@@ -358,7 +356,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     fn flush_pending_multiret(
         &mut self,
         block_id: usize,
-        stmts: &mut Vec<Spanned<HilStmt>>,
+        stmts: &mut Vec<Stmt>,
         pending_multiret: &mut Option<MultiRet>,
     ) {
         let Some(multiret) = pending_multiret.take() else {
@@ -430,8 +428,8 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     fn collect_loop_written_regs(&self, loop_body: &HashSet<usize>) -> RegSet {
         let mut written_regs = RegSet::new();
         for &block_id in loop_body {
-            for sd in &self.proto.instrs[self.raw_blocks[block_id].instr_range.clone()] {
-                written_regs.extend(sd.node.written_registers());
+            for decoded in &self.proto.instrs[self.raw_blocks[block_id].instr_range.clone()] {
+                written_regs.extend(decoded.instr.written_registers());
             }
             written_regs.extend(self.raw_blocks[block_id].exit_writes.clone());
         }
@@ -479,7 +477,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     fn union_phi_versions(&self, disjoint_set: &mut UnionFind<SymbolId>) {
         for (block_idx, block) in self.blocks.iter().enumerate() {
             for stmt in &block.stmts {
-                if let HilStmt::Phi(phi) = &stmt {
+                if let Stmt::Phi(phi) = &stmt {
                     for (pred_block, operand) in &phi.operands {
                         if is_loop_header_loop_var_operand(
                             &self.blocks,
@@ -682,9 +680,9 @@ impl RegUseDefCollector<'_, '_, '_> {
     }
 
     /// Treats plain symbol lvalues as definitions and complex lvalues as reads.
-    fn visit_lvalue_def(&mut self, lvalue: &HilExpr) {
+    fn visit_lvalue_def(&mut self, lvalue: &Expr) {
         match lvalue {
-            HilExpr::Symbol(sym) => self.note_def(*sym),
+            Expr::Symbol(sym) => self.note_def(*sym),
             other => self.visit_expr(other),
         }
     }
@@ -702,26 +700,26 @@ impl Visitor for RegUseDefCollector<'_, '_, '_> {
     }
 
     /// Applies statement-level use/def ordering before expression traversal.
-    fn visit_stmt(&mut self, stmt: &HilStmt) {
+    fn visit_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            HilStmt::Assign { left, value } => {
+            Stmt::Assign { left, value } => {
                 self.visit_expr(value);
                 self.visit_lvalue_def(left);
             }
-            HilStmt::AssignMany { left, value } => {
+            Stmt::AssignMany { left, value } => {
                 self.visit_expr(value);
                 for lvalue in left {
                     self.visit_lvalue_def(lvalue);
                 }
             }
-            HilStmt::Call(expr) => self.visit_expr(expr),
-            HilStmt::SetList { table, values, .. } => {
+            Stmt::Call(expr) => self.visit_expr(expr),
+            Stmt::SetList { table, values, .. } => {
                 self.note_use(*table);
                 for value in values {
                     self.visit_expr(value);
                 }
             }
-            HilStmt::Phi(phi) => self.note_def(phi.target),
+            Stmt::Phi(phi) => self.note_def(phi.target),
         }
     }
 }

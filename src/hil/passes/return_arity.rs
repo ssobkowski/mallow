@@ -1,7 +1,7 @@
 use crate::hil::{
     ReturnArity, StructuredFunction,
     cflow::region::RegionNode,
-    ir::HilExpr,
+    ir::Expr,
     visitor::{Visitor, walk_region},
 };
 
@@ -11,17 +11,17 @@ struct ReturnCollector<'a> {
 }
 
 impl ReturnCollector<'_> {
-    fn expr_arity(&self, expr: &HilExpr) -> ReturnArity {
+    fn expr_arity(&self, expr: &Expr) -> ReturnArity {
         match expr {
-            HilExpr::Call { fun, .. } => self.call_arity(fun),
-            HilExpr::MethodCall { .. } => ReturnArity::Unknown,
-            HilExpr::VarArgs => ReturnArity::Unknown,
+            Expr::Call { fun, .. } => self.call_arity(fun),
+            Expr::MethodCall { .. } => ReturnArity::Unknown,
+            Expr::VarArgs => ReturnArity::Unknown,
             _ => ReturnArity::Exact(1),
         }
     }
 
-    fn call_arity(&self, fun: &HilExpr) -> ReturnArity {
-        let HilExpr::Closure { proto, .. } = fun else {
+    fn call_arity(&self, fun: &Expr) -> ReturnArity {
+        let Expr::Closure { proto, .. } = fun else {
             return ReturnArity::Unknown;
         };
 
@@ -37,7 +37,7 @@ impl ReturnCollector<'_> {
         }
     }
 
-    fn values_arity(&self, values: &[HilExpr]) -> ReturnArity {
+    fn values_arity(&self, values: &[Expr]) -> ReturnArity {
         let Some((tail, prefix)) = values.split_last() else {
             return ReturnArity::Exact(0);
         };
@@ -49,7 +49,7 @@ impl ReturnCollector<'_> {
         }
     }
 
-    fn observe_return(&mut self, values: &[HilExpr]) {
+    fn observe_return(&mut self, values: &[Expr]) {
         let curr = self.values_arity(values);
         self.signal = Some(match self.signal {
             Some(prev) => prev.merge(curr),
@@ -101,11 +101,11 @@ pub fn infer_all(functions: &mut [StructuredFunction]) {
 }
 
 /// Returns the known arity for Luau builtins addressed by a HIL callee expression.
-pub fn luau_libfunc_arity(func: &HilExpr) -> ReturnArity {
+pub fn luau_libfunc_arity(func: &Expr) -> ReturnArity {
     match func {
-        HilExpr::Global(name) => luau_global_arity(name),
-        HilExpr::GetField { obj, field } => match obj.as_ref() {
-            HilExpr::Global(lib) => luau_member_arity(lib, field),
+        Expr::Global(name) => luau_global_arity(name),
+        Expr::GetField { obj, field } => match obj.as_ref() {
+            Expr::Global(lib) => luau_member_arity(lib, field),
             _ => ReturnArity::Unknown,
         },
         _ => ReturnArity::Unknown,

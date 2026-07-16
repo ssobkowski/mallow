@@ -8,9 +8,9 @@ use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::{
-    ast::BinOp,
     disasm::Chunk,
     il::{BytecodeType, Proto, TypeTag},
+    operator::BinOp,
 };
 
 pub type TypeId = Id<Type>;
@@ -770,7 +770,7 @@ pub enum TypePrecedence {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::ast::BinOp;
+    use crate::operator::BinOp;
 
     use super::{Metamethod, Metatable, Type, TypeStore};
 

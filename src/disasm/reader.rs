@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
 use crate::{
-    common::Spanned,
     disasm::Chunk,
     il::{
-        ConstId, Constant, FunctionTypeInfo, ImportPath, Instr, LocalDebug, LocalTypeInfo,
-        LuauString, Proto, ProtoId, ProtoTypeInfo, StringId, TypeTag, UserdataTypeMapping,
+        ConstId, Constant, DecodedInstr, FunctionTypeInfo, ImportPath, Instr, LocalDebug,
+        LocalTypeInfo, LuauString, Proto, ProtoId, ProtoTypeInfo, StringId, TypeTag,
+        UserdataTypeMapping,
     },
 };
 
@@ -502,39 +502,39 @@ fn decode_integer_constant(is_negative: bool, magnitude: u64) -> Result<i64> {
     }
 }
 
-fn decode_stream_with_word_pcs(words: &[u32]) -> Result<Vec<Spanned<Instr>>> {
+fn decode_stream_with_word_pcs(words: &[u32]) -> Result<Vec<DecodedInstr>> {
     let mut out = Vec::new();
     let mut pc = 0;
 
     while pc < words.len() {
         ensure!(pc < u32::MAX as usize, "pc overflow at word pc {pc}");
 
-        let header_pc = pc;
-        let header = words[header_pc];
+        let word_pc = pc;
+        let header = words[word_pc];
         let opcode = (header & 0xff) as u8;
 
         ensure!(
             opcode < Instr::LOP_COUNT,
-            "invalid Luau opcode {opcode} at word pc {header_pc} in header word 0x{header:08x}",
+            "invalid Luau opcode {opcode} at word pc {word_pc} in header word 0x{header:08x}",
         );
 
         let aux = if Instr::opcode_requires_aux(opcode) {
             pc += 1;
             ensure!(
                 pc < words.len(),
-                "truncated bytecode: opcode {opcode} at word pc {header_pc} requires AUX word",
+                "truncated bytecode: opcode {opcode} at word pc {word_pc} requires AUX word",
             );
             Some(words[pc])
         } else {
             None
         };
 
-        out.push(Spanned::new(
-            Instr::new(header, aux).map_err(|e| {
-                anyhow::anyhow!("failed to decode instruction at word pc {header_pc}: {e}")
+        out.push(DecodedInstr {
+            instr: Instr::new(header, aux).map_err(|e| {
+                anyhow::anyhow!("failed to decode instruction at word pc {word_pc}: {e}")
             })?,
-            header_pc as u32,
-        ));
+            word_pc: word_pc as u32,
+        });
         pc += 1;
     }
 

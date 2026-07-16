@@ -19,7 +19,7 @@
 use crate::hil::{
     StructuredFunction,
     cflow::region::RegionNode,
-    ir::{HilExpr, HilStmt},
+    ir::{Expr, Stmt},
     visitor::{VisitorMut, walk_region_mut},
 };
 
@@ -49,7 +49,7 @@ impl VisitorMut for BoolAssignFolding {
 
         if let Some((lhs, new_value)) = fold_result {
             *region = RegionNode::BasicBlock {
-                stmts: vec![HilStmt::Assign {
+                stmts: vec![Stmt::Assign {
                     left: lhs,
                     value: new_value,
                 }],
@@ -64,7 +64,7 @@ impl VisitorMut for BoolAssignFolding {
 fn extract_matching_assignments(
     then_branch: &RegionNode,
     else_branch: &RegionNode,
-) -> Option<(HilExpr, HilExpr, HilExpr)> {
+) -> Option<(Expr, Expr, Expr)> {
     let (then_lhs, then_val) = single_assign(then_branch)?;
     let (else_lhs, else_val) = single_assign(else_branch)?;
     (then_lhs == else_lhs).then_some((then_lhs, then_val, else_val))
@@ -72,7 +72,7 @@ fn extract_matching_assignments(
 
 /// Extracts the single `(lhs, value)` pair from a node that consists of exactly
 /// one assignment statement. Transparently unwraps single-element sequences.
-fn single_assign(node: &RegionNode) -> Option<(HilExpr, HilExpr)> {
+fn single_assign(node: &RegionNode) -> Option<(Expr, Expr)> {
     if let RegionNode::Sequence { nodes } = node
         && let [node] = nodes.as_slice()
     {
@@ -82,7 +82,7 @@ fn single_assign(node: &RegionNode) -> Option<(HilExpr, HilExpr)> {
     let RegionNode::BasicBlock { stmts } = node else {
         return None;
     };
-    let [HilStmt::Assign { left, value }] = stmts.as_slice() else {
+    let [Stmt::Assign { left, value }] = stmts.as_slice() else {
         return None;
     };
 
@@ -90,11 +90,11 @@ fn single_assign(node: &RegionNode) -> Option<(HilExpr, HilExpr)> {
 }
 
 /// Produces the replacement expression for an if/else assignment pair.
-fn fold_to_expr(condition: HilExpr, then_val: HilExpr, else_val: HilExpr) -> HilExpr {
+fn fold_to_expr(condition: Expr, then_val: Expr, else_val: Expr) -> Expr {
     match (&then_val, &else_val) {
-        (HilExpr::Bool(true), HilExpr::Bool(false)) => condition,
-        (HilExpr::Bool(false), HilExpr::Bool(true)) => HilExpr::not(condition),
-        _ => HilExpr::IfElse {
+        (Expr::Bool(true), Expr::Bool(false)) => condition,
+        (Expr::Bool(false), Expr::Bool(true)) => Expr::not(condition),
+        _ => Expr::IfElse {
             condition: Box::new(condition),
             then_expr: Box::new(then_val),
             else_expr: Box::new(else_val),
@@ -113,18 +113,18 @@ mod tests {
     use super::*;
     use crate::hil::{
         cflow::region::RegionNode,
-        ir::{HilExpr, HilStmt},
+        ir::{Expr, Stmt},
         lifter::ssa::Symbol,
     };
     use id_arena::Arena;
 
-    fn assign(lhs: HilExpr, value: HilExpr) -> RegionNode {
+    fn assign(lhs: Expr, value: Expr) -> RegionNode {
         RegionNode::BasicBlock {
-            stmts: vec![HilStmt::Assign { left: lhs, value }],
+            stmts: vec![Stmt::Assign { left: lhs, value }],
         }
     }
 
-    fn if_else(condition: HilExpr, then_branch: RegionNode, else_branch: RegionNode) -> RegionNode {
+    fn if_else(condition: Expr, then_branch: RegionNode, else_branch: RegionNode) -> RegionNode {
         RegionNode::If {
             condition,
             then_branch: Box::new(then_branch),
@@ -132,11 +132,11 @@ mod tests {
         }
     }
 
-    fn folded_value(node: &RegionNode) -> &HilExpr {
+    fn folded_value(node: &RegionNode) -> &Expr {
         let RegionNode::BasicBlock { stmts } = node else {
             panic!("expected a basic block after folding");
         };
-        let [HilStmt::Assign { value, .. }] = stmts.as_slice() else {
+        let [Stmt::Assign { value, .. }] = stmts.as_slice() else {
             panic!("expected a single assignment after folding");
         };
         value
@@ -146,12 +146,12 @@ mod tests {
     fn folds_true_false_to_condition() {
         let mut symbols: Arena<Symbol> = Arena::new();
         let target = symbols.alloc(Symbol::reg(0));
-        let cond = HilExpr::Symbol(symbols.alloc(Symbol::reg(1)));
+        let cond = Expr::Symbol(symbols.alloc(Symbol::reg(1)));
 
         let mut region = if_else(
             cond.clone(),
-            assign(HilExpr::Symbol(target), HilExpr::Bool(true)),
-            assign(HilExpr::Symbol(target), HilExpr::Bool(false)),
+            assign(Expr::Symbol(target), Expr::Bool(true)),
+            assign(Expr::Symbol(target), Expr::Bool(false)),
         );
 
         let changed = run_on_region(&mut region);
@@ -163,12 +163,12 @@ mod tests {
     fn folds_false_true_to_inverted_condition() {
         let mut symbols: Arena<Symbol> = Arena::new();
         let target = symbols.alloc(Symbol::reg(0));
-        let cond = HilExpr::Symbol(symbols.alloc(Symbol::reg(1)));
+        let cond = Expr::Symbol(symbols.alloc(Symbol::reg(1)));
 
         let mut region = if_else(
             cond.clone(),
-            assign(HilExpr::Symbol(target), HilExpr::Bool(false)),
-            assign(HilExpr::Symbol(target), HilExpr::Bool(true)),
+            assign(Expr::Symbol(target), Expr::Bool(false)),
+            assign(Expr::Symbol(target), Expr::Bool(true)),
         );
 
         let changed = run_on_region(&mut region);
@@ -182,27 +182,27 @@ mod tests {
         // involved. The fold must produce `not (a < b)`, not `a >= b`.
         let mut symbols: Arena<Symbol> = Arena::new();
         let target = symbols.alloc(Symbol::reg(0));
-        let a = HilExpr::Symbol(symbols.alloc(Symbol::reg(1)));
-        let b = HilExpr::Symbol(symbols.alloc(Symbol::reg(2)));
+        let a = Expr::Symbol(symbols.alloc(Symbol::reg(1)));
+        let b = Expr::Symbol(symbols.alloc(Symbol::reg(2)));
 
-        let cond = HilExpr::Binary {
+        let cond = Expr::Binary {
             lhs: Box::new(a),
-            op: crate::ast::BinOp::Lt,
+            op: crate::operator::BinOp::Lt,
             rhs: Box::new(b),
         };
 
         let mut region = if_else(
             cond.clone(),
-            assign(HilExpr::Symbol(target), HilExpr::Bool(false)),
-            assign(HilExpr::Symbol(target), HilExpr::Bool(true)),
+            assign(Expr::Symbol(target), Expr::Bool(false)),
+            assign(Expr::Symbol(target), Expr::Bool(true)),
         );
 
         let changed = run_on_region(&mut region);
         assert!(changed);
         assert_eq!(
             folded_value(&region),
-            &HilExpr::Unary {
-                op: crate::ast::UnOp::Not,
+            &Expr::Unary {
+                op: crate::operator::UnOp::Not,
                 expr: Box::new(cond),
             }
         );
@@ -212,21 +212,21 @@ mod tests {
     fn folds_general_values_to_if_expression() {
         let mut symbols: Arena<Symbol> = Arena::new();
         let target = symbols.alloc(Symbol::reg(0));
-        let cond = HilExpr::Symbol(symbols.alloc(Symbol::reg(1)));
-        let a = HilExpr::Symbol(symbols.alloc(Symbol::reg(2)));
-        let b = HilExpr::Symbol(symbols.alloc(Symbol::reg(3)));
+        let cond = Expr::Symbol(symbols.alloc(Symbol::reg(1)));
+        let a = Expr::Symbol(symbols.alloc(Symbol::reg(2)));
+        let b = Expr::Symbol(symbols.alloc(Symbol::reg(3)));
 
         let mut region = if_else(
             cond.clone(),
-            assign(HilExpr::Symbol(target), a.clone()),
-            assign(HilExpr::Symbol(target), b.clone()),
+            assign(Expr::Symbol(target), a.clone()),
+            assign(Expr::Symbol(target), b.clone()),
         );
 
         let changed = run_on_region(&mut region);
         assert!(changed);
         assert_eq!(
             folded_value(&region),
-            &HilExpr::IfElse {
+            &Expr::IfElse {
                 condition: Box::new(cond),
                 then_expr: Box::new(a),
                 else_expr: Box::new(b),
@@ -239,12 +239,12 @@ mod tests {
         let mut symbols: Arena<Symbol> = Arena::new();
         let a = symbols.alloc(Symbol::reg(0));
         let b = symbols.alloc(Symbol::reg(1));
-        let cond = HilExpr::Symbol(symbols.alloc(Symbol::reg(2)));
+        let cond = Expr::Symbol(symbols.alloc(Symbol::reg(2)));
 
         let mut region = if_else(
             cond,
-            assign(HilExpr::Symbol(a), HilExpr::Bool(true)),
-            assign(HilExpr::Symbol(b), HilExpr::Bool(false)),
+            assign(Expr::Symbol(a), Expr::Bool(true)),
+            assign(Expr::Symbol(b), Expr::Bool(false)),
         );
 
         let changed = run_on_region(&mut region);
@@ -256,11 +256,11 @@ mod tests {
     fn does_not_fold_without_else_branch() {
         let mut symbols: Arena<Symbol> = Arena::new();
         let target = symbols.alloc(Symbol::reg(0));
-        let cond = HilExpr::Symbol(symbols.alloc(Symbol::reg(1)));
+        let cond = Expr::Symbol(symbols.alloc(Symbol::reg(1)));
 
         let mut region = RegionNode::If {
             condition: cond,
-            then_branch: Box::new(assign(HilExpr::Symbol(target), HilExpr::Bool(true))),
+            then_branch: Box::new(assign(Expr::Symbol(target), Expr::Bool(true))),
             else_branch: None,
         };
 
@@ -274,17 +274,17 @@ mod tests {
         let mut symbols: Arena<Symbol> = Arena::new();
         let target = symbols.alloc(Symbol::reg(0));
         let other = symbols.alloc(Symbol::reg(1));
-        let cond = HilExpr::Symbol(symbols.alloc(Symbol::reg(2)));
+        let cond = Expr::Symbol(symbols.alloc(Symbol::reg(2)));
 
         let then_branch = RegionNode::BasicBlock {
             stmts: vec![
-                HilStmt::Assign {
-                    left: HilExpr::Symbol(target),
-                    value: HilExpr::Bool(true),
+                Stmt::Assign {
+                    left: Expr::Symbol(target),
+                    value: Expr::Bool(true),
                 },
-                HilStmt::Assign {
-                    left: HilExpr::Symbol(other),
-                    value: HilExpr::Bool(true),
+                Stmt::Assign {
+                    left: Expr::Symbol(other),
+                    value: Expr::Bool(true),
                 },
             ],
         };
@@ -292,10 +292,7 @@ mod tests {
         let mut region = RegionNode::If {
             condition: cond,
             then_branch: Box::new(then_branch),
-            else_branch: Some(Box::new(assign(
-                HilExpr::Symbol(target),
-                HilExpr::Bool(false),
-            ))),
+            else_branch: Some(Box::new(assign(Expr::Symbol(target), Expr::Bool(false)))),
         };
 
         let changed = run_on_region(&mut region);

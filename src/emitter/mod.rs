@@ -10,11 +10,7 @@ use std::collections::HashSet;
 use smol_str::SmolStr;
 
 use crate::{
-    DecompileOptions,
-    ast::{
-        Block, CompoundBinOp, ElseClause, Expr, Identifier, If, Literal, Parameter, Stmt,
-        TableItem, Typed, UnOp,
-    },
+    DecompileOptions, ast,
     common::is_valid_luau_identifier,
     emitter::{
         collectors::ReadCollector, declarations::DeclarationState, plan::FunctionPlan,
@@ -23,13 +19,14 @@ use crate::{
     hil::{
         StructuredFunction,
         cflow::region::RegionNode,
-        ir::{HilExpr, HilNumber, HilStmt, HilTableItem},
+        ir as hil,
         lifter::ssa::SymbolId,
         ty::{FunctionTypeParam, FunctionTypeReturn, Type},
         visitor::Visitor,
     },
     il::ProtoId,
     logging::{Diagnostics, LogLevel, LogTarget},
+    operator::{CompoundBinOp, UnOp},
 };
 
 const MAX_LOCAL_COUNT: usize = 199;
@@ -120,17 +117,17 @@ impl AssignCollector {
 }
 
 impl Visitor for AssignCollector {
-    fn visit_stmt(&mut self, stmt: &HilStmt) {
+    fn visit_stmt(&mut self, stmt: &hil::Stmt) {
         match stmt {
-            HilStmt::Assign {
-                left: HilExpr::Symbol(sym),
+            hil::Stmt::Assign {
+                left: hil::Expr::Symbol(sym),
                 ..
             } => {
                 self.symbols.insert(*sym);
             }
-            HilStmt::AssignMany { left, .. } => {
+            hil::Stmt::AssignMany { left, .. } => {
                 self.symbols.extend(left.iter().filter_map(|lv| {
-                    if let HilExpr::Symbol(s) = lv {
+                    if let hil::Expr::Symbol(s) = lv {
                         Some(*s)
                     } else {
                         None
@@ -165,7 +162,7 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
-    fn visit_entry(&mut self) -> Block {
+    fn visit_entry(&mut self) -> ast::Block {
         let entry_ctx = self.create_context(self.entry);
         self.visit_function(entry_ctx)
     }
@@ -184,7 +181,7 @@ impl Emitter<'_> {
         self.contexts[self.current_ctx].proto_idx
     }
 
-    fn visit_function(&mut self, ctx_idx: usize) -> Block {
+    fn visit_function(&mut self, ctx_idx: usize) -> ast::Block {
         let old_ctx = self.current_ctx;
         self.current_ctx = ctx_idx;
 
@@ -211,17 +208,17 @@ impl Emitter<'_> {
             .collect::<Vec<_>>()
             .join(", ");
         let mut block = if self.entry != proto_idx {
-            Block::with_stmts(vec![Stmt::Comment {
+            ast::Block::with_stmts(vec![ast::Stmt::Comment {
                 text: format!("proto {}: upvalues = [{}]", proto_idx, upvalue_str),
             }])
         } else {
-            Block::with_stmts(Vec::new())
+            ast::Block::with_stmts(Vec::new())
         };
         block.stmts.extend(self.visit_region(&fun.root).stmts);
         for (idx, anomaly) in self.contexts[self.current_ctx].anomalies.iter().enumerate() {
             block.stmts.insert(
                 idx + 1,
-                Stmt::Comment {
+                ast::Stmt::Comment {
                     text: format!("anomaly: {anomaly}"),
                 },
             );
@@ -229,9 +226,9 @@ impl Emitter<'_> {
         if let Some(table) = self.contexts[self.current_ctx].plan.spill_table() {
             block.stmts.insert(
                 1 + self.contexts[self.current_ctx].anomalies.len(),
-                Stmt::LocalDeclaration {
-                    names: vec![Typed::untyped(table)],
-                    values: vec![Expr::Table { items: Vec::new() }],
+                ast::Stmt::LocalDeclaration {
+                    names: vec![ast::Typed::untyped(table)],
+                    values: vec![ast::Expr::Table { items: Vec::new() }],
                 },
             );
         }
@@ -243,11 +240,11 @@ impl Emitter<'_> {
         block
     }
 
-    fn get_symbol_name(&mut self, sym: &SymbolId) -> Identifier {
+    fn get_symbol_name(&mut self, sym: &SymbolId) -> ast::Identifier {
         self.get_symbol_name_for(self.current_ctx, *sym)
     }
 
-    fn get_symbol_name_for(&mut self, ctx_idx: usize, sym: SymbolId) -> Identifier {
+    fn get_symbol_name_for(&mut self, ctx_idx: usize, sym: SymbolId) -> ast::Identifier {
         let proto_idx = self.contexts[ctx_idx].proto_idx;
         let is_param = self.functions[proto_idx].symbols.params.contains(&sym);
         self.contexts[ctx_idx].plan.get_symbol_name(sym, is_param)
@@ -257,20 +254,24 @@ impl Emitter<'_> {
         &self,
         proto_idx: usize,
         sym: SymbolId,
-        name: Identifier,
-    ) -> Typed<Identifier> {
+        name: ast::Identifier,
+    ) -> ast::Typed<ast::Identifier> {
         if let Some(ty) = self.functions[proto_idx]
             .symbol_type(sym)
             .filter(|ty| ty.is_meaningful() && !ty.contains_unknown())
             .cloned()
         {
-            Typed::new(name, ty)
+            ast::Typed::new(name, ty)
         } else {
-            Typed::untyped(name)
+            ast::Typed::untyped(name)
         }
     }
 
-    fn typed_identifier(&self, sym: SymbolId, name: Identifier) -> Typed<Identifier> {
+    fn typed_identifier(
+        &self,
+        sym: SymbolId,
+        name: ast::Identifier,
+    ) -> ast::Typed<ast::Identifier> {
         self.typed_identifier_for(self.current_proto_idx(), sym, name)
     }
 
@@ -278,16 +279,16 @@ impl Emitter<'_> {
         &self,
         proto_idx: usize,
         sym: SymbolId,
-        parameter: Parameter,
-    ) -> Typed<Parameter> {
+        parameter: ast::Parameter,
+    ) -> ast::Typed<ast::Parameter> {
         if let Some(ty) = self.functions[proto_idx]
             .symbol_type(sym)
             .filter(|ty| ty.is_meaningful() && !ty.contains_unknown())
             .cloned()
         {
-            Typed::new(parameter, ty)
+            ast::Typed::new(parameter, ty)
         } else {
-            Typed::untyped(parameter)
+            ast::Typed::untyped(parameter)
         }
     }
 
@@ -321,7 +322,7 @@ impl Emitter<'_> {
         });
     }
 
-    fn fresh_temp_local(&mut self) -> Identifier {
+    fn fresh_temp_local(&mut self) -> ast::Identifier {
         self.current_context_mut().plan.fresh_temp_local()
     }
 
@@ -383,7 +384,7 @@ impl Emitter<'_> {
         )
     }
 
-    fn symbol_expr(&mut self, sym: SymbolId) -> Expr {
+    fn symbol_expr(&mut self, sym: SymbolId) -> ast::Expr {
         match self.symbol_storage(sym) {
             Some(storage) => storage.into_expr(),
             None => {
@@ -395,7 +396,7 @@ impl Emitter<'_> {
                     sym.index(),
                     name.as_str()
                 ));
-                Expr::Named(name)
+                ast::Expr::Named(name)
             }
         }
     }
@@ -407,15 +408,15 @@ impl Emitter<'_> {
         }
     }
 
-    fn visit_region(&mut self, region: &RegionNode) -> Block {
+    fn visit_region(&mut self, region: &RegionNode) -> ast::Block {
         let mut stmts = Vec::new();
         self.visit_node(region, &mut stmts);
-        Block::with_stmts(stmts)
+        ast::Block::with_stmts(stmts)
     }
 
     /// Visits a flat sequence of region nodes, giving each `If` node access to its
     /// continuation so that only symbols genuinely needed after the branch are hoisted.
-    fn visit_sequence(&mut self, nodes: &[RegionNode], buf: &mut Vec<Stmt>) {
+    fn visit_sequence(&mut self, nodes: &[RegionNode], buf: &mut Vec<ast::Stmt>) {
         for (i, node) in nodes.iter().enumerate() {
             if let RegionNode::If {
                 condition,
@@ -443,11 +444,11 @@ impl Emitter<'_> {
     /// this `if` in the enclosing sequence).
     fn visit_if_node(
         &mut self,
-        condition: &HilExpr,
+        condition: &hil::Expr,
         then_branch: &RegionNode,
         else_branch: Option<&RegionNode>,
         continuation: &[RegionNode],
-        buf: &mut Vec<Stmt>,
+        buf: &mut Vec<ast::Stmt>,
     ) {
         let then_assigned = AssignCollector::collect_assigned_symbols(then_branch);
 
@@ -483,7 +484,7 @@ impl Emitter<'_> {
                 })
                 .collect();
             if !names.is_empty() {
-                buf.push(Stmt::LocalDeclaration {
+                buf.push(ast::Stmt::LocalDeclaration {
                     names,
                     values: Vec::new(),
                 });
@@ -500,21 +501,21 @@ impl Emitter<'_> {
             self.declarations.pop_scope();
 
             // if the region is only one If statement we can fold into an elseif
-            if let [Stmt::If(elseif)] = region.stmts.as_slice() {
-                return ElseClause::If(Box::new(elseif.clone()));
+            if let [ast::Stmt::If(elseif)] = region.stmts.as_slice() {
+                return ast::ElseClause::If(Box::new(elseif.clone()));
             }
 
-            ElseClause::Else(region)
+            ast::ElseClause::Else(region)
         });
 
-        buf.push(Stmt::If(If {
+        buf.push(ast::Stmt::If(ast::If {
             condition: self.visit_expr(condition),
             then_body,
             else_clause,
         }));
     }
 
-    fn visit_node(&mut self, node: &RegionNode, buf: &mut Vec<Stmt>) {
+    fn visit_node(&mut self, node: &RegionNode, buf: &mut Vec<ast::Stmt>) {
         match node {
             RegionNode::BasicBlock { stmts } => self.visit_block(stmts, buf),
             RegionNode::Sequence { nodes } => self.visit_sequence(nodes, buf),
@@ -535,7 +536,7 @@ impl Emitter<'_> {
                 self.declarations.push_scope();
 
                 let body = self.visit_region(body);
-                buf.push(Stmt::While {
+                buf.push(ast::Stmt::While {
                     condition: self.visit_expr(condition),
                     body,
                 });
@@ -546,7 +547,7 @@ impl Emitter<'_> {
                 self.declarations.push_scope();
 
                 let body = self.visit_region(body);
-                buf.push(Stmt::RepeatUntil {
+                buf.push(ast::Stmt::RepeatUntil {
                     condition: self.visit_expr(condition),
                     body,
                 });
@@ -568,7 +569,7 @@ impl Emitter<'_> {
                 self.declare_slot(slot);
                 self.current_context_mut().plan.force_named_symbol(*var);
                 let var = match self.symbol_storage(*var).unwrap().into_expr() {
-                    Expr::Named(name) => name,
+                    ast::Expr::Named(name) => name,
                     _ => unreachable!("numeric-for variables cannot be spilled"),
                 };
                 let start = self.visit_expr(start);
@@ -576,7 +577,7 @@ impl Emitter<'_> {
                 let step = Some(self.visit_expr(step));
 
                 let body = self.visit_region(body);
-                buf.push(Stmt::NumericFor {
+                buf.push(ast::Stmt::NumericFor {
                     var,
                     start,
                     end,
@@ -600,37 +601,37 @@ impl Emitter<'_> {
                 let vars = vars
                     .iter()
                     .map(|s| match self.symbol_storage(*s).unwrap().into_expr() {
-                        Expr::Named(name) => name,
+                        ast::Expr::Named(name) => name,
                         _ => unreachable!("generic-for variables cannot be spilled"),
                     })
                     .collect();
                 let exprs = exprs.iter().map(|expr| self.visit_expr(expr)).collect();
                 let body = self.visit_region(body);
-                buf.push(Stmt::GenericFor { vars, exprs, body });
+                buf.push(ast::Stmt::GenericFor { vars, exprs, body });
 
                 self.declarations.pop_scope();
             }
-            RegionNode::Continue => buf.push(Stmt::Continue),
-            RegionNode::Break => buf.push(Stmt::Break),
+            RegionNode::Continue => buf.push(ast::Stmt::Continue),
+            RegionNode::Break => buf.push(ast::Stmt::Break),
             RegionNode::Return { values } => {
-                buf.push(Stmt::Return {
+                buf.push(ast::Stmt::Return {
                     values: values.iter().map(|expr| self.visit_expr(expr)).collect(),
                 });
             }
         }
     }
 
-    fn visit_block(&mut self, stmts: &[HilStmt], buf: &mut Vec<Stmt>) {
+    fn visit_block(&mut self, stmts: &[hil::Stmt], buf: &mut Vec<ast::Stmt>) {
         for stmt in stmts {
             self.maybe_predeclare_recursive_local(stmt, buf);
             self.visit_stmt(stmt, buf);
         }
     }
 
-    fn maybe_predeclare_recursive_local(&mut self, stmt: &HilStmt, buf: &mut Vec<Stmt>) {
-        let HilStmt::Assign {
-            left: HilExpr::Symbol(sym),
-            value: HilExpr::Closure { proto, captures },
+    fn maybe_predeclare_recursive_local(&mut self, stmt: &hil::Stmt, buf: &mut Vec<ast::Stmt>) {
+        let hil::Stmt::Assign {
+            left: hil::Expr::Symbol(sym),
+            value: hil::Expr::Closure { proto, captures },
         } = stmt
         else {
             return;
@@ -650,25 +651,25 @@ impl Emitter<'_> {
         let slot = self.declare_symbol(*sym);
         self.declare_slot(slot);
         if let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym) {
-            buf.push(Stmt::LocalDeclaration {
+            buf.push(ast::Stmt::LocalDeclaration {
                 names: vec![self.typed_identifier(*sym, name)],
                 values: Vec::new(),
             });
         }
     }
 
-    fn visit_stmt(&mut self, stmt: &HilStmt, buf: &mut Vec<Stmt>) {
+    fn visit_stmt(&mut self, stmt: &hil::Stmt, buf: &mut Vec<ast::Stmt>) {
         match stmt {
-            HilStmt::Assign { left, value } => {
+            hil::Stmt::Assign { left, value } => {
                 let mut needs_declaration = false;
                 let mut named_closure = false;
 
                 let left_expr = match left {
-                    HilExpr::Symbol(sym) => {
+                    hil::Expr::Symbol(sym) => {
                         if !self.declarations.contains_symbol(sym) {
                             // If value is a named closure, reserve its debug_name
                             // as the symbol name before declaring/symbol_expr.
-                            if let HilExpr::Closure { proto, .. } = value {
+                            if let hil::Expr::Closure { proto, .. } = value {
                                 let debug_name =
                                     self.functions[proto.0 as usize].debug_name.clone();
                                 if let Some(name) = debug_name {
@@ -689,24 +690,24 @@ impl Emitter<'_> {
                     _ => self.visit_expr(left),
                 };
                 let right = match value {
-                    HilExpr::Closure { proto, captures } => self.visit_closure(*proto, captures),
+                    hil::Expr::Closure { proto, captures } => self.visit_closure(*proto, captures),
                     _ => self.visit_expr(value),
                 };
 
                 if needs_declaration {
-                    let HilExpr::Symbol(sym) = left else {
+                    let hil::Expr::Symbol(sym) = left else {
                         unreachable!("non-symbol lvalues are never declarations");
                     };
 
                     if named_closure
                         && let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
-                        && let Expr::AnonymousFunction {
+                        && let ast::Expr::AnonymousFunction {
                             generics,
                             params,
                             body,
                         } = right
                     {
-                        buf.push(Stmt::LocalFunction {
+                        buf.push(ast::Stmt::LocalFunction {
                             name,
                             generics,
                             params,
@@ -723,23 +724,23 @@ impl Emitter<'_> {
                         .expect("symbol was just declared in scope")
                     {
                         SymbolStorage::Named(name) => {
-                            buf.push(Stmt::LocalDeclaration {
-                                names: vec![Typed::untyped(name)],
+                            buf.push(ast::Stmt::LocalDeclaration {
+                                names: vec![ast::Typed::untyped(name)],
                                 values: vec![right],
                             });
                         }
-                        SymbolStorage::Spilled(_) => buf.push(Stmt::Assignment {
+                        SymbolStorage::Spilled(_) => buf.push(ast::Stmt::Assignment {
                             lhs: vec![left_expr],
                             rhs: vec![right],
                         }),
                     }
                 } else {
-                    if let Expr::Binary { lhs, op, rhs } = &right
+                    if let ast::Expr::Binary { lhs, op, rhs } = &right
                         && left.is_pure()
                         && lhs.as_ref() == &left_expr
                         && let Ok(compound_op) = CompoundBinOp::try_from(*op)
                     {
-                        buf.push(Stmt::CompoundAssignment {
+                        buf.push(ast::Stmt::CompoundAssignment {
                             lhs: left_expr,
                             op: compound_op,
                             rhs: rhs.as_ref().clone(),
@@ -747,20 +748,20 @@ impl Emitter<'_> {
                         return;
                     }
 
-                    buf.push(Stmt::Assignment {
+                    buf.push(ast::Stmt::Assignment {
                         lhs: vec![left_expr],
                         rhs: vec![right],
                     });
                 }
             }
-            HilStmt::AssignMany { left, value } => {
+            hil::Stmt::AssignMany { left, value } => {
                 let right = self.visit_expr(value);
                 if left
                     .iter()
-                    .any(|lvalue| !matches!(lvalue, HilExpr::Symbol(_)))
+                    .any(|lvalue| !matches!(lvalue, hil::Expr::Symbol(_)))
                 {
                     let lhs = left.iter().map(|lvalue| self.visit_expr(lvalue)).collect();
-                    buf.push(Stmt::Assignment {
+                    buf.push(ast::Stmt::Assignment {
                         lhs,
                         rhs: vec![right],
                     });
@@ -770,7 +771,7 @@ impl Emitter<'_> {
                 let symbols: Vec<_> = left
                     .iter()
                     .map(|lvalue| {
-                        let HilExpr::Symbol(sym) = lvalue else {
+                        let hil::Expr::Symbol(sym) = lvalue else {
                             unreachable!("guarded by symbol-only branch")
                         };
                         *sym
@@ -781,7 +782,7 @@ impl Emitter<'_> {
 
                 let all_declared = targets.iter().all(|target| target.slot_was_declared);
                 if all_declared {
-                    buf.push(Stmt::Assignment {
+                    buf.push(ast::Stmt::Assignment {
                         lhs: targets
                             .into_iter()
                             .map(|target| target.storage.into_expr())
@@ -798,11 +799,11 @@ impl Emitter<'_> {
                     let names = targets
                         .into_iter()
                         .map(|target| match target.storage {
-                            SymbolStorage::Named(name) => Typed::untyped(name),
+                            SymbolStorage::Named(name) => ast::Typed::untyped(name),
                             SymbolStorage::Spilled(_) => unreachable!("guarded by all_named"),
                         })
                         .collect();
-                    buf.push(Stmt::LocalDeclaration {
+                    buf.push(ast::Stmt::LocalDeclaration {
                         names,
                         values: vec![right],
                     });
@@ -810,24 +811,24 @@ impl Emitter<'_> {
                 }
 
                 let temps: Vec<_> = (0..targets.len())
-                    .map(|_| Typed::untyped(self.fresh_temp_local()))
+                    .map(|_| ast::Typed::untyped(self.fresh_temp_local()))
                     .collect();
-                buf.push(Stmt::LocalDeclaration {
+                buf.push(ast::Stmt::LocalDeclaration {
                     names: temps.clone(),
                     values: vec![right],
                 });
 
                 for (target, temp) in targets.into_iter().zip(temps) {
-                    let rhs = vec![Expr::Named(temp.as_ref().clone())];
+                    let rhs = vec![ast::Expr::Named(temp.as_ref().clone())];
                     match (target.storage, target.slot_was_declared) {
                         (SymbolStorage::Named(name), false) => {
-                            buf.push(Stmt::LocalDeclaration {
-                                names: vec![Typed::untyped(name)],
+                            buf.push(ast::Stmt::LocalDeclaration {
+                                names: vec![ast::Typed::untyped(name)],
                                 values: rhs,
                             });
                         }
                         (storage, true) | (storage @ SymbolStorage::Spilled(_), false) => {
-                            buf.push(Stmt::Assignment {
+                            buf.push(ast::Stmt::Assignment {
                                 lhs: vec![storage.into_expr()],
                                 rhs,
                             });
@@ -835,13 +836,13 @@ impl Emitter<'_> {
                     }
                 }
             }
-            HilStmt::SetList {
+            hil::Stmt::SetList {
                 table,
                 index,
                 values,
                 has_variadic_tail,
             } => {
-                let table_expr = self.visit_expr(&HilExpr::Symbol(*table));
+                let table_expr = self.visit_expr(&hil::Expr::Symbol(*table));
                 if *has_variadic_tail {
                     // The idea is that if we have a variadic tail, we can't simply assign
                     // a tuple to a single index (t[k] = a, b)
@@ -852,34 +853,36 @@ impl Emitter<'_> {
                     // This should run only if the 'fold_tables' pass did not fold this SetList
                     // into table constructor.
 
-                    let temp_table_ident = Identifier::new("__t");
-                    buf.push(Stmt::Do {
-                        body: Block::with_stmts(vec![
-                            Stmt::LocalDeclaration {
-                                names: vec![Typed::untyped(temp_table_ident.clone())],
-                                values: vec![Expr::Table {
+                    let temp_table_ident = ast::Identifier::new("__t");
+                    buf.push(ast::Stmt::Do {
+                        body: ast::Block::with_stmts(vec![
+                            ast::Stmt::LocalDeclaration {
+                                names: vec![ast::Typed::untyped(temp_table_ident.clone())],
+                                values: vec![ast::Expr::Table {
                                     items: values
                                         .iter()
-                                        .map(|v| TableItem::Implicit {
+                                        .map(|v| ast::TableItem::Implicit {
                                             value: self.visit_expr(v),
                                         })
                                         .collect(),
                                 }],
                             },
-                            Stmt::Expression {
-                                expr: Expr::FunctionCall {
-                                    func: Box::new(Expr::Field {
-                                        base: Box::new(Expr::Named(Identifier::new("table"))),
-                                        field: Identifier::new("move"),
+                            ast::Stmt::Expression {
+                                expr: ast::Expr::FunctionCall {
+                                    func: Box::new(ast::Expr::Field {
+                                        base: Box::new(ast::Expr::Named(ast::Identifier::new(
+                                            "table",
+                                        ))),
+                                        field: ast::Identifier::new("move"),
                                     }),
                                     args: vec![
-                                        Expr::Named(temp_table_ident.clone()),
-                                        Expr::Literal(Literal::Float(1.0)),
-                                        Expr::Unary {
+                                        ast::Expr::Named(temp_table_ident.clone()),
+                                        ast::Expr::Literal(ast::Literal::Float(1.0)),
+                                        ast::Expr::Unary {
                                             op: UnOp::Length,
-                                            expr: Box::new(Expr::Named(temp_table_ident)),
+                                            expr: Box::new(ast::Expr::Named(temp_table_ident)),
                                         },
-                                        Expr::Literal(Literal::Float(*index as f64)),
+                                        ast::Expr::Literal(ast::Literal::Float(*index as f64)),
                                         table_expr,
                                     ],
                                 },
@@ -889,20 +892,20 @@ impl Emitter<'_> {
                 } else {
                     let base = *index as usize;
                     let lhs = (base..base + values.len())
-                        .map(|i| Expr::Index {
+                        .map(|i| ast::Expr::Index {
                             base: Box::new(table_expr.clone()),
-                            index: Box::new(Expr::Literal(Literal::Float(i as f64))),
+                            index: Box::new(ast::Expr::Literal(ast::Literal::Float(i as f64))),
                         })
                         .collect();
                     let rhs = values.iter().map(|v| self.visit_expr(v)).collect();
 
-                    buf.push(Stmt::Assignment { lhs, rhs });
+                    buf.push(ast::Stmt::Assignment { lhs, rhs });
                 }
             }
-            HilStmt::Call(expr) => buf.push(Stmt::Expression {
+            hil::Stmt::Call(expr) => buf.push(ast::Stmt::Expression {
                 expr: self.visit_expr(expr),
             }),
-            HilStmt::Phi(node) => {
+            hil::Stmt::Phi(node) => {
                 panic!(
                     "encountered unfolded phi node during structuring: target={}, operands={:?}",
                     node.target.index(),
@@ -912,93 +915,93 @@ impl Emitter<'_> {
         }
     }
 
-    fn visit_expr(&mut self, expr: &HilExpr) -> Expr {
+    fn visit_expr(&mut self, expr: &hil::Expr) -> ast::Expr {
         match expr {
-            HilExpr::Nil => Expr::Literal(Literal::Nil),
-            HilExpr::Number(num) => match num {
-                HilNumber::Integer(i) => Expr::Literal(Literal::Integer(*i)),
-                HilNumber::Float(f) => Expr::Literal(Literal::Float(*f)),
+            hil::Expr::Nil => ast::Expr::Literal(ast::Literal::Nil),
+            hil::Expr::Number(num) => match num {
+                hil::Number::Integer(i) => ast::Expr::Literal(ast::Literal::Integer(*i)),
+                hil::Number::Float(f) => ast::Expr::Literal(ast::Literal::Float(*f)),
             },
-            HilExpr::String(s) => Expr::Literal(Literal::String(s.into())),
-            HilExpr::Bool(b) => Expr::Literal(Literal::Bool(*b)),
-            HilExpr::Symbol(sym) => self.symbol_expr(*sym),
-            HilExpr::Closure { proto, captures } => self.visit_closure(*proto, captures),
-            HilExpr::Binary { lhs, op, rhs } => Expr::Binary {
+            hil::Expr::String(s) => ast::Expr::Literal(ast::Literal::String(s.into())),
+            hil::Expr::Bool(b) => ast::Expr::Literal(ast::Literal::Bool(*b)),
+            hil::Expr::Symbol(sym) => self.symbol_expr(*sym),
+            hil::Expr::Closure { proto, captures } => self.visit_closure(*proto, captures),
+            hil::Expr::Binary { lhs, op, rhs } => ast::Expr::Binary {
                 lhs: Box::new(self.visit_expr(lhs)),
                 op: *op,
                 rhs: Box::new(self.visit_expr(rhs)),
             },
-            HilExpr::Unary { op, expr } => Expr::Unary {
+            hil::Expr::Unary { op, expr } => ast::Expr::Unary {
                 op: *op,
                 expr: Box::new(self.visit_expr(expr)),
             },
-            HilExpr::Global(name) => Expr::Named(Identifier::new(name.clone())),
-            HilExpr::GetField { obj, field } => {
+            hil::Expr::Global(name) => ast::Expr::Named(ast::Identifier::new(name.clone())),
+            hil::Expr::GetField { obj, field } => {
                 let base = Box::new(self.visit_expr(obj));
 
                 if is_valid_luau_identifier(field) {
-                    Expr::Field {
+                    ast::Expr::Field {
                         base,
-                        field: Identifier::new(field.clone()),
+                        field: ast::Identifier::new(field.clone()),
                     }
                 } else {
-                    Expr::Index {
+                    ast::Expr::Index {
                         base,
-                        index: Box::new(Expr::Literal(Literal::String(field.clone()))),
+                        index: Box::new(ast::Expr::Literal(ast::Literal::String(field.clone()))),
                     }
                 }
             }
-            HilExpr::GetIndex { obj, index } => Expr::Index {
+            hil::Expr::GetIndex { obj, index } => ast::Expr::Index {
                 base: Box::new(self.visit_expr(obj)),
                 index: Box::new(self.visit_expr(index)),
             },
-            HilExpr::Call { fun, args } => Expr::FunctionCall {
+            hil::Expr::Call { fun, args } => ast::Expr::FunctionCall {
                 func: Box::new(self.visit_expr(fun)),
                 args: args.iter().map(|expr| self.visit_expr(expr)).collect(),
             },
-            HilExpr::MethodCall {
+            hil::Expr::MethodCall {
                 object,
                 method,
                 args,
-            } => Expr::MethodCall {
+            } => ast::Expr::MethodCall {
                 object: Box::new(self.visit_expr(object)),
-                method: Identifier::new(method.clone()),
+                method: ast::Identifier::new(method.clone()),
                 args: args.iter().map(|expr| self.visit_expr(expr)).collect(),
             },
-            HilExpr::IfElse {
+            hil::Expr::IfElse {
                 condition,
                 then_expr,
                 else_expr,
-            } => Expr::IfElse {
+            } => ast::Expr::IfElse {
                 condition: Box::new(self.visit_expr(condition)),
                 then_expr: Box::new(self.visit_expr(then_expr)),
                 else_expr: Box::new(self.visit_expr(else_expr)),
             },
-            HilExpr::Table { items } => Expr::Table {
+            hil::Expr::Table { items } => ast::Expr::Table {
                 items: self.visit_table_items(items),
             },
-            HilExpr::VarArgs => Expr::Vararg,
+            hil::Expr::VarArgs => ast::Expr::Vararg,
         }
     }
 
-    fn visit_table_items(&mut self, items: &[HilTableItem]) -> Vec<TableItem> {
+    fn visit_table_items(&mut self, items: &[hil::TableItem]) -> Vec<ast::TableItem> {
         items
             .iter()
             .map(|item| match item {
-                HilTableItem::List(expr) => TableItem::Implicit {
+                hil::TableItem::List(expr) => ast::TableItem::Implicit {
                     value: self.visit_expr(expr),
                 },
-                HilTableItem::Index(key, value) => {
+                hil::TableItem::Index(key, value) => {
                     let value = self.visit_expr(value);
-                    if let HilExpr::String(s) = key
+                    if let hil::Expr::String(s) = key
                         && is_valid_luau_identifier(s)
                     {
-                        TableItem::Named {
-                            name: Identifier::new(s.clone()),
+                        ast::TableItem::Named {
+                            name: ast::Identifier::new(s.clone()),
                             value,
                         }
                     } else {
-                        TableItem::Indexed {
+                        ast::TableItem::Indexed {
                             index: self.visit_expr(key),
                             value,
                         }
@@ -1009,7 +1012,7 @@ impl Emitter<'_> {
     }
 
     /// Emits one closure with the best inferred parameter annotations available.
-    fn visit_closure(&mut self, proto_idx: ProtoId, captures: &[SymbolId]) -> Expr {
+    fn visit_closure(&mut self, proto_idx: ProtoId, captures: &[SymbolId]) -> ast::Expr {
         let proto_idx = proto_idx.0 as usize;
         let mut generic_names = HashSet::new();
         for symbol in &self.functions[proto_idx].symbols.params {
@@ -1054,18 +1057,18 @@ impl Emitter<'_> {
             .into_iter()
             .map(|sym| {
                 let name = self.get_symbol_name_for(child_ctx, sym);
-                self.typed_parameter_for(proto_idx, sym, Parameter::Regular(name))
+                self.typed_parameter_for(proto_idx, sym, ast::Parameter::Regular(name))
             })
             .collect();
         if is_vararg {
-            params.push(Typed::untyped(Parameter::Vararg));
+            params.push(ast::Typed::untyped(ast::Parameter::Vararg));
         }
 
         let body = self.visit_function(child_ctx);
 
         self.declarations = old_declarations;
 
-        Expr::AnonymousFunction {
+        ast::Expr::AnonymousFunction {
             generics,
             params,
             body,
@@ -1078,7 +1081,7 @@ pub fn emit_ast(
     entry: usize,
     options: DecompileOptions,
     diagnostics: &Diagnostics,
-) -> Block {
+) -> ast::Block {
     let mut st = Emitter {
         functions,
         entry,

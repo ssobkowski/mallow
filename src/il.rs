@@ -3,8 +3,6 @@ use std::{fmt, rc::Rc};
 use anyhow::{Result, ensure};
 use smallvec::{SmallVec, smallvec};
 
-use crate::common::Spanned;
-
 /// An index into the constant table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConstId(pub u32);
@@ -384,6 +382,18 @@ pub enum Instr {
         slot: u16,
         method: u16,
     },
+}
+
+/// A decoded Luau instruction paired with its header word position.
+///
+/// Instruction indices cannot stand in for word positions because instructions
+/// that consume an AUX word advance the bytecode program counter by two words.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodedInstr {
+    /// The decoded instruction payload.
+    pub instr: Instr,
+    /// The zero-based word position of the instruction header in the bytecode stream.
+    pub word_pc: u32,
 }
 
 impl Instr {
@@ -1249,7 +1259,7 @@ pub struct Proto {
     pub is_vararg: bool,
     pub flags: u8,
     pub type_info: ProtoTypeInfo,
-    pub instrs: Vec<Spanned<Instr>>,
+    pub instrs: Vec<DecodedInstr>,
     pub consts: Vec<Constant>,
     pub child_protos: Vec<ProtoId>,
     pub debug_name: Option<StringId>,

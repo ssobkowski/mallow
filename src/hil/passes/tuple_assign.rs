@@ -1,6 +1,6 @@
 use crate::hil::{
     StructuredFunction,
-    ir::{HilExpr, HilStmt},
+    ir::{Expr, Stmt},
     lifter::ssa::SymbolId,
     visitor::{VisitorMut, walk_stmts_mut},
 };
@@ -11,10 +11,10 @@ struct Rewriter {
 }
 
 impl Rewriter {
-    fn try_rewrite_stmts(&mut self, stmts: &mut Vec<HilStmt>) {
+    fn try_rewrite_stmts(&mut self, stmts: &mut Vec<Stmt>) {
         let mut i = 0;
         while i < stmts.len() {
-            let HilStmt::AssignMany { left, value } = &stmts[i] else {
+            let Stmt::AssignMany { left, value } = &stmts[i] else {
                 i += 1;
                 continue;
             };
@@ -22,7 +22,7 @@ impl Rewriter {
             let tuple_symbols: Vec<_> = left
                 .iter()
                 .filter_map(|lvalue| match lvalue {
-                    HilExpr::Symbol(sym) => Some(*sym),
+                    Expr::Symbol(sym) => Some(*sym),
                     _ => None,
                 })
                 .collect();
@@ -41,9 +41,9 @@ impl Rewriter {
                     break;
                 }
 
-                let HilStmt::Assign {
+                let Stmt::Assign {
                     left: target,
-                    value: HilExpr::Symbol(src),
+                    value: Expr::Symbol(src),
                 } = &stmts[idx]
                 else {
                     break;
@@ -72,7 +72,7 @@ impl Rewriter {
             }
 
             let rhs = value.clone();
-            stmts[i] = HilStmt::AssignMany {
+            stmts[i] = Stmt::AssignMany {
                 left: tuple_lvalues,
                 value: rhs,
             };
@@ -85,35 +85,35 @@ impl Rewriter {
 }
 
 impl VisitorMut for Rewriter {
-    fn visit_stmts(&mut self, stmts: &mut Vec<HilStmt>) {
+    fn visit_stmts(&mut self, stmts: &mut Vec<Stmt>) {
         self.try_rewrite_stmts(stmts);
         walk_stmts_mut(self, stmts);
     }
 }
 
-fn is_safe_tuple_lvalue_target(target: &HilExpr, tuple_symbols: &[SymbolId]) -> bool {
+fn is_safe_tuple_lvalue_target(target: &Expr, tuple_symbols: &[SymbolId]) -> bool {
     if tuple_symbols.iter().any(|sym| target.reads_symbol(sym)) {
         return false;
     }
 
     match target {
-        HilExpr::GetField { obj, .. } => obj.is_pure(),
-        HilExpr::GetIndex { obj, index } => obj.is_pure() && index.is_pure(),
+        Expr::GetField { obj, .. } => obj.is_pure(),
+        Expr::GetIndex { obj, index } => obj.is_pure() && index.is_pure(),
         _ => false,
     }
 }
 
-fn stmt_mentions_symbol(stmt: &HilStmt, sym: SymbolId) -> bool {
+fn stmt_mentions_symbol(stmt: &Stmt, sym: SymbolId) -> bool {
     match stmt {
-        HilStmt::Assign { left, value } => left.reads_symbol(&sym) || value.reads_symbol(&sym),
-        HilStmt::AssignMany { left, value } => {
+        Stmt::Assign { left, value } => left.reads_symbol(&sym) || value.reads_symbol(&sym),
+        Stmt::AssignMany { left, value } => {
             left.iter().any(|lvalue| lvalue.reads_symbol(&sym)) || value.reads_symbol(&sym)
         }
-        HilStmt::SetList { table, values, .. } => {
+        Stmt::SetList { table, values, .. } => {
             *table == sym || values.iter().any(|expr| expr.reads_symbol(&sym))
         }
-        HilStmt::Call(expr) => expr.reads_symbol(&sym),
-        HilStmt::Phi(node) => {
+        Stmt::Call(expr) => expr.reads_symbol(&sym),
+        Stmt::Phi(node) => {
             node.target == sym || node.operands.iter().any(|(_, operand)| *operand == sym)
         }
     }

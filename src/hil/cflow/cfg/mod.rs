@@ -10,16 +10,15 @@ use smallvec::SmallVec;
 use anyhow::{Result, anyhow, ensure};
 
 use crate::{
-    ast::BinOp,
-    common::Spanned,
     disasm::Chunk,
     hil::{
         cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
-        ir::{HilExpr, HilStmt, PhiNode},
+        ir::{Expr, PhiNode, Stmt},
         lifter::ssa::SymbolId,
         ty::{TypeId, TypeStore},
     },
-    il::{Instr, Proto, reg_add, reg_range},
+    il::{DecodedInstr, Instr, Proto, reg_add, reg_range},
+    operator::BinOp,
 };
 
 /// Represents an unlifted block
@@ -106,7 +105,7 @@ impl RawBlockExit {
 /// Represents a lifted block
 #[derive(Debug, Clone)]
 pub struct Block {
-    stmts: Vec<HilStmt>,
+    stmts: Vec<Stmt>,
     exit: BlockExit,
 }
 
@@ -130,12 +129,12 @@ impl Block {
     }
 
     /// Returns an iterator over the statements of this block.
-    pub fn stmts(&self) -> &[HilStmt] {
+    pub fn stmts(&self) -> &[Stmt] {
         &self.stmts
     }
 
     /// Returns a mutable reference to the statements of this block.
-    pub fn stmts_mut(&mut self) -> &mut Vec<HilStmt> {
+    pub fn stmts_mut(&mut self) -> &mut Vec<Stmt> {
         &mut self.stmts
     }
 
@@ -156,7 +155,7 @@ pub enum BlockExit {
     Jump(usize),
     Fallthrough(usize),
     CondJump {
-        cond: HilExpr,
+        cond: Expr,
         then_block: usize,
         else_block: usize,
     },
@@ -165,9 +164,9 @@ pub enum BlockExit {
         body_block: usize,
         exit_block: usize,
         var: SymbolId,
-        start: HilExpr,
-        end: HilExpr,
-        step: HilExpr,
+        start: Expr,
+        end: Expr,
+        step: Expr,
     },
     FornLoop {
         base: u8,
@@ -178,7 +177,7 @@ pub enum BlockExit {
         base: u8,
         body_block: usize,
         exit_block: usize,
-        exprs: [HilExpr; 3],
+        exprs: [Expr; 3],
     },
     ForgLoop {
         base: u8,
@@ -186,7 +185,7 @@ pub enum BlockExit {
         exit_block: usize,
         vars: SmallVec<[SymbolId; 3]>,
     },
-    Return(SmallVec<[HilExpr; 3]>),
+    Return(SmallVec<[Expr; 3]>),
 }
 
 impl BlockExit {
@@ -381,9 +380,9 @@ impl ControlFlowGraph {
 
         let phis: Vec<_> = self.blocks[block_idx]
             .stmts
-            .extract_if(.., |stmt| matches!(stmt, HilStmt::Phi(_)))
+            .extract_if(.., |stmt| matches!(stmt, Stmt::Phi(_)))
             .map(|stmt| {
-                let HilStmt::Phi(PhiNode { target, operands }) = stmt else {
+                let Stmt::Phi(PhiNode { target, operands }) = stmt else {
                     unreachable!();
                 };
 
@@ -404,9 +403,9 @@ impl ControlFlowGraph {
 
             // Emit the target declaration in the idom block. The structurer
             // will determine whether to make it a declaration or not.
-            self.blocks[idom].stmts.push(HilStmt::Assign {
-                left: HilExpr::Symbol(target),
-                value: HilExpr::Nil,
+            self.blocks[idom].stmts.push(Stmt::Assign {
+                left: Expr::Symbol(target),
+                value: Expr::Nil,
             });
 
             // In each operand block insert the `target = operand` statement.
@@ -414,9 +413,9 @@ impl ControlFlowGraph {
                 if version == target {
                     continue;
                 }
-                self.blocks[op_block_idx].stmts.push(HilStmt::Assign {
-                    left: HilExpr::Symbol(target),
-                    value: HilExpr::Symbol(version),
+                self.blocks[op_block_idx].stmts.push(Stmt::Assign {
+                    left: Expr::Symbol(target),
+                    value: Expr::Symbol(version),
                 });
             }
         }
@@ -482,12 +481,12 @@ impl GraphView for ControlFlowGraph {
 }
 
 /// Returns the list of instruction indices which are block entries.
-pub fn find_block_entries(instrs: &[Spanned<Instr>]) -> Result<Vec<usize>> {
+pub fn find_block_entries(instrs: &[DecodedInstr]) -> Result<Vec<usize>> {
     let mut entries = BTreeSet::new();
     entries.insert(0);
 
-    for (idx, sd) in instrs.iter().enumerate() {
-        match sd.node {
+    for (idx, decoded) in instrs.iter().enumerate() {
+        match decoded.instr {
             Instr::Return { .. } if idx + 1 < instrs.len() => {
                 entries.insert(idx + 1);
             }
@@ -547,7 +546,7 @@ pub fn find_block_entries(instrs: &[Spanned<Instr>]) -> Result<Vec<usize>> {
 }
 
 /// Builds raw blocks from a list of entries and instructions.
-fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Result<Vec<RawBlock>> {
+fn build_raw_blocks(entries: &[usize], instrs: &[DecodedInstr]) -> Result<Vec<RawBlock>> {
     let mut raw_blocks = Vec::with_capacity(entries.len());
 
     for (block_idx, &start) in entries.iter().enumerate() {
@@ -555,7 +554,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Result<Vec<
 
         let Some(last_instr) = instrs
             .get(end.saturating_sub(1))
-            .map(|spanned| spanned.node)
+            .map(|decoded| decoded.instr)
         else {
             continue;
         };
@@ -576,7 +575,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Result<Vec<
         };
 
         let exit_instr_idx = end.saturating_sub(1);
-        let exit_pc = exit_instr.map(|_| instrs[exit_instr_idx].pc);
+        let exit_pc = exit_instr.map(|_| instrs[exit_instr_idx].word_pc);
         let exit = match exit_instr {
             Some(Instr::Return { base, count }) => RawBlockExit::Return { base, count },
             Some(Instr::Jump { offset }) | Some(Instr::JumpBack { offset }) => {
@@ -771,7 +770,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Result<Vec<
                 let end = entries.get(exit_block + 1).copied().unwrap_or(instrs.len());
                 let result_count = match instrs
                     .get(end.saturating_sub(1))
-                    .map(|spanned| spanned.node)
+                    .map(|decoded| decoded.instr)
                 {
                     Some(Instr::ForgLoop { var_count, .. }) => Ok(var_count),
                     other => Err(anyhow!(
@@ -820,11 +819,7 @@ fn build_raw_blocks(entries: &[usize], instrs: &[Spanned<Instr>]) -> Result<Vec<
 }
 
 /// Resolves a relative branch target from an instruction index.
-fn rel_target_from_instr(
-    instr_idx: usize,
-    offset: i32,
-    instrs: &[Spanned<Instr>],
-) -> Result<usize> {
+fn rel_target_from_instr(instr_idx: usize, offset: i32, instrs: &[DecodedInstr]) -> Result<usize> {
     ensure!(!instrs.is_empty(), "instrs must not be empty");
 
     if instr_idx >= instrs.len() {
@@ -838,12 +833,12 @@ fn rel_target_from_instr(
     }
 
     let target_word_pc = instrs[instr_idx]
-        .pc
+        .word_pc
         .saturating_add(1)
         .saturating_add_signed(offset);
 
     instrs
-        .binary_search_by(|spanned| spanned.pc.cmp(&target_word_pc))
+        .binary_search_by(|decoded| decoded.word_pc.cmp(&target_word_pc))
         .map_err(|_| anyhow!("branch target {target_word_pc} does not point at an instruction"))
 }
 
@@ -857,11 +852,11 @@ fn pc_to_block_idx(entries: &[usize], pc: usize) -> usize {
 
 /// Returns the truthiness of a symbol in a block, if it is assigned.
 ///
-/// See [`HilExpr::truthiness`]
+/// See [`Expr::truthiness`]
 fn symbol_truthiness_in_block(block: &Block, symbol: SymbolId) -> Option<bool> {
     block.stmts.iter().find_map(|stmt| {
-        let HilStmt::Assign {
-            left: HilExpr::Symbol(target),
+        let Stmt::Assign {
+            left: Expr::Symbol(target),
             value,
         } = &stmt
         else {
@@ -886,7 +881,7 @@ fn fold_truthy_cond_jumps(blocks: &mut [Block]) -> bool {
                 then_block,
                 else_block,
             } => match cond {
-                HilExpr::Symbol(symbol) => symbol_truthiness_in_block(block, *symbol)
+                Expr::Symbol(symbol) => symbol_truthiness_in_block(block, *symbol)
                     .map(|truthy| if truthy { *then_block } else { *else_block }),
                 _ => cond
                     .truthiness()
@@ -929,7 +924,7 @@ fn fold_condition_chains(blocks: &mut [Block], predecessors: &[Vec<usize>]) -> b
             && else_a == else_b
         {
             blocks[i].exit = BlockExit::CondJump {
-                cond: HilExpr::Binary {
+                cond: Expr::Binary {
                     lhs: Box::new(cond_a.clone()),
                     op: BinOp::And,
                     rhs: Box::new(cond_b.clone()),
@@ -951,7 +946,7 @@ fn fold_condition_chains(blocks: &mut [Block], predecessors: &[Vec<usize>]) -> b
             && then_a == then_b
         {
             blocks[i].exit = BlockExit::CondJump {
-                cond: HilExpr::Binary {
+                cond: Expr::Binary {
                     lhs: Box::new(cond_a.clone()),
                     op: BinOp::Or,
                     rhs: Box::new(cond_b.clone()),

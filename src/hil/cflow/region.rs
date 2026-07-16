@@ -3,16 +3,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use smallvec::SmallVec;
 
 use crate::{
-    ast::UnOp,
     hil::{
         cflow::{
             cfg::{BlockExit, ControlFlowGraph},
             graph::{DominatorTree, GraphView, Reversed, SeseGraphView},
         },
-        ir::{HilExpr, HilStmt},
+        ir::{Expr, Stmt},
         lifter::ssa::SymbolId,
     },
     logging::{Diagnostics, LogLevel, LogTarget},
+    operator::UnOp,
 };
 
 /// The lexical control-flow shape recognized from CFG facts.
@@ -35,7 +35,7 @@ enum Shape {
     /// A structured continue split.
     Continue,
     /// A structured return split.
-    Return(SmallVec<[HilExpr; 3]>),
+    Return(SmallVec<[Expr; 3]>),
     /// A virtual exit split.
     VirtualExit,
 }
@@ -44,37 +44,37 @@ enum Shape {
 #[derive(Debug, Clone)]
 pub enum RegionNode {
     /// A plain basic block payload that does not by itself decide control transfer.
-    BasicBlock { stmts: Vec<HilStmt> },
+    BasicBlock { stmts: Vec<Stmt> },
     /// A sequence of nodes executed sequentially.
     Sequence { nodes: Vec<RegionNode> },
     /// A structured if/else split.
     If {
-        condition: HilExpr,
+        condition: Expr,
         then_branch: Box<RegionNode>,
         else_branch: Option<Box<RegionNode>>,
     },
     /// A structured while loop.
     While {
-        condition: HilExpr,
+        condition: Expr,
         body: Box<RegionNode>,
     },
     /// A structured `repeat [body] until [condition]` loop.
     RepeatUntil {
-        condition: HilExpr,
+        condition: Expr,
         body: Box<RegionNode>,
     },
     /// A structured numeric `for` loop.
     NumericFor {
         var: SymbolId,
-        start: HilExpr,
-        end: HilExpr,
-        step: HilExpr,
+        start: Expr,
+        end: Expr,
+        step: Expr,
         body: Box<RegionNode>,
     },
     /// A structured generic `for` loop.
     GenericFor {
         vars: SmallVec<[SymbolId; 3]>,
-        exprs: SmallVec<[HilExpr; 3]>,
+        exprs: SmallVec<[Expr; 3]>,
         body: Box<RegionNode>,
     },
     /// Explicit `continue` edge for a loop.
@@ -82,7 +82,7 @@ pub enum RegionNode {
     /// Explicit `break` edge from a loop body.
     Break,
     /// Explicit return.
-    Return { values: SmallVec<[HilExpr; 3]> },
+    Return { values: SmallVec<[Expr; 3]> },
 }
 
 impl RegionNode {
@@ -105,7 +105,7 @@ impl RegionNode {
 #[derive(Debug, Clone)]
 struct IfShape {
     /// The condition expression of the `if` statement.
-    condition: HilExpr,
+    condition: Expr,
     /// Structured payload reached when `condition` is true.
     then_branch: Box<Shape>,
     /// Structured payload reached when `condition` is false, omitted
@@ -173,7 +173,7 @@ enum LoopKind {
     /// `while cond do`; condition is owned by the loop header.
     While {
         /// Source-level condition that reaches the loop body when truthy.
-        condition: HilExpr,
+        condition: Expr,
         /// First payload block executed after the guard succeeds.
         body: usize,
         /// Empty conditional blocks consumed into `condition`; these are loop
@@ -184,23 +184,23 @@ enum LoopKind {
     },
     /// `repeat ... until cond`; condition is owned by the loop latch.
     RepeatUntil {
-        condition: HilExpr,
+        condition: Expr,
         latch: usize,
         body: usize,
     },
     /// for var = start, step, end
     NumericFor {
         var: SymbolId,
-        start: HilExpr,
-        end: HilExpr,
-        step: HilExpr,
+        start: Expr,
+        end: Expr,
+        step: Expr,
         body: usize,
         exit: usize,
     },
     /// for \[vars\] in \[exprs\]
     GenericFor {
         vars: SmallVec<[SymbolId; 3]>,
-        exprs: [HilExpr; 3],
+        exprs: [Expr; 3],
         body: usize,
         exit: usize,
     },
@@ -262,7 +262,7 @@ struct Scope {
 struct ConditionalShape {
     /// CFG block whose terminator branches to `then_entry` or `else_entry`.
     head: usize,
-    condition: HilExpr,
+    condition: Expr,
     then_entry: usize,
     else_entry: usize,
     /// In-scope immediate post-dominator where both branches rejoin.
@@ -295,7 +295,7 @@ struct LoopInfo {
 #[derive(Debug, Clone)]
 struct WhileGuard {
     /// Combined truth condition for all guard paths that reach `body`.
-    condition: HilExpr,
+    condition: Expr,
     /// Unique payload entry reached by the truthy guard paths.
     body: usize,
     /// Empty CFG blocks folded into `condition`.
@@ -307,7 +307,7 @@ struct WhileGuard {
 #[derive(Debug, Clone)]
 struct GuardBranch {
     /// Condition under which this branch reaches `body`.
-    condition: HilExpr,
+    condition: Expr,
     /// Payload entry reached by this branch, or `None` for a loop exit branch.
     body: Option<usize>,
     /// Empty CFG blocks folded while following this branch.
@@ -1629,7 +1629,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             && (*then_block == loop_info.header) ^ (*else_block == loop_info.header)
         {
             let condition = if *then_block == loop_info.header {
-                HilExpr::Unary {
+                Expr::Unary {
                     op: UnOp::Not,
                     expr: Box::new(cond.clone()),
                 }
@@ -1733,9 +1733,9 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         exits.extend(else_branch.exits);
 
         Some(GuardBranch {
-            condition: HilExpr::or(
-                HilExpr::and(cond.clone(), then_branch.condition),
-                HilExpr::and(cond.clone().invert(), else_branch.condition),
+            condition: Expr::or(
+                Expr::and(cond.clone(), then_branch.condition),
+                Expr::and(cond.clone().invert(), else_branch.condition),
             ),
             body,
             guard_nodes,
@@ -1758,7 +1758,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
     ) -> Option<GuardBranch> {
         if !loop_info.body.contains(&target) {
             return Some(GuardBranch {
-                condition: HilExpr::Bool(false),
+                condition: Expr::Bool(false),
                 body: None,
                 guard_nodes: HashSet::new(),
                 exits: [target].into_iter().collect(),
@@ -1775,7 +1775,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         }
 
         Some(GuardBranch {
-            condition: HilExpr::Bool(true),
+            condition: Expr::Bool(true),
             body: Some(target),
             guard_nodes: HashSet::new(),
             exits: HashSet::new(),
@@ -2032,7 +2032,7 @@ impl Shape {
                     body: Box::new(shape.body.lower(cfg)),
                 },
                 LoopKind::Infinite { .. } => RegionNode::While {
-                    condition: HilExpr::Bool(true),
+                    condition: Expr::Bool(true),
                     body: Box::new(shape.body.lower(cfg)),
                 },
             },

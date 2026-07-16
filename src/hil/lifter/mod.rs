@@ -7,12 +7,10 @@ use ssa::Ssa;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
-    ast::{BinOp, UnOp},
-    common::{Spanned, ToSpanned as _},
     disasm::Chunk,
     hil::{
         cflow::graph::GraphView,
-        ir::{HilExpr, HilNumber, HilStmt},
+        ir::{Expr, Number, Stmt},
         lifter::{
             common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL},
             ssa::{Symbol, SymbolId},
@@ -20,15 +18,16 @@ use crate::{
         ty::ProtoTypeContext,
     },
     il::{
-        ChildProtoId, ConstId, Constant, Count, ImportPath, Instr, LuauString, Proto, ProtoId,
-        reg_add, reg_range,
+        ChildProtoId, ConstId, Constant, Count, DecodedInstr, ImportPath, Instr, LuauString, Proto,
+        ProtoId, reg_add, reg_range,
     },
+    operator::{BinOp, UnOp},
 };
 
 /// A deferred variadic source that has not yet been consumed.
 ///
-/// Either a multiret call result (`HilExpr::Call` / `HilExpr::MethodCall`) or a full
-/// vararg splice (`HilExpr::VarArgs`). The `base` register is the first slot of
+/// Either a multiret call result (`Expr::Call` / `Expr::MethodCall`) or a full
+/// vararg splice (`Expr::VarArgs`). The `base` register is the first slot of
 /// the variadic sequence; consumers pull as many values as they need starting
 /// there.
 #[derive(Debug)]
@@ -36,7 +35,7 @@ pub struct MultiRet {
     /// First result register of the variadic sequence.
     pub base: u8,
     /// The expression that produced the sequence.
-    pub expr: Spanned<HilExpr>,
+    pub expr: Expr,
 }
 
 /// Returns true when an instruction can appear between a pending multiret and
@@ -85,7 +84,7 @@ fn unop_for_instr(instr: &Instr) -> UnOp {
 }
 
 pub struct LiftContext<'a, 'cfg, G: GraphView> {
-    pub instrs: &'a [Spanned<Instr>],
+    pub instrs: &'a [DecodedInstr],
     pub chunk: &'a Chunk,
     pub proto: &'a Proto,
     pub type_context: &'a ProtoTypeContext,
@@ -96,7 +95,7 @@ pub struct LiftContext<'a, 'cfg, G: GraphView> {
 pub struct Lifter<'a, 'cfg, G: GraphView> {
     ip: usize,
 
-    instrs: &'a [Spanned<Instr>],
+    instrs: &'a [DecodedInstr],
     chunk: &'a Chunk,
     proto: &'a Proto,
     type_context: &'a ProtoTypeContext,
@@ -104,7 +103,7 @@ pub struct Lifter<'a, 'cfg, G: GraphView> {
     ssa: &'a mut Ssa<'cfg, G>,
     block_idx: usize,
 
-    stmts: Vec<Spanned<HilStmt>>,
+    stmts: Vec<Stmt>,
     pending_multiret: Option<MultiRet>,
 
     reg_generations: [u16; 256],
@@ -136,7 +135,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             self.instrs.len()
         );
 
-        self.instrs[ip].pc
+        self.instrs[ip].word_pc
     }
 
     fn next(&mut self) -> Option<Instr> {
@@ -144,39 +143,39 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         if instr.is_some() {
             self.ip += 1;
         }
-        instr.map(|i| i.node)
+        instr.map(|decoded| decoded.instr)
     }
 
-    /// Pushes one statement tagged with the current instruction PC.
-    fn push(&mut self, stmt: HilStmt) {
-        self.stmts.push(Spanned::new(stmt, self.current_pc()));
+    /// Pushes one statement into the lifted block body.
+    fn push(&mut self, stmt: Stmt) {
+        self.stmts.push(stmt);
     }
 
     /// Reads the values of the given register range from the SSA table.
-    fn read_regs(&mut self, start: u8, count: u8) -> Vec<HilExpr> {
+    fn read_regs(&mut self, start: u8, count: u8) -> Vec<Expr> {
         reg_range(start, count)
-            .map(|reg| HilExpr::Symbol(self.get_reg_symbol(reg)))
+            .map(|reg| Expr::Symbol(self.get_reg_symbol(reg)))
             .collect()
     }
 
     /// Allocates a range of registers and returns their symbolic expressions.
-    fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<HilExpr> {
+    fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<Expr> {
         reg_range(start, count)
-            .map(|reg| HilExpr::Symbol(self.alloc_reg_symbol(reg)))
+            .map(|reg| Expr::Symbol(self.alloc_reg_symbol(reg)))
             .collect()
     }
 
     /// Returns a chained concatenated expression of the values of the given register range.
-    fn concat_expr_range(&mut self, start: u8, end: u8) -> HilExpr {
+    fn concat_expr_range(&mut self, start: u8, end: u8) -> Expr {
         assert!(
             start <= end,
             "invalid CONCAT register range: {start}..{end}"
         );
 
-        let mut expr = HilExpr::Symbol(self.get_reg_symbol(end));
+        let mut expr = Expr::Symbol(self.get_reg_symbol(end));
         for reg in (start..end).rev() {
-            expr = HilExpr::Binary {
-                lhs: Box::new(HilExpr::Symbol(self.get_reg_symbol(reg))),
+            expr = Expr::Binary {
+                lhs: Box::new(Expr::Symbol(self.get_reg_symbol(reg))),
                 op: BinOp::Concat,
                 rhs: Box::new(expr),
             };
@@ -184,17 +183,16 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         expr
     }
 
-    /// Emits a plain assignment statement at the current PC span.
-    fn assign(&mut self, left: HilExpr, value: HilExpr) {
-        self.push(HilStmt::Assign { left, value });
+    /// Emits a plain assignment statement.
+    fn assign(&mut self, left: Expr, value: Expr) {
+        self.push(Stmt::Assign { left, value });
     }
 
-    /// Emits a plain assignment statement at the current PC span, and allocates
-    /// a new register symbol in the arena.
-    fn assign_reg(&mut self, reg: u8, value: HilExpr) {
+    /// Emits a plain assignment statement and allocates a new register symbol.
+    fn assign_reg(&mut self, reg: u8, value: Expr) {
         let sym = self.alloc_reg_symbol(reg);
-        self.push(HilStmt::Assign {
-            left: HilExpr::Symbol(sym),
+        self.push(Stmt::Assign {
+            left: Expr::Symbol(sym),
             value,
         });
     }
@@ -276,17 +274,17 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         self.flush_multiret();
     }
 
-    /// Lifts all instructions into pc-spanned HIL statements in bytecode order.
-    pub fn run(mut self) -> Result<(Vec<Spanned<HilStmt>>, Option<MultiRet>)> {
+    /// Lifts all instructions into HIL statements in bytecode order.
+    pub fn run(mut self) -> Result<(Vec<Stmt>, Option<MultiRet>)> {
         while let Some(instr) = self.next() {
             self.flush_pending_before(instr);
 
             match &instr {
                 Instr::Nop => {}
-                Instr::LoadNil { reg } => self.assign_reg(*reg, HilExpr::Nil),
-                Instr::LoadB { reg, value, .. } => self.assign_reg(*reg, HilExpr::Bool(*value)),
+                Instr::LoadNil { reg } => self.assign_reg(*reg, Expr::Nil),
+                Instr::LoadB { reg, value, .. } => self.assign_reg(*reg, Expr::Bool(*value)),
                 Instr::LoadN { reg, value } => {
-                    self.assign_reg(*reg, HilExpr::Number(HilNumber::Float(*value as f64)))
+                    self.assign_reg(*reg, Expr::Number(Number::Float(*value as f64)))
                 }
                 Instr::LoadK { reg, index } => {
                     let value = self.const_expr(ConstId(*index as u32))?;
@@ -298,12 +296,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 }
                 Instr::Move { dest, src } => {
                     let sym = self.get_reg_symbol(*src);
-                    self.assign_reg(*dest, HilExpr::Symbol(sym))
+                    self.assign_reg(*dest, Expr::Symbol(sym))
                 }
                 Instr::GetGlobal { dest, key, .. } => {
                     self.assign_reg(
                         *dest,
-                        HilExpr::Global(
+                        Expr::Global(
                             self.const_string(ConstId(*key))
                                 .with_context(|| format!("invalid string constant {key}"))?
                                 .to_smolstr(),
@@ -313,17 +311,17 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 Instr::SetGlobal { src, key, .. } => {
                     let sym = self.get_reg_symbol(*src);
                     self.assign(
-                        HilExpr::Global(
+                        Expr::Global(
                             self.const_string(ConstId(*key))
                                 .with_context(|| format!("invalid string constant {key}"))?
                                 .to_smolstr(),
                         ),
-                        HilExpr::Symbol(sym),
+                        Expr::Symbol(sym),
                     );
                 }
                 Instr::GetUpval { dest, upval } => {
                     let upval_sym = self.ssa.read_upval(self.block_idx, *upval);
-                    self.assign_reg(*dest, HilExpr::Symbol(upval_sym));
+                    self.assign_reg(*dest, Expr::Symbol(upval_sym));
                 }
                 Instr::SetUpval { src, upval } => {
                     let upval_sym = self.ssa.alloc_symbol(Symbol::upval(*upval));
@@ -331,12 +329,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
                     let src_sym = self.get_reg_symbol(*src);
 
-                    self.assign(HilExpr::Symbol(upval_sym), HilExpr::Symbol(src_sym))
+                    self.assign(Expr::Symbol(upval_sym), Expr::Symbol(src_sym))
                 }
                 Instr::GetImport { dest, path, .. } => {
                     self.assign_reg(
                         *dest,
-                        HilExpr::import(ImportPath(*path), self.chunk, self.proto)?,
+                        Expr::import(ImportPath(*path), self.chunk, self.proto)?,
                     );
                 }
 
@@ -368,8 +366,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let field = self.const_string(ConstId(*key))?;
                     self.assign_reg(
                         *dest,
-                        HilExpr::GetField {
-                            obj: Box::new(HilExpr::Symbol(sym)),
+                        Expr::GetField {
+                            obj: Box::new(Expr::Symbol(sym)),
                             field: field.to_smolstr(),
                         },
                     );
@@ -384,8 +382,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let field = self.const_string(ConstId(u32::from(*key)))?;
                     self.assign_reg(
                         *dest,
-                        HilExpr::GetField {
-                            obj: Box::new(HilExpr::Symbol(sym)),
+                        Expr::GetField {
+                            obj: Box::new(Expr::Symbol(sym)),
                             field: field.to_smolstr(),
                         },
                     );
@@ -395,9 +393,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let key_sym = self.get_reg_symbol(*key);
                     self.assign_reg(
                         *dest,
-                        HilExpr::GetIndex {
-                            obj: Box::new(HilExpr::Symbol(table_sym)),
-                            index: Box::new(HilExpr::Symbol(key_sym)),
+                        Expr::GetIndex {
+                            obj: Box::new(Expr::Symbol(table_sym)),
+                            index: Box::new(Expr::Symbol(key_sym)),
                         },
                     );
                 }
@@ -405,9 +403,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let sym = self.get_reg_symbol(*table);
                     self.assign_reg(
                         *dest,
-                        HilExpr::GetIndex {
-                            obj: Box::new(HilExpr::Symbol(sym)),
-                            index: Box::new(HilExpr::Number(HilNumber::Float(*index as f64))),
+                        Expr::GetIndex {
+                            obj: Box::new(Expr::Symbol(sym)),
+                            index: Box::new(Expr::Number(Number::Float(*index as f64))),
                         },
                     );
                 }
@@ -418,11 +416,11 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let value_sym = self.get_reg_symbol(*src);
                     let field = self.const_string(ConstId(*key))?;
                     self.assign(
-                        HilExpr::GetField {
-                            obj: Box::new(HilExpr::Symbol(table_sym)),
+                        Expr::GetField {
+                            obj: Box::new(Expr::Symbol(table_sym)),
                             field: field.to_smolstr(),
                         },
-                        HilExpr::Symbol(value_sym),
+                        Expr::Symbol(value_sym),
                     );
                 }
                 Instr::SetUDataKS {
@@ -432,22 +430,22 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let value_sym = self.get_reg_symbol(*src);
                     let field = self.const_string(ConstId(u32::from(*key)))?;
                     self.assign(
-                        HilExpr::GetField {
-                            obj: Box::new(HilExpr::Symbol(userdata_sym)),
+                        Expr::GetField {
+                            obj: Box::new(Expr::Symbol(userdata_sym)),
                             field: field.to_smolstr(),
                         },
-                        HilExpr::Symbol(value_sym),
+                        Expr::Symbol(value_sym),
                     );
                 }
                 Instr::SetTableN { src, table, index } => {
                     let table_sym = self.get_reg_symbol(*table);
                     let value_sym = self.get_reg_symbol(*src);
                     self.assign(
-                        HilExpr::GetIndex {
-                            obj: Box::new(HilExpr::Symbol(table_sym)),
-                            index: Box::new(HilExpr::Number(HilNumber::Float(*index as f64))),
+                        Expr::GetIndex {
+                            obj: Box::new(Expr::Symbol(table_sym)),
+                            index: Box::new(Expr::Number(Number::Float(*index as f64))),
                         },
-                        HilExpr::Symbol(value_sym),
+                        Expr::Symbol(value_sym),
                     );
                 }
                 Instr::SetTable { src, table, key } => {
@@ -455,11 +453,11 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let key_sym = self.get_reg_symbol(*key);
                     let value_sym = self.get_reg_symbol(*src);
                     self.assign(
-                        HilExpr::GetIndex {
-                            obj: Box::new(HilExpr::Symbol(table_sym)),
-                            index: Box::new(HilExpr::Symbol(key_sym)),
+                        Expr::GetIndex {
+                            obj: Box::new(Expr::Symbol(table_sym)),
+                            index: Box::new(Expr::Symbol(key_sym)),
                         },
-                        HilExpr::Symbol(value_sym),
+                        Expr::Symbol(value_sym),
                     );
                 }
 
@@ -477,10 +475,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let rhs_sym = self.get_reg_symbol(*b);
                     self.assign_reg(
                         *dest,
-                        HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Symbol(lhs_sym)),
+                        Expr::Binary {
+                            lhs: Box::new(Expr::Symbol(lhs_sym)),
                             op: binop_for_instr(&instr),
-                            rhs: Box::new(HilExpr::Symbol(rhs_sym)),
+                            rhs: Box::new(Expr::Symbol(rhs_sym)),
                         },
                     );
                 }
@@ -502,10 +500,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let lhs_sym = self.get_reg_symbol(*reg);
                     self.assign_reg(
                         *dest,
-                        HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Symbol(lhs_sym)),
+                        Expr::Binary {
+                            lhs: Box::new(Expr::Symbol(lhs_sym)),
                             op: binop_for_instr(&instr),
-                            rhs: Box::new(HilExpr::Number(HilNumber::Float(num))),
+                            rhs: Box::new(Expr::Number(Number::Float(num))),
                         },
                     );
                 }
@@ -521,10 +519,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let rhs_sym = self.get_reg_symbol(*reg);
                     self.assign_reg(
                         *dest,
-                        HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Number(HilNumber::Float(num))),
+                        Expr::Binary {
+                            lhs: Box::new(Expr::Number(Number::Float(num))),
                             op: binop_for_instr(&instr),
-                            rhs: Box::new(HilExpr::Symbol(rhs_sym)),
+                            rhs: Box::new(Expr::Symbol(rhs_sym)),
                         },
                     );
                 }
@@ -534,8 +532,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let lhs_sym = self.get_reg_symbol(*reg);
                     self.assign_reg(
                         *dest,
-                        HilExpr::Binary {
-                            lhs: Box::new(HilExpr::Symbol(lhs_sym)),
+                        Expr::Binary {
+                            lhs: Box::new(Expr::Symbol(lhs_sym)),
                             op: binop_for_instr(&instr),
                             rhs: Box::new(self.const_expr(ConstId(*k as u32))?),
                         },
@@ -553,15 +551,15 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let sym = self.get_reg_symbol(*reg);
                     self.assign_reg(
                         *dest,
-                        HilExpr::Unary {
+                        Expr::Unary {
                             op: unop_for_instr(&instr),
-                            expr: Box::new(HilExpr::Symbol(sym)),
+                            expr: Box::new(Expr::Symbol(sym)),
                         },
                     )
                 }
 
                 Instr::NewTable { dest, .. } => {
-                    self.assign_reg(*dest, HilExpr::Table { items: Vec::new() });
+                    self.assign_reg(*dest, Expr::Table { items: Vec::new() });
                 }
                 Instr::DupTable { dest, k } => {
                     let value = self.const_expr(ConstId(*k as u32))?;
@@ -576,7 +574,6 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 } => self.lift_setlist(*table, *base, *count, *index),
 
                 Instr::NewClosure { dest, proto: index } => {
-                    let pc = self.current_pc();
                     let Some(proto_id) = self.proto.get_child_proto(ChildProtoId(*index)) else {
                         bail!(
                             "did not find child proto for index {} in proto {:?}",
@@ -584,10 +581,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                             self.proto.id,
                         );
                     };
-                    self.lift_closure(*dest, proto_id, pc)?;
+                    self.lift_closure(*dest, proto_id)?;
                 }
                 Instr::DupClosure { dest, k } => {
-                    let pc = self.current_pc();
                     let Some(Constant::Closure(proto_id)) =
                         self.proto.get_constant(ConstId(*k as u32))
                     else {
@@ -597,7 +593,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                             self.proto.id
                         );
                     };
-                    self.lift_closure(*dest, *proto_id, pc)?;
+                    self.lift_closure(*dest, *proto_id)?;
                 }
 
                 Instr::CloseUpvals { reg } => self.note_close_upvals(*reg),
@@ -619,14 +615,14 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                         debug_assert!(self.pending_multiret.is_none());
                         self.pending_multiret = Some(MultiRet {
                             base: *dest,
-                            expr: HilExpr::VarArgs.to_spanned(self.current_pc()),
+                            expr: Expr::VarArgs,
                         });
                     }
                     Count::Number(n) => {
                         let left = self.alloc_regs(*dest, n);
-                        self.push(HilStmt::AssignMany {
+                        self.push(Stmt::AssignMany {
                             left,
-                            value: HilExpr::VarArgs,
+                            value: Expr::VarArgs,
                         });
                     }
                 },
@@ -677,8 +673,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 Vec::new()
             }),
         };
-        let call = HilExpr::Call {
-            fun: Box::new(HilExpr::Symbol(self.get_reg_symbol(func))),
+        let call = Expr::Call {
+            fun: Box::new(Expr::Symbol(self.get_reg_symbol(func))),
             args,
         };
         self.emit_call_result(func, ret_count, call);
@@ -739,8 +735,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             _ => Vec::new(),
         };
 
-        let method_call = HilExpr::MethodCall {
-            object: Box::new(HilExpr::Symbol(self.get_reg_symbol(object))),
+        let method_call = Expr::MethodCall {
+            object: Box::new(Expr::Symbol(self.get_reg_symbol(object))),
             method: method.to_smolstr(),
             args,
         };
@@ -761,7 +757,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         };
 
         let table_sym = self.get_reg_symbol(table);
-        self.push(HilStmt::SetList {
+        self.push(Stmt::SetList {
             table: table_sym,
             index,
             values,
@@ -770,29 +766,26 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
     }
 
     /// Emit the result of a CALL or NAMECALL depending on the return count.
-    fn emit_call_result(&mut self, dest: u8, ret_count: u8, expr: HilExpr) {
+    fn emit_call_result(&mut self, dest: u8, ret_count: u8, expr: Expr) {
         assert!(
-            matches!(expr, HilExpr::Call { .. } | HilExpr::MethodCall { .. }),
+            matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. }),
             "expected a call expression"
         );
         match Count::from(ret_count) {
-            Count::Number(0) => self.push(HilStmt::Call(expr)),
+            Count::Number(0) => self.push(Stmt::Call(expr)),
             Count::Number(1) => self.assign_reg(dest, expr),
             Count::Number(n) => {
                 let left = self.alloc_regs(dest, n);
-                self.push(HilStmt::AssignMany { left, value: expr });
+                self.push(Stmt::AssignMany { left, value: expr });
             }
             Count::Variadic => {
                 debug_assert!(self.pending_multiret.is_none());
-                self.pending_multiret = Some(MultiRet {
-                    base: dest,
-                    expr: expr.to_spanned(self.current_pc()),
-                });
+                self.pending_multiret = Some(MultiRet { base: dest, expr });
             }
         }
     }
 
-    fn lift_closure(&mut self, dest: u8, proto_id: ProtoId, pc: u32) -> Result<()> {
+    fn lift_closure(&mut self, dest: u8, proto_id: ProtoId) -> Result<()> {
         let sym = self.alloc_reg_symbol(dest);
         let proto = self
             .chunk
@@ -801,24 +794,21 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
         let captures = self.consume_captures(proto.num_upvals)?;
 
-        self.stmts.push(
-            HilStmt::Assign {
-                left: HilExpr::Symbol(sym),
-                value: HilExpr::Closure {
-                    proto: proto.id,
-                    captures,
-                },
-            }
-            .to_spanned(pc),
-        );
+        self.stmts.push(Stmt::Assign {
+            left: Expr::Symbol(sym),
+            value: Expr::Closure {
+                proto: proto.id,
+                captures,
+            },
+        });
 
         Ok(())
     }
 
     /// Build a variadic argument list from the pending multiret starting no
-    /// later than `first`. The result is a fixed-prefix of `HilExpr::Reg`
+    /// later than `first`. The result is a fixed-prefix of `Expr::Reg`
     /// values followed by the multiret expression.
-    fn take_variadic_from(&mut self, first: u8) -> Option<Vec<HilExpr>> {
+    fn take_variadic_from(&mut self, first: u8) -> Option<Vec<Expr>> {
         if self
             .pending_multiret
             .as_ref()
@@ -828,7 +818,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         }
         let MultiRet { base, expr } = self.pending_multiret.take().unwrap();
         let mut args = self.read_regs(first, base - first);
-        args.push(expr.strip());
+        args.push(expr);
         Some(args)
     }
 
@@ -893,12 +883,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
     /// A helper for resolving expression constants from the proto.
     #[inline]
-    fn const_expr(&self, id: ConstId) -> Result<HilExpr> {
+    fn const_expr(&self, id: ConstId) -> Result<Expr> {
         let ct = self
             .proto
             .get_constant(id)
             .with_context(|| format!("missing constant at {id:?}"))?;
-        HilExpr::from_constant(ct, self.chunk, self.proto)
+        Expr::from_constant(ct, self.chunk, self.proto)
     }
 }
 
@@ -911,25 +901,22 @@ pub fn flush_multiret<G: GraphView>(
     multiret: MultiRet,
     block_idx: usize,
     ssa: &mut Ssa<'_, G>,
-    stmts: &mut Vec<Spanned<HilStmt>>,
+    stmts: &mut Vec<Stmt>,
 ) {
     let MultiRet { base, expr } = multiret;
 
-    match expr.node {
-        HilExpr::Call { .. } | HilExpr::MethodCall { .. } => {
-            stmts.push(expr.map(HilStmt::Call));
+    match expr {
+        call @ (Expr::Call { .. } | Expr::MethodCall { .. }) => {
+            stmts.push(Stmt::Call(call));
         }
-        HilExpr::VarArgs => {
+        Expr::VarArgs => {
             let sym = ssa.alloc_symbol(Symbol::reg(base));
             ssa.write_reg(block_idx, base, sym);
 
-            stmts.push(
-                HilStmt::Assign {
-                    left: HilExpr::Symbol(sym),
-                    value: HilExpr::VarArgs,
-                }
-                .to_spanned(expr.pc), // this is probably not correct
-            );
+            stmts.push(Stmt::Assign {
+                left: Expr::Symbol(sym),
+                value: Expr::VarArgs,
+            });
         }
         _ => unreachable!("unexpected deferred variadic source"),
     }
@@ -938,7 +925,7 @@ pub fn flush_multiret<G: GraphView>(
 /// Lifts one instruction slice into raw HIL statements.
 pub fn lift<'a, 'cfg, G: GraphView>(
     ctx: LiftContext<'a, 'cfg, G>,
-) -> Result<(Vec<Spanned<HilStmt>>, Option<MultiRet>)> {
+) -> Result<(Vec<Stmt>, Option<MultiRet>)> {
     let lifter = Lifter::new(ctx);
     lifter.run()
 }

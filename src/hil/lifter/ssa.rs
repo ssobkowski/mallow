@@ -4,7 +4,7 @@ use id_arena::{Arena, Id};
 
 use crate::hil::{
     cflow::{cfg::Block, graph::GraphView},
-    ir::{HilStmt, PhiNode},
+    ir::{PhiNode, Stmt},
     ty::TypeId,
 };
 
@@ -296,9 +296,7 @@ impl<'a, G: GraphView> Ssa<'a, G> {
                 operands: resolved_operands,
             };
 
-            blocks[block_idx]
-                .stmts_mut()
-                .insert(0, HilStmt::Phi(phi_node));
+            blocks[block_idx].stmts_mut().insert(0, Stmt::Phi(phi_node));
         }
     }
 }
