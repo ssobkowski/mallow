@@ -3,7 +3,6 @@ pub mod ir;
 pub mod lifted;
 pub mod lifter;
 pub mod passes;
-pub mod ty;
 pub mod ty2;
 pub mod visitor;
 
@@ -16,9 +15,8 @@ use crate::{
             graph::GraphView,
             region::{self, RegionNode},
         },
-        lifted::{FunctionSymbols, FunctionTypes, LiftedFunction},
-        lifter::ssa::SymbolId,
-        ty::Type,
+        lifted::{FunctionTypes, LiftedFunction},
+        lifter::ssa::FunctionSymbols,
     },
     il::ProtoId,
     logging::{Diagnostics, LogLevel, LogTarget},
@@ -53,15 +51,11 @@ pub struct StructuredFunction {
 }
 
 impl StructuredFunction {
-    /// Returns the best available type for a final HIL symbol.
-    pub fn symbol_type(&self, sym: SymbolId) -> Option<&Type> {
-        self.types.symbol_type(sym)
-    }
-
     pub fn from_lifted(mut lifted: LiftedFunction, diagnostics: &Diagnostics) -> Result<Self> {
         let diagnostics = diagnostics.for_proto(lifted.proto.0);
         let info = diagnostics.at(LogLevel::Info, LogTarget::Hil);
 
+        lifted.destruct_ssa();
         lifted.cfg.unfold_phis();
 
         info.line(1, format_args!("running pre-region passes..."));

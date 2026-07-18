@@ -15,7 +15,7 @@ use crate::{
             common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL},
             ssa::{Symbol, SymbolId},
         },
-        ty::ProtoTypeContext,
+        ty2::bytecode::ProtoTypeContext,
     },
     il::{
         ChildProtoId, ConstId, Constant, Count, DecodedInstr, ImportPath, Instr, LuauString, Proto,

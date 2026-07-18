@@ -1,9 +1,9 @@
-use smol_str::SmolStr;
-
 use crate::{
-    ast::{Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Typed},
+    ast::{
+        Block, ElseClause, Expr, GenericBinder, If, Literal, Parameter, Stmt, TableItem, Type,
+        TypeLiteral, TypePack, TypePackTail, TypePrecedence, Typed,
+    },
     common::escape_string,
-    hil::ty::{FunctionTypeParam, FunctionTypeReturn, Type, TypeLiteral, TypePrecedence},
     operator::{BinOp, UnOp},
 };
 
@@ -132,7 +132,7 @@ impl AstPrinter {
                 generics,
                 params,
                 body,
-                ty,
+                returns,
             } => {
                 self.write("local function ");
                 self.write(name.as_str());
@@ -140,7 +140,10 @@ impl AstPrinter {
                 self.write("(");
                 self.write_params(params);
                 self.write(")");
-                self.write_type_annotation(ty.as_ref());
+                if let Some(returns) = returns {
+                    self.write(": ");
+                    self.write_return_type_pack(returns);
+                }
                 self.newline();
                 self.indent += 1;
                 self.walk_block(body);
@@ -444,13 +447,16 @@ impl AstPrinter {
     }
 
     /// Writes a generic parameter declaration when one is present.
-    fn write_generics(&mut self, generics: &[SmolStr]) {
+    fn write_generics(&mut self, generics: &[GenericBinder]) {
         if generics.is_empty() {
             return;
         }
         self.write("<");
         self.write_punctuated(generics, ", ", |printer, generic| {
-            printer.write(generic.as_str());
+            printer.write(generic.name().as_str());
+            if matches!(generic, GenericBinder::Pack(_)) {
+                printer.write("...");
+            }
         });
         self.write(">");
     }
@@ -495,38 +501,30 @@ impl AstPrinter {
             Type::Function {
                 generics,
                 params,
-                return_type,
+                returns,
             } => {
                 if !generics.is_empty() {
                     self.write("<");
                     self.write_punctuated(generics, ", ", |p, generic| {
-                        p.write(generic);
+                        p.write(generic.name().as_str());
+                        if matches!(generic, GenericBinder::Pack(_)) {
+                            p.write("...");
+                        }
                     });
                     self.write(">");
                 }
                 self.write("(");
-                self.write_punctuated(params, ", ", |p, param| match param {
-                    FunctionTypeParam::Type(ty) => p.write_type(ty, TypePrecedence::Lowest),
-                    FunctionTypeParam::Vararg(ty) => {
-                        p.write("...");
-                        p.write_type(ty, TypePrecedence::Lowest);
-                    }
+                self.write_punctuated(&params.head, ", ", |p, ty| {
+                    p.write_type(ty, TypePrecedence::Lowest)
                 });
+                if let Some(tail) = &params.tail {
+                    if !params.head.is_empty() {
+                        self.write(", ");
+                    }
+                    self.write_type_pack_tail(tail);
+                }
                 self.write(") -> ");
-                let parenthesized_returns = return_type.len() > 1;
-                if parenthesized_returns {
-                    self.write("(");
-                }
-                self.write_punctuated(return_type, ", ", |p, return_type| match return_type {
-                    FunctionTypeReturn::Type(ty) => p.write_type(ty, TypePrecedence::Lowest),
-                    FunctionTypeReturn::Vararg(ty) => {
-                        p.write("...");
-                        p.write_type(ty, TypePrecedence::Lowest);
-                    }
-                });
-                if parenthesized_returns {
-                    self.write(")");
-                }
+                self.write_return_type_pack(returns);
             }
             Type::Thread => self.write("thread"),
             Type::Userdata => self.write("userdata"),
@@ -537,7 +535,6 @@ impl AstPrinter {
             Type::Never => self.write("never"),
             Type::Any => self.write("any"),
             Type::Named(name) | Type::Generic(name) => self.write(name.as_str()),
-            Type::Unit => self.write("()"),
             Type::Literal(literal) => self.write_type_literal(literal),
             Type::Union(types) => {
                 self.write_punctuated(types, " | ", |p, ty| {
@@ -556,6 +553,44 @@ impl AstPrinter {
 
         if needs_parens {
             self.write(")");
+        }
+    }
+
+    /// Writes one homogeneous or generic type-pack tail.
+    fn write_type_pack_tail(&mut self, tail: &TypePackTail) {
+        match tail {
+            TypePackTail::Homogeneous(ty) => {
+                self.write("...");
+                self.write_type(ty, TypePrecedence::Lowest);
+            }
+            TypePackTail::Generic(name) => {
+                self.write(name.as_str());
+                self.write("...");
+            }
+        }
+    }
+
+    /// Writes a function return pack with the parentheses required by Luau.
+    fn write_return_type_pack(&mut self, returns: &TypePack) {
+        let return_count = returns.head.len() + usize::from(returns.tail.is_some());
+        if return_count == 0 {
+            self.write("()");
+        } else if return_count > 1 {
+            self.write("(");
+            self.write_punctuated(&returns.head, ", ", |printer, ty| {
+                printer.write_type(ty, TypePrecedence::Lowest);
+            });
+            if let Some(tail) = &returns.tail {
+                if !returns.head.is_empty() {
+                    self.write(", ");
+                }
+                self.write_type_pack_tail(tail);
+            }
+            self.write(")");
+        } else if let Some(ty) = returns.head.first() {
+            self.write_type(ty, TypePrecedence::Lowest);
+        } else if let Some(tail) = &returns.tail {
+            self.write_type_pack_tail(tail);
         }
     }
 
@@ -779,8 +814,9 @@ mod tests {
     use super::{
         AstPrinter, escape_string, escaped_len, long_string_level, print, should_use_long_string,
     };
-    use crate::ast::{Block, Expr, Literal, Stmt};
-    use crate::hil::ty::{FunctionTypeParam, FunctionTypeReturn, Type, TypePrecedence};
+    use crate::ast::{
+        Block, Expr, GenericBinder, Literal, Stmt, Type, TypePack, TypePackTail, TypePrecedence,
+    };
 
     fn render_type(ty: &Type) -> String {
         let mut printer = AstPrinter::new();
@@ -807,8 +843,14 @@ mod tests {
     fn unknown_function_type() -> Type {
         Type::Function {
             generics: Vec::new(),
-            params: vec![FunctionTypeParam::Vararg(Type::Unknown)],
-            return_type: vec![FunctionTypeReturn::Type(Type::Unknown)],
+            params: TypePack {
+                head: Vec::new(),
+                tail: Some(TypePackTail::Homogeneous(Box::new(Type::Unknown))),
+            },
+            returns: TypePack {
+                head: vec![Type::Unknown],
+                tail: None,
+            },
         }
     }
 
@@ -836,7 +878,7 @@ mod tests {
 
     #[test]
     fn prints_optional_function_type_with_function_parenthesized() {
-        let ty = unknown_function_type().union(Type::Nil);
+        let ty = Type::Union(vec![unknown_function_type(), Type::Nil]);
 
         assert_eq!(render_type(&ty), "((...unknown) -> unknown) | nil");
     }
@@ -845,11 +887,32 @@ mod tests {
     fn prints_function_return_union_without_changing_function_type() {
         let ty = Type::Function {
             generics: Vec::new(),
-            params: Vec::new(),
-            return_type: vec![FunctionTypeReturn::Type(Type::Unknown.union(Type::Nil))],
+            params: TypePack::default(),
+            returns: TypePack {
+                head: vec![Type::Union(vec![Type::Unknown, Type::Nil])],
+                tail: None,
+            },
         };
 
         assert_eq!(render_type(&ty), "() -> unknown | nil");
+    }
+
+    /// Generic pack binders and tails retain Luau's postfix ellipsis syntax.
+    #[test]
+    fn prints_generic_type_pack_tails() {
+        let ty = Type::Function {
+            generics: vec![GenericBinder::Pack("T".into())],
+            params: TypePack {
+                head: Vec::new(),
+                tail: Some(TypePackTail::Generic("T".into())),
+            },
+            returns: TypePack {
+                head: Vec::new(),
+                tail: Some(TypePackTail::Generic("T".into())),
+            },
+        };
+
+        assert_eq!(render_type(&ty), "<T...>(T...) -> T...");
     }
 
     #[test]

@@ -14,8 +14,8 @@ use crate::{
     hil::{
         cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
         ir::{Expr, PhiNode, Stmt, ValuePack},
-        lifter::ssa::SymbolId,
-        ty::{TypeId, TypeStore},
+        lifter::ssa::{FunctionSymbols, SymbolId},
+        ty2::{canonical::TypeId, store::TypeStore},
     },
     il::{DecodedInstr, Instr, Proto, reg_add, reg_range},
     operator::BinOp,
@@ -258,11 +258,15 @@ pub struct ControlFlowGraph {
     idoms: DominatorTree,
 }
 
+/// Control-flow graph and SSA metadata produced for one proto.
 pub struct CfgBuild {
+    /// Lifted graph with explicit nontrivial Phi statements.
     pub cfg: ControlFlowGraph,
-    pub params: Vec<SymbolId>,
-    pub upvalues: Vec<SymbolId>,
+    /// Symbols and storage links found while building SSA.
+    pub symbols: FunctionSymbols,
+    /// Bytecode type facts for the surviving SSA versions.
     pub symbol_types: HashMap<SymbolId, TypeId>,
+    /// Type graph that owns the IDs in `symbol_types`.
     pub type_store: TypeStore,
 }
 
@@ -277,8 +281,7 @@ pub fn build_from_proto(proto: &Proto, chunk: &Chunk) -> Result<CfgBuild> {
 
     let block_lifter::BuildResult {
         mut blocks,
-        params,
-        upvalues,
+        symbols,
         symbol_types,
         type_store,
     } = block_lifter::lift_blocks(proto, chunk, &raw_blocks, &graph)?;
@@ -314,8 +317,7 @@ pub fn build_from_proto(proto: &Proto, chunk: &Chunk) -> Result<CfgBuild> {
 
     Ok(CfgBuild {
         cfg,
-        params,
-        upvalues,
+        symbols,
         symbol_types,
         type_store,
     })

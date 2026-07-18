@@ -1,9 +1,193 @@
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+};
+
 use smol_str::SmolStr;
 
-use crate::{
-    hil::ty::Type,
-    operator::{BinOp, CompoundBinOp, UnOp},
-};
+use crate::operator::{BinOp, CompoundBinOp, UnOp};
+
+/// A singleton value represented in a source type annotation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TypeLiteral {
+    /// One exact string value.
+    String(String),
+    /// One exact boolean value.
+    Boolean(bool),
+}
+
+/// The printable shape of a function's positional and variadic slots.
+///
+/// The HIL graph stores packs by `TypeId`; the AST owns this recursive form so
+/// the printer never needs to know about graph arenas or solver identities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct TypePack {
+    /// Fixed positional elements before an optional variadic tail.
+    pub head: Vec<Type>,
+    /// Variadic or generic tail, when the pack is open.
+    pub tail: Option<TypePackTail>,
+}
+
+/// One open tail in a printable Luau type pack.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TypePackTail {
+    /// A homogeneous `...T` tail that repeats one element type.
+    Homogeneous(Box<Type>),
+    /// A generic `T...` tail that substitutes an entire type pack.
+    Generic(SmolStr),
+}
+
+/// One generic binder printed on a function declaration or function type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GenericBinder {
+    /// Binds a single type such as `T`.
+    Type(SmolStr),
+    /// Binds a type pack such as `T...`.
+    Pack(SmolStr),
+}
+
+impl GenericBinder {
+    /// Returns the binder name without pack punctuation.
+    #[must_use]
+    pub fn name(&self) -> &SmolStr {
+        match self {
+            Self::Type(name) | Self::Pack(name) => name,
+        }
+    }
+}
+
+/// A source-level Luau type annotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Type {
+    /// The `nil` type.
+    Nil,
+    /// The `string` type.
+    String,
+    /// The `number` type.
+    Number,
+    /// The `boolean` type.
+    Boolean,
+    /// A structural table shape.
+    Table {
+        /// Statically named fields.
+        fields: HashMap<SmolStr, Type>,
+        /// Indexed field key and value types.
+        array: Option<Box<(Type, Type)>>,
+    },
+    /// A structural function signature.
+    Function {
+        /// Generic binders declared by the function.
+        generics: Vec<GenericBinder>,
+        /// Positional and variadic parameters.
+        params: TypePack,
+        /// Positional and variadic returns; an empty pack prints `()`.
+        returns: TypePack,
+    },
+    /// The `thread` type.
+    Thread,
+    /// The `userdata` type.
+    Userdata,
+    /// The `vector` type.
+    Vector,
+    /// The `integer` type.
+    Integer,
+    /// The `buffer` type.
+    Buffer,
+    /// The `unknown` type.
+    Unknown,
+    /// The `never` type.
+    Never,
+    /// The `any` type.
+    Any,
+    /// A named runtime type.
+    Named(SmolStr),
+    /// A singleton literal type.
+    Literal(TypeLiteral),
+    /// A named generic type parameter.
+    Generic(SmolStr),
+    /// A structural union.
+    Union(Vec<Type>),
+    /// A structural intersection.
+    Intersection(Vec<Type>),
+    /// A base type with modeled metatable behavior.
+    WithMetatable {
+        /// Value type before metatable behavior is applied.
+        base: Box<Type>,
+        /// Method signatures exposed by the metatable.
+        metatable: Vec<(SmolStr, Type)>,
+    },
+}
+
+impl Hash for Type {
+    /// Hashes table fields in sorted order so annotations remain deterministic.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Table { fields, array } => {
+                let mut fields: Vec<_> = fields.iter().collect();
+                fields.sort_unstable_by_key(|(name, _)| name.as_str());
+                fields.hash(state);
+                array.hash(state);
+            }
+            Self::Function {
+                generics,
+                params,
+                returns,
+            } => {
+                generics.hash(state);
+                params.hash(state);
+                returns.hash(state);
+            }
+            Self::Named(name) | Self::Generic(name) => name.hash(state),
+            Self::Literal(literal) => literal.hash(state),
+            Self::Union(types) | Self::Intersection(types) => types.hash(state),
+            Self::WithMetatable { base, metatable } => {
+                base.hash(state);
+                metatable.hash(state);
+            }
+            Self::Nil
+            | Self::String
+            | Self::Number
+            | Self::Boolean
+            | Self::Thread
+            | Self::Userdata
+            | Self::Vector
+            | Self::Integer
+            | Self::Buffer
+            | Self::Unknown
+            | Self::Never
+            | Self::Any => {}
+        }
+    }
+}
+
+/// Binding strength used when printing a type inside another type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TypePrecedence {
+    /// Allows every type form without parentheses.
+    Lowest = 0,
+    /// Parenthesizes surrounding function types.
+    Function = 1,
+    /// Parenthesizes surrounding union and function types.
+    Union = 2,
+    /// Parenthesizes surrounding intersection, union, and function types.
+    Intersection = 3,
+    /// Atomic type that never needs parentheses.
+    Primary = 4,
+}
+
+impl Type {
+    /// Returns the binding strength used when emitting a nested type.
+    pub const fn precedence(&self) -> TypePrecedence {
+        match self {
+            Self::Function { .. } => TypePrecedence::Function,
+            Self::Union(_) => TypePrecedence::Union,
+            Self::Intersection(_) => TypePrecedence::Intersection,
+            Self::WithMetatable { base, .. } => base.precedence(),
+            _ => TypePrecedence::Primary,
+        }
+    }
+}
 
 /// An identifier such as `foo`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
@@ -103,13 +287,13 @@ pub enum Stmt {
         /// Function name.
         name: Identifier,
         /// Generic parameters declared by the function.
-        generics: Vec<SmolStr>,
+        generics: Vec<GenericBinder>,
         /// Function parameters.
         params: Vec<Typed<Parameter>>,
         /// Function body.
         body: Block,
-        /// Optional return type.
-        ty: Option<Type>,
+        /// Optional return pack.
+        returns: Option<TypePack>,
     },
     /// `local a, b = ...`.
     LocalDeclaration {
@@ -223,7 +407,7 @@ pub enum Expr {
     /// Anonymous function expression.
     AnonymousFunction {
         /// Generic parameters declared by the function expression.
-        generics: Vec<SmolStr>,
+        generics: Vec<GenericBinder>,
         /// Function parameters.
         params: Vec<Typed<Parameter>>,
         /// Function body.

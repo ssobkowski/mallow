@@ -20,6 +20,10 @@ tracing-subscriber = "0.3.22"
 libtest-mimic = "0.8.2"
 tempfile = "3.26.0"
 
+[build-dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
 [features]
 default = []
 profile = ["dep:tracing-chrome"]

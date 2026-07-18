@@ -5,7 +5,7 @@ use id_arena::{Arena, Id};
 use crate::hil::{
     cflow::{cfg::Block, graph::GraphView},
     ir::{PhiNode, Stmt},
-    ty::TypeId,
+    ty2::canonical::TypeId,
 };
 
 pub type SymbolId = Id<Symbol>;
@@ -24,6 +24,53 @@ pub enum SymbolKind {
     CapturedRegister { reg: u8, generation: u16 },
     Upvalue(u8),
     Param(u8),
+}
+
+/// Stores the symbols and storage links found while building SSA.
+#[derive(Debug, Clone)]
+pub struct FunctionSymbols {
+    /// Entry versions for the function parameters.
+    pub params: Vec<SymbolId>,
+    /// Entry versions for the declared upvalues.
+    pub upvalues: Vec<SymbolId>,
+    /// Version groups for declared upvalue storage.
+    pub(crate) upvalue_version_groups: Vec<Vec<SymbolId>>,
+    /// Version groups for captured register storage.
+    pub(crate) captured_version_groups: Vec<Vec<SymbolId>>,
+    /// Version pairs that must use one source local after inference.
+    pub(crate) loop_carried_versions: Vec<(SymbolId, SymbolId)>,
+}
+
+impl FunctionSymbols {
+    /// Creates the symbol metadata for one lifted function.
+    pub(crate) fn new(
+        params: Vec<SymbolId>,
+        upvalues: Vec<SymbolId>,
+        upvalue_version_groups: Vec<Vec<SymbolId>>,
+        captured_version_groups: Vec<Vec<SymbolId>>,
+        loop_carried_versions: Vec<(SymbolId, SymbolId)>,
+    ) -> Self {
+        Self {
+            params,
+            upvalues,
+            upvalue_version_groups,
+            captured_version_groups,
+            loop_carried_versions,
+        }
+    }
+
+    /// Returns all versions of declared upvalue storage.
+    pub(crate) fn upvalue_version_groups(&self) -> impl Iterator<Item = &[SymbolId]> {
+        self.upvalue_version_groups.iter().map(Vec::as_slice)
+    }
+
+    /// Returns all version groups for mutable storage.
+    pub(crate) fn storage_version_groups(&self) -> impl Iterator<Item = &[SymbolId]> {
+        self.upvalue_version_groups
+            .iter()
+            .chain(&self.captured_version_groups)
+            .map(Vec::as_slice)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -281,22 +328,27 @@ impl<'a, G: GraphView> Ssa<'a, G> {
         }
     }
 
+    /// Materializes surviving Phi nodes in deterministic block and symbol order.
     pub fn finish(&mut self, blocks: &mut [Block]) {
-        let map = std::mem::take(&mut self.phi_to_operands);
-        for (phi_sym, operands) in map {
-            let block_idx = self.phi_to_block[&phi_sym];
+        let mut phis: Vec<_> = std::mem::take(&mut self.phi_to_operands)
+            .into_iter()
+            .collect();
+        phis.sort_by_key(|(symbol, _)| (self.phi_to_block[symbol], *symbol));
 
-            let resolved_operands: Vec<_> = operands
+        // Inserting at the front reverses each block's local order, so consume
+        // the globally sorted list backward to leave ascending symbol IDs.
+        for (phi_symbol, operands) in phis.into_iter().rev() {
+            let block_index = self.phi_to_block[&phi_symbol];
+            let operands = operands
                 .into_iter()
-                .map(|(p, sym)| (p, self.resolve(sym)))
+                .map(|(predecessor, symbol)| (predecessor, self.resolve(symbol)))
                 .collect();
-
-            let phi_node = PhiNode {
-                target: phi_sym,
-                operands: resolved_operands,
+            let phi = PhiNode {
+                target: phi_symbol,
+                operands,
             };
 
-            blocks[block_idx].stmts_mut().insert(0, Stmt::Phi(phi_node));
+            blocks[block_index].stmts_mut().insert(0, Stmt::Phi(phi));
         }
     }
 }

@@ -1,8 +1,8 @@
 pub mod cfg;
-mod common;
 pub mod graph;
+mod reg_set;
 pub mod region;
-mod union_find;
+pub(crate) mod union_find;
 
 #[cfg(feature = "visualize")]
 pub mod visualize;

@@ -86,13 +86,13 @@ impl<'b> BytecodeReader<'b> {
     }
 
     pub fn read_chunk(&mut self) -> Result<Chunk> {
-        let version = self.read::<u8>()?;
+        let version: u8 = self.read()?;
         ensure!(
             matches!(version, 5 | 6 | 7 | 8 | 9),
             "unsupported bytecode version {version}; expected version 5, 6, 7, 8, or 9",
         );
 
-        let types_version = self.read::<u8>()?;
+        let types_version: u8 = self.read()?;
         ensure!(
             matches!(types_version, 1 | 2 | 3),
             "invalid types version {types_version}; expected 1, 2, or 3",
@@ -133,7 +133,7 @@ impl<'b> BytecodeReader<'b> {
     }
 
     fn read_string_table(&mut self) -> Result<Vec<LuauString>> {
-        let len: usize = self.read_varint()?;
+        let len = self.read_varint()?;
         let mut strings = Vec::with_capacity(len);
         for _ in 0..len {
             strings.push(self.read_luau_string()?);
@@ -181,7 +181,7 @@ impl<'b> BytecodeReader<'b> {
     where
         T: FromLeBytes,
     {
-        let len: usize = self.read_varint()?;
+        let len = self.read_varint()?;
         let mut vec = Vec::with_capacity(len);
         for _ in 0..len {
             vec.push(self.read()?);
@@ -413,9 +413,9 @@ impl<'b> TypeReader<'b> {
     }
 
     fn read_v2_or_v3(&mut self) -> Result<ProtoTypeInfo> {
-        let function_size: usize = self.reader.read_varint()?;
-        let upvalue_count: usize = self.reader.read_varint()?;
-        let local_count: usize = self.reader.read_varint()?;
+        let function_size = self.reader.read_varint()?;
+        let upvalue_count = self.reader.read_varint()?;
+        let local_count = self.reader.read_varint()?;
 
         let function = if function_size == 0 {
             None

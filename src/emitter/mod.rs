@@ -21,7 +21,13 @@ use crate::{
         cflow::region::RegionNode,
         ir as hil,
         lifter::ssa::SymbolId,
-        ty::{FunctionTypeParam, FunctionTypeReturn, Type},
+        ty2::{
+            canonical::{
+                GenericBinder as GraphGenericBinder, Type as GraphType, TypeId, TypeLiteral,
+                TypePackId, TypePackTail as GraphTypePackTail,
+            },
+            store::TypeStore,
+        },
         visitor::Visitor,
     },
     il::ProtoId,
@@ -31,75 +37,160 @@ use crate::{
 
 const MAX_LOCAL_COUNT: usize = 199;
 
-/// Extracts the return annotation expected by `local function` syntax.
-///
-/// Symbol facts for a local function name may contain the full structural
-/// function type inferred for the closure. The AST node stores only the return
-/// annotation, so multi-return or unknown signatures are left unannotated here
-/// instead of printing the whole function type in return position.
-fn local_function_return_type(ty: &Type) -> Option<Type> {
-    let Type::Function { return_type, .. } = ty else {
-        return (ty.is_meaningful() && !ty.contains_unknown()).then(|| ty.clone());
-    };
-
-    let [return_ty] = return_type.as_slice() else {
-        return None;
-    };
-
-    let ty = match return_ty {
-        FunctionTypeReturn::Type(ty) | FunctionTypeReturn::Vararg(ty) => ty,
-    };
-
-    (ty.is_meaningful() && !ty.contains_unknown()).then(|| ty.clone())
-}
-
-/// Collects generic names referenced by one emitted type annotation.
-fn collect_generic_names(ty: &Type, names: &mut HashSet<SmolStr>) {
+/// Collects generic binders referenced by one emitted type annotation.
+fn collect_generic_binders(ty: &ast::Type, binders: &mut HashSet<ast::GenericBinder>) {
     match ty {
-        Type::Generic(name) => {
-            names.insert(name.clone());
+        ast::Type::Generic(name) => {
+            binders.insert(ast::GenericBinder::Type(name.clone()));
         }
-        Type::Table { fields, array } => {
+        ast::Type::Table { fields, array } => {
             for field in fields.values() {
-                collect_generic_names(field, names);
+                collect_generic_binders(field, binders);
             }
             if let Some(array) = array {
-                collect_generic_names(&array.0, names);
-                collect_generic_names(&array.1, names);
+                collect_generic_binders(&array.0, binders);
+                collect_generic_binders(&array.1, binders);
             }
         }
-        Type::Function {
-            params,
-            return_type,
-            ..
+        ast::Type::Function {
+            params, returns, ..
         } => {
-            for param in params {
-                match param {
-                    FunctionTypeParam::Type(ty) | FunctionTypeParam::Vararg(ty) => {
-                        collect_generic_names(ty, names);
-                    }
-                }
+            for ty in &params.head {
+                collect_generic_binders(ty, binders);
             }
-            for returned in return_type {
-                match returned {
-                    FunctionTypeReturn::Type(ty) | FunctionTypeReturn::Vararg(ty) => {
-                        collect_generic_names(ty, names);
-                    }
-                }
+            if let Some(tail) = &params.tail {
+                collect_pack_tail_generic_binders(tail, binders);
+            }
+            for ty in &returns.head {
+                collect_generic_binders(ty, binders);
+            }
+            if let Some(tail) = &returns.tail {
+                collect_pack_tail_generic_binders(tail, binders);
             }
         }
-        Type::Union(types) | Type::Intersection(types) => {
+        ast::Type::Union(types) | ast::Type::Intersection(types) => {
             for ty in types {
-                collect_generic_names(ty, names);
+                collect_generic_binders(ty, binders);
             }
         }
-        Type::WithMetatable { base, metatable } => {
-            collect_generic_names(base, names);
-            for (_, method) in metatable.iter() {
-                collect_generic_names(method, names);
+        ast::Type::WithMetatable { base, metatable } => {
+            collect_generic_binders(base, binders);
+            for (_, method) in metatable {
+                collect_generic_binders(method, binders);
             }
         }
         _ => {}
+    }
+}
+
+/// Collects generic binders referenced by one emitted type-pack tail.
+fn collect_pack_tail_generic_binders(
+    tail: &ast::TypePackTail,
+    binders: &mut HashSet<ast::GenericBinder>,
+) {
+    match tail {
+        ast::TypePackTail::Homogeneous(ty) => collect_generic_binders(ty, binders),
+        ast::TypePackTail::Generic(name) => {
+            binders.insert(ast::GenericBinder::Pack(name.clone()));
+        }
+    }
+}
+
+/// Materializes one canonical graph node as a printer-owned AST type.
+fn materialize_type(store: &TypeStore, id: TypeId) -> ast::Type {
+    match store.get(id) {
+        GraphType::Never => ast::Type::Never,
+        GraphType::Unknown => ast::Type::Unknown,
+        GraphType::Any => ast::Type::Any,
+        GraphType::Nil => ast::Type::Nil,
+        GraphType::String => ast::Type::String,
+        GraphType::Number => ast::Type::Number,
+        GraphType::Boolean => ast::Type::Boolean,
+        GraphType::Thread => ast::Type::Thread,
+        GraphType::Userdata => ast::Type::Userdata,
+        GraphType::Vector => ast::Type::Vector,
+        GraphType::Integer => ast::Type::Integer,
+        GraphType::Buffer => ast::Type::Buffer,
+        GraphType::Named(name) => ast::Type::Named(name.clone()),
+        GraphType::Generic(name) => ast::Type::Generic(name.clone()),
+        GraphType::Literal(literal) => ast::Type::Literal(match literal {
+            TypeLiteral::String(value) => ast::TypeLiteral::String(value.clone()),
+            TypeLiteral::Boolean(value) => ast::TypeLiteral::Boolean(*value),
+        }),
+        GraphType::Table => ast::Type::Table {
+            fields: std::collections::HashMap::new(),
+            array: Some(Box::new((ast::Type::Unknown, ast::Type::Unknown))),
+        },
+        GraphType::TableShape { fields, indexer } => ast::Type::Table {
+            fields: fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), materialize_type(store, *ty)))
+                .collect(),
+            array: indexer.as_ref().map(|(key, value)| {
+                Box::new((
+                    materialize_type(store, *key),
+                    materialize_type(store, *value),
+                ))
+            }),
+        },
+        GraphType::Function => ast::Type::Function {
+            generics: Vec::new(),
+            params: ast::TypePack {
+                head: Vec::new(),
+                tail: Some(ast::TypePackTail::Homogeneous(Box::new(ast::Type::Unknown))),
+            },
+            returns: ast::TypePack {
+                head: Vec::new(),
+                tail: Some(ast::TypePackTail::Homogeneous(Box::new(ast::Type::Unknown))),
+            },
+        },
+        GraphType::FunctionSignature { params, returns } => ast::Type::Function {
+            generics: Vec::new(),
+            params: materialize_pack(store, *params),
+            returns: materialize_pack(store, *returns),
+        },
+        GraphType::Union(types) => ast::Type::Union(
+            types
+                .iter()
+                .map(|ty| materialize_type(store, *ty))
+                .collect(),
+        ),
+        GraphType::Intersection(types) => ast::Type::Intersection(
+            types
+                .iter()
+                .map(|ty| materialize_type(store, *ty))
+                .collect(),
+        ),
+        GraphType::WithMetatable { base, methods } => ast::Type::WithMetatable {
+            base: Box::new(materialize_type(store, *base)),
+            metatable: methods
+                .iter()
+                .map(|method| {
+                    (
+                        SmolStr::new(method.method.field()),
+                        materialize_type(store, method.ty),
+                    )
+                })
+                .collect(),
+        },
+    }
+}
+
+/// Materializes one canonical function type pack for AST printing.
+fn materialize_pack(store: &TypeStore, id: TypePackId) -> ast::TypePack {
+    let pack = store.get_pack(id);
+    ast::TypePack {
+        head: pack
+            .head
+            .iter()
+            .map(|ty| materialize_type(store, *ty))
+            .collect(),
+        tail: pack.tail.as_ref().map(|tail| match tail {
+            GraphTypePackTail::Homogeneous(ty) => {
+                ast::TypePackTail::Homogeneous(Box::new(materialize_type(store, *ty)))
+            }
+            GraphTypePackTail::Generic(name) => ast::TypePackTail::Generic(name.clone()),
+        }),
     }
 }
 
@@ -250,17 +341,54 @@ impl Emitter<'_> {
         self.contexts[ctx_idx].plan.get_symbol_name(sym, is_param)
     }
 
+    /// Materializes one symbol's graph type for AST annotation decisions.
+    fn symbol_ast_type(&self, proto_idx: usize, sym: SymbolId) -> Option<ast::Type> {
+        let function = &self.functions[proto_idx];
+        let id = function.types.symbol_type_id(sym)?;
+        let mut ty = materialize_type(function.types.type_store(), id);
+        if let ast::Type::Function { generics, .. } = &mut ty
+            && let Some(scheme) = function.types.symbol_type_scheme(sym)
+        {
+            generics.extend(scheme.binders().iter().map(|binder| match binder {
+                GraphGenericBinder::Type(name) => ast::GenericBinder::Type(name.clone()),
+                GraphGenericBinder::Pack(name) => ast::GenericBinder::Pack(name.clone()),
+            }));
+        }
+        Some(ty)
+    }
+
+    /// Materializes one symbol annotation only when its graph is source-safe.
+    fn emittable_symbol_ast_type(&self, proto_idx: usize, sym: SymbolId) -> Option<ast::Type> {
+        let function = &self.functions[proto_idx];
+        let id = function.types.symbol_type_id(sym)?;
+        function
+            .types
+            .type_store()
+            .is_emittable_annotation(id)
+            .then(|| self.symbol_ast_type(proto_idx, sym))
+            .flatten()
+    }
+
+    /// Materializes the complete return pack of one inferred local function.
+    fn local_function_return_pack(&self, proto_idx: usize, sym: SymbolId) -> Option<ast::TypePack> {
+        let function = &self.functions[proto_idx];
+        let store = function.types.type_store();
+        let id = function.types.symbol_type_id(sym)?;
+        let GraphType::FunctionSignature { returns, .. } = store.get(id) else {
+            return None;
+        };
+        store
+            .is_emittable_return_pack(*returns)
+            .then(|| materialize_pack(store, *returns))
+    }
+
     fn typed_identifier_for(
         &self,
         proto_idx: usize,
         sym: SymbolId,
         name: ast::Identifier,
     ) -> ast::Typed<ast::Identifier> {
-        if let Some(ty) = self.functions[proto_idx]
-            .symbol_type(sym)
-            .filter(|ty| ty.is_meaningful() && !ty.contains_unknown())
-            .cloned()
-        {
+        if let Some(ty) = self.emittable_symbol_ast_type(proto_idx, sym) {
             ast::Typed::new(name, ty)
         } else {
             ast::Typed::untyped(name)
@@ -281,11 +409,7 @@ impl Emitter<'_> {
         sym: SymbolId,
         parameter: ast::Parameter,
     ) -> ast::Typed<ast::Parameter> {
-        if let Some(ty) = self.functions[proto_idx]
-            .symbol_type(sym)
-            .filter(|ty| ty.is_meaningful() && !ty.contains_unknown())
-            .cloned()
-        {
+        if let Some(ty) = self.emittable_symbol_ast_type(proto_idx, sym) {
             ast::Typed::new(parameter, ty)
         } else {
             ast::Typed::untyped(parameter)
@@ -712,9 +836,8 @@ impl Emitter<'_> {
                             generics,
                             params,
                             body,
-                            ty: self.functions[self.current_proto_idx()]
-                                .symbol_type(*sym)
-                                .and_then(local_function_return_type),
+                            returns: self
+                                .local_function_return_pack(self.current_proto_idx(), *sym),
                         });
                         return;
                     }
@@ -1049,14 +1172,14 @@ impl Emitter<'_> {
     /// Emits one closure with the best inferred parameter annotations available.
     fn visit_closure(&mut self, proto_idx: ProtoId, captures: &[SymbolId]) -> ast::Expr {
         let proto_idx = proto_idx.0 as usize;
-        let mut generic_names = HashSet::new();
+        let mut generic_binders = HashSet::new();
         for symbol in &self.functions[proto_idx].symbols.params {
-            if let Some(ty) = self.functions[proto_idx].symbol_type(*symbol) {
-                collect_generic_names(ty, &mut generic_names);
+            if let Some(ty) = self.symbol_ast_type(proto_idx, *symbol) {
+                collect_generic_binders(&ty, &mut generic_binders);
             }
         }
-        let mut generics = generic_names.into_iter().collect::<Vec<_>>();
-        generics.sort();
+        let mut generics: Vec<_> = generic_binders.into_iter().collect();
+        generics.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
         let parent_bindings: Vec<_> = captures
             .iter()
             .map(|sym| {
@@ -1128,4 +1251,45 @@ pub fn emit_ast(
     };
 
     st.visit_entry()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::materialize_type;
+    use crate::{ast, hil::ty2::store::TypeStore};
+
+    /// Materialization preserves nested shapes and zero-result function packs.
+    #[test]
+    fn materializes_nested_signature_with_empty_returns() {
+        let mut store = TypeStore::new();
+        let string = store.primitives().string;
+        let table = store.table_shape(vec![("name".into(), string)], None);
+        let params = store.pack(vec![table], None);
+        let returns = store.pack(Vec::new(), None);
+        let function = store.function_signature(params, returns);
+
+        let ast::Type::Function {
+            params, returns, ..
+        } = materialize_type(&store, function)
+        else {
+            panic!("expected function type")
+        };
+        assert!(returns.head.is_empty() && returns.tail.is_none());
+        assert!(
+            matches!(params.head.as_slice(), [ast::Type::Table { fields, .. }] if fields.contains_key("name"))
+        );
+    }
+
+    /// Broad graph tables print as conservative unknown indexers.
+    #[test]
+    fn materializes_broad_table_as_unknown_indexer() {
+        let store = TypeStore::new();
+        let table = store.primitives().table;
+        assert!(matches!(
+            materialize_type(&store, table),
+            ast::Type::Table { fields, array: Some(array) }
+                if fields.is_empty()
+                    && matches!(array.as_ref(), (ast::Type::Unknown, ast::Type::Unknown))
+        ));
+    }
 }

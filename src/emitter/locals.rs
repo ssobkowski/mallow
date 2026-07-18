@@ -7,7 +7,7 @@ use crate::{
         cflow::region::RegionNode,
         ir::{Expr, Stmt, ValuePack},
         lifter::ssa::SymbolId,
-        ty::Type,
+        ty2::canonical::TypeId,
         visitor::{Visitor, walk_expr},
     },
 };
@@ -64,8 +64,8 @@ struct LifetimeAnalysis {
     last_read: HashMap<SymbolId, usize>,
     /// All symbols seen by the planner, including write-only symbols.
     mentioned: HashSet<SymbolId>,
-    /// Printable type attached to each symbol by lifting or inference.
-    annotations: HashMap<SymbolId, Type>,
+    /// Printable graph type attached to each symbol by lifting or inference.
+    annotations: HashMap<SymbolId, TypeId>,
 }
 
 impl LifetimeAnalysis {
@@ -81,9 +81,8 @@ impl LifetimeAnalysis {
             mentioned: HashSet::new(),
             annotations: fun
                 .types
-                .symbol_types()
-                .filter(|(_, ty)| ty.is_meaningful())
-                .map(|(symbol, ty)| (symbol, ty.clone()))
+                .symbol_type_ids()
+                .filter(|(_, ty)| fun.types.type_store().is_emittable_annotation(*ty))
                 .collect(),
         }
     }
@@ -94,7 +93,7 @@ impl LifetimeAnalysis {
         let mut pinned: Vec<_> = self.pinned.iter().copied().collect();
         pinned.sort_by_key(|sym| sym.index());
         for sym in pinned {
-            allocation.allocate_pinned(sym, self.annotations.get(&sym));
+            allocation.allocate_pinned(sym, self.annotations.get(&sym).copied());
         }
 
         for (event_idx, event) in self.events.iter().enumerate() {
@@ -105,7 +104,7 @@ impl LifetimeAnalysis {
                 if allocation.has_slot(sym) {
                     continue;
                 }
-                allocation.allocate(sym, &self.pinned, self.annotations.get(&sym));
+                allocation.allocate(sym, &self.pinned, self.annotations.get(&sym).copied());
             }
 
             allocation.release_dead(event_idx + 1, &self.last_read, &self.pinned);
@@ -115,7 +114,7 @@ impl LifetimeAnalysis {
         remaining.sort_by_key(|sym| sym.index());
         for sym in remaining {
             if !allocation.has_slot(sym) {
-                allocation.allocate(sym, &self.pinned, self.annotations.get(&sym));
+                allocation.allocate(sym, &self.pinned, self.annotations.get(&sym).copied());
             }
         }
 
@@ -276,7 +275,7 @@ struct SlotAllocator {
     active: HashMap<SymbolId, usize>,
     free_slots: Vec<usize>,
     /// Declared type contract established when each source-local slot is created.
-    slot_annotations: HashMap<usize, Option<Type>>,
+    slot_annotations: HashMap<usize, Option<TypeId>>,
     next_slot: usize,
 }
 
@@ -285,17 +284,17 @@ impl SlotAllocator {
         self.slots.contains_key(&sym)
     }
 
-    fn allocate_pinned(&mut self, sym: SymbolId, annotation: Option<&Type>) {
+    fn allocate_pinned(&mut self, sym: SymbolId, annotation: Option<TypeId>) {
         if self.has_slot(sym) {
             return;
         }
         let slot = self.next_fresh_slot();
-        self.slot_annotations.insert(slot, annotation.cloned());
+        self.slot_annotations.insert(slot, annotation);
         self.slots.insert(sym, slot);
         self.active.insert(sym, slot);
     }
 
-    fn allocate(&mut self, sym: SymbolId, pinned: &HashSet<SymbolId>, annotation: Option<&Type>) {
+    fn allocate(&mut self, sym: SymbolId, pinned: &HashSet<SymbolId>, annotation: Option<TypeId>) {
         if pinned.contains(&sym) {
             self.allocate_pinned(sym, annotation);
             return;
@@ -304,13 +303,13 @@ impl SlotAllocator {
         let compatible = self.free_slots.iter().rposition(|slot| {
             self.slot_annotations
                 .get(slot)
-                .is_some_and(|contract| contract.as_ref() == annotation)
+                .is_some_and(|contract| *contract == annotation)
         });
         let slot = compatible
             .map(|index| self.free_slots.swap_remove(index))
             .unwrap_or_else(|| {
                 let slot = self.next_fresh_slot();
-                self.slot_annotations.insert(slot, annotation.cloned());
+                self.slot_annotations.insert(slot, annotation);
                 slot
             });
         self.slots.insert(sym, slot);

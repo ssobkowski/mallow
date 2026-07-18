@@ -129,11 +129,39 @@ print(add_one(value))
     );
 }
 
+/// Writes through deferred upvalue versions remain nonlocal and optional.
+#[test]
+fn mutable_upvalue_versions_remain_nonlocal_storage() {
+    let output = infer_and_analyze(
+        r#"
+local state
+
+local function write()
+    state = {}
+    state.value = 1
+end
+
+local function read()
+    return state.value
+end
+
+write()
+print(read())
+"#,
+    );
+
+    assert!(
+        output.contains("local function v2(): nil | number"),
+        "an upvalue write was mistaken for definite local construction:\n{output}"
+    );
+}
+
 /// Recursive arithmetic must not depend on randomized worklist insertion order.
 #[test]
 fn recursive_memo_table_inference_is_deterministic() {
     let temp = TempDir::new().expect("create recursive inference test directory");
     let bytecode = compile_source(include_str!("../fib.luau"), &temp);
+    let mut previous = None;
 
     for iteration in 0..24 {
         let output = infer_bytecode(&bytecode);
@@ -141,7 +169,14 @@ fn recursive_memo_table_inference_is_deterministic() {
             output.contains("local function v1(p0: number): number"),
             "iteration {iteration} lost recursive numeric inference:\n{output}"
         );
+        if let Some(previous) = &previous {
+            assert_eq!(
+                &output, previous,
+                "iteration {iteration} emitted nondeterministic inferred output"
+            );
+        }
         analyze_source(&output, &temp);
+        previous = Some(output);
     }
 }
 
@@ -163,7 +198,8 @@ fn correlated_table_callback_recovers_generic_signature() {
         "numeric callback parameter was not recovered:\n{output}"
     );
     assert!(
-        output.contains("function(p0: { [number]: nil | number | string })"),
+        output.contains("function(p0: { [number]: nil | number | string })")
+            || output.contains("function(p0: { [number]: nil | string | number })"),
         "table callback parameter was not recovered:\n{output}"
     );
 }
@@ -203,12 +239,12 @@ fn identity_with_omitted_argument_recovers_optional_generic() {
         "identity parameter and return were not tied by one optional generic:\n{output}"
     );
     assert!(
-        output.contains("local v1 = v0(1)"),
-        "the present identity call repeated its inferred result type:\n{output}"
+        output.contains("local v1 = v0(1)") || output.contains("print(v0(1),"),
+        "the present identity call was neither retained nor inlined cleanly:\n{output}"
     );
     assert!(
-        output.contains("local v2 = v0()"),
-        "the omitted identity call repeated its inferred result type:\n{output}"
+        output.contains("local v2 = v0()") || output.contains("(v0()))"),
+        "the omitted identity call was neither retained nor inlined cleanly:\n{output}"
     );
 }
 
@@ -260,6 +296,62 @@ fn dynamic_index_uses_table_metamethod() {
     );
 }
 
+/// Direct generic results remain correlated independently at each callsite.
+#[test]
+fn direct_generic_pack_results_do_not_pool_callsite_types() {
+    let output = infer_and_analyze(
+        r#"
+local function id(value)
+    return value
+end
+local number_value = id(1)
+local string_value = id("x")
+print(number_value + 1, string.upper(string_value))
+"#,
+    );
+
+    assert!(
+        output.contains("local function v0<T>(p0: T): T"),
+        "the identity pack lost its direct generic relation:\n{output}"
+    );
+}
+
+/// Fixed heads and open tails retain their distinct positional behavior.
+#[test]
+fn value_packs_preserve_assignment_call_return_and_table_flow() {
+    let output = infer_and_analyze(include_str!("inference-cases/value-packs.luau"));
+
+    assert!(
+        output.contains("local function v0(): (number, string)"),
+        "the fixed two-result producer lost its return pack:\n{output}"
+    );
+    assert!(
+        output.contains("local function v1<T, T1, T2>(p0: T, p1: T1, p2: T2): (T, T1, T2)"),
+        "the open argument tail did not fill all fixed parameters:\n{output}"
+    );
+    assert!(
+        output.contains("local v3, v4 = v0()")
+            && output.contains("local v5 = v0()")
+            && output.contains("local v7 = v0()")
+            && output.contains("local v8 = nil"),
+        "fixed and open assignment contexts were flattened together:\n{output}"
+    );
+    assert!(
+        output.contains("take = function<T, T1>(p0, p1: T, p2: T1)"),
+        "the method receiver displaced its open user-argument pack:\n{output}"
+    );
+    assert!(
+        output.contains("local function v14(...): (string, number)"),
+        "vararg forwarding lost the positional result types:\n{output}"
+    );
+    assert!(
+        output.contains("local v10 = {\n    true,\n    v0()\n}")
+            && (output.contains("local function v17(): { [number]: nil | number | string }")
+                || output.contains("local function v17(): { [number]: nil | string | number }")),
+        "open table constructor tails were collapsed to one scalar value:\n{output}"
+    );
+}
+
 /// Real-world MD5 inference stays concise while retaining its useful contracts.
 #[test]
 fn md5_inference_recovers_numeric_and_table_contracts_without_unknown() {
@@ -268,6 +360,10 @@ fn md5_inference_recovers_numeric_and_table_contracts_without_unknown() {
     assert!(
         !output.contains("unknown"),
         "MD5 inference emitted unresolved placeholder types:\n{output}"
+    );
+    assert!(
+        output.contains("local v0: number\n            if p0 <= 2147483647 then"),
+        "the conditional Phi target was destructed before numeric inference:\n{output}"
     );
     assert!(
         output.contains("local function v32(p0: string, ...): { [number]: nil | number }"),

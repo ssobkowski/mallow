@@ -1,17 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
     disasm::Chunk,
     hil::{
-        cflow::{common::RegSet, graph::GraphView, union_find::UnionFind},
+        cflow::{graph::GraphView, reg_set::RegSet},
         ir::{Expr, PhiNode, Stmt, ValuePack},
         lifter::{
             LiftContext, MultiRet, flush_multiret, lift,
-            ssa::{Ssa, Symbol, SymbolId, SymbolKind},
+            ssa::{FunctionSymbols, Ssa, Symbol, SymbolId, SymbolKind},
         },
-        ty::{ProtoTypeContext, TypeId, TypeStore},
+        ty2::{bytecode::ProtoTypeContext, canonical::TypeId, store::TypeStore},
         visitor::{Visitor, VisitorMut},
     },
     il::{ConstId, Count, Proto, reg_add, reg_range},
@@ -19,20 +19,22 @@ use crate::{
 
 use super::{Block, BlockExit, Cond, CondRhs, RawBlock, RawBlockExit};
 
-/// Blocks, parameter symbols, and upvalue symbols produced by SSA construction.
+/// Blocks and SSA metadata produced by one block-lifting run.
 pub(super) struct BuildResult {
+    /// Lifted blocks with explicit nontrivial Phi statements.
     pub blocks: Vec<Block>,
-    pub params: Vec<SymbolId>,
-    pub upvalues: Vec<SymbolId>,
+    /// Symbols and storage links found while building SSA.
+    pub symbols: FunctionSymbols,
+    /// Bytecode type facts for the surviving SSA versions.
     pub symbol_types: HashMap<SymbolId, TypeId>,
+    /// Type graph that owns the IDs in `symbol_types`.
     pub type_store: TypeStore,
 }
 
-/// Lifts raw blocks into HIL blocks and resolves temporary SSA versions.
+/// Lifts raw blocks into HIL blocks while preserving nontrivial SSA versions.
 ///
 /// This phase owns the mutable SSA algorithm because block lifting, synthetic
-/// terminator writes, loop-carried repairs, and final symbol canonicalization
-/// are tightly coupled.
+/// terminator writes, and loop-carried repairs depend on its block state.
 pub(super) fn lift_blocks<G: GraphView>(
     proto: &Proto,
     chunk: &Chunk,
@@ -59,7 +61,7 @@ struct BlockLifter<'a, G: GraphView> {
 
 impl<'a, G: GraphView> BlockLifter<'a, G> {
     fn new(proto: &'a Proto, chunk: &'a Chunk, raw_blocks: &'a [RawBlock], graph: &'a G) -> Self {
-        let mut type_store = TypeStore::default();
+        let mut type_store = TypeStore::new();
         let type_context = ProtoTypeContext::from_proto(proto, chunk, &mut type_store);
 
         Self {
@@ -77,17 +79,25 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
         }
     }
 
-    /// Runs SSA-backed lifting through final symbol canonicalization.
+    /// Runs SSA-backed lifting through non-destructive alias resolution.
     fn build(mut self) -> Result<BuildResult> {
         self.initialize_entry_symbols();
         self.lift_blocks()?;
         self.collect_loop_carried_versions();
-        let symbol_types = self.finalize();
+        let symbol_types = self.finish_ssa();
+        let (upvalue_version_groups, captured_version_groups) = self.storage_version_groups();
+
+        let symbols = FunctionSymbols::new(
+            self.params,
+            self.upvalues,
+            upvalue_version_groups,
+            captured_version_groups,
+            self.loop_carried_versions,
+        );
 
         Ok(BuildResult {
             blocks: self.blocks,
-            params: self.params,
-            upvalues: self.upvalues,
+            symbols,
             symbol_types,
             type_store: self.type_store,
         })
@@ -99,7 +109,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             let sym = self
                 .ssa
                 .alloc_symbol(Symbol::param(i).with_type(self.type_context.param(i)));
-            self.ssa.write_reg(0, i, sym);
+            self.ssa.write_reg(self.graph.entry(), i, sym);
             self.params.push(sym);
         }
 
@@ -107,7 +117,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             let sym = self
                 .ssa
                 .alloc_symbol(Symbol::upval(i).with_type(self.type_context.upvalue(i)));
-            self.ssa.write_upval(0, i, sym);
+            self.ssa.write_upval(self.graph.entry(), i, sym);
             self.upvalues.push(sym);
         }
     }
@@ -166,19 +176,19 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
         let exit = &self.raw_blocks[block_id].exit;
         let exit_writes = &self.raw_blocks[block_id].exit_writes;
         let exit_pc = self.raw_blocks[block_id].exit_pc;
-        match exit {
+        match *exit {
             RawBlockExit::Jump(t) => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
-                Ok(BlockExit::Jump(*t))
+                Ok(BlockExit::Jump(t))
             }
             RawBlockExit::Fallthrough(t) => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
-                Ok(BlockExit::Fallthrough(*t))
+                Ok(BlockExit::Fallthrough(t))
             }
             RawBlockExit::CondJump {
-                cond,
+                ref cond,
                 then_block,
                 else_block,
             } => {
@@ -187,8 +197,8 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::CondJump {
                     cond,
-                    then_block: *then_block,
-                    else_block: *else_block,
+                    then_block,
+                    else_block,
                 })
             }
             RawBlockExit::FornPrep {
@@ -199,20 +209,20 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
 
                 // These are current-block reads. They must happen before exit_writes.
-                let start = self.ssa.read_reg(block_id, reg_add(*base, 2));
-                let end = self.ssa.read_reg(block_id, reg_add(*base, 0));
-                let step = self.ssa.read_reg(block_id, reg_add(*base, 1));
+                let start = self.ssa.read_reg(block_id, reg_add(base, 2));
+                let end = self.ssa.read_reg(block_id, reg_add(base, 0));
+                let step = self.ssa.read_reg(block_id, reg_add(base, 1));
 
                 // These are terminator/edge writes.
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
 
                 // This is a successor/body-block read. It must happen after exit_writes.
-                let var = self.ssa.read_reg(*body_block, reg_add(*base, 2));
+                let var = self.ssa.read_reg(body_block, reg_add(base, 2));
 
                 Ok(BlockExit::FornPrep {
-                    base: *base,
-                    body_block: *body_block,
-                    exit_block: *exit_block,
+                    base,
+                    body_block,
+                    exit_block,
                     var,
                     start: Expr::Symbol(start),
                     end: Expr::Symbol(end),
@@ -227,9 +237,9 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::FornLoop {
-                    base: *base,
-                    body_block: *body_block,
-                    exit_block: *exit_block,
+                    base,
+                    body_block,
+                    exit_block,
                 })
             }
             RawBlockExit::ForgPrep {
@@ -239,15 +249,15 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 let exprs = [
-                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 0))),
-                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 1))),
-                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(*base, 2))),
+                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(base, 0))),
+                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(base, 1))),
+                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(base, 2))),
                 ];
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::ForgPrep {
-                    base: *base,
-                    body_block: *body_block,
-                    exit_block: *exit_block,
+                    base,
+                    body_block,
+                    exit_block,
                     exprs,
                 })
             }
@@ -260,13 +270,13 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::ForgLoop {
-                    base: *base,
-                    body_block: *body_block,
-                    exit_block: *exit_block,
-                    vars: (0..*result_count)
+                    base,
+                    body_block,
+                    exit_block,
+                    vars: (0..result_count)
                         .map(|i| {
                             self.ssa
-                                .read_reg(*body_block, reg_add(reg_add(*base, 3), i as u8))
+                                .read_reg(body_block, reg_add(reg_add(base, 3), i as u8))
                         })
                         .collect(),
                 })
@@ -277,7 +287,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                     "RETURN must not have synthetic exit writes: {exit_writes:?}"
                 );
 
-                match Count::from(*count) {
+                match Count::from(count) {
                     Count::Variadic => {
                         assert!(
                             exit_writes.is_empty(),
@@ -289,14 +299,14 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                         };
 
                         ensure!(
-                            multiret.base >= *base,
+                            multiret.base >= base,
                             "pending multiret base {} is before variadic return base {}",
                             multiret.base,
                             base
                         );
 
                         let mut head = Vec::new();
-                        for i in *base..multiret.base {
+                        for i in base..multiret.base {
                             head.push(Expr::Symbol(self.ssa.read_reg(block_id, i)));
                         }
 
@@ -314,7 +324,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                         );
 
                         let rets = ValuePack::Fixed(
-                            reg_range(*base, n)
+                            reg_range(base, n)
                                 .map(|i| Expr::Symbol(self.ssa.read_reg(block_id, i)))
                                 .collect(),
                         );
@@ -438,86 +448,67 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
         written_regs
     }
 
-    /// Seals SSA, emits Phi nodes, rewrites all symbols to canonical IDs, and
-    /// returns bytecode type facts keyed by those canonical symbols.
-    fn finalize(&mut self) -> HashMap<SymbolId, TypeId> {
+    /// Seals SSA, emits nontrivial Phi nodes, resolves trivial aliases, and
+    /// returns bytecode facts keyed by the surviving SSA versions.
+    fn finish_ssa(&mut self) -> HashMap<SymbolId, TypeId> {
         self.ssa.seal_blocks();
         self.ssa.finish(&mut self.blocks);
+        resolve_ssa_aliases(&mut self.blocks, &self.ssa);
 
-        let mut disjoint_set = UnionFind::new();
-        for (target, source) in self.loop_carried_versions.drain(..) {
-            disjoint_set.union(target, source);
+        for symbol in &mut self.params {
+            *symbol = self.ssa.resolve(*symbol);
         }
-
-        self.union_phi_versions(&mut disjoint_set);
-        self.union_storage_versions(&mut disjoint_set);
-        resolve_ssa_symbols(&mut self.blocks, &self.ssa, &mut disjoint_set);
-
-        for sym in &mut self.params {
-            *sym = disjoint_set.find(self.ssa.resolve(*sym));
+        for symbol in &mut self.upvalues {
+            *symbol = self.ssa.resolve(*symbol);
         }
-        for sym in &mut self.upvalues {
-            *sym = disjoint_set.find(self.ssa.resolve(*sym));
+        for (target, source) in &mut self.loop_carried_versions {
+            *target = self.ssa.resolve(*target);
+            *source = self.ssa.resolve(*source);
         }
+        self.loop_carried_versions
+            .retain(|(target, source)| target != source);
 
         self.ssa
             .arena()
             .iter()
-            .filter_map(|(id, symbol)| symbol.ty.map(|ty| (id, ty)))
-            .fold(HashMap::new(), |mut acc, (id, ty)| {
-                let canonical = disjoint_set.find(self.ssa.resolve(id));
-
-                acc.entry(canonical)
+            .filter_map(|(id, symbol)| symbol.ty.map(|ty| (self.ssa.resolve(id), ty)))
+            .fold(HashMap::new(), |mut facts, (symbol, ty)| {
+                facts
+                    .entry(symbol)
                     .and_modify(|existing| *existing = self.type_store.union(*existing, ty))
                     .or_insert(ty);
-
-                acc
+                facts
             })
     }
 
-    /// Unions Phi targets with operands except for loop-preheader loop variables.
-    fn union_phi_versions(&self, disjoint_set: &mut UnionFind<SymbolId>) {
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            for stmt in &block.stmts {
-                if let Stmt::Phi(phi) = &stmt {
-                    for (pred_block, operand) in &phi.operands {
-                        if is_loop_header_loop_var_operand(
-                            &self.blocks,
-                            block_idx,
-                            *pred_block,
-                            phi.target,
-                        ) {
-                            continue;
-                        }
-                        disjoint_set.union(phi.target, *operand);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Unions storage versions that represent one logical upvalue or capture.
-    fn union_storage_versions(&self, disjoint_set: &mut UnionFind<SymbolId>) {
-        let mut upval_versions: HashMap<_, Vec<_>> = HashMap::new();
-        let mut captured_versions: HashMap<_, Vec<_>> = HashMap::new();
+    /// Groups surviving versions by declared-upvalue or captured-register storage.
+    fn storage_version_groups(&self) -> (Vec<Vec<SymbolId>>, Vec<Vec<SymbolId>>) {
+        let mut upvalue_versions: BTreeMap<u8, Vec<_>> = BTreeMap::new();
+        let mut captured_versions: BTreeMap<(u8, u16), Vec<_>> = BTreeMap::new();
 
         for (id, symbol) in self.ssa.arena().iter() {
-            match symbol.kind {
-                SymbolKind::Upvalue(idx) => {
-                    upval_versions.entry(idx).or_default().push(id);
-                }
+            let resolved = self.ssa.resolve(id);
+            let versions = match symbol.kind {
+                SymbolKind::Upvalue(index) => upvalue_versions.entry(index).or_default(),
                 SymbolKind::CapturedRegister { reg, generation } => {
-                    captured_versions
-                        .entry((reg, generation))
-                        .or_default()
-                        .push(id);
+                    captured_versions.entry((reg, generation)).or_default()
                 }
-                SymbolKind::Register(_) | SymbolKind::Param(_) => {}
+                SymbolKind::Register(_) | SymbolKind::Param(_) => continue,
+            };
+            if !versions.contains(&resolved) {
+                versions.push(resolved);
             }
         }
 
-        union_version_groups(upval_versions.values().map(Vec::as_slice), disjoint_set);
-        union_version_groups(captured_versions.values().map(Vec::as_slice), disjoint_set);
+        let upvalue_versions = upvalue_versions
+            .into_values()
+            .filter(|versions| versions.len() > 1)
+            .collect();
+        let captured_versions = captured_versions
+            .into_values()
+            .filter(|versions| versions.len() > 1)
+            .collect();
+        (upvalue_versions, captured_versions)
     }
 
     /// Applies exit writes to the SSA block, writing each register in `exit_writes` to a fresh symbol.
@@ -530,58 +521,36 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     }
 }
 
-/// Unions each symbol group into the first symbol in that group.
-fn union_version_groups<'a, I>(groups: I, uf: &mut UnionFind<SymbolId>)
-where
-    I: IntoIterator<Item = &'a [SymbolId]>,
-{
-    for versions in groups {
-        let Some((&first, rest)) = versions.split_first() else {
-            continue;
-        };
-
-        for &version in rest {
-            uf.union(first, version);
-        }
-    }
-}
-
-/// Rewrites all SSA temporary symbols in lifted blocks to their canonical IDs.
-fn resolve_ssa_symbols<G: GraphView>(
-    blocks: &mut [Block],
-    ssa: &Ssa<'_, G>,
-    djs: &mut UnionFind<SymbolId>,
-) {
-    let mut resolver = SymbolResolver { ssa, djs };
+/// Rewrites every CFG reference through the trivial-alias relation owned by SSA.
+fn resolve_ssa_aliases<G: GraphView>(blocks: &mut [Block], ssa: &Ssa<'_, G>) {
+    let mut resolver = SsaAliasResolver { ssa };
     for block in blocks {
-        for stmt in &mut block.stmts {
-            resolver.visit_stmt(stmt);
-        }
-        resolver.visit_block_exit(&mut block.exit);
+        resolver.visit_block(block);
     }
 }
 
-/// Visitor that canonicalizes every symbol reference it sees.
-struct SymbolResolver<'ssa, 'cfg, 'uf, G: GraphView> {
+/// Visitor that removes temporary IDs belonging to trivial Phi nodes.
+struct SsaAliasResolver<'ssa, 'cfg, G: GraphView> {
+    /// Completed SSA state containing the trivial-alias relation.
     ssa: &'ssa Ssa<'cfg, G>,
-    djs: &'uf mut UnionFind<SymbolId>,
 }
 
-impl<G: GraphView> VisitorMut for SymbolResolver<'_, '_, '_, G> {
-    fn visit_symbol(&mut self, sym: &mut SymbolId) {
-        let resolved = self.ssa.resolve(*sym);
-        *sym = self.djs.find(resolved);
+impl<G: GraphView> VisitorMut for SsaAliasResolver<'_, '_, G> {
+    /// Resolves one symbol without coalescing distinct nontrivial versions.
+    fn visit_symbol(&mut self, symbol: &mut SymbolId) {
+        *symbol = self.ssa.resolve(*symbol);
     }
 
-    fn visit_capture(&mut self, _index: usize, sym: &mut SymbolId) {
-        self.visit_symbol(sym);
+    /// Resolves a closure capture owned by the enclosing function.
+    fn visit_capture(&mut self, _index: usize, symbol: &mut SymbolId) {
+        self.visit_symbol(symbol);
     }
 
-    /// Phi nodes are synthetic statements, so resolve both target and operands.
+    /// Resolves the target and operands of a synthetic Phi statement.
     fn visit_phi(&mut self, phi: &mut PhiNode) {
         self.visit_symbol(&mut phi.target);
-        for (_, op) in &mut phi.operands {
-            self.visit_symbol(op);
+        for (_, operand) in &mut phi.operands {
+            self.visit_symbol(operand);
         }
     }
 }
@@ -803,33 +772,4 @@ fn compute_loop_live_out_regs<G: GraphView>(
     }
 
     live_out
-}
-
-/// Returns true when a Phi operand is the pre-loop value for a loop variable.
-fn is_loop_header_loop_var_operand(
-    blocks: &[Block],
-    block_idx: usize,
-    pred_block: usize,
-    target: SymbolId,
-) -> bool {
-    let Some(pred) = blocks.get(pred_block) else {
-        return false;
-    };
-
-    match &pred.exit {
-        BlockExit::FornPrep {
-            body_block, var, ..
-        } if *body_block == block_idx => *var == target,
-        BlockExit::ForgPrep {
-            body_block,
-            exit_block,
-            ..
-        } if *body_block == block_idx => blocks.get(*exit_block).is_some_and(|block| {
-            matches!(
-                &block.exit,
-                BlockExit::ForgLoop { vars, .. } if vars.contains(&target)
-            )
-        }),
-        _ => false,
-    }
 }

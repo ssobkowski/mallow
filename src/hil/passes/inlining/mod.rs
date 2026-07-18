@@ -1,5 +1,5 @@
 use crate::hil::{
-    ReturnArity, StructuredFunction, cflow::cfg::ControlFlowGraph, lifted::FunctionSymbols,
+    ReturnArity, StructuredFunction, cflow::cfg::ControlFlowGraph, lifter::ssa::FunctionSymbols,
 };
 
 mod common;

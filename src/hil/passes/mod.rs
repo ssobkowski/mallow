@@ -1,4 +1,4 @@
-use crate::hil::{StructuredFunction, cflow::cfg::ControlFlowGraph, lifted::FunctionSymbols};
+use crate::hil::{StructuredFunction, cflow::cfg::ControlFlowGraph, lifter::ssa::FunctionSymbols};
 
 mod continue_cleanup;
 mod fold_bool_assign;
