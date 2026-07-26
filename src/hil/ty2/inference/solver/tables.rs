@@ -2,8 +2,8 @@
 
 use smol_str::SmolStr;
 
-use crate::hil::ty2::canonical::TypeLiteral;
-use crate::hil::ty2::canonical::{Type, TypeId};
+use crate::hil::ty2::canonical::{Type, TypeId, TypeLiteral};
+use crate::hil::ty2::inference::solver::model::Activation;
 
 use super::model::{
     InferenceVarId, PackVarId, SolverCallArgument, SolverConstraint, TableObjectId, TypeSolver,
@@ -21,8 +21,8 @@ impl TypeSolver<'_> {
         let tables: Vec<_> = self.variables[object].tables.iter().copied().collect();
         for table in tables {
             if !self
-                .activated_table_constraints
-                .insert((constraint_id, table))
+                .activations
+                .insert(constraint_id, Activation::TableConstraint(table))
             {
                 continue;
             }
@@ -44,9 +44,9 @@ impl TypeSolver<'_> {
     ) {
         let tables: Vec<_> = self.variables[object].tables.iter().copied().collect();
         for table in tables {
-            if self
-                .activated_table_constraints
-                .insert((constraint_id, table))
+            if !self
+                .activations
+                .insert(constraint_id, Activation::TableConstraint(table))
             {
                 let table_values = self.tables[table].values;
                 self.add_constraint(value, SolverConstraint::FlowFrom(table_values));
@@ -66,8 +66,8 @@ impl TypeSolver<'_> {
             fields.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
             for (field, field_value) in fields {
                 if self
-                    .activated_dynamic_fields
-                    .insert((constraint_id, table, field))
+                    .activations
+                    .insert(constraint_id, Activation::DynamicField(table, field))
                 {
                     self.add_constraint(value, SolverConstraint::FlowFrom(field_value));
                 }
@@ -94,8 +94,8 @@ impl TypeSolver<'_> {
         let tables: Vec<_> = self.variables[object].tables.iter().copied().collect();
         for table in tables {
             if !self
-                .activated_table_constraints
-                .insert((constraint_id, table))
+                .activations
+                .insert(constraint_id, Activation::TableConstraint(table))
             {
                 continue;
             }
@@ -115,9 +115,9 @@ impl TypeSolver<'_> {
     ) {
         let tables: Vec<_> = self.variables[object].tables.iter().copied().collect();
         for table in tables {
-            if self
-                .activated_table_constraints
-                .insert((constraint_id, table))
+            if !self
+                .activations
+                .insert(constraint_id, Activation::TableConstraint(table))
             {
                 let field_value = self.table_field_variable(table, field.clone(), false);
                 self.add_constraint(value, SolverConstraint::FlowFrom(field_value));
@@ -155,8 +155,8 @@ impl TypeSolver<'_> {
         let tables: Vec<_> = self.variables[object].tables.iter().copied().collect();
         for table in tables {
             if !self
-                .activated_table_constraints
-                .insert((constraint_id, table))
+                .activations
+                .insert(constraint_id, Activation::TableConstraint(table))
             {
                 continue;
             }
@@ -192,8 +192,8 @@ impl TypeSolver<'_> {
         let metatables: Vec<_> = self.tables[table].metatables.iter().copied().collect();
         for metatable in metatables {
             if !self
-                .activated_index_dispatches
-                .insert((constraint_id, metatable))
+                .activations
+                .insert(constraint_id, Activation::IndexDispatch(metatable))
             {
                 continue;
             }
@@ -226,8 +226,8 @@ impl TypeSolver<'_> {
         let metatables: Vec<_> = self.tables[table].metatables.iter().copied().collect();
         for metatable in metatables {
             if !self
-                .activated_index_dispatches
-                .insert((constraint_id, metatable))
+                .activations
+                .insert(constraint_id, Activation::IndexDispatch(metatable))
             {
                 continue;
             }

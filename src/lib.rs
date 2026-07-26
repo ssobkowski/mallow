@@ -203,7 +203,7 @@ pub fn decompile_bytecode_with_diagnostics(
     };
 
     if options.infer_types {
-        hil::ty2::inference::run(&mut lifted);
+        hil::ty3::inference::run(&mut lifted);
     }
 
     let mut functions: Vec<_> = if options.emit == EmitMode::Ssa {

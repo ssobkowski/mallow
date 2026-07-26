@@ -8,7 +8,7 @@ use crate::{
     hil::ty2::{
         builtins::{BuiltinCallEffect, BuiltinIndex, BuiltinPath},
         canonical::{GenericBinder, Metamethod, Type, TypeId, TypePackTail, TypeScheme},
-        inference::program::TypeSlot,
+        inference::{program::TypeSlot, solver::model::Activation},
     },
     il::ProtoId,
 };
@@ -32,25 +32,30 @@ impl TypeSolver<'_> {
             let call = self.callsites[call_id].clone();
             debug_assert_eq!(call.callee, callee);
             for proto in &closures {
-                if self.activated_closures.insert((call_id, *proto)) {
+                if self
+                    .activations
+                    .insert(call_id, Activation::Closure(*proto))
+                {
                     self.connect_call_to_proto(&call, *proto);
                 }
             }
             for path in &builtins {
                 let (minimum, maximum) = self.pack_arity(call.args);
                 let argument_types = self.call_argument_types(call.args, minimum, maximum);
-                if self.activated_builtins.insert((
+                if self.activations.insert(
                     call_id,
-                    path.clone(),
-                    minimum,
-                    maximum,
-                    argument_types,
-                )) {
+                    Activation::Builtin {
+                        path: path.clone(),
+                        minimum,
+                        maximum,
+                        argument_types,
+                    },
+                ) {
                     self.instantiate_builtin(&call, path);
                 }
                 if !self
-                    .activated_builtin_effects
-                    .contains(&(call_id, path.clone()))
+                    .activations
+                    .contains(call_id, &Activation::BuiltinEffect(path.clone()))
                 {
                     self.deferred_builtin_effects
                         .insert((call_id, path.clone()));
@@ -84,8 +89,8 @@ impl TypeSolver<'_> {
         let mut activated = false;
         for (call_id, path) in deferred {
             if !self
-                .activated_builtin_effects
-                .insert((call_id, path.clone()))
+                .activations
+                .insert(call_id, Activation::BuiltinEffect(path.clone()))
             {
                 continue;
             }
@@ -124,7 +129,7 @@ impl TypeSolver<'_> {
 
         let returned = self.pack_for_slot(super::super::program::PackSlot::Returns(proto));
         let relations = self
-            .generic_value_relations
+            .body_value_relations
             .get(&proto)
             .cloned()
             .unwrap_or_default();
@@ -584,8 +589,8 @@ impl TypeSolver<'_> {
             return;
         };
         if !self
-            .activated_call_signatures
-            .insert((constraint_id, *signature))
+            .activations
+            .insert(constraint_id, Activation::CallSignature(*signature))
         {
             return;
         }

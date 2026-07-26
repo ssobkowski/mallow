@@ -19,9 +19,7 @@ use crate::{
     operator::{BinOp, UnOp},
 };
 
-use super::super::program::{
-    GenericFieldCall, GenericValueRelation, PackSlot, TableKey, Truthiness, TypeSlot,
-};
+use super::super::program::{GenericFieldCall, PackSlot, TableKey, Truthiness, TypeSlot};
 
 /// Stable handle for one solver inference variable.
 pub(super) type InferenceVarId = Id<InferenceVariable>;
@@ -288,6 +286,60 @@ pub(super) enum DeferredOperator {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum Activation {
+    Closure(ProtoId),
+    Builtin {
+        path: BuiltinPath,
+        minimum: usize,
+        maximum: Option<usize>,
+        argument_types: Vec<Option<TypeId>>,
+    },
+    BuiltinEffect(BuiltinPath),
+    CallSignature(TypeId),
+    TableConstraint(TableObjectId),
+    IndexDispatch(TableObjectId),
+    DynamicField(TableObjectId, SmolStr),
+    RefinementFallback,
+    OperatorFallback,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ActivationTracker {
+    seen: HashMap<usize, HashSet<Activation>>,
+}
+
+impl ActivationTracker {
+    /// Returns an empty tracker
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true if this activation was newly inserted (i.e. first time seen).
+    pub fn insert(&mut self, constraint_id: usize, activation: Activation) -> bool {
+        self.seen
+            .entry(constraint_id)
+            .or_default()
+            .insert(activation)
+    }
+
+    /// Checks if an activation has already occurred.
+    pub fn contains(&self, constraint_id: usize, activation: &Activation) -> bool {
+        self.seen
+            .get(&constraint_id)
+            .is_some_and(|set| set.contains(activation))
+    }
+}
+
+/// One exact value flow from a formal parameter to a return position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BodyValueRelation {
+    /// Position of the source in the function parameter pack.
+    pub(super) parameter_index: usize,
+    /// Position of the same value in the function return pack.
+    pub(super) return_index: usize,
+}
+
 /// Arena-backed bounded constraint solver.
 pub(in crate::hil::ty2::inference) struct TypeSolver<'a> {
     /// Canonical graph owned by this inference session.
@@ -324,46 +376,20 @@ pub(in crate::hil::ty2::inference) struct TypeSolver<'a> {
     pub(super) builtins: &'a BuiltinEnvironment,
     /// Same-table callback relations recovered for generic source signatures.
     pub(super) generic_field_calls: HashMap<ProtoId, Vec<GenericFieldCall>>,
-    /// Direct formal-to-return relations recovered for generic source signatures.
-    pub(super) generic_value_relations: HashMap<ProtoId, Vec<GenericValueRelation>>,
+    /// Formal and return positions connected by body value flow.
+    pub(super) body_value_relations: HashMap<ProtoId, Vec<BodyValueRelation>>,
     /// Actual argument packs observed for each concrete closure proto.
     pub(super) closure_argument_packs: HashMap<ProtoId, HashSet<PackVarId>>,
     /// Callsites stored by dense call ID.
     pub(super) callsites: Vec<CallSite>,
-    /// Dynamic callable requirements waiting for identity propagation to settle.
-    pub(super) deferred_callable_requirements: HashMap<usize, CallSite>,
     /// Call IDs grouped by callee variable.
     pub(super) callsites_by_callee: HashMap<InferenceVarId, Vec<usize>>,
-    /// Closure targets already connected to a callsite.
-    pub(super) activated_closures: HashSet<(usize, ProtoId)>,
-    /// Builtin arity and argument-type states already instantiated at each callsite.
-    pub(super) activated_builtins: HashSet<(
-        usize,
-        BuiltinPath,
-        usize,
-        Option<usize>,
-        Vec<Option<TypeId>>,
-    )>,
-    /// Builtin callsites waiting for stable-arity heap-effect activation.
-    pub(super) deferred_builtin_effects: HashSet<(usize, BuiltinPath)>,
-    /// Builtin heap effects already activated after ordinary pack propagation settled.
-    pub(super) activated_builtin_effects: HashSet<(usize, BuiltinPath)>,
-    /// Structural call signatures already connected to one constraint.
-    pub(super) activated_call_signatures: HashSet<(usize, TypeId)>,
-    /// Table operations already connected to a concrete allocation.
-    pub(super) activated_table_constraints: HashSet<(usize, TableObjectId)>,
-    /// Index-dispatch handlers already connected for each table read.
-    pub(super) activated_index_dispatches: HashSet<(usize, TableObjectId)>,
-    /// Named fields already connected to each dynamic table read.
-    pub(super) activated_dynamic_fields: HashSet<(usize, TableObjectId, SmolStr)>,
-    /// Refinements waiting for producer-free fallback after normal quiescence.
+    pub(super) activations: ActivationTracker,
     pub(super) deferred_refinements: HashMap<usize, DeferredRefinement>,
-    /// Refinement records whose producer-free fallback has run once.
-    pub(super) activated_refinement_fallbacks: HashSet<usize>,
-    /// Operators waiting for primitive fallback after identity propagation.
     pub(super) deferred_operators: HashMap<usize, DeferredOperator>,
-    /// Operator records whose primitive fallback decision has run once.
-    pub(super) activated_operator_fallbacks: HashSet<usize>,
+    /// Dynamic callable requirements waiting for identity propagation to settle.
+    pub(super) deferred_callable_requirements: HashMap<usize, CallSite>,
+    pub(super) deferred_builtin_effects: HashSet<(usize, BuiltinPath)>,
     /// Next stable constraint identity.
     pub(super) next_constraint_id: usize,
 }

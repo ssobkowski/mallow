@@ -6,7 +6,9 @@ use crate::{
 };
 use smol_str::SmolStr;
 
-use super::model::{DeferredOperator, InferenceVarId, PackVarId, SolverConstraint, TypeSolver};
+use super::model::{
+    Activation, DeferredOperator, InferenceVarId, PackVarId, SolverConstraint, TypeSolver,
+};
 
 impl TypeSolver<'_> {
     /// Activates primitive operator defaults after table and closure identities settle.
@@ -17,7 +19,10 @@ impl TypeSolver<'_> {
         deferred.sort_by_key(|(constraint_id, _)| *constraint_id);
         let mut activated = false;
         for (constraint_id, operator) in deferred {
-            if !self.activated_operator_fallbacks.insert(constraint_id) {
+            if !self
+                .activations
+                .insert(constraint_id, Activation::OperatorFallback)
+            {
                 continue;
             }
             let number = self.types.primitives().number;
@@ -72,7 +77,10 @@ impl TypeSolver<'_> {
 
     /// Records one operator fallback unless its final decision already ran.
     fn defer_operator(&mut self, constraint_id: usize, operator: DeferredOperator) {
-        if !self.activated_operator_fallbacks.contains(&constraint_id) {
+        if !self
+            .activations
+            .contains(constraint_id, &Activation::OperatorFallback)
+        {
             self.deferred_operators
                 .entry(constraint_id)
                 .or_insert(operator);

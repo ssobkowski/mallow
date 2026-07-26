@@ -200,8 +200,6 @@ pub(super) struct CollectedFunction {
     pack_constraints: HashMap<PackSlot, Vec<CollectedPackConstraint>>,
     /// Relational field calls suitable for generic signature recovery.
     generic_field_calls: Vec<GenericFieldCall>,
-    /// Direct formal-to-return relations proven from source HIL.
-    generic_value_relations: Vec<GenericValueRelation>,
     /// Next proto-local synthetic slot number.
     next_synthetic_slot: u32,
     /// Next proto-local synthetic pack number.
@@ -219,8 +217,6 @@ pub(super) struct CollectedProgram {
     pub(super) pack_constraints: HashMap<PackSlot, Vec<CollectedPackConstraint>>,
     /// Relational field calls that can be expressed as source-level generics.
     pub(super) generic_field_calls: HashMap<ProtoId, Vec<GenericFieldCall>>,
-    /// Direct formal-parameter to return-slot relations proven from source HIL.
-    pub(super) generic_value_relations: HashMap<ProtoId, Vec<GenericValueRelation>>,
 }
 
 /// A same-table field relationship suitable for generic signature recovery.
@@ -234,17 +230,6 @@ pub(super) struct GenericFieldCall {
     pub(super) field_arguments: Vec<(usize, SmolStr)>,
     /// Fixed callback results consumed, or `None` for an open result context.
     pub(super) return_count: Option<usize>,
-}
-
-/// A direct opaque value relation suitable for source-level generic recovery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct GenericValueRelation {
-    /// Formal parameter whose exact runtime value is returned.
-    pub(super) parameter: SymbolId,
-    /// Fixed position of `parameter` in the closure signature.
-    pub(super) parameter_index: usize,
-    /// Fixed return position receiving that same runtime value.
-    pub(super) return_index: usize,
 }
 
 impl CollectedFunction {
@@ -275,7 +260,6 @@ impl CollectedFunction {
             constraints: HashMap::new(),
             pack_constraints: HashMap::new(),
             generic_field_calls: Vec::new(),
-            generic_value_relations: Vec::new(),
             next_synthetic_slot: 0,
             next_synthetic_pack: 0,
             next_table_key: 0,
@@ -361,14 +345,6 @@ impl CollectedFunction {
         }
     }
 
-    /// Sets finalized direct generic return relations.
-    pub(super) fn set_return_metadata(
-        &mut self,
-        generic_value_relations: Vec<GenericValueRelation>,
-    ) {
-        self.generic_value_relations = generic_value_relations;
-    }
-
     /// Ensures that `slot` participates in solver construction.
     fn ensure_slot(&mut self, slot: TypeSlot) {
         self.constraints.entry(slot).or_default();
@@ -404,7 +380,6 @@ impl CollectedProgram {
             constraints,
             pack_constraints,
             generic_field_calls,
-            generic_value_relations,
             ..
         } = function;
 
@@ -430,10 +405,6 @@ impl CollectedProgram {
         }
         if !generic_field_calls.is_empty() {
             self.generic_field_calls.insert(proto, generic_field_calls);
-        }
-        if !generic_value_relations.is_empty() {
-            self.generic_value_relations
-                .insert(proto, generic_value_relations);
         }
     }
 }

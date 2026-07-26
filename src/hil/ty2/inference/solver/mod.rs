@@ -20,7 +20,10 @@ use crate::hil::{
     ty2::{
         builtins::{BuiltinEnvironment, BuiltinPath},
         canonical::{Type, TypeId},
-        inference::queue::WorkQueue,
+        inference::{
+            queue::WorkQueue,
+            solver::model::{Activation, ActivationTracker},
+        },
         store::TypeStore,
     },
 };
@@ -31,8 +34,9 @@ use super::program::{
     Truthiness, TypeSlot,
 };
 use model::{
-    CallSite, ConstraintRecord, DeferredRefinement, InferenceVarId, InferenceVariable,
-    PackAlternative, PackVariable, SolverCallArgument, SolverConstraint, TableObjectId,
+    BodyValueRelation, CallSite, ConstraintRecord, DeferredRefinement, InferenceVarId,
+    InferenceVariable, PackAlternative, PackVariable, SolverCallArgument, SolverConstraint,
+    TableObjectId,
 };
 
 pub(super) use model::TypeSolver;
@@ -64,23 +68,15 @@ impl<'a> TypeSolver<'a> {
             functions,
             builtins,
             generic_field_calls: program.generic_field_calls,
-            generic_value_relations: program.generic_value_relations,
+            body_value_relations: HashMap::new(),
             closure_argument_packs: HashMap::new(),
             callsites: Vec::new(),
             deferred_callable_requirements: HashMap::new(),
             callsites_by_callee: HashMap::new(),
-            activated_closures: HashSet::new(),
-            activated_builtins: HashSet::new(),
+            activations: ActivationTracker::new(),
             deferred_builtin_effects: HashSet::new(),
-            activated_builtin_effects: HashSet::new(),
-            activated_call_signatures: HashSet::new(),
-            activated_table_constraints: HashSet::new(),
-            activated_index_dispatches: HashSet::new(),
-            activated_dynamic_fields: HashSet::new(),
             deferred_refinements: HashMap::new(),
-            activated_refinement_fallbacks: HashSet::new(),
             deferred_operators: HashMap::new(),
-            activated_operator_fallbacks: HashSet::new(),
             next_constraint_id: 0,
         };
 
@@ -118,6 +114,7 @@ impl<'a> TypeSolver<'a> {
                 solver.add_constraint(variable, SolverConstraint::Require(ty));
             }
         }
+        solver.derive_body_value_relations();
         solver
     }
 
@@ -160,6 +157,132 @@ impl<'a> TypeSolver<'a> {
         let variable = self.fresh_variable();
         self.variables_by_slot.insert(slot, variable);
         variable
+    }
+
+    /// Derives parameter and return relationships from the body constraint graph.
+    fn derive_body_value_relations(&mut self) {
+        let functions: Vec<_> = self
+            .functions
+            .iter()
+            .map(|function| (function.proto, function.symbols.params.clone()))
+            .collect();
+
+        for (proto, parameters) in functions {
+            let parameter_by_variable: HashMap<_, _> = parameters
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, parameter)| {
+                    (
+                        self.variable_for_slot(TypeSlot::Symbol(proto, parameter)),
+                        index,
+                    )
+                })
+                .collect();
+            let returns = self.pack_for_slot(super::program::PackSlot::Returns(proto));
+            let guaranteed = self.pack_arity(returns).0;
+            let mut relations = Vec::new();
+
+            for return_index in 0..guaranteed {
+                let returned = self.project_pack(returns, return_index);
+                let mut sources = HashSet::new();
+                let mut visited = HashSet::new();
+                let mut opaque = false;
+                self.collect_parameter_sources(
+                    returned,
+                    &parameter_by_variable,
+                    &mut visited,
+                    &mut sources,
+                    &mut opaque,
+                );
+                if !opaque && sources.len() == 1 {
+                    let parameter_index = *sources.iter().next().expect("one source exists");
+                    relations.push(BodyValueRelation {
+                        parameter_index,
+                        return_index,
+                    });
+                }
+            }
+
+            if !relations.is_empty() {
+                self.body_value_relations.insert(proto, relations);
+            }
+        }
+    }
+
+    /// Returns whether body operations leave a formal free to generalize.
+    fn parameter_allows_generic(&self, variable: InferenceVarId) -> bool {
+        self.constraints
+            .get(&variable)
+            .into_iter()
+            .flatten()
+            .all(|record| {
+                matches!(
+                    record.constraint,
+                    SolverConstraint::Observe(_)
+                        | SolverConstraint::Require(_)
+                        | SolverConstraint::FlowFrom(_)
+                        | SolverConstraint::Equal(_)
+                        | SolverConstraint::RefinedFrom { .. }
+                        | SolverConstraint::GenericFrom { .. }
+                        | SolverConstraint::NonNilFrom { .. }
+                )
+            })
+    }
+
+    /// Collects formal roots which are the only producers of `variable`.
+    fn collect_parameter_sources(
+        &self,
+        variable: InferenceVarId,
+        parameters: &HashMap<InferenceVarId, usize>,
+        visited: &mut HashSet<InferenceVarId>,
+        sources: &mut HashSet<usize>,
+        opaque: &mut bool,
+    ) {
+        if let Some(parameter) = parameters.get(&variable) {
+            sources.insert(*parameter);
+            return;
+        }
+        if !visited.insert(variable) {
+            return;
+        }
+
+        let constraints = self.constraints.get(&variable);
+        let mut has_source = false;
+        for record in constraints.into_iter().flatten() {
+            let source = match &record.constraint {
+                SolverConstraint::FlowFrom(source)
+                | SolverConstraint::Equal(source)
+                | SolverConstraint::RefinedFrom { source, .. }
+                | SolverConstraint::GenericFrom { source, .. }
+                | SolverConstraint::NonNilFrom { source } => Some(*source),
+                SolverConstraint::Observe(_)
+                | SolverConstraint::NewTable(_)
+                | SolverConstraint::Closure(_)
+                | SolverConstraint::Builtin(_) => {
+                    *opaque = true;
+                    None
+                }
+                SolverConstraint::Require(_)
+                | SolverConstraint::SetIndex { .. }
+                | SolverConstraint::SetIndexPack { .. }
+                | SolverConstraint::GetIndex { .. }
+                | SolverConstraint::SetField { .. }
+                | SolverConstraint::GetField { .. }
+                | SolverConstraint::Binary { .. }
+                | SolverConstraint::Unary { .. }
+                | SolverConstraint::Call { .. }
+                | SolverConstraint::FieldCall { .. }
+                | SolverConstraint::SetMetatable { .. } => None,
+            };
+            if let Some(source) = source {
+                has_source = true;
+                self.collect_parameter_sources(source, parameters, visited, sources, opaque);
+            }
+        }
+        if !has_source {
+            *opaque = true;
+        }
     }
 
     /// Lowers and installs one collected constraint.
@@ -447,7 +570,9 @@ impl<'a> TypeSolver<'a> {
         let mut activated = false;
         for (constraint_id, refinement) in deferred {
             if self.evidence_type(refinement.source).is_some()
-                || !self.activated_refinement_fallbacks.insert(constraint_id)
+                || !self
+                    .activations
+                    .insert(constraint_id, Activation::RefinementFallback)
             {
                 continue;
             }
@@ -625,7 +750,10 @@ impl<'a> TypeSolver<'a> {
                 Truthiness::Falsy => self.types.falsy_part(source_ty),
             };
             self.observe(target, refined);
-        } else if !self.activated_refinement_fallbacks.contains(&constraint_id) {
+        } else if !self
+            .activations
+            .contains(constraint_id, &Activation::RefinementFallback)
+        {
             self.deferred_refinements.insert(
                 constraint_id,
                 DeferredRefinement {

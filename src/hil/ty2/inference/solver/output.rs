@@ -384,7 +384,10 @@ impl TypeSolver<'_> {
 
     /// Plans collision-free direct-value generics whose formal upper bound stayed unknown.
     pub(super) fn generic_value_plans(&self, proto: ProtoId) -> Vec<GenericValuePlan> {
-        let Some(relations) = self.generic_value_relations.get(&proto) else {
+        let Some(relations) = self.body_value_relations.get(&proto) else {
+            return Vec::new();
+        };
+        let Some(function) = self.functions.get(proto.0 as usize) else {
             return Vec::new();
         };
 
@@ -409,25 +412,32 @@ impl TypeSolver<'_> {
         let unknown = self.types.primitives().unknown;
         let mut plans: Vec<GenericValuePlan> = Vec::new();
         for relation in sorted {
-            let slot = TypeSlot::Symbol(proto, relation.parameter);
+            let parameter_index = relation.parameter_index;
+            let return_index = relation.return_index;
+            let Some(parameter) = function.symbols.params.get(parameter_index).copied() else {
+                continue;
+            };
+            let slot = TypeSlot::Symbol(proto, parameter);
             let Some(variable) = self.variables_by_slot.get(&slot) else {
                 continue;
             };
-            if self.variables[*variable].upper != unknown {
+            if self.variables[*variable].upper != unknown
+                || !self.parameter_allows_generic(*variable)
+            {
                 continue;
             }
             if let Some(existing) = plans
                 .iter_mut()
-                .find(|plan| plan.parameter_index == relation.parameter_index)
+                .find(|plan| plan.parameter_index == parameter_index)
             {
-                existing.return_indices.push(relation.return_index);
+                existing.return_indices.push(return_index);
                 continue;
             }
             let name_index = reserved_count + plans.len();
             plans.push(GenericValuePlan {
-                parameter: relation.parameter,
-                parameter_index: relation.parameter_index,
-                return_indices: vec![relation.return_index],
+                parameter,
+                parameter_index,
+                return_indices: vec![return_index],
                 name: Self::conventional_generic_name(name_index),
                 optional: self
                     .closure_argument_packs
@@ -435,7 +445,7 @@ impl TypeSolver<'_> {
                     .is_some_and(|packs| {
                         packs.iter().any(|pack| {
                             let (minimum, _) = self.pack_arity(*pack);
-                            minimum <= relation.parameter_index
+                            minimum <= parameter_index
                         })
                     }),
             });

@@ -4,6 +4,7 @@ pub mod lifted;
 pub mod lifter;
 pub mod passes;
 pub mod ty2;
+pub mod ty3;
 pub mod visitor;
 
 use anyhow::Result;

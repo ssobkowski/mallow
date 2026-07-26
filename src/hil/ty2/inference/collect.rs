@@ -7,7 +7,7 @@ use smol_str::SmolStr;
 use crate::{
     hil::{
         cflow::cfg::BlockExit,
-        ir::{Expr, PhiNode, Stmt, TableItem, ValuePack},
+        ir::{Expr, Stmt, TableItem, ValuePack},
         lifted::LiftedFunction,
         lifter::ssa::SymbolId,
         ty2::{
@@ -22,7 +22,7 @@ use crate::{
 
 use super::program::{
     CollectedCallArgument, CollectedConstraint, CollectedFunction, CollectedPackConstraint,
-    GenericFieldCall, GenericValueRelation, PackSlot, Truthiness, TypeSlot,
+    GenericFieldCall, PackSlot, Truthiness, TypeSlot,
 };
 
 /// One named-field read resolved through SSA symbol definitions.
@@ -166,11 +166,6 @@ impl FunctionSymbolIndex {
     /// Returns whether `symbol` is a formal parameter.
     fn is_parameter(&self, symbol: SymbolId) -> bool {
         self.parameter_indices.contains_key(&symbol)
-    }
-
-    /// Returns the signature position of `symbol` when it is a formal parameter.
-    fn parameter_index(&self, symbol: SymbolId) -> Option<usize> {
-        self.parameter_indices.get(&symbol).copied()
     }
 
     /// Returns whether `symbol` is backed by nonlocal upvalue storage.
@@ -344,187 +339,6 @@ impl IncomingTruthiness {
     }
 }
 
-/// Direct-return classification accumulated for one fixed return position.
-#[derive(Clone, Copy)]
-enum DirectReturnSource {
-    /// No return exit observed this position yet.
-    Unseen,
-    /// Every observed value at this position is this same formal parameter.
-    Parameter(SymbolId),
-    /// At least one exit cannot prove the same direct formal parameter.
-    Ineligible,
-}
-
-/// Centralized direct generic-relation analysis for function returns.
-struct ReturnAnalysis {
-    /// Whether at least one concrete return exit was observed.
-    has_return: bool,
-    /// Direct formal-to-return relations proven from source HIL.
-    direct_value_relations: Vec<GenericValueRelation>,
-}
-
-impl ReturnAnalysis {
-    /// Analyzes strict direct-formal relationships in one function.
-    fn analyze(function: &LiftedFunction, symbols: &FunctionSymbolIndex) -> Self {
-        let mut analyzer = ReturnAnalyzer::new(symbols);
-        for block in function.cfg.blocks() {
-            analyzer.visit_stmts(block.stmts());
-            match block.exit() {
-                BlockExit::Return(values) => analyzer.observe_return(values),
-                exit => analyzer.visit_block_exit(exit),
-            }
-        }
-        analyzer.finish()
-    }
-
-    /// Installs generic metadata and the implicit empty result when needed.
-    fn complete_function(self, output: &mut CollectedFunction) {
-        if !self.has_return {
-            let returns = output.return_pack();
-            output.push_pack(
-                returns,
-                CollectedPackConstraint::Sequence {
-                    head: Vec::new(),
-                    tail: None,
-                },
-            );
-        }
-        output.set_return_metadata(self.direct_value_relations);
-    }
-}
-
-/// Mutable implementation state used only while deriving [`ReturnAnalysis`].
-struct ReturnAnalyzer<'a> {
-    /// Formal symbol classification for the analyzed function.
-    symbols: &'a FunctionSymbolIndex,
-    /// Merged direct-formal classification for every explicit return position.
-    sources: Vec<DirectReturnSource>,
-    /// Every direct formal occurrence and its return position.
-    direct_occurrences: Vec<(SymbolId, usize)>,
-    /// Formal parameters read anywhere except a bare direct return position.
-    non_direct_uses: HashSet<SymbolId>,
-    /// Number of concrete return exits.
-    return_count: usize,
-}
-
-impl<'a> ReturnAnalyzer<'a> {
-    /// Creates empty analysis state for one function's symbols.
-    fn new(symbols: &'a FunctionSymbolIndex) -> Self {
-        Self {
-            symbols,
-            sources: Vec::new(),
-            direct_occurrences: Vec::new(),
-            non_direct_uses: HashSet::new(),
-            return_count: 0,
-        }
-    }
-
-    /// Records one return exit without treating an open tail as one scalar value.
-    fn observe_return(&mut self, values: &ValuePack) {
-        let previous_returns = self.return_count;
-        self.return_count += 1;
-        let head = values.head();
-        if self.sources.len() < head.len() {
-            let fill = if previous_returns == 0 {
-                DirectReturnSource::Unseen
-            } else {
-                DirectReturnSource::Ineligible
-            };
-            self.sources.resize(head.len(), fill);
-        }
-        for source in self.sources.iter_mut().skip(head.len()) {
-            *source = DirectReturnSource::Ineligible;
-        }
-
-        for (return_index, value) in head.iter().enumerate() {
-            let source = match value {
-                Expr::Symbol(symbol) if self.symbols.is_parameter(*symbol) => {
-                    self.direct_occurrences.push((*symbol, return_index));
-                    DirectReturnSource::Parameter(*symbol)
-                }
-                _ => {
-                    self.visit_expr(value);
-                    DirectReturnSource::Ineligible
-                }
-            };
-            self.sources[return_index] = match (self.sources[return_index], source) {
-                (DirectReturnSource::Unseen, source) => source,
-                (DirectReturnSource::Parameter(existing), DirectReturnSource::Parameter(new))
-                    if existing == new =>
-                {
-                    DirectReturnSource::Parameter(existing)
-                }
-                _ => DirectReturnSource::Ineligible,
-            };
-        }
-
-        if let Some(tail) = values.tail() {
-            self.visit_expr(tail);
-        }
-    }
-
-    /// Produces immutable generic relation facts from all return exits.
-    fn finish(self) -> ReturnAnalysis {
-        let mut relations: Vec<_> = self
-            .sources
-            .iter()
-            .copied()
-            .enumerate()
-            .filter_map(|(return_index, source)| {
-                let DirectReturnSource::Parameter(parameter) = source else {
-                    return None;
-                };
-                let parameter_index = self.symbols.parameter_index(parameter)?;
-                Some(GenericValueRelation {
-                    parameter,
-                    parameter_index,
-                    return_index,
-                })
-            })
-            .collect();
-
-        let valid_relations: HashSet<_> = relations
-            .iter()
-            .map(|relation| (relation.parameter, relation.return_index))
-            .collect();
-        let mut disqualified = self.non_direct_uses;
-        for occurrence in self.direct_occurrences {
-            if !valid_relations.contains(&occurrence) {
-                disqualified.insert(occurrence.0);
-            }
-        }
-        relations.retain(|relation| !disqualified.contains(&relation.parameter));
-        relations.sort_by_key(|relation| (relation.parameter_index, relation.return_index));
-
-        ReturnAnalysis {
-            has_return: self.return_count > 0,
-            direct_value_relations: relations,
-        }
-    }
-}
-
-impl Visitor for ReturnAnalyzer<'_> {
-    /// Records a formal parameter read outside a bare direct return position.
-    fn visit_symbol(&mut self, symbol: SymbolId) {
-        if self.symbols.is_parameter(symbol) {
-            self.non_direct_uses.insert(symbol);
-        }
-    }
-
-    /// Records a captured formal parameter as a non-return use.
-    fn visit_capture(&mut self, _index: usize, symbol: SymbolId) {
-        self.visit_symbol(symbol);
-    }
-
-    /// Records phi operands because the generic visitor deliberately treats phis as leaves.
-    fn visit_phi(&mut self, phi: &PhiNode) {
-        self.visit_symbol(phi.target);
-        for &(_, operand) in &phi.operands {
-            self.visit_symbol(operand);
-        }
-    }
-}
-
 /// Collects one lifted function into proto-qualified constraints.
 pub(super) fn collect(
     function: &LiftedFunction,
@@ -535,8 +349,8 @@ pub(super) fn collect(
     let symbols = FunctionSymbolIndex::new(function);
     let provenance = SymbolProvenance::analyze(function);
     let incoming_truthiness = IncomingTruthiness::analyze(function);
-    let returns = ReturnAnalysis::analyze(function, &symbols);
     let mut output = CollectedFunction::from_function(function);
+    let mut has_return = false;
 
     for (block_index, block) in function.cfg.blocks().enumerate() {
         let mut collector = BlockCollector::new(
@@ -552,10 +366,20 @@ pub(super) fn collect(
         for statement in block.stmts() {
             collector.collect_statement(statement);
         }
+        has_return |= matches!(block.exit(), BlockExit::Return(_));
         collector.collect_exit(block.exit());
     }
 
-    returns.complete_function(&mut output);
+    if !has_return {
+        let returns = output.return_pack();
+        output.push_pack(
+            returns,
+            CollectedPackConstraint::Sequence {
+                head: Vec::new(),
+                tail: None,
+            },
+        );
+    }
     output
 }
 
@@ -1092,64 +916,12 @@ fn condition_symbol(condition: &Expr) -> Option<(SymbolId, Truthiness)> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     use id_arena::Arena;
 
-    use super::{Expr, FunctionSymbolIndex, ReturnAnalyzer, SymbolProvenance, ValuePack};
-    use crate::hil::{
-        lifter::ssa::{Symbol, SymbolId},
-        visitor::Visitor,
-    };
-
-    /// Creates symbol classification for an ordered list of test parameters.
-    fn symbol_index(parameters: &[SymbolId]) -> FunctionSymbolIndex {
-        let parameter_indices = parameters
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, symbol)| (symbol, index))
-            .collect();
-        FunctionSymbolIndex {
-            parameter_indices,
-            upvalues: HashSet::new(),
-        }
-    }
-
-    /// Direct return analysis rejects omissions, mixed formals, and other uses.
-    #[test]
-    fn direct_return_analysis_is_strict() {
-        let mut arena: Arena<Symbol> = Arena::new();
-        let parameter = arena.alloc(Symbol::param(0));
-        let other = arena.alloc(Symbol::param(1));
-        let symbols = symbol_index(&[parameter, other]);
-
-        let mut direct = ReturnAnalyzer::new(&symbols);
-        direct.observe_return(&ValuePack::Fixed(vec![Expr::Symbol(parameter)]));
-        let direct = direct.finish();
-        assert_eq!(direct.direct_value_relations.len(), 1);
-        assert_eq!(direct.direct_value_relations[0].parameter, parameter);
-        assert_eq!(direct.direct_value_relations[0].parameter_index, 0);
-        assert_eq!(direct.direct_value_relations[0].return_index, 0);
-
-        let mut omitted = ReturnAnalyzer::new(&symbols);
-        omitted.observe_return(&ValuePack::Fixed(vec![Expr::Symbol(parameter)]));
-        omitted.observe_return(&ValuePack::empty());
-        assert!(omitted.finish().direct_value_relations.is_empty());
-
-        let mut mixed = ReturnAnalyzer::new(&symbols);
-        mixed.observe_return(&ValuePack::Fixed(vec![Expr::Symbol(parameter)]));
-        mixed.observe_return(&ValuePack::Fixed(vec![Expr::Symbol(other)]));
-        assert!(mixed.finish().direct_value_relations.is_empty());
-
-        let mut otherwise_used = ReturnAnalyzer::new(&symbols);
-        otherwise_used.visit_expr(&Expr::GetField {
-            obj: Box::new(Expr::Symbol(parameter)),
-            field: "value".into(),
-        });
-        otherwise_used.observe_return(&ValuePack::Fixed(vec![Expr::Symbol(parameter)]));
-        assert!(otherwise_used.finish().direct_value_relations.is_empty());
-    }
+    use super::{Expr, SymbolProvenance};
+    use crate::hil::lifter::ssa::Symbol;
 
     /// A direct SSA definition provides stable field provenance.
     #[test]

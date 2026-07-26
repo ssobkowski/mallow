@@ -316,6 +316,57 @@ print(number_value + 1, string.upper(string_value))
     );
 }
 
+/// Body value flow preserves identity through aliases and harmless uses.
+#[test]
+fn identity_relation_comes_from_body_value_flow() {
+    let output = infer_and_analyze(
+        r#"
+local function id(value)
+    print(value)
+    local alias = value
+    return alias
+end
+local number_value = id(1)
+local string_value = id("x")
+print(number_value + 1, string.upper(string_value))
+"#,
+    );
+
+    assert!(
+        output.contains("local function v0<T>(p0: T): T"),
+        "body value flow did not preserve the identity relation:\n{output}"
+    );
+}
+
+/// Mixed producers and body requirements do not become unconstrained generics.
+#[test]
+fn body_constraints_prevent_false_identity_generics() {
+    let output = infer_and_analyze(
+        r#"
+local function mixed(value, condition)
+    if condition then
+        return value
+    end
+    return 1
+end
+local function numeric(value)
+    local unused = value + 1
+    return value
+end
+print(mixed("x", true), numeric(2))
+"#,
+    );
+
+    assert!(
+        !output.contains("function v0<T>") && !output.contains("function v1<T>"),
+        "a mixed or constrained return became an unconstrained generic:\n{output}"
+    );
+    assert!(
+        output.contains("function v1(p0: number): number"),
+        "the body numeric requirement did not beat call evidence:\n{output}"
+    );
+}
+
 /// Fixed heads and open tails retain their distinct positional behavior.
 #[test]
 fn value_packs_preserve_assignment_call_return_and_table_flow() {
