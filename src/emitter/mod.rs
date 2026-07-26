@@ -10,10 +10,12 @@ use std::collections::HashSet;
 use smol_str::SmolStr;
 
 use crate::{
-    DecompileOptions, ast,
+    DecompileOptions, EmitMode, ast,
     common::is_valid_luau_identifier,
     emitter::{
-        collectors::ReadCollector, declarations::DeclarationState, plan::FunctionPlan,
+        collectors::ReadCollector,
+        declarations::DeclarationState,
+        plan::{FunctionPlan, format_ssa_symbol_name},
         storage::SymbolStorage,
     },
     hil::{
@@ -233,12 +235,30 @@ impl Visitor for AssignCollector {
 struct FunctionContext {
     proto_idx: usize,
     plan: FunctionPlan,
+    /// Parent symbol names captured by each SSA upvalue.
+    ssa_upvalue_sources: Vec<ast::Identifier>,
     anomalies: Vec<String>,
 }
 
 struct AssignManyTarget {
     storage: SymbolStorage,
     slot_was_declared: bool,
+}
+
+/// Formats the predecessor-to-symbol mapping for one SSA phi node.
+fn format_phi_operands(proto_idx: u16, phi: &hil::PhiNode) -> String {
+    let operands = phi
+        .operands
+        .iter()
+        .map(|(predecessor, symbol)| {
+            format!(
+                "b{predecessor} = {}",
+                format_ssa_symbol_name(proto_idx, *symbol)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("phi operands: {operands}")
 }
 
 struct Emitter<'a> {
@@ -261,7 +281,8 @@ impl Emitter<'_> {
     fn create_context(&mut self, proto_idx: usize) -> usize {
         let ctx = FunctionContext {
             proto_idx,
-            plan: FunctionPlan::new(&self.functions[proto_idx]),
+            plan: FunctionPlan::new(&self.functions[proto_idx], self.options.emit),
+            ssa_upvalue_sources: Vec::new(),
             anomalies: Vec::new(),
         };
         self.contexts.push(ctx);
@@ -291,13 +312,29 @@ impl Emitter<'_> {
             self.declare_slot(slot);
         }
 
-        let upvalue_str = fun
-            .symbols
-            .upvalues
-            .iter()
-            .map(|u| self.get_symbol_name(u).0)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let upvalue_str = if self.options.emit == crate::EmitMode::Ssa {
+            let sources = self.contexts[self.current_ctx].ssa_upvalue_sources.clone();
+            fun.symbols
+                .upvalues
+                .iter()
+                .enumerate()
+                .map(|(index, upvalue)| {
+                    let name = self.get_symbol_name(upvalue).0;
+                    sources
+                        .get(index)
+                        .map(|source| format!("{name} <- {}", source.as_str()))
+                        .unwrap_or_else(|| name.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            fun.symbols
+                .upvalues
+                .iter()
+                .map(|upvalue| self.get_symbol_name(upvalue).0)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let mut block = if self.entry != proto_idx {
             ast::Block::with_stmts(vec![ast::Stmt::Comment {
                 text: format!("proto {}: upvalues = [{}]", proto_idx, upvalue_str),
@@ -495,6 +532,16 @@ impl Emitter<'_> {
     }
 
     fn symbol_storage(&mut self, sym: SymbolId) -> Option<SymbolStorage> {
+        if self.options.emit == EmitMode::Ssa {
+            let slot = self.current_context_mut().plan.symbol_slot(sym);
+            return Some(self.current_context_mut().plan.storage_for(
+                sym,
+                slot,
+                false,
+                MAX_LOCAL_COUNT,
+            ));
+        }
+
         if let Some(storage) = self.current_context().plan.inherited_storage(sym) {
             return Some(storage);
         }
@@ -1026,12 +1073,32 @@ impl Emitter<'_> {
             hil::Stmt::Call(expr) => buf.push(ast::Stmt::Expression {
                 expr: self.visit_expr(expr),
             }),
-            hil::Stmt::Phi(node) => {
-                panic!(
-                    "encountered unfolded phi node during structuring: target={}, operands={:?}",
-                    node.target.index(),
-                    node.operands
-                )
+            hil::Stmt::Phi(phi) => {
+                assert_eq!(
+                    self.options.emit,
+                    EmitMode::Ssa,
+                    "encountered phi node while emitting cleaned source: target={}, operands={:?}",
+                    phi.target.index(),
+                    phi.operands
+                );
+
+                let proto_idx = self.functions[self.current_proto_idx()].proto.0;
+                buf.push(ast::Stmt::Comment {
+                    text: format_phi_operands(proto_idx, phi),
+                });
+                let assignment = hil::Stmt::Assign {
+                    left: hil::Expr::Symbol(phi.target),
+                    value: hil::Expr::Call {
+                        fun: Box::new(hil::Expr::Global("@phi".into())),
+                        args: hil::ValuePack::Fixed(
+                            phi.operands
+                                .iter()
+                                .map(|(_, symbol)| hil::Expr::Symbol(*symbol))
+                                .collect(),
+                        ),
+                    },
+                };
+                self.visit_stmt(&assignment, buf);
             }
         }
     }
@@ -1180,6 +1247,14 @@ impl Emitter<'_> {
         }
         let mut generics: Vec<_> = generic_binders.into_iter().collect();
         generics.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
+        let ssa_upvalue_sources = if self.options.emit == EmitMode::Ssa {
+            captures
+                .iter()
+                .map(|symbol| self.get_symbol_name(symbol))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let parent_bindings: Vec<_> = captures
             .iter()
             .map(|sym| {
@@ -1189,6 +1264,7 @@ impl Emitter<'_> {
             .collect();
 
         let child_ctx = self.create_context(proto_idx);
+        self.contexts[child_ctx].ssa_upvalue_sources = ssa_upvalue_sources;
         let child_upvalues = self.functions[proto_idx].symbols.upvalues.clone();
         for (i, binding) in parent_bindings.into_iter().enumerate() {
             if let Some(&child_upval_sym) = child_upvalues.get(i) {
@@ -1255,8 +1331,31 @@ pub fn emit_ast(
 
 #[cfg(test)]
 mod tests {
-    use super::materialize_type;
-    use crate::{ast, hil::ty2::store::TypeStore};
+    use id_arena::Arena;
+
+    use super::{format_phi_operands, materialize_type};
+    use crate::{
+        ast,
+        hil::{ir::PhiNode, lifter::ssa::Symbol, ty2::store::TypeStore},
+    };
+
+    /// Phi comments preserve each predecessor-to-symbol association.
+    #[test]
+    fn formats_phi_predecessors() {
+        let mut symbols: Arena<Symbol> = Arena::new();
+        let target = symbols.alloc(Symbol::reg(0));
+        let first = symbols.alloc(Symbol::reg(1));
+        let second = symbols.alloc(Symbol::reg(2));
+        let phi = PhiNode {
+            target,
+            operands: vec![(3, first), (8, second)],
+        };
+
+        assert_eq!(
+            format_phi_operands(4, &phi),
+            "phi operands: b3 = p4_v1, b8 = p4_v2"
+        );
+    }
 
     /// Materialization preserves nested shapes and zero-result function packs.
     #[test]

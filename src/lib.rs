@@ -22,9 +22,21 @@ use crate::{
     logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget},
 };
 
+/// Output form produced by bytecode decompilation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EmitMode {
+    /// Emit cleaned Luau source code.
+    #[default]
+    Source,
+    /// Emit regioned SSA without destroying symbols or running cleanup passes.
+    Ssa,
+}
+
 /// Options controlling bytecode decompilation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecompileOptions {
+    /// Selects the output form.
+    pub emit: EmitMode,
     /// Spill emitter-introduced locals into table storage when Luau's local limit
     /// is exceeded.
     pub spill_locals: bool,
@@ -156,12 +168,12 @@ fn format_type_tag(tag: TypeTag, chunk: &Chunk) -> String {
     base
 }
 
-/// Decompiles Luau bytecode into Luau source code.
+/// Emits Luau bytecode as cleaned source or regioned SSA text.
 pub fn decompile_bytecode(bytecode: &[u8], options: DecompileOptions) -> Result<String> {
     decompile_bytecode_with_diagnostics(bytecode, options, &Diagnostics::default())
 }
 
-/// Decompiles Luau bytecode using an already constructed diagnostics context.
+/// Emits Luau bytecode using an already constructed diagnostics context.
 pub fn decompile_bytecode_with_diagnostics(
     bytecode: &[u8],
     options: DecompileOptions,
@@ -172,6 +184,7 @@ pub fn decompile_bytecode_with_diagnostics(
         byte_len = bytecode.len(),
         spill_locals = options.spill_locals,
         infer_types = options.infer_types,
+        emit = ?options.emit,
     );
     let _enter = span.enter();
 
@@ -193,18 +206,28 @@ pub fn decompile_bytecode_with_diagnostics(
         hil::ty2::inference::run(&mut lifted);
     }
 
-    let mut functions: Vec<_> = lifted
-        .into_iter()
-        .map(|fun| StructuredFunction::from_lifted(fun, &diagnostics))
-        .collect::<Result<_, _>>()?;
+    let mut functions: Vec<_> = if options.emit == EmitMode::Ssa {
+        lifted
+            .into_iter()
+            .map(|fun| StructuredFunction::from_lifted_ssa(fun, &diagnostics))
+            .collect()
+    } else {
+        lifted
+            .into_iter()
+            .map(|fun| StructuredFunction::from_lifted(fun, &diagnostics))
+            .collect::<Result<_, _>>()?
+    };
 
-    diagnostics
-        .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
-        .line(0, format_args!("running passes..."));
-    {
-        let span = tracing::info_span!("run_post_region_passes", function_count = functions.len());
-        let _enter = span.enter();
-        hil::passes::run(&mut functions);
+    if options.emit == EmitMode::Source {
+        diagnostics
+            .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
+            .line(0, format_args!("running passes..."));
+        {
+            let span =
+                tracing::info_span!("run_post_region_passes", function_count = functions.len());
+            let _enter = span.enter();
+            hil::passes::run(&mut functions);
+        }
     }
 
     diagnostics

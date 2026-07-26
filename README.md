@@ -91,10 +91,22 @@ mallow disasm -i <bytecode>
 mallow decompile -i <bytecode>
 ```
 
+Pass `--emit=ssa` to emit regioned SSA with its original symbol IDs instead of cleaned source:
+
+```sh
+mallow decompile -i <bytecode> --emit=ssa
+```
+
 **roundtrip** - compile a `.luau` file then immediately decompile it (requires `luau-compile` in PATH):
 
 ```sh
 mallow roundtrip -i <source.luau>
+```
+
+The same SSA output is available after compilation:
+
+```sh
+mallow roundtrip -i <source.luau> --emit=ssa
 ```
 
 **visualize** - generate an interactive CFG as HTML (requires `--features visualize`):

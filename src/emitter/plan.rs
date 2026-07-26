@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use smol_str::SmolStr;
 
 use crate::{
+    EmitMode,
     ast::Identifier,
     emitter::{
         locals::LocalPlan,
@@ -13,6 +14,10 @@ use crate::{
 };
 
 pub struct FunctionPlan {
+    /// Selects source naming or identity-preserving SSA naming.
+    emit: EmitMode,
+    /// Proto namespace used for identity-preserving SSA names.
+    proto_idx: u16,
     /// Owns all emitted identifiers for this function.
     names: NamePlan,
     /// Maps HIL symbols to emitted source-local slots.
@@ -30,31 +35,63 @@ pub struct FunctionPlan {
 }
 
 impl FunctionPlan {
-    pub fn new(fun: &StructuredFunction) -> Self {
-        let locals = LocalPlan::build(fun);
+    /// Builds the storage and name plan for one function.
+    pub fn new(fun: &StructuredFunction, emit: EmitMode) -> Self {
+        let locals = LocalPlan::build(fun, emit == EmitMode::Source);
         let next_fallback_slot = locals.slot_count();
         let forced_named_symbols =
             identity_named_symbols(&fun.symbols.params, &fun.symbols.upvalues);
-        Self {
+        let mut plan = Self {
+            emit,
+            proto_idx: fun.proto.0,
             names: NamePlan::new(),
             locals,
             fallback_slots: HashMap::new(),
             next_fallback_slot,
             forced_named_symbols,
             inherited_spills: HashMap::new(),
+        };
+
+        if emit == EmitMode::Ssa {
+            let mut symbols: Vec<_> = plan
+                .locals
+                .symbol_slots()
+                .into_iter()
+                .map(|(symbol, _)| symbol)
+                .chain(fun.symbols.params.iter().copied())
+                .chain(fun.symbols.upvalues.iter().copied())
+                .collect();
+            symbols.sort_by_key(|symbol| symbol.index());
+            symbols.dedup();
+            for symbol in symbols {
+                plan.reserve_ssa_symbol_name(symbol);
+            }
         }
+
+        plan
     }
 
     pub fn reserve_symbol_name_exact(&mut self, sym: SymbolId, preferred: SmolStr) -> Identifier {
-        self.names.reserve_symbol_name_exact(sym, preferred)
+        match self.emit {
+            EmitMode::Ssa => self.reserve_ssa_symbol_name(sym),
+            EmitMode::Source => self.names.reserve_symbol_name_exact(sym, preferred),
+        }
     }
 
     pub fn get_symbol_name(&mut self, sym: SymbolId, is_param: bool) -> Identifier {
-        self.names.get_symbol_name(sym, is_param)
+        match self.emit {
+            EmitMode::Ssa => self.reserve_ssa_symbol_name(sym),
+            EmitMode::Source => self.names.get_symbol_name(sym, is_param),
+        }
     }
 
     pub fn bind_slot_to_symbol_name(&mut self, slot: usize, sym: SymbolId, is_param: bool) {
-        self.names.bind_slot_to_symbol_name(slot, sym, is_param);
+        match self.emit {
+            EmitMode::Ssa => {
+                self.reserve_ssa_symbol_name(sym);
+            }
+            EmitMode::Source => self.names.bind_slot_to_symbol_name(slot, sym, is_param),
+        }
     }
 
     pub fn get_slot_name(&mut self, slot: usize) -> Identifier {
@@ -92,10 +129,18 @@ impl FunctionPlan {
     }
 
     pub fn inherit_named_upvalue(&mut self, child_upvalue_sym: SymbolId, name: Identifier) {
+        if self.emit == EmitMode::Ssa {
+            self.reserve_ssa_symbol_name(child_upvalue_sym);
+            return;
+        }
         self.reserve_symbol_name_exact(child_upvalue_sym, name.0);
     }
 
     pub fn inherit_spilled_upvalue(&mut self, child_upvalue_sym: SymbolId, spill: SpillSlot) {
+        if self.emit == EmitMode::Ssa {
+            self.reserve_ssa_symbol_name(child_upvalue_sym);
+            return;
+        }
         self.names.reserve_exact_name(&spill.table);
         self.inherited_spills.insert(child_upvalue_sym, spill);
     }
@@ -107,6 +152,10 @@ impl FunctionPlan {
         spill_locals: bool,
         max_local_count: usize,
     ) -> SymbolStorage {
+        if self.emit == EmitMode::Ssa {
+            return SymbolStorage::Named(self.reserve_ssa_symbol_name(sym));
+        }
+
         if spill_locals && slot >= max_local_count && !self.forced_named_symbols.contains(&sym) {
             return SymbolStorage::Spilled(SpillSlot {
                 table: self.reserve_spill_table(),
@@ -123,6 +172,12 @@ impl FunctionPlan {
 
     fn reserve_spill_table(&mut self) -> Identifier {
         self.names.reserve_spill_table()
+    }
+
+    /// Reserves the identifier derived from one underlying SSA symbol ID.
+    fn reserve_ssa_symbol_name(&mut self, sym: SymbolId) -> Identifier {
+        self.names
+            .reserve_symbol_name_exact(sym, format_ssa_symbol_name(self.proto_idx, sym))
     }
 
     /// Returns every symbol that currently has an emitted source name.
@@ -154,6 +209,11 @@ fn identity_named_symbols(params: &[SymbolId], upvalues: &[SymbolId]) -> HashSet
     params.iter().chain(upvalues).copied().collect()
 }
 
+/// Formats one SSA symbol with the proto namespace that owns its arena.
+pub(crate) fn format_ssa_symbol_name(proto_idx: u16, sym: SymbolId) -> SmolStr {
+    format!("p{}_v{}", proto_idx, sym.index()).into()
+}
+
 #[cfg(test)]
 mod tests {
     use id_arena::Arena;
@@ -172,6 +232,8 @@ mod tests {
 
     fn empty_plan() -> FunctionPlan {
         FunctionPlan {
+            emit: EmitMode::Source,
+            proto_idx: 0,
             names: NamePlan::new(),
             locals: LocalPlan::default(),
             fallback_slots: HashMap::new(),
@@ -179,6 +241,28 @@ mod tests {
             forced_named_symbols: HashSet::new(),
             inherited_spills: HashMap::new(),
         }
+    }
+
+    /// SSA storage names expose the underlying symbol arena index.
+    #[test]
+    fn ssa_storage_uses_symbol_id_name() {
+        let symbols = symbols(3);
+        let symbol = symbols[2];
+        let mut plan = FunctionPlan {
+            emit: EmitMode::Ssa,
+            proto_idx: 7,
+            names: NamePlan::new(),
+            locals: LocalPlan::default(),
+            fallback_slots: HashMap::new(),
+            next_fallback_slot: 0,
+            forced_named_symbols: HashSet::new(),
+            inherited_spills: HashMap::new(),
+        };
+
+        let SymbolStorage::Named(name) = plan.storage_for(symbol, 0, true, 0) else {
+            panic!("SSA symbols must remain named")
+        };
+        assert_eq!(name.as_str(), "p7_v2");
     }
 
     #[test]
@@ -216,6 +300,8 @@ mod tests {
         let upvalue = symbols[1];
         let ordinary = symbols[2];
         let mut plan = FunctionPlan {
+            emit: EmitMode::Source,
+            proto_idx: 0,
             names: NamePlan::new(),
             locals: LocalPlan::default(),
             fallback_slots: HashMap::new(),

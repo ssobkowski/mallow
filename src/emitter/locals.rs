@@ -21,10 +21,11 @@ pub struct LocalPlan {
 }
 
 impl LocalPlan {
-    pub fn build(fun: &StructuredFunction) -> Self {
+    /// Builds local slots for one structured function.
+    pub fn build(fun: &StructuredFunction, reuse_slots: bool) -> Self {
         let mut analysis = LifetimeAnalysis::new(fun);
         analysis.visit_region(&fun.root);
-        if is_straight_line_region(&fun.root) {
+        if reuse_slots && is_straight_line_region(&fun.root) {
             analysis.allocate()
         } else {
             analysis.allocate_without_reuse()
@@ -256,7 +257,10 @@ impl Visitor for LifetimeAnalysis {
                 self.record_event(reads, HashSet::new());
             }
             Stmt::Call(expr) => self.record_expr_event(expr),
-            Stmt::Phi(_) => unreachable!(),
+            Stmt::Phi(phi) => {
+                let reads = phi.operands.iter().map(|(_, symbol)| *symbol).collect();
+                self.record_event(reads, [phi.target].into_iter().collect());
+            }
         }
     }
 }

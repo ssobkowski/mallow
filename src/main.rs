@@ -1,9 +1,9 @@
 use std::{path::PathBuf, process::Command};
 
 use anyhow::{Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use mallow::{
-    DecompileOptions, DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
+    DecompileOptions, DiagnosticConfig, Diagnostics, EmitMode, LogLevel, LogTarget, ProtoSelector,
     decompile_bytecode_with_diagnostics, disassemble_bytecode_with_diagnostics,
 };
 
@@ -34,6 +34,25 @@ struct Cli {
     profile_output: Option<PathBuf>,
 }
 
+/// Output form selected by the command line.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Emit {
+    /// Emit cleaned Luau source code.
+    Source,
+    /// Emit regioned SSA with its original symbol IDs.
+    Ssa,
+}
+
+impl Emit {
+    /// Returns the matching library output mode.
+    const fn mode(self) -> EmitMode {
+        match self {
+            Self::Source => EmitMode::Source,
+            Self::Ssa => EmitMode::Ssa,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Disassemble a bytecode file
@@ -46,7 +65,7 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Decompile a bytecode file to Luau source code
+    /// Emit a bytecode file as cleaned Luau or regioned SSA
     Decompile {
         /// Path to the input bytecode file
         #[arg(short, long)]
@@ -56,6 +75,10 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
+        /// Output form to emit
+        #[arg(long, value_enum, default_value = "source")]
+        emit: Emit,
+
         /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
         #[arg(long)]
         spill_locals: bool,
@@ -64,7 +87,7 @@ enum Commands {
         #[arg(long)]
         infer_types: bool,
     },
-    /// Compile a Luau source file and decompile the resulting bytecode
+    /// Compile a Luau source file and emit cleaned Luau or regioned SSA
     Roundtrip {
         /// Path to the input Luau source file
         #[arg(short, long)]
@@ -85,6 +108,10 @@ enum Commands {
         /// Type info level, passed as '-t<n>' to the Luau compiler.
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
         type_level: Option<u8>,
+
+        /// Output form to emit
+        #[arg(long, value_enum, default_value = "source")]
+        emit: Emit,
 
         /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
         #[arg(long)]
@@ -125,6 +152,7 @@ fn main() -> Result<()> {
         Commands::Decompile {
             input,
             output,
+            emit,
             spill_locals,
             infer_types,
         } => {
@@ -136,6 +164,7 @@ fn main() -> Result<()> {
             let code = decompile_bytecode_with_diagnostics(
                 &bytecode,
                 DecompileOptions {
+                    emit: emit.mode(),
                     spill_locals,
                     infer_types,
                 },
@@ -152,6 +181,7 @@ fn main() -> Result<()> {
             opt_level,
             debug_level,
             type_level,
+            emit,
             spill_locals,
             infer_types,
         } => {
@@ -179,6 +209,7 @@ fn main() -> Result<()> {
             let code = decompile_bytecode_with_diagnostics(
                 &compile_out.stdout,
                 DecompileOptions {
+                    emit: emit.mode(),
                     spill_locals,
                     infer_types,
                 },
