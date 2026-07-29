@@ -1,0 +1,32 @@
+[package]
+name = "mallow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+either.workspace = true
+id-arena.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+smallvec.workspace = true
+smol_str.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+libtest-mimic.workspace = true
+tempfile.workspace = true
+
+[build-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+visualize = ["dep:serde", "dep:serde_json"]
+
+[[test]]
+name = "decompiler"
+harness = false

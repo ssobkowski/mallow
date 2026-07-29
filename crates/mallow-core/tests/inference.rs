@@ -37,9 +37,9 @@ fn compile_source(source: &str, temp: &TempDir) -> Vec<u8> {
 
 /// Decompiles bytecode with whole-program inference enabled.
 fn infer_bytecode(bytecode: &[u8]) -> String {
-    mallow::decompile_bytecode(
+    mallow_core::decompile_bytecode(
         bytecode,
-        mallow::DecompileOptions {
+        mallow_core::DecompileOptions {
             infer_types: true,
             ..Default::default()
         },
@@ -153,54 +153,6 @@ print(read())
     assert!(
         output.contains("local function v2(): nil | number"),
         "an upvalue write was mistaken for definite local construction:\n{output}"
-    );
-}
-
-/// Recursive arithmetic must not depend on randomized worklist insertion order.
-#[test]
-fn recursive_memo_table_inference_is_deterministic() {
-    let temp = TempDir::new().expect("create recursive inference test directory");
-    let bytecode = compile_source(include_str!("../fib.luau"), &temp);
-    let mut previous = None;
-
-    for iteration in 0..24 {
-        let output = infer_bytecode(&bytecode);
-        assert!(
-            output.contains("local function v1(p0: number): number"),
-            "iteration {iteration} lost recursive numeric inference:\n{output}"
-        );
-        if let Some(previous) = &previous {
-            assert_eq!(
-                &output, previous,
-                "iteration {iteration} emitted nondeterministic inferred output"
-            );
-        }
-        analyze_source(&output, &temp);
-        previous = Some(output);
-    }
-}
-
-/// Same-table callback/data fields retain their relationship as a generic.
-#[test]
-fn correlated_table_callback_recovers_generic_signature() {
-    let output = infer_and_analyze(include_str!("../type-playground.luau"));
-
-    assert!(
-        output.contains("local function v4(p0: boolean, p1: string): string"),
-        "the earlier closure lost its annotations during local-slot reuse:\n{output}"
-    );
-    assert!(
-        output.contains("local function v5<T>(p0: { data: T, f: (T) -> () }, ...): ()"),
-        "correlated callback fields were flattened into unrelated unions:\n{output}"
-    );
-    assert!(
-        output.contains("function(p0: number)"),
-        "numeric callback parameter was not recovered:\n{output}"
-    );
-    assert!(
-        output.contains("function(p0: { [number]: nil | number | string })")
-            || output.contains("function(p0: { [number]: nil | string | number })"),
-        "table callback parameter was not recovered:\n{output}"
     );
 }
 

@@ -5,12 +5,16 @@
 !build.rs
 !assets/
 !assets/**/*
+!crates/
+!crates/**/*
 !docs/
 !docs/**/*
 !src/
 !src/**/*
 !tests
 !tests/**/*
+!xtask/
+!xtask/**/*
 !Cargo.lock
 !Cargo.toml
 !README.md

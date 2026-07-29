@@ -1,0 +1,8 @@
+[package]
+name = "mallow-luau-toolchain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[dependencies]

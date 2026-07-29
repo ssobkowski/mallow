@@ -1,0 +1,24 @@
+[package]
+name = "mallow-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "mallow"
+path = "src/main.rs"
+
+[dependencies]
+mallow-core = { path = "../mallow-core" }
+
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-chrome = { workspace = true, optional = true }
+tracing-subscriber.workspace = true
+
+[features]
+default = []
+profile = ["dep:tracing-chrome"]
+visualize = ["mallow-core/visualize"]

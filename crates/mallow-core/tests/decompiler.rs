@@ -238,9 +238,9 @@ fn decompile_bytecode(
 ) -> Result<(), Failed> {
     let bytecode = fs::read(bytecode_path)
         .map_err(|e| Failed::from(format!("failed to read bytecode: {e}")))?;
-    let code = mallow::decompile_bytecode(
+    let code = mallow_core::decompile_bytecode(
         &bytecode,
-        mallow::DecompileOptions {
+        mallow_core::DecompileOptions {
             spill_locals,
             ..Default::default()
         },

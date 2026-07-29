@@ -1,0 +1,11 @@
+[package]
+name = "mallow-test-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]

@@ -10,7 +10,7 @@ mod printer;
 mod scopes;
 
 pub use logging::{
-    DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector, TracingGuard, init_tracing,
+    DIAGNOSTIC_EVENT_TARGET, DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
 };
 
 use anyhow::Result;
