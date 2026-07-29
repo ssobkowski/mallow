@@ -6,3 +6,15 @@ license.workspace = true
 readme.workspace = true
 
 [dependencies]
+tempfile.workspace = true
+
+directories = "6.0.0"
+fs2 = "0.4.3"
+reqwest = { version = "0.13.4", features = ["blocking", "rustls"] }
+sha2 = "0.11.0"
+thiserror = "2.0.19"
+zip = { version = "8.6.0", features = ["deflate"] }
+
+[build-dependencies]
+serde.workspace = true
+serde_json.workspace = true
