@@ -8,10 +8,12 @@ mod logging;
 mod operator;
 mod printer;
 mod scopes;
+mod types_view;
 
 pub use logging::{
     DIAGNOSTIC_EVENT_TARGET, DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
 };
+pub use types_view::{TypeFactory, TypePackView, TypeView, TypesView};
 
 use anyhow::Result;
 
@@ -168,6 +170,56 @@ fn format_type_tag(tag: TypeTag, chunk: &Chunk) -> String {
     base
 }
 
+/// Lifted functions and the entry proto shared by public bytecode pipelines.
+struct LiftedProgram {
+    /// Functions indexed by their proto IDs.
+    functions: Vec<LiftedFunction>,
+    /// Proto that starts execution for this chunk.
+    entry_proto: u16,
+}
+
+/// Disassembles and lifts bytecode without structuring its control flow.
+fn lift_bytecode_with_diagnostics(
+    bytecode: &[u8],
+    diagnostics: &Diagnostics,
+) -> Result<LiftedProgram> {
+    let disassembled = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    let entry_proto = disassembled.entry_proto.0;
+    let diagnostics = diagnostics.with_entry_proto(disassembled.entry_proto.0);
+    let functions = {
+        let span = tracing::info_span!("lift_protos", proto_count = disassembled.protos.len());
+        let _enter = span.enter();
+
+        disassembled
+            .protos
+            .iter()
+            .map(|proto| LiftedFunction::from_proto(proto, &disassembled, &diagnostics))
+            .collect::<Result<_, _>>()?
+    };
+
+    Ok(LiftedProgram {
+        functions,
+        entry_proto,
+    })
+}
+
+/// Infers named-local types from Luau bytecode.
+pub fn infer_bytecode_types(bytecode: &[u8]) -> Result<TypesView> {
+    infer_bytecode_types_with_diagnostics(bytecode, &Diagnostics::default())
+}
+
+/// Infers named-local types using an existing diagnostics context.
+pub fn infer_bytecode_types_with_diagnostics(
+    bytecode: &[u8],
+    diagnostics: &Diagnostics,
+) -> Result<TypesView> {
+    let span = tracing::info_span!("infer_bytecode_types", byte_len = bytecode.len());
+    let _enter = span.enter();
+    let mut program = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    hil::ty3::inference::run(&mut program.functions);
+    Ok(TypesView::from_inferred(&program.functions))
+}
+
 /// Emits Luau bytecode as cleaned source or regioned SSA text.
 pub fn decompile_bytecode(bytecode: &[u8], options: DecompileOptions) -> Result<String> {
     decompile_bytecode_with_diagnostics(bytecode, options, &Diagnostics::default())
@@ -188,31 +240,23 @@ pub fn decompile_bytecode_with_diagnostics(
     );
     let _enter = span.enter();
 
-    let disassembled = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let diagnostics = diagnostics.with_entry_proto(disassembled.entry_proto.0);
-
-    let mut lifted: Vec<_> = {
-        let span = tracing::info_span!("lift_protos", proto_count = disassembled.protos.len());
-        let _enter = span.enter();
-
-        disassembled
-            .protos
-            .iter()
-            .map(|proto| LiftedFunction::from_proto(proto, &disassembled, &diagnostics))
-            .collect::<Result<_, _>>()?
-    };
+    let mut program = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    let entry_proto = program.entry_proto;
+    let diagnostics = diagnostics.with_entry_proto(entry_proto);
 
     if options.infer_types {
-        hil::ty3::inference::run(&mut lifted);
+        hil::ty3::inference::run(&mut program.functions);
     }
 
     let mut functions: Vec<_> = if options.emit == EmitMode::Ssa {
-        lifted
+        program
+            .functions
             .into_iter()
             .map(|fun| StructuredFunction::from_lifted_ssa(fun, &diagnostics))
             .collect()
     } else {
-        lifted
+        program
+            .functions
             .into_iter()
             .map(|fun| StructuredFunction::from_lifted(fun, &diagnostics))
             .collect::<Result<_, _>>()?
@@ -234,14 +278,9 @@ pub fn decompile_bytecode_with_diagnostics(
         .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
         .line(0, format_args!("emitting AST..."));
     let ast = {
-        let span = tracing::info_span!("emit_ast", entry_proto = disassembled.entry_proto.0);
+        let span = tracing::info_span!("emit_ast", entry_proto);
         let _enter = span.enter();
-        emitter::emit_ast(
-            functions,
-            disassembled.entry_proto.0 as usize,
-            options,
-            &diagnostics,
-        )
+        emitter::emit_ast(functions, entry_proto as usize, options, &diagnostics)
     };
 
     let comments = vec![format!(
@@ -267,23 +306,21 @@ pub fn visualize_bytecode(
     output: impl AsRef<std::path::Path>,
     diagnostics: &Diagnostics,
 ) -> Result<()> {
-    use crate::hil::{cflow::visualize::dump_cfgs, lifted::LiftedFunction};
+    use crate::hil::cflow::visualize::dump_cfgs;
 
     let span = tracing::info_span!("visualize_bytecode", byte_len = bytecode.len());
     let _enter = span.enter();
 
-    let disassembly = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let cfgs: Vec<_> = disassembly
-        .protos
-        .iter()
-        .map(|proto| {
-            LiftedFunction::from_proto(proto, &disassembly, diagnostics).map(|lifted| lifted.cfg)
-        })
-        .collect::<Result<_, _>>()?;
+    let program = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    let cfgs = program
+        .functions
+        .into_iter()
+        .map(|function| function.cfg)
+        .collect::<Vec<_>>();
 
     dump_cfgs(
         &cfgs,
-        disassembly.entry_proto.0 as usize,
+        program.entry_proto as usize,
         output.as_ref().to_path_buf(),
     );
     Ok(())

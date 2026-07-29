@@ -9,7 +9,7 @@ use crate::{
         ir::{Expr, PhiNode, Stmt, ValuePack},
         lifter::{
             LiftContext, MultiRet, flush_multiret, lift,
-            ssa::{FunctionSymbols, Ssa, Symbol, SymbolId, SymbolKind},
+            ssa::{FunctionSymbols, NamedLocal, Ssa, Symbol, SymbolId, SymbolKind},
         },
         ty2::{bytecode::ProtoTypeContext, canonical::TypeId, store::TypeStore},
         visitor::{Visitor, VisitorMut},
@@ -85,11 +85,13 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
         self.lift_blocks()?;
         self.collect_loop_carried_versions();
         let symbol_types = self.finish_ssa();
+        let named_locals = self.named_locals();
         let (upvalue_version_groups, captured_version_groups) = self.storage_version_groups();
 
         let symbols = FunctionSymbols::new(
             self.params,
             self.upvalues,
+            named_locals,
             upvalue_version_groups,
             captured_version_groups,
             self.loop_carried_versions,
@@ -106,9 +108,11 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     /// Seeds entry-block SSA state for parameters and declared upvalues.
     fn initialize_entry_symbols(&mut self) {
         for i in 0..self.proto.num_params {
-            let sym = self
-                .ssa
-                .alloc_symbol(Symbol::param(i).with_type(self.type_context.param(i)));
+            let sym = self.ssa.alloc_symbol(
+                Symbol::param(i)
+                    .with_type(self.type_context.param(i))
+                    .with_local_index(self.proto.local_index_at(i, 0)),
+            );
             self.ssa.write_reg(self.graph.entry(), i, sym);
             self.params.push(sym);
         }
@@ -481,6 +485,34 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             })
     }
 
+    /// Builds named locals from debug records and their surviving SSA versions.
+    fn named_locals(&self) -> Vec<NamedLocal> {
+        let mut symbols_by_local = vec![Vec::new(); self.proto.locals.len()];
+        for (id, symbol) in self.ssa.arena().iter() {
+            let Some(local_index) = symbol.local_index else {
+                continue;
+            };
+            let resolved = self.ssa.resolve(id);
+            if !symbols_by_local[local_index].contains(&resolved) {
+                symbols_by_local[local_index].push(resolved);
+            }
+        }
+
+        self.proto
+            .locals
+            .iter()
+            .zip(symbols_by_local)
+            .filter_map(|(local, symbols)| {
+                self.chunk.get_string(local.name).map(|name| NamedLocal {
+                    name: name.to_string(),
+                    start_pc: local.start_pc,
+                    end_pc: local.end_pc,
+                    symbols,
+                })
+            })
+            .collect()
+    }
+
     /// Groups surviving versions by declared-upvalue or captured-register storage.
     fn storage_version_groups(&self) -> (Vec<Vec<SymbolId>>, Vec<Vec<SymbolId>>) {
         let mut upvalue_versions: BTreeMap<u8, Vec<_>> = BTreeMap::new();
@@ -515,7 +547,10 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     fn apply_exit_writes(&mut self, block_id: usize, exit_pc: Option<u32>, exit_writes: &[u8]) {
         for &reg in exit_writes {
             let ty = exit_pc.and_then(|pc| self.type_context.local_at(reg, pc));
-            let sym = self.ssa.alloc_symbol(Symbol::reg(reg).with_type(ty));
+            let local_index = exit_pc.and_then(|pc| self.proto.local_index_after(reg, pc));
+            let sym = self
+                .ssa
+                .alloc_symbol(Symbol::reg(reg).with_type(ty).with_local_index(local_index));
             self.ssa.write_reg(block_id, reg, sym);
         }
     }

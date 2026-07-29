@@ -1125,8 +1125,8 @@ impl fmt::Display for Instr {
 #[derive(Debug, Clone)]
 pub struct LocalDebug {
     pub name: StringId,
-    pub start_pc: usize,
-    pub end_pc: usize,
+    pub start_pc: u32,
+    pub end_pc: u32,
     pub register: u8,
 }
 
@@ -1277,6 +1277,28 @@ impl Proto {
     #[inline]
     pub fn get_child_proto(&self, id: ChildProtoId) -> Option<ProtoId> {
         self.child_protos.get(id.0 as usize).copied()
+    }
+
+    /// Returns the debug-local index active for `register` at `pc`.
+    pub fn local_index_at(&self, register: u8, pc: u32) -> Option<usize> {
+        self.locals
+            .iter()
+            .enumerate()
+            .filter(|(_, local)| {
+                local.register == register && pc >= local.start_pc && pc < local.end_pc
+            })
+            .max_by_key(|(_, local)| local.start_pc)
+            .map(|(index, _)| index)
+    }
+
+    /// Returns the debug-local index visible after the instruction at `pc`.
+    pub fn local_index_after(&self, register: u8, pc: u32) -> Option<usize> {
+        let next_pc = self
+            .instrs
+            .iter()
+            .find(|instr| instr.word_pc > pc)
+            .map_or(pc.saturating_add(1), |instr| instr.word_pc);
+        self.local_index_at(register, next_pc)
     }
 }
 

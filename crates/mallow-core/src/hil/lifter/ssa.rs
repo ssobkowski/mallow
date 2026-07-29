@@ -16,6 +16,8 @@ pub struct Symbol {
     pub kind: SymbolKind,
     /// Bytecode-provided type fact for this symbol, if one was available.
     pub ty: Option<TypeId>,
+    /// Index of the active debug-local record, if debug information was present.
+    pub local_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,6 +28,19 @@ pub enum SymbolKind {
     Param(u8),
 }
 
+/// One named local and its SSA versions.
+#[derive(Debug, Clone)]
+pub struct NamedLocal {
+    /// Name stored in Luau debug information.
+    pub name: String,
+    /// First bytecode PC covered by the local.
+    pub start_pc: u32,
+    /// First bytecode PC after the local's lifetime.
+    pub end_pc: u32,
+    /// SSA versions associated with this local.
+    pub symbols: Vec<SymbolId>,
+}
+
 /// Stores the symbols and storage links found while building SSA.
 #[derive(Debug, Clone)]
 pub struct FunctionSymbols {
@@ -33,6 +48,8 @@ pub struct FunctionSymbols {
     pub params: Vec<SymbolId>,
     /// Entry versions for the declared upvalues.
     pub upvalues: Vec<SymbolId>,
+    /// Named locals recovered from Luau debug information.
+    pub named_locals: Vec<NamedLocal>,
     /// Version groups for declared upvalue storage.
     pub(crate) upvalue_version_groups: Vec<Vec<SymbolId>>,
     /// Version groups for captured register storage.
@@ -46,6 +63,7 @@ impl FunctionSymbols {
     pub(crate) fn new(
         params: Vec<SymbolId>,
         upvalues: Vec<SymbolId>,
+        named_locals: Vec<NamedLocal>,
         upvalue_version_groups: Vec<Vec<SymbolId>>,
         captured_version_groups: Vec<Vec<SymbolId>>,
         loop_carried_versions: Vec<(SymbolId, SymbolId)>,
@@ -53,6 +71,7 @@ impl FunctionSymbols {
         Self {
             params,
             upvalues,
+            named_locals,
             upvalue_version_groups,
             captured_version_groups,
             loop_carried_versions,
@@ -93,6 +112,7 @@ impl Symbol {
         Self {
             kind: SymbolKind::Register(reg),
             ty: None,
+            local_index: None,
         }
     }
 
@@ -100,6 +120,7 @@ impl Symbol {
         Self {
             kind: SymbolKind::Upvalue(index),
             ty: None,
+            local_index: None,
         }
     }
 
@@ -107,6 +128,7 @@ impl Symbol {
         Self {
             kind: SymbolKind::CapturedRegister { reg, generation },
             ty: None,
+            local_index: None,
         }
     }
 
@@ -114,11 +136,18 @@ impl Symbol {
         Self {
             kind: SymbolKind::Param(index),
             ty: None,
+            local_index: None,
         }
     }
 
     pub fn with_type(mut self, ty: Option<TypeId>) -> Self {
         self.ty = ty;
+        self
+    }
+
+    /// Associates this version with one debug-local record.
+    pub fn with_local_index(mut self, local_index: Option<usize>) -> Self {
+        self.local_index = local_index;
         self
     }
 }
@@ -165,6 +194,11 @@ impl<'a, G: GraphView> Ssa<'a, G> {
 
     pub fn promote_to_captured_reg(&mut self, symbol: SymbolId, reg: u8, generation: u16) {
         self.arena[symbol].kind = SymbolKind::CapturedRegister { reg, generation };
+    }
+
+    /// Updates the debug-local record after a multi-instruction write is complete.
+    pub fn set_local_index(&mut self, symbol: SymbolId, local_index: Option<usize>) {
+        self.arena[symbol].local_index = local_index;
     }
 
     pub fn alloc_symbol(&mut self, sym: Symbol) -> SymbolId {
@@ -289,7 +323,12 @@ impl<'a, G: GraphView> Ssa<'a, G> {
         let replacement = same.unwrap_or_else(|| {
             let kind = self.arena[phi_sym].kind;
             let ty = self.arena[phi_sym].ty;
-            self.arena.alloc(Symbol { kind, ty })
+            let local_index = self.arena[phi_sym].local_index;
+            self.arena.alloc(Symbol {
+                kind,
+                ty,
+                local_index,
+            })
         });
 
         self.phi_to_operands.remove(&phi_sym);

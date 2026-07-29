@@ -327,6 +327,13 @@ impl LiftedFunction {
             *symbol = disjoint_set.find(*symbol);
         }
         self.types.canonicalize_symbols(&mut disjoint_set);
+        for local in &mut self.symbols.named_locals {
+            for symbol in &mut local.symbols {
+                *symbol = disjoint_set.find(*symbol);
+            }
+            local.symbols.sort();
+            local.symbols.dedup();
+        }
 
         let mut canonicalizer = SymbolCanonicalizer {
             disjoint_set: &mut disjoint_set,

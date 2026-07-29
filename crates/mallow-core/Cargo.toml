@@ -17,6 +17,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 libtest-mimic.workspace = true
+mallow-luau-toolchain = { path = "../mallow-luau-toolchain" }
+mallow-test-macros = { path = "../mallow-test-macros" }
 tempfile.workspace = true
 
 [build-dependencies]

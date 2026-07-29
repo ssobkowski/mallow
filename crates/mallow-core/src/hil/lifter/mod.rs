@@ -36,6 +36,8 @@ pub struct MultiRet {
     pub base: u8,
     /// The expression that produced the sequence.
     pub expr: Expr,
+    /// Debug-local index used if a deferred vararg must be materialized.
+    pub local_index: Option<usize>,
 }
 
 /// Returns true when an instruction can appear between a pending multiret and
@@ -205,8 +207,11 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         let symbol = match self.open_captured_ref[reg as usize] {
             Some(generation) => Symbol::captured_reg(reg, generation),
             None => Symbol::reg(reg),
-        }
-        .with_type(self.type_context.local_at(reg, self.current_pc()));
+        };
+        let pc = self.current_pc();
+        let symbol = symbol
+            .with_type(self.type_context.local_at(reg, pc))
+            .with_local_index(self.proto.local_index_after(reg, pc));
 
         let sym = self.ssa.alloc_symbol(symbol);
         self.ssa.write_reg(self.block_idx, reg, sym);
@@ -616,6 +621,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                         self.pending_multiret = Some(MultiRet {
                             base: *dest,
                             expr: Expr::VarArgs,
+                            local_index: self.proto.local_index_after(*dest, self.current_pc()),
                         });
                     }
                     Count::Number(n) => {
@@ -781,7 +787,11 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             }
             Count::Variadic => {
                 debug_assert!(self.pending_multiret.is_none());
-                self.pending_multiret = Some(MultiRet { base: dest, expr });
+                self.pending_multiret = Some(MultiRet {
+                    base: dest,
+                    expr,
+                    local_index: None,
+                });
             }
         }
     }
@@ -794,6 +804,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             .with_context(|| format!("did not find proto {proto_id:?}"))?;
 
         let captures = self.consume_captures(proto.num_upvals)?;
+        let local_index = self.proto.local_index_after(dest, self.current_pc());
+        self.ssa.set_local_index(sym, local_index);
 
         self.stmts.push(Stmt::Assign {
             left: Expr::Symbol(sym),
@@ -815,7 +827,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         {
             return None;
         }
-        let MultiRet { base, expr } = self.pending_multiret.take().unwrap();
+        let MultiRet { base, expr, .. } = self.pending_multiret.take().unwrap();
         Some(ValuePack::Open {
             head: self.read_regs(first, base - first),
             tail: Box::new(expr),
@@ -903,14 +915,18 @@ pub fn flush_multiret<G: GraphView>(
     ssa: &mut Ssa<'_, G>,
     stmts: &mut Vec<Stmt>,
 ) {
-    let MultiRet { base, expr } = multiret;
+    let MultiRet {
+        base,
+        expr,
+        local_index,
+    } = multiret;
 
     match expr {
         call @ (Expr::Call { .. } | Expr::MethodCall { .. }) => {
             stmts.push(Stmt::Call(call));
         }
         Expr::VarArgs => {
-            let sym = ssa.alloc_symbol(Symbol::reg(base));
+            let sym = ssa.alloc_symbol(Symbol::reg(base).with_local_index(local_index));
             ssa.write_reg(block_idx, base, sym);
 
             stmts.push(Stmt::Assign {
