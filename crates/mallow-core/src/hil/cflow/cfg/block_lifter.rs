@@ -72,7 +72,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             type_store,
             type_context,
             blocks: vec![Block::dummy(); raw_blocks.len()],
-            ssa: Ssa::new(graph),
+            ssa: Ssa::new(graph, proto.max_stack_size, proto.num_upvals),
             params: Vec::with_capacity(proto.num_params as usize),
             upvalues: Vec::with_capacity(proto.num_upvals as usize),
             loop_carried_versions: Vec::new(),

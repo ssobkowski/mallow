@@ -1,4 +1,34 @@
-use crate::hil::{StructuredFunction, cflow::cfg::ControlFlowGraph, lifter::ssa::FunctionSymbols};
+use std::{error::Error, fmt};
+
+use crate::{
+    hil::{StructuredFunction, cflow::cfg::ControlFlowGraph, lifter::ssa::FunctionSymbols},
+    il::ProtoId,
+};
+
+/// A non-fatal failure produced while simplifying structured HIL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassError {
+    /// Post-region passes kept changing the function at the iteration limit.
+    DidNotConverge {
+        /// Function that did not reach a fixed point.
+        proto: ProtoId,
+        /// Number of completed pass iterations.
+        iterations: usize,
+    },
+}
+
+impl fmt::Display for PassError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DidNotConverge { proto, iterations } => write!(
+                f,
+                "post-region passes did not converge for proto {proto} after {iterations} iterations; output may be less simplified"
+            ),
+        }
+    }
+}
+
+impl Error for PassError {}
 
 mod continue_cleanup;
 mod fold_bool_assign;
@@ -27,7 +57,8 @@ macro_rules! run_pass {
     }};
 }
 
-pub fn run(fns: &mut [StructuredFunction]) {
+/// Runs the post-region passes and returns every non-fatal pass failure.
+pub fn run(fns: &mut [StructuredFunction], max_iterations: usize) -> Vec<PassError> {
     {
         let span = tracing::info_span!("infer_return_arity", function_count = fns.len());
         let _enter = span.enter();
@@ -41,13 +72,13 @@ pub fn run(fns: &mut [StructuredFunction]) {
         })
         .collect();
 
+    let mut errors = Vec::new();
     for fun in &mut *fns {
         let span = tracing::info_span!("post_region_function", proto = fun.proto.0);
         let _enter = span.enter();
-        let mut iteration = 0;
 
-        loop {
-            iteration += 1;
+        let mut converged = false;
+        for iteration in 1..=max_iterations {
             let proto_index = fun.proto.0;
 
             let mut changed = run_pass!(proto_index, iteration, "inlining_post_region", {
@@ -77,10 +108,20 @@ pub fn run(fns: &mut [StructuredFunction]) {
             changed |= run_pass!(proto_index, iteration, "normalize", { normalize::run(fun) });
 
             if !changed {
+                converged = true;
                 break;
             }
         }
+
+        if !converged {
+            errors.push(PassError::DidNotConverge {
+                proto: fun.proto,
+                iterations: max_iterations,
+            });
+        }
     }
+
+    errors
 }
 
 pub(crate) fn run_pre_region(cfg: &mut ControlFlowGraph, symbols: &FunctionSymbols) -> bool {

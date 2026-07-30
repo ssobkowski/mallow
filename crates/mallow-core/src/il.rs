@@ -1198,7 +1198,6 @@ impl fmt::Display for BytecodeType {
 pub struct TypeTag {
     pub ty: BytecodeType,
     pub optional: bool,
-    pub raw: u8,
 }
 
 impl TypeTag {
@@ -1206,7 +1205,6 @@ impl TypeTag {
         Self {
             ty: BytecodeType::from_byte(value),
             optional: value & BytecodeType::OPTIONAL != 0,
-            raw: value,
         }
     }
 }

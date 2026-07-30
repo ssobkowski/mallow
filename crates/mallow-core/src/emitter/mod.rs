@@ -34,7 +34,7 @@ use crate::{
     },
     il::ProtoId,
     logging::{Diagnostics, LogLevel, LogTarget},
-    operator::{CompoundBinOp, UnOp},
+    operator::CompoundBinOp,
 };
 
 const MAX_LOCAL_COUNT: usize = 199;
@@ -1010,50 +1010,18 @@ impl Emitter<'_> {
             } => {
                 let table_expr = self.visit_expr(&hil::Expr::Symbol(*table));
                 if values.is_open() {
-                    // The idea is that if we have a variadic tail, we can't simply assign
-                    // a tuple to a single index (t[k] = a, b)
-                    //
-                    // We create a temporary table and then copy the contents of it into the
-                    // true table with `table.move`
-                    //
-                    // This should run only if the 'fold_tables' pass did not fold this SetList
-                    // into table constructor.
+                    // Preserve the exact value count because a table length drops trailing nils.
+                    let packed_values = self.visit_value_pack(values);
+                    let temp_table = self.fresh_temp_local();
+                    let temp_count = self.fresh_temp_local();
 
-                    let temp_table_ident = ast::Identifier::new("__t");
-                    buf.push(ast::Stmt::Do {
-                        body: ast::Block::with_stmts(vec![
-                            ast::Stmt::LocalDeclaration {
-                                names: vec![ast::Typed::untyped(temp_table_ident.clone())],
-                                values: vec![ast::Expr::Table {
-                                    items: self
-                                        .visit_value_pack(values)
-                                        .into_iter()
-                                        .map(|v| ast::TableItem::Implicit { value: v })
-                                        .collect(),
-                                }],
-                            },
-                            ast::Stmt::Expression {
-                                expr: ast::Expr::FunctionCall {
-                                    func: Box::new(ast::Expr::Field {
-                                        base: Box::new(ast::Expr::Named(ast::Identifier::new(
-                                            "table",
-                                        ))),
-                                        field: ast::Identifier::new("move"),
-                                    }),
-                                    args: vec![
-                                        ast::Expr::Named(temp_table_ident.clone()),
-                                        ast::Expr::Literal(ast::Literal::Float(1.0)),
-                                        ast::Expr::Unary {
-                                            op: UnOp::Length,
-                                            expr: Box::new(ast::Expr::Named(temp_table_ident)),
-                                        },
-                                        ast::Expr::Literal(ast::Literal::Float(*index as f64)),
-                                        table_expr,
-                                    ],
-                                },
-                            },
-                        ]),
-                    });
+                    buf.extend(open_set_list_fallback(
+                        packed_values,
+                        temp_table,
+                        temp_count,
+                        *index,
+                        table_expr,
+                    ));
                 } else {
                     let base = *index as usize;
                     let length = values
@@ -1310,6 +1278,58 @@ impl Emitter<'_> {
     }
 }
 
+/// Builds a source fallback for an open table-constructor value pack.
+fn open_set_list_fallback(
+    packed_values: Vec<ast::Expr>,
+    temp_table: ast::Identifier,
+    temp_count: ast::Identifier,
+    index: u32,
+    table: ast::Expr,
+) -> [ast::Stmt; 2] {
+    [
+        ast::Stmt::Comment {
+            text: "the following code is a fallback, not the original table constructor"
+                .to_string(),
+        },
+        ast::Stmt::Do {
+            body: ast::Block::with_stmts(vec![
+                ast::Stmt::LocalDeclaration {
+                    names: vec![ast::Typed::untyped(temp_table.clone())],
+                    values: vec![ast::Expr::FunctionCall {
+                        func: Box::new(ast::Expr::Field {
+                            base: Box::new(ast::Expr::Named(ast::Identifier::new("table"))),
+                            field: ast::Identifier::new("pack"),
+                        }),
+                        args: packed_values,
+                    }],
+                },
+                ast::Stmt::LocalDeclaration {
+                    names: vec![ast::Typed::untyped(temp_count.clone())],
+                    values: vec![ast::Expr::Field {
+                        base: Box::new(ast::Expr::Named(temp_table.clone())),
+                        field: ast::Identifier::new("n"),
+                    }],
+                },
+                ast::Stmt::Expression {
+                    expr: ast::Expr::FunctionCall {
+                        func: Box::new(ast::Expr::Field {
+                            base: Box::new(ast::Expr::Named(ast::Identifier::new("table"))),
+                            field: ast::Identifier::new("move"),
+                        }),
+                        args: vec![
+                            ast::Expr::Named(temp_table),
+                            ast::Expr::Literal(ast::Literal::Float(1.0)),
+                            ast::Expr::Named(temp_count),
+                            ast::Expr::Literal(ast::Literal::Float(index as f64)),
+                            table,
+                        ],
+                    },
+                },
+            ]),
+        },
+    ]
+}
+
 pub fn emit_ast(
     functions: Vec<StructuredFunction>,
     entry: usize,
@@ -1333,7 +1353,7 @@ pub fn emit_ast(
 mod tests {
     use id_arena::Arena;
 
-    use super::{format_phi_operands, materialize_type};
+    use super::{format_phi_operands, materialize_type, open_set_list_fallback};
     use crate::{
         ast,
         hil::{ir::PhiNode, lifter::ssa::Symbol, ty2::store::TypeStore},
@@ -1354,6 +1374,34 @@ mod tests {
         assert_eq!(
             format_phi_operands(4, &phi),
             "phi operands: b3 = p4_v1, b8 = p4_v2"
+        );
+    }
+
+    /// Open SetList fallback keeps the value count produced by table.pack.
+    #[test]
+    fn open_set_list_fallback_uses_packed_count() {
+        let statements = open_set_list_fallback(
+            vec![ast::Expr::FunctionCall {
+                func: Box::new(ast::Expr::Named(ast::Identifier::new("returns_stuff"))),
+                args: Vec::new(),
+            }],
+            ast::Identifier::new("__t"),
+            ast::Identifier::new("__n"),
+            1,
+            ast::Expr::Named(ast::Identifier::new("target")),
+        );
+        let output = crate::printer::print(&ast::Block::with_stmts(Vec::from(statements)), &[]);
+
+        assert_eq!(
+            output,
+            concat!(
+                "-- the following code is a fallback, not the original table constructor\n",
+                "do\n",
+                "    local __t = table.pack(returns_stuff())\n",
+                "    local __n = __t.n\n",
+                "    table.move(__t, 1, __n, 1, target)\n",
+                "end\n",
+            )
         );
     }
 

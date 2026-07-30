@@ -190,7 +190,7 @@ impl Type {
 }
 
 /// An identifier such as `foo`.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Identifier(pub SmolStr);
 
 impl Identifier {

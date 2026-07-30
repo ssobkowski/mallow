@@ -15,7 +15,7 @@ pub use logging::{
 };
 pub use types_view::{TypeFactory, TypePackView, TypeView, TypesView};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 
 use crate::{
     disasm::Chunk,
@@ -34,8 +34,11 @@ pub enum EmitMode {
     Ssa,
 }
 
+/// Default maximum number of post-region pass iterations per function.
+pub const DEFAULT_MAX_PASS_ITERATIONS: usize = 20;
+
 /// Options controlling bytecode decompilation.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct DecompileOptions {
     /// Selects the output form.
     pub emit: EmitMode,
@@ -45,6 +48,19 @@ pub struct DecompileOptions {
     /// Emit conservative decompiler-inferred type annotations in addition to
     /// bytecode-recovered type annotations.
     pub infer_types: bool,
+    /// Maximum number of post-region pass iterations per function.
+    pub max_pass_iterations: usize,
+}
+
+impl Default for DecompileOptions {
+    fn default() -> Self {
+        Self {
+            emit: EmitMode::default(),
+            spill_locals: false,
+            infer_types: false,
+            max_pass_iterations: DEFAULT_MAX_PASS_ITERATIONS,
+        }
+    }
 }
 
 /// Disassembles Luau bytecode without emitting diagnostics.
@@ -236,9 +252,15 @@ pub fn decompile_bytecode_with_diagnostics(
         byte_len = bytecode.len(),
         spill_locals = options.spill_locals,
         infer_types = options.infer_types,
+        max_pass_iterations = options.max_pass_iterations,
         emit = ?options.emit,
     );
     let _enter = span.enter();
+
+    ensure!(
+        options.max_pass_iterations > 0,
+        "max pass iterations must be greater than zero"
+    );
 
     let mut program = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
     let entry_proto = program.entry_proto;
@@ -262,16 +284,21 @@ pub fn decompile_bytecode_with_diagnostics(
             .collect::<Result<_, _>>()?
     };
 
-    if options.emit == EmitMode::Source {
+    let pass_errors = if options.emit == EmitMode::Source {
         diagnostics
             .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
             .line(0, format_args!("running passes..."));
-        {
-            let span =
-                tracing::info_span!("run_post_region_passes", function_count = functions.len());
-            let _enter = span.enter();
-            hil::passes::run(&mut functions);
-        }
+        let span = tracing::info_span!("run_post_region_passes", function_count = functions.len());
+        let _enter = span.enter();
+        hil::passes::run(&mut functions, options.max_pass_iterations)
+    } else {
+        Vec::new()
+    };
+
+    for error in &pass_errors {
+        diagnostics
+            .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
+            .line(0, format_args!("warning: {error}"));
     }
 
     diagnostics
@@ -283,10 +310,15 @@ pub fn decompile_bytecode_with_diagnostics(
         emitter::emit_ast(functions, entry_proto as usize, options, &diagnostics)
     };
 
-    let comments = vec![format!(
+    let mut comments = vec![format!(
         "Decompiled by mallow {}",
         env!("CARGO_PKG_VERSION")
     )];
+    comments.extend(
+        pass_errors
+            .into_iter()
+            .map(|error| format!("Pass warning: {error}")),
+    );
 
     diagnostics
         .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)

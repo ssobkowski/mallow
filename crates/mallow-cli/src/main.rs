@@ -11,8 +11,8 @@ use std::{
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use mallow_core::{
-    DIAGNOSTIC_EVENT_TARGET, DecompileOptions, DiagnosticConfig, Diagnostics, EmitMode, LogLevel,
-    LogTarget, ProtoSelector, decompile_bytecode_with_diagnostics,
+    DEFAULT_MAX_PASS_ITERATIONS, DIAGNOSTIC_EVENT_TARGET, DecompileOptions, DiagnosticConfig,
+    Diagnostics, EmitMode, LogLevel, LogTarget, ProtoSelector, decompile_bytecode_with_diagnostics,
     disassemble_bytecode_with_diagnostics,
 };
 use tracing::{Event, Subscriber, field::Visit};
@@ -120,6 +120,37 @@ impl Emit {
     }
 }
 
+/// Parses a positive cleanup pass iteration limit.
+fn parse_max_pass_iterations(value: &str) -> Result<usize, String> {
+    let iterations = value
+        .parse::<usize>()
+        .map_err(|_| format!("expected a positive integer, got '{value}'"))?;
+    if iterations == 0 {
+        return Err("max pass iterations must be greater than zero".to_string());
+    }
+    Ok(iterations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_max_pass_iterations;
+
+    /// Positive pass limits are accepted.
+    #[test]
+    fn parses_max_pass_iterations() {
+        assert_eq!(parse_max_pass_iterations("12"), Ok(12));
+    }
+
+    /// A zero pass limit is rejected.
+    #[test]
+    fn rejects_zero_max_pass_iterations() {
+        assert_eq!(
+            parse_max_pass_iterations("0"),
+            Err("max pass iterations must be greater than zero".to_string())
+        );
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Disassemble a bytecode file
@@ -153,6 +184,14 @@ enum Commands {
         /// Emit conservative decompiler-inferred type annotations
         #[arg(long)]
         infer_types: bool,
+
+        /// Maximum number of cleanup pass iterations per function
+        #[arg(
+            long,
+            default_value_t = DEFAULT_MAX_PASS_ITERATIONS,
+            value_parser = parse_max_pass_iterations
+        )]
+        max_pass_iterations: usize,
     },
     /// Compile a Luau source file and emit cleaned Luau or regioned SSA
     Roundtrip {
@@ -187,6 +226,14 @@ enum Commands {
         /// Emit conservative decompiler-inferred type annotations
         #[arg(long)]
         infer_types: bool,
+
+        /// Maximum number of cleanup pass iterations per function
+        #[arg(
+            long,
+            default_value_t = DEFAULT_MAX_PASS_ITERATIONS,
+            value_parser = parse_max_pass_iterations
+        )]
+        max_pass_iterations: usize,
     },
     /// Generate a control flow graph visualization for a bytecode file
     #[cfg(feature = "visualize")]
@@ -222,6 +269,7 @@ fn main() -> Result<()> {
             emit,
             spill_locals,
             infer_types,
+            max_pass_iterations,
         } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
 
@@ -234,6 +282,7 @@ fn main() -> Result<()> {
                     emit: emit.mode(),
                     spill_locals,
                     infer_types,
+                    max_pass_iterations,
                 },
                 &diagnostics,
             )?;
@@ -251,6 +300,7 @@ fn main() -> Result<()> {
             emit,
             spill_locals,
             infer_types,
+            max_pass_iterations,
         } => {
             let mut cmd = Command::new("luau-compile");
             cmd.arg("--binary");
@@ -279,6 +329,7 @@ fn main() -> Result<()> {
                     emit: emit.mode(),
                     spill_locals,
                     infer_types,
+                    max_pass_iterations,
                 },
                 &diagnostics,
             )?;

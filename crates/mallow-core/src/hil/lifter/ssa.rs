@@ -152,28 +152,52 @@ impl Symbol {
     }
 }
 
+/// Builds SSA versions for the registers and upvalues in one function.
 pub struct Ssa<'a, G: GraphView> {
-    registers: Vec<[Option<SymbolId>; 256]>,
-    upvalues: Vec<[Option<SymbolId>; 256]>,
-
+    /// Register versions stored as contiguous block rows.
+    registers: Vec<Option<SymbolId>>,
+    /// Number of register slots in each block row.
+    register_count: usize,
+    /// Upvalue versions stored as contiguous block rows.
+    upvalues: Vec<Option<SymbolId>>,
+    /// Number of upvalue slots in each block row.
+    upvalue_count: usize,
+    /// Control-flow graph that owns the block indices.
     graph: &'a G,
+    /// Symbols allocated while constructing SSA.
     arena: Arena<Symbol>,
-
+    /// Trivial Phi symbols mapped to their surviving symbols.
     aliases: HashMap<SymbolId, SymbolId>,
+    /// Phi symbols that read each symbol.
     phi_uses: HashMap<SymbolId, BTreeSet<SymbolId>>,
+    /// Block containing each Phi symbol.
     phi_to_block: HashMap<SymbolId, usize>,
+    /// Predecessor operands read by each Phi symbol.
     phi_to_operands: HashMap<SymbolId, Vec<(usize, SymbolId)>>,
-
+    /// Whether each block has received all local writes.
     filled_blocks: Vec<bool>,
+    /// Phi symbols waiting for predecessor blocks to be filled.
     incomplete_phis: HashMap<usize, Vec<(SsaVar, SymbolId)>>,
 }
 
 impl<'a, G: GraphView> Ssa<'a, G> {
-    pub fn new(graph: &'a G) -> Self {
+    /// Creates empty SSA state sized to the function's declared storage.
+    pub fn new(graph: &'a G, register_count: u8, upvalue_count: u8) -> Self {
         let blocks_count = graph.len();
+        let register_count = usize::from(register_count);
+        let upvalue_count = usize::from(upvalue_count);
+        let register_slots = blocks_count
+            .checked_mul(register_count)
+            .expect("SSA register state size overflow");
+        let upvalue_slots = blocks_count
+            .checked_mul(upvalue_count)
+            .expect("SSA upvalue state size overflow");
+
         Self {
-            registers: vec![[None; 256]; blocks_count],
-            upvalues: vec![[None; 256]; blocks_count],
+            registers: vec![None; register_slots],
+            register_count,
+            upvalues: vec![None; upvalue_slots],
+            upvalue_count,
             graph,
             arena: Arena::new(),
             aliases: HashMap::new(),
@@ -185,10 +209,40 @@ impl<'a, G: GraphView> Ssa<'a, G> {
         }
     }
 
+    /// Returns the flat state index for one register in one block.
+    fn register_index(&self, block: usize, reg: u8) -> usize {
+        assert!(block < self.graph.len(), "SSA block index out of range");
+        let reg = usize::from(reg);
+        assert!(
+            reg < self.register_count,
+            "register R{reg} exceeds max stack size {}",
+            self.register_count
+        );
+        block * self.register_count + reg
+    }
+
+    /// Returns the flat state index for one upvalue in one block.
+    fn upvalue_index(&self, block: usize, upvalue: u8) -> usize {
+        assert!(block < self.graph.len(), "SSA block index out of range");
+        let upvalue = usize::from(upvalue);
+        assert!(
+            upvalue < self.upvalue_count,
+            "upvalue U{upvalue} exceeds declared count {}",
+            self.upvalue_count
+        );
+        block * self.upvalue_count + upvalue
+    }
+
     fn write_var(&mut self, block: usize, var: SsaVar, symbol: SymbolId) {
         match var {
-            SsaVar::Reg(reg) => self.registers[block][reg as usize] = Some(symbol),
-            SsaVar::Upval(index) => self.upvalues[block][index as usize] = Some(symbol),
+            SsaVar::Reg(reg) => {
+                let index = self.register_index(block, reg);
+                self.registers[index] = Some(symbol);
+            }
+            SsaVar::Upval(upvalue) => {
+                let index = self.upvalue_index(block, upvalue);
+                self.upvalues[index] = Some(symbol);
+            }
         }
     }
 
@@ -223,7 +277,8 @@ impl<'a, G: GraphView> Ssa<'a, G> {
 
     #[must_use]
     pub fn read_reg(&mut self, block: usize, reg: u8) -> SymbolId {
-        if let Some(sym) = self.registers[block][reg as usize] {
+        let index = self.register_index(block, reg);
+        if let Some(sym) = self.registers[index] {
             sym
         } else {
             self.read_var_recursive(block, SsaVar::Reg(reg))
@@ -235,11 +290,12 @@ impl<'a, G: GraphView> Ssa<'a, G> {
     }
 
     #[must_use]
-    pub fn read_upval(&mut self, block: usize, index: u8) -> SymbolId {
-        if let Some(sym) = self.upvalues[block][index as usize] {
+    pub fn read_upval(&mut self, block: usize, upvalue: u8) -> SymbolId {
+        let index = self.upvalue_index(block, upvalue);
+        if let Some(sym) = self.upvalues[index] {
             sym
         } else {
-            self.read_var_recursive(block, SsaVar::Upval(index))
+            self.read_var_recursive(block, SsaVar::Upval(upvalue))
         }
     }
 
@@ -389,5 +445,31 @@ impl<'a, G: GraphView> Ssa<'a, G> {
 
             blocks[block_index].stmts_mut().insert(0, Stmt::Phi(phi));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Ssa, Symbol};
+    use crate::hil::cflow::graph::AdjGraph;
+
+    /// SSA state uses the declared row widths and keeps block rows separate.
+    #[test]
+    fn state_uses_declared_storage_sizes() {
+        let successors = vec![Vec::new(), Vec::new(), Vec::new()];
+        let predecessors = vec![Vec::new(), Vec::new(), Vec::new()];
+        let graph = AdjGraph::new(0, &successors, &predecessors);
+        let mut ssa = Ssa::new(&graph, 4, 2);
+
+        assert_eq!(ssa.registers.len(), 12);
+        assert_eq!(ssa.upvalues.len(), 6);
+
+        let register = ssa.alloc_symbol(Symbol::reg(3));
+        let upvalue = ssa.alloc_symbol(Symbol::upval(1));
+        ssa.write_reg(2, 3, register);
+        ssa.write_upval(2, 1, upvalue);
+
+        assert_eq!(ssa.read_reg(2, 3), register);
+        assert_eq!(ssa.read_upval(2, 1), upvalue);
     }
 }
