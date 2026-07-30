@@ -2,7 +2,7 @@ The following third-party files are included in this repository.
 
 --------------------------------------------------------------------------------
 
-File: assets/builtin_definitions.luau
+File: xtask/builtin-definitions/base.luau
 Source: https://github.com/luau-lang/luau/blob/master/Analysis/src/EmbeddedBuiltinDefinitions.cpp
 Author: Roblox Corporation and Lua.org, PUC-Rio
 License: MIT

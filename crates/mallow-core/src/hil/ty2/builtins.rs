@@ -14,9 +14,9 @@ use crate::hil::{
 #[derive(Debug)]
 pub struct BuiltinEnvironment {
     /// Global names mapped to their polymorphic graph schemes.
-    globals: HashMap<SmolStr, TypeScheme>,
-    /// Namespace fields indexed without allocating temporary schemes.
-    namespace_fields: HashMap<(SmolStr, SmolStr), TypeScheme>,
+    globals: HashMap<&'static str, TypeScheme>,
+    /// Static namespace and field names mapped to their graph schemes.
+    namespace_fields: HashMap<&'static str, HashMap<&'static str, TypeScheme>>,
 }
 
 /// Stable symbolic reference into a [`BuiltinEnvironment`].
@@ -140,22 +140,17 @@ impl BuiltinEnvironment {
         let mut globals = HashMap::with_capacity(definitions.len());
         let mut namespace_fields = HashMap::new();
         for definition in definitions {
-            let BuiltinDefinition {
-                name,
-                scheme,
-                fields,
-            } = definition;
-            let name = SmolStr::new(name);
-            let previous = globals.insert(name.clone(), scheme.intern(type_store));
+            let previous = globals.insert(definition.name, definition.scheme.intern(type_store));
             assert!(
                 previous.is_none(),
                 "generated builtin globals must be unique"
             );
 
-            for field in fields {
-                let field_name = SmolStr::new(field.name);
-                let previous = namespace_fields
-                    .insert((name.clone(), field_name), field.scheme.intern(type_store));
+            let fields = namespace_fields
+                .entry(definition.name)
+                .or_insert_with(HashMap::new);
+            for field in definition.fields {
+                let previous = fields.insert(field.name, field.scheme.intern(type_store));
                 assert!(
                     previous.is_none(),
                     "generated builtin namespace fields must be unique"
@@ -172,10 +167,11 @@ impl BuiltinEnvironment {
     #[must_use]
     pub fn get_path(&self, path: &BuiltinPath) -> Option<&TypeScheme> {
         match path {
-            BuiltinPath::Global(name) => self.globals.get(name),
+            BuiltinPath::Global(name) => self.globals.get(name.as_str()),
             BuiltinPath::NamespaceField { namespace, field } => self
                 .namespace_fields
-                .get(&(namespace.clone(), field.clone())),
+                .get(namespace.as_str())?
+                .get(field.as_str()),
         }
     }
 }
@@ -184,18 +180,18 @@ impl BuiltinEnvironment {
 #[derive(Debug)]
 struct BuiltinDefinition {
     /// Global name.
-    name: String,
+    name: &'static str,
     /// Global type scheme.
     scheme: BuiltinSchemeDefinition,
     /// Direct namespace field schemes.
-    fields: Vec<BuiltinFieldDefinition>,
+    fields: &'static [BuiltinFieldDefinition],
 }
 
 /// One direct field exported by a builtin namespace.
 #[derive(Debug)]
 struct BuiltinFieldDefinition {
     /// Exported field name.
-    name: String,
+    name: &'static str,
     /// Independently instantiated field scheme.
     scheme: BuiltinSchemeDefinition,
 }
@@ -204,7 +200,7 @@ struct BuiltinFieldDefinition {
 #[derive(Debug)]
 struct BuiltinSchemeDefinition {
     /// Type and type-pack binders in declaration order.
-    binders: Vec<BuiltinBinderDefinition>,
+    binders: &'static [BuiltinBinderDefinition],
     /// Owned type tree to intern.
     body: BuiltinType,
 }
@@ -213,21 +209,25 @@ struct BuiltinSchemeDefinition {
 #[derive(Debug)]
 enum BuiltinBinderDefinition {
     /// A binder substituted by one type.
-    Type(String),
+    Type(&'static str),
     /// A binder substituted by one type pack.
-    Pack(String),
+    Pack(&'static str),
 }
 
 impl BuiltinSchemeDefinition {
     /// Interns this owned definition and validates its precomputed binders.
-    fn intern(self, store: &mut TypeStore) -> TypeScheme {
+    fn intern(&self, store: &mut TypeStore) -> TypeScheme {
         let body = self.body.intern(store);
         let binders = self
             .binders
-            .into_iter()
+            .iter()
             .map(|binder| match binder {
-                BuiltinBinderDefinition::Type(name) => GenericBinder::Type(SmolStr::new(name)),
-                BuiltinBinderDefinition::Pack(name) => GenericBinder::Pack(SmolStr::new(name)),
+                BuiltinBinderDefinition::Type(name) => {
+                    GenericBinder::Type(SmolStr::new_static(name))
+                }
+                BuiltinBinderDefinition::Pack(name) => {
+                    GenericBinder::Pack(SmolStr::new_static(name))
+                }
             })
             .collect();
         store.type_scheme(body, binders)
@@ -241,17 +241,17 @@ enum BuiltinType {
     /// One canonical primitive kind.
     Primitive(BuiltinPrimitive),
     /// A host-provided nominal type.
-    Named(String),
+    Named(&'static str),
     /// A generic placeholder covered by its generated scheme.
-    Generic(String),
+    Generic(&'static str),
     /// An exact singleton literal.
-    Literal(TypeLiteral),
+    Literal(BuiltinLiteral),
     /// A structural table.
     Table {
         /// Named fields.
-        fields: Vec<(String, BuiltinType)>,
+        fields: &'static [(&'static str, BuiltinType)],
         /// Optional key and value indexer.
-        indexer: Option<(Box<BuiltinType>, Box<BuiltinType>)>,
+        indexer: Option<(&'static BuiltinType, &'static BuiltinType)>,
     },
     /// A function signature.
     Function {
@@ -261,23 +261,23 @@ enum BuiltinType {
         returns: BuiltinPack,
     },
     /// A structural union.
-    Union(Vec<BuiltinType>),
+    Union(&'static [BuiltinType]),
     /// An overloaded intersection.
-    Intersection(Vec<BuiltinType>),
+    Intersection(&'static [BuiltinType]),
 }
 
 impl BuiltinType {
     /// Recursively interns this owned tree into the session's canonical store.
-    fn intern(self, store: &mut TypeStore) -> TypeId {
+    fn intern(&self, store: &mut TypeStore) -> TypeId {
         match self {
             Self::Primitive(primitive) => primitive.id(store),
-            Self::Named(name) => store.named(name),
-            Self::Generic(name) => store.generic(name),
-            Self::Literal(literal) => store.literal(literal),
+            Self::Named(name) => store.named(*name),
+            Self::Generic(name) => store.generic(*name),
+            Self::Literal(literal) => store.literal(literal.to_owned()),
             Self::Table { fields, indexer } => {
                 let fields = fields
-                    .into_iter()
-                    .map(|(name, ty)| (SmolStr::new(name), ty.intern(store)))
+                    .iter()
+                    .map(|(name, ty)| (SmolStr::new_static(name), ty.intern(store)))
                     .collect();
                 let indexer = indexer.map(|(key, value)| (key.intern(store), value.intern(store)));
                 store.table_shape(fields, indexer)
@@ -301,6 +301,26 @@ impl BuiltinType {
                     .collect::<Vec<_>>();
                 store.intersection_all(members)
             }
+        }
+    }
+}
+
+/// A static singleton literal used by a generated builtin definition.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum BuiltinLiteral {
+    /// One exact string value.
+    String(&'static str),
+    /// One exact boolean value.
+    Boolean(bool),
+}
+
+impl BuiltinLiteral {
+    /// Creates the owned literal stored in the canonical type graph.
+    fn to_owned(&self) -> TypeLiteral {
+        match self {
+            Self::String(value) => TypeLiteral::String((*value).to_owned()),
+            Self::Boolean(value) => TypeLiteral::Boolean(*value),
         }
     }
 }
@@ -357,16 +377,16 @@ impl BuiltinPrimitive {
 #[derive(Debug)]
 struct BuiltinPack {
     /// Fixed positional elements.
-    head: Vec<BuiltinType>,
+    head: &'static [BuiltinType],
     /// Optional open tail.
     tail: Option<BuiltinPackTail>,
 }
 
 impl BuiltinPack {
     /// Recursively interns this pack and all types it references.
-    fn intern(self, store: &mut TypeStore) -> TypePackId {
-        let head = self.head.into_iter().map(|ty| ty.intern(store)).collect();
-        let tail = self.tail.map(|tail| tail.intern(store));
+    fn intern(&self, store: &mut TypeStore) -> TypePackId {
+        let head = self.head.iter().map(|ty| ty.intern(store)).collect();
+        let tail = self.tail.as_ref().map(|tail| tail.intern(store));
         store.pack(head, tail)
     }
 }
@@ -375,19 +395,19 @@ impl BuiltinPack {
 #[derive(Debug)]
 enum BuiltinPackTail {
     /// Repeats one type indefinitely.
-    Homogeneous(Box<BuiltinType>),
+    Homogeneous(&'static BuiltinType),
     /// References one declared generic type pack.
-    Generic(String),
+    Generic(&'static str),
 }
 
 impl BuiltinPackTail {
     /// Interns the type carried by this pack tail.
-    fn intern(self, store: &mut TypeStore) -> TypePackTail {
+    fn intern(&self, store: &mut TypeStore) -> TypePackTail {
         match self {
             Self::Homogeneous(ty) => TypePackTail::Homogeneous(ty.intern(store)),
-            Self::Generic(name) => TypePackTail::Generic(SmolStr::new(name)),
+            Self::Generic(name) => TypePackTail::Generic(SmolStr::new_static(name)),
         }
     }
 }
 
-include!(concat!(env!("OUT_DIR"), "/builtin_definitions.rs"));
+include!("builtin_definitions.rs");

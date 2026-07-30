@@ -6,3 +6,6 @@ license.workspace = true
 readme.workspace = true
 
 [dependencies]
+mallow-luau-toolchain = { path = "../crates/mallow-luau-toolchain" }
+serde.workspace = true
+serde_json.workspace = true
