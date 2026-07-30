@@ -120,34 +120,143 @@ impl Emit {
     }
 }
 
-/// Parses a positive cleanup pass iteration limit.
-fn parse_max_pass_iterations(value: &str) -> Result<usize, String> {
-    let iterations = value
-        .parse::<usize>()
-        .map_err(|_| format!("expected a positive integer, got '{value}'"))?;
-    if iterations == 0 {
-        return Err("max pass iterations must be greater than zero".to_string());
-    }
-    Ok(iterations)
+/// Decompiler settings shared by commands that emit decompiled output.
+#[derive(Debug, clap::Args)]
+struct DecompileArgs {
+    /// Output file path. Prints to stdout if omitted
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Output form to emit
+    #[arg(long, value_enum, default_value = "source")]
+    emit: Emit,
+
+    /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
+    #[arg(long)]
+    spill_locals: bool,
+
+    /// Emit conservative decompiler-inferred type annotations
+    #[arg(long)]
+    infer_types: bool,
+
+    /// Maximum number of cleanup pass iterations per function
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_PASS_ITERATIONS,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    max_pass_iterations: usize,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_max_pass_iterations;
+impl DecompileArgs {
+    /// Returns the matching library decompiler settings.
+    const fn options(&self) -> DecompileOptions {
+        DecompileOptions {
+            emit: self.emit.mode(),
+            spill_locals: self.spill_locals,
+            infer_types: self.infer_types,
+            max_pass_iterations: self.max_pass_iterations,
+        }
+    }
+}
 
-    /// Positive pass limits are accepted.
-    #[test]
-    fn parses_max_pass_iterations() {
-        assert_eq!(parse_max_pass_iterations("12"), Ok(12));
+/// Parses a bytecode version supported by the managed Luau registry.
+#[cfg(feature = "luau-toolchain")]
+fn parse_luau_bytecode(value: &str) -> Result<mallow_luau_toolchain::BytecodeVersion, String> {
+    let number = value
+        .parse::<u8>()
+        .map_err(|_| format!("expected a bytecode version number, got '{value}'"))?;
+    mallow_luau_toolchain::BytecodeVersion::try_from(number).map_err(|error| error.to_string())
+}
+
+/// Luau release selection for managed development commands.
+#[cfg(feature = "luau-toolchain")]
+#[derive(Debug, clap::Args)]
+struct LuauToolchainArgs {
+    /// Use this exact Luau release.
+    #[arg(long, value_name = "VERSION", conflicts_with = "luau_bytecode")]
+    luau_release: Option<String>,
+
+    /// Use the newest Luau release that emits this bytecode version.
+    #[arg(long, value_name = "VERSION", value_parser = parse_luau_bytecode)]
+    luau_bytecode: Option<mallow_luau_toolchain::BytecodeVersion>,
+}
+
+/// Compiler selected for a roundtrip operation.
+enum LuauCompiler {
+    /// Compiler resolved through the process PATH.
+    System(Command),
+    /// Compiler installed by the managed Luau toolchain.
+    #[cfg(feature = "luau-toolchain")]
+    Managed(Command),
+}
+
+impl LuauCompiler {
+    /// Creates a compiler resolved through the process PATH.
+    fn system() -> Self {
+        Self::System(Command::new("luau-compile"))
     }
 
-    /// A zero pass limit is rejected.
-    #[test]
-    fn rejects_zero_max_pass_iterations() {
-        assert_eq!(
-            parse_max_pass_iterations("0"),
-            Err("max pass iterations must be greater than zero".to_string())
+    /// Returns the command so compiler arguments can be added.
+    fn command(&mut self) -> &mut Command {
+        match self {
+            Self::System(command) => command,
+            #[cfg(feature = "luau-toolchain")]
+            Self::Managed(command) => command,
+        }
+    }
+
+    /// Runs the compiler and explains how to obtain a missing PATH tool.
+    fn output(&mut self) -> Result<std::process::Output> {
+        match self {
+            Self::System(command) => command.output().map_err(system_compiler_error),
+            #[cfg(feature = "luau-toolchain")]
+            Self::Managed(command) => Ok(command.output()?),
+        }
+    }
+}
+
+/// Adds installation guidance when the PATH compiler does not exist.
+fn system_compiler_error(error: std::io::Error) -> anyhow::Error {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return error.into();
+    }
+
+    #[cfg(feature = "luau-toolchain")]
+    {
+        anyhow::anyhow!(
+            "could not find `luau-compile` in PATH; install the Luau toolchain yourself and add `luau-compile` to PATH, or select a managed compiler with `--luau-release` or `--luau-bytecode`"
+        )
+    }
+    #[cfg(not(feature = "luau-toolchain"))]
+    {
+        anyhow::anyhow!(
+            "could not find `luau-compile` in PATH; install the Luau toolchain yourself and add `luau-compile` to PATH, or rebuild mallow with the `luau-toolchain` feature and select a managed compiler"
+        )
+    }
+}
+
+#[cfg(feature = "luau-toolchain")]
+impl LuauToolchainArgs {
+    /// Builds a PATH compiler or the explicitly selected managed compiler.
+    fn compiler(&self) -> Result<LuauCompiler> {
+        use mallow_luau_toolchain::{Manager, VersionSelector};
+
+        ensure!(
+            self.luau_release.is_none() || self.luau_bytecode.is_none(),
+            "--luau-release conflicts with --luau-bytecode"
         );
+
+        let selector = if let Some(release) = self.luau_release.as_deref() {
+            VersionSelector::release(release)
+        } else if let Some(bytecode) = self.luau_bytecode {
+            VersionSelector::bytecode(bytecode)
+        } else {
+            return Ok(LuauCompiler::system());
+        };
+
+        let manager = Manager::new()?;
+        Ok(LuauCompiler::Managed(manager.compiler(selector)?))
     }
 }
 
@@ -169,39 +278,15 @@ enum Commands {
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Output file path. Prints to stdout if omitted
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// Output form to emit
-        #[arg(long, value_enum, default_value = "source")]
-        emit: Emit,
-
-        /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
-        #[arg(long)]
-        spill_locals: bool,
-
-        /// Emit conservative decompiler-inferred type annotations
-        #[arg(long)]
-        infer_types: bool,
-
-        /// Maximum number of cleanup pass iterations per function
-        #[arg(
-            long,
-            default_value_t = DEFAULT_MAX_PASS_ITERATIONS,
-            value_parser = parse_max_pass_iterations
-        )]
-        max_pass_iterations: usize,
+        /// Settings for decompiled output.
+        #[command(flatten)]
+        decompile: DecompileArgs,
     },
     /// Compile a Luau source file and emit cleaned Luau or regioned SSA
     Roundtrip {
         /// Path to the input Luau source file
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Output file path. Prints to stdout if omitted
-        #[arg(short, long)]
-        output: Option<PathBuf>,
 
         /// Optimization level, passed as '-O<n>' to the Luau compiler.
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=2))]
@@ -215,25 +300,14 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=1))]
         type_level: Option<u8>,
 
-        /// Output form to emit
-        #[arg(long, value_enum, default_value = "source")]
-        emit: Emit,
+        /// Settings for decompiled output.
+        #[command(flatten)]
+        decompile: DecompileArgs,
 
-        /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
-        #[arg(long)]
-        spill_locals: bool,
-
-        /// Emit conservative decompiler-inferred type annotations
-        #[arg(long)]
-        infer_types: bool,
-
-        /// Maximum number of cleanup pass iterations per function
-        #[arg(
-            long,
-            default_value_t = DEFAULT_MAX_PASS_ITERATIONS,
-            value_parser = parse_max_pass_iterations
-        )]
-        max_pass_iterations: usize,
+        /// Managed Luau release selection.
+        #[cfg(feature = "luau-toolchain")]
+        #[command(flatten)]
+        toolchain: LuauToolchainArgs,
     },
     /// Generate a control flow graph visualization for a bytecode file
     #[cfg(feature = "visualize")]
@@ -263,46 +337,34 @@ fn main() -> Result<()> {
             chunk.dump(&mut out)?;
             Ok(())
         }
-        Commands::Decompile {
-            input,
-            output,
-            emit,
-            spill_locals,
-            infer_types,
-            max_pass_iterations,
-        } => {
+        Commands::Decompile { input, decompile } => {
             let bytecode = std::fs::read(input).expect("Failed to read bytecode file");
 
             diagnostics
                 .at(LogLevel::Info, LogTarget::Driver)
                 .line(0, format_args!("decompiling..."));
-            let code = decompile_bytecode_with_diagnostics(
-                &bytecode,
-                DecompileOptions {
-                    emit: emit.mode(),
-                    spill_locals,
-                    infer_types,
-                    max_pass_iterations,
-                },
-                &diagnostics,
-            )?;
+            let code =
+                decompile_bytecode_with_diagnostics(&bytecode, decompile.options(), &diagnostics)?;
 
-            let mut out = get_output(output)?;
+            let mut out = get_output(decompile.output)?;
             out.write_all(code.as_bytes())?;
             Ok(())
         }
         Commands::Roundtrip {
             input,
-            output,
             opt_level,
             debug_level,
             type_level,
-            emit,
-            spill_locals,
-            infer_types,
-            max_pass_iterations,
+            decompile,
+            #[cfg(feature = "luau-toolchain")]
+            toolchain,
         } => {
-            let mut cmd = Command::new("luau-compile");
+            #[cfg(feature = "luau-toolchain")]
+            let mut compiler = toolchain.compiler()?;
+            #[cfg(not(feature = "luau-toolchain"))]
+            let mut compiler = LuauCompiler::system();
+
+            let cmd = compiler.command();
             cmd.arg("--binary");
             cmd.arg(input);
             if let Some(opt_level) = opt_level {
@@ -315,7 +377,7 @@ fn main() -> Result<()> {
                 cmd.arg(format!("-t{}", type_level));
             }
 
-            let compile_out = cmd.output()?;
+            let compile_out = compiler.output()?;
 
             ensure!(
                 compile_out.status.success(),
@@ -325,16 +387,11 @@ fn main() -> Result<()> {
 
             let code = decompile_bytecode_with_diagnostics(
                 &compile_out.stdout,
-                DecompileOptions {
-                    emit: emit.mode(),
-                    spill_locals,
-                    infer_types,
-                    max_pass_iterations,
-                },
+                decompile.options(),
                 &diagnostics,
             )?;
 
-            let mut out = get_output(output)?;
+            let mut out = get_output(decompile.output)?;
             out.write_all(code.as_bytes())?;
             Ok(())
         }

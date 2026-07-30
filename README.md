@@ -75,6 +75,12 @@ To include CFG visualization support:
 cargo build --release --features visualize
 ```
 
+To let the development `roundtrip` command download and cache verified Luau releases:
+
+```sh
+cargo build --release -p mallow-cli --features luau-toolchain
+```
+
 Binary lands at `target/release/mallow`.
 
 ## Usage
@@ -97,10 +103,17 @@ Pass `--emit=ssa` to emit regioned SSA with its original symbol IDs instead of c
 mallow decompile -i <bytecode> --emit=ssa
 ```
 
-**roundtrip** - compile a `.luau` file then immediately decompile it (requires `luau-compile` in PATH):
+**roundtrip** - compile a `.luau` file then immediately decompile it. Without the `luau-toolchain` feature, this requires `luau-compile` in PATH:
 
 ```sh
 mallow roundtrip -i <source.luau>
+```
+
+With the `luau-toolchain` feature, an exact Luau release or the newest release for a bytecode version can be selected explicitly. Without either selector, roundtrip still uses `luau-compile` from PATH:
+
+```sh
+mallow roundtrip -i <source.luau> --luau-release 0.650
+mallow roundtrip -i <source.luau> --luau-bytecode 8
 ```
 
 The same SSA output is available after compilation:

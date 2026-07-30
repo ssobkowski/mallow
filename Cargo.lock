@@ -1074,6 +1074,7 @@ dependencies = [
  "anyhow",
  "clap",
  "mallow-core",
+ "mallow-luau-toolchain",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
