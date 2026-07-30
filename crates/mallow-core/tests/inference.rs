@@ -23,13 +23,19 @@ fn types_view(source_path: &Path) -> TypesView {
     mallow_core::infer_bytecode_types(&compiled.stdout).expect("infer fixture types")
 }
 
+/// Returns the shared Luau release manager without installing a toolchain.
+fn manager() -> &'static Manager {
+    static MANAGER: OnceLock<Manager> = OnceLock::new();
+
+    MANAGER.get_or_init(|| Manager::new().expect("create Luau toolchain manager"))
+}
+
 /// Returns the shared verified Luau toolchain installation.
 fn toolchain() -> &'static Installation {
     static TOOLCHAIN: OnceLock<Installation> = OnceLock::new();
 
     TOOLCHAIN.get_or_init(|| {
-        Manager::new()
-            .expect("create Luau toolchain manager")
+        manager()
             .install_bytecode(BytecodeVersion::V9)
             .expect("install Luau toolchain for inference tests")
     })

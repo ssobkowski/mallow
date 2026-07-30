@@ -16,10 +16,13 @@ smol_str.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-libtest-mimic.workspace = true
 mallow-luau-toolchain = { path = "../mallow-luau-toolchain" }
 mallow-test-macros = { path = "../mallow-test-macros" }
+
+libtest-mimic.workspace = true
 tempfile.workspace = true
+
+wait-timeout = "0.2.1"
 
 [features]
 default = []
