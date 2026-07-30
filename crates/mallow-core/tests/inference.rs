@@ -1,20 +1,15 @@
-use std::{fs, sync::OnceLock};
+use std::{path::Path, sync::OnceLock};
 
 use mallow_core::TypesView;
 use mallow_luau_toolchain::{BytecodeVersion, Installation, Manager};
 use mallow_test_macros::inference_test;
-use tempfile::TempDir;
 
 /// Builds an inferred type view from one Luau fixture.
-fn types_view(source: &str) -> TypesView {
-    let temp = TempDir::new().expect("create type-inference test directory");
-    let source_path = temp.path().join("source.luau");
-    fs::write(&source_path, source).expect("write type-inference source");
-
+fn types_view(source_path: &Path) -> TypesView {
     let compiled = toolchain()
         .compiler()
         .arg("--binary")
-        .arg(&source_path)
+        .arg(source_path)
         .arg("-O1")
         .arg("-g2")
         .output()

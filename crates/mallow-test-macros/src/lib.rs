@@ -70,7 +70,7 @@ fn expand_inference_test(
         #[doc = #fixture_doc]
         #[test]
         #vis fn #name() {
-            let #parameter: TypesView = crate::types_view(include_str!(concat!(
+            let #parameter: TypesView = crate::types_view(::std::path::Path::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 #fixture_path,
             )));
