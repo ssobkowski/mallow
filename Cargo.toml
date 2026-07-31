@@ -1,7 +1,7 @@
 [workspace]
 members = [
-  "crates/mallow-core",
   "crates/mallow-cli",
+  "crates/mallow-core",
   "crates/mallow-luau-toolchain",
   "crates/mallow-test-macros",
   "xtask",
@@ -15,16 +15,29 @@ license = "AGPL-3.0-only"
 readme = "README.md"
 
 [workspace.dependencies]
+mallow-core = { path = "crates/mallow-core" }
+mallow-luau-toolchain = { path = "crates/mallow-luau-toolchain" }
+mallow-test-macros = { path = "crates/mallow-test-macros" }
+
 anyhow = "1.0.102"
 clap = { version = "4.5.60", features = ["derive"] }
-either = "1.15.0"
+directories = "6.0.0"
+fs2 = "0.4.3"
 id-arena = "2.3.0"
 libtest-mimic = "0.8.2"
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+reqwest = { version = "0.13.4", features = ["blocking", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = "0.11.0"
 smallvec = "1.15.1"
 smol_str = "0.3.5"
+syn = { version = "2.0.117", features = ["full"] }
 tempfile = "3.26.0"
+thiserror = "2.0.19"
 tracing = "0.1.41"
 tracing-chrome = "0.7.2"
 tracing-subscriber = "0.3.22"
+wait-timeout = "0.2.1"
+zip = { version = "8.6.0", features = ["deflate"] }

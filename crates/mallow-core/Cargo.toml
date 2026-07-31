@@ -6,23 +6,21 @@ license.workspace = true
 readme.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-either.workspace = true
-id-arena.workspace = true
+anyhow = { workspace = true }
+id-arena = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-smallvec.workspace = true
-smol_str.workspace = true
-tracing.workspace = true
+smallvec = { workspace = true }
+smol_str = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-mallow-luau-toolchain = { path = "../mallow-luau-toolchain" }
-mallow-test-macros = { path = "../mallow-test-macros" }
+mallow-luau-toolchain = { workspace = true }
+mallow-test-macros = { workspace = true }
 
-libtest-mimic.workspace = true
-tempfile.workspace = true
-
-wait-timeout = "0.2.1"
+libtest-mimic = { workspace = true }
+tempfile = { workspace = true }
+wait-timeout = { workspace = true }
 
 [features]
 default = []
