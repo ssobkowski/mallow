@@ -40,6 +40,7 @@ mod return_arity;
 mod short_circuit;
 mod terminator_cleanup;
 mod tuple_assign;
+mod use_def;
 
 macro_rules! run_pass {
     ($proto:expr, $iteration:expr, $name:literal, $run:expr) => {{
@@ -81,10 +82,13 @@ pub fn run(fns: &mut [StructuredFunction], max_iterations: usize) -> Vec<PassErr
         for iteration in 1..=max_iterations {
             let proto_index = fun.proto.0;
 
-            let mut changed = run_pass!(proto_index, iteration, "inlining_post_region", {
+            run_pass!(proto_index, iteration, "inlining_post_region", {
                 inlining::run_post_region(fun, &return_arities)
             });
-            changed |= run_pass!(proto_index, iteration, "tuple_assign", {
+
+            // Inlining owns its fixed point. Only a later pass can make another
+            // outer round necessary after inlining has finished.
+            let mut changed = run_pass!(proto_index, iteration, "tuple_assign", {
                 tuple_assign::run(fun)
             });
             changed |= run_pass!(proto_index, iteration, "fold_tables", {

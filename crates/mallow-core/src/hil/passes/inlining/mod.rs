@@ -3,6 +3,7 @@ use crate::hil::{
 };
 
 mod common;
+mod evaluation;
 mod post_region;
 mod pre_region;
 

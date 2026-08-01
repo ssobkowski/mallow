@@ -100,13 +100,6 @@ pub(super) fn count_symbol_reads_in_expr(expr: &Expr, sym: SymbolId) -> usize {
     counter.count
 }
 
-/// Counts the number of times a symbol is read in a statement.
-pub(super) fn count_symbol_reads_in_stmt(stmt: &Stmt, sym: SymbolId) -> usize {
-    let mut counter = SymbolReadCounter::new(sym);
-    counter.visit_stmt(stmt);
-    counter.count
-}
-
 /// Replaces all occurrences of a symbol in an expression with a replacement.
 /// Returns the number of replacements made.
 pub(super) fn replace_symbol_in_expr(expr: &mut Expr, sym: SymbolId, replacement: &Expr) -> usize {
@@ -151,18 +144,5 @@ pub(super) fn stmt_written_symbols(stmt: &Stmt) -> HashSet<SymbolId> {
         Stmt::Phi(_) => {
             unreachable!("phi nodes should have been unfolded at this point")
         }
-    }
-}
-
-/// Returns whether a statement writes a given symbol.
-pub(super) fn stmt_writes_symbol(stmt: &Stmt, sym: SymbolId) -> bool {
-    match stmt {
-        Stmt::Assign { left, .. } => matches!(left, Expr::Symbol(target) if *target == sym),
-        Stmt::AssignMany { left, .. } => left
-            .iter()
-            .any(|left| matches!(left, Expr::Symbol(target) if *target == sym)),
-        Stmt::SetList { table, .. } => *table == sym,
-        Stmt::Call(_) => false,
-        Stmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
     }
 }
