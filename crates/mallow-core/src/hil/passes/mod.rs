@@ -1,9 +1,10 @@
-use std::{error::Error, fmt};
+use std::error::Error;
+use std::fmt;
 
-use crate::{
-    hil::{StructuredFunction, cflow::cfg::ControlFlowGraph, lifter::ssa::FunctionSymbols},
-    il::ProtoId,
-};
+use crate::hil::StructuredFunction;
+use crate::hil::cflow::cfg::ControlFlowGraph;
+use crate::hil::lifter::ssa::FunctionSymbols;
+use crate::il::ProtoId;
 
 /// A non-fatal failure produced while simplifying structured HIL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

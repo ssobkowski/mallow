@@ -1,16 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    emitter::collectors::ReadCollector,
-    hil::{
-        StructuredFunction,
-        cflow::region::RegionNode,
-        ir::{Expr, Stmt, ValuePack},
-        lifter::ssa::SymbolId,
-        ty2::canonical::TypeId,
-        visitor::{Visitor, walk_expr},
-    },
-};
+use crate::emitter::collectors::ReadCollector;
+use crate::hil::StructuredFunction;
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::{Expr, Stmt, ValuePack};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::ty2::canonical::TypeId;
+use crate::hil::visitor::{Visitor, walk_expr};
 
 #[derive(Default)]
 pub struct LocalPlan {

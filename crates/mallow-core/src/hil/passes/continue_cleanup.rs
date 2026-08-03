@@ -6,11 +6,9 @@
 //! falls through to the same loop continuation, or extracts a plain
 //! `else continue`/`then continue` branch into an early guard.
 
-use crate::hil::{
-    StructuredFunction,
-    cflow::region::RegionNode,
-    visitor::{VisitorMut, walk_region_mut},
-};
+use crate::hil::StructuredFunction;
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::visitor::{VisitorMut, walk_region_mut};
 
 #[derive(Default)]
 struct ContinueCleanup {

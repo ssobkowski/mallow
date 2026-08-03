@@ -1,4 +1,5 @@
-use crate::{hil::lifter::ssa::SymbolId, scopes::Scopes};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::scopes::Scopes;
 
 #[derive(Default)]
 pub struct DeclarationState {

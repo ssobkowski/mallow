@@ -2,22 +2,18 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::{
-    disasm::Chunk,
-    hil::{
-        cflow::{graph::GraphView, reg_set::RegSet},
-        ir::{Expr, PhiNode, Stmt, ValuePack},
-        lifter::{
-            CaptureState, LiftContext, MultiRet, flush_multiret, lift,
-            ssa::{FunctionSymbols, NamedLocal, Ssa, Symbol, SymbolId, SymbolKind},
-        },
-        ty2::{bytecode::ProtoTypeContext, canonical::TypeId, store::TypeStore},
-        visitor::{Visitor, VisitorMut},
-    },
-    il::{ConstId, Count, Proto, reg_add, reg_range},
-};
-
 use super::{Block, BlockExit, Cond, CondRhs, RawBlock, RawBlockExit};
+use crate::disasm::Chunk;
+use crate::hil::cflow::graph::GraphView;
+use crate::hil::cflow::reg_set::RegSet;
+use crate::hil::ir::{Expr, PhiNode, Stmt, ValuePack};
+use crate::hil::lifter::ssa::{FunctionSymbols, NamedLocal, Ssa, Symbol, SymbolId, SymbolKind};
+use crate::hil::lifter::{CaptureState, LiftContext, MultiRet, flush_multiret, lift};
+use crate::hil::ty2::bytecode::ProtoTypeContext;
+use crate::hil::ty2::canonical::TypeId;
+use crate::hil::ty2::store::TypeStore;
+use crate::hil::visitor::{Visitor, VisitorMut};
+use crate::il::{ConstId, Count, Proto, reg_add, reg_range};
 
 /// Blocks and SSA metadata produced by one block-lifting run.
 pub(super) struct BuildResult {

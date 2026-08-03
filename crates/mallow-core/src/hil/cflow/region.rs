@@ -2,18 +2,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use smallvec::SmallVec;
 
-use crate::{
-    hil::{
-        cflow::{
-            cfg::{BlockExit, ControlFlowGraph},
-            graph::{DominatorTree, GraphView, Reversed, SeseGraphView},
-        },
-        ir::{Expr, Stmt, ValuePack},
-        lifter::ssa::SymbolId,
-    },
-    logging::{Diagnostics, LogLevel, LogTarget},
-    operator::UnOp,
-};
+use crate::hil::cflow::cfg::{BlockExit, ControlFlowGraph};
+use crate::hil::cflow::graph::{DominatorTree, GraphView, Reversed, SeseGraphView};
+use crate::hil::ir::{Expr, Stmt, ValuePack};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::logging::{Diagnostics, LogLevel, LogTarget};
+use crate::operator::UnOp;
 
 /// The lexical control-flow shape recognized from CFG facts.
 ///

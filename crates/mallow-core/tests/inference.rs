@@ -1,4 +1,5 @@
-use std::{path::Path, sync::OnceLock};
+use std::path::Path;
+use std::sync::OnceLock;
 
 use mallow_core::TypesView;
 use mallow_luau_toolchain::{BytecodeVersion, Installation, Manager};

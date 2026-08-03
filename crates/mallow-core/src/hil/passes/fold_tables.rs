@@ -3,11 +3,9 @@
 //!
 //! Such instructions can be folded only if they appear after an assignment to a table expr.
 
-use crate::hil::{
-    StructuredFunction,
-    ir::{Expr, Number, Stmt, TableItem},
-    visitor::VisitorMut,
-};
+use crate::hil::StructuredFunction;
+use crate::hil::ir::{Expr, Number, Stmt, TableItem};
+use crate::hil::visitor::VisitorMut;
 
 #[derive(Default)]
 struct Inliner {

@@ -10,19 +10,17 @@ mod printer;
 mod scopes;
 mod types_view;
 
+use anyhow::{Result, ensure};
 pub use logging::{
     DIAGNOSTIC_EVENT_TARGET, DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
 };
 pub use types_view::{TypeFactory, TypePackView, TypeView, TypesView};
 
-use anyhow::{Result, ensure};
-
-use crate::{
-    disasm::Chunk,
-    hil::{StructuredFunction, lifted::LiftedFunction},
-    il::{BytecodeType, ProtoTypeInfo, TypeTag},
-    logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget},
-};
+use crate::disasm::Chunk;
+use crate::hil::StructuredFunction;
+use crate::hil::lifted::LiftedFunction;
+use crate::il::{BytecodeType, ProtoTypeInfo, TypeTag};
+use crate::logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget};
 
 /// Output form produced by bytecode decompilation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

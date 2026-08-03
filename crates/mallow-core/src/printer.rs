@@ -1,11 +1,9 @@
-use crate::{
-    ast::{
-        Block, ElseClause, Expr, GenericBinder, If, Literal, Parameter, Stmt, TableItem, Type,
-        TypeLiteral, TypePack, TypePackTail, TypePrecedence, Typed,
-    },
-    common::{ByteString, escape_bytes},
-    operator::{BinOp, UnOp},
+use crate::ast::{
+    Block, ElseClause, Expr, GenericBinder, If, Literal, Parameter, Stmt, TableItem, Type,
+    TypeLiteral, TypePack, TypePackTail, TypePrecedence, Typed,
 };
+use crate::common::{ByteString, escape_bytes};
+use crate::operator::{BinOp, UnOp};
 
 pub fn print(block: &Block, top_comments: &[String]) -> String {
     let mut buf = String::new();
@@ -837,12 +835,10 @@ mod tests {
         AstPrinter, StringStyle, choose_string_style, escape_bytes, escaped_len, long_string_level,
         long_string_text, print,
     };
-    use crate::{
-        ast::{
-            Block, Expr, GenericBinder, Literal, Stmt, Type, TypePack, TypePackTail, TypePrecedence,
-        },
-        common::ByteString,
+    use crate::ast::{
+        Block, Expr, GenericBinder, Literal, Stmt, Type, TypePack, TypePackTail, TypePrecedence,
     };
+    use crate::common::ByteString;
 
     fn render_type(ty: &Type) -> String {
         let mut printer = AstPrinter::new();

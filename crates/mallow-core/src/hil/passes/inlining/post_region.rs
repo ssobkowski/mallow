@@ -1,22 +1,19 @@
 use std::collections::HashSet;
 
-use crate::hil::{
-    ReturnArity, StructuredFunction,
-    cflow::region::RegionNode,
-    ir::{Expr, Stmt, ValuePack},
-    lifter::ssa::SymbolId,
-    passes::return_arity::luau_libfunc_arity,
+use super::common::{
+    expr_read_symbols, region_read_symbols, replace_symbol_in_expr, replace_symbol_in_stmt,
 };
-
-use super::{
-    common::{
-        expr_read_symbols, region_read_symbols, replace_symbol_in_expr, replace_symbol_in_stmt,
-    },
-    evaluation::{can_substitute_in_expr, can_substitute_in_stmt, is_adjacent_assignment_consumer},
+use super::evaluation::{
+    can_substitute_in_expr, can_substitute_in_stmt, is_adjacent_assignment_consumer,
 };
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::{Expr, Stmt, ValuePack};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::passes::return_arity::luau_libfunc_arity;
 use crate::hil::passes::use_def::{
     BlockUseDef, CallSource, FunctionUseDef, SymbolUseDef, positions_contain_in_range,
 };
+use crate::hil::{ReturnArity, StructuredFunction};
 
 /// Describes one tuple assignment which can move into a consumer.
 struct TupleSource {

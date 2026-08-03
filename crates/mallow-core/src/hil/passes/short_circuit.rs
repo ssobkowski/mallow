@@ -7,16 +7,12 @@
 //! by replacing them with a logical expression. It is not a normalization pass
 //! because it changes the structure of the IR rather than canonicalizing it.
 
-use crate::{
-    hil::{
-        StructuredFunction,
-        cflow::region::RegionNode,
-        ir::{Expr, Stmt},
-        lifter::ssa::SymbolId,
-        visitor::{VisitorMut, walk_region_mut},
-    },
-    operator::BinOp,
-};
+use crate::hil::StructuredFunction;
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::{Expr, Stmt};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::visitor::{VisitorMut, walk_region_mut};
+use crate::operator::BinOp;
 
 #[derive(Default)]
 struct ShortCircuitFolding {
@@ -150,10 +146,10 @@ pub fn run(fun: &mut StructuredFunction) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use id_arena::Arena;
+
     use super::*;
     use crate::hil::lifter::ssa::Symbol;
-
-    use id_arena::Arena;
 
     fn assign(sym: SymbolId, value: Expr) -> RegionNode {
         RegionNode::BasicBlock {

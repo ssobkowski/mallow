@@ -1,9 +1,7 @@
-use crate::hil::{
-    ReturnArity, StructuredFunction,
-    cflow::region::RegionNode,
-    ir::{Expr, ValuePack},
-    visitor::{Visitor, walk_region},
-};
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::{Expr, ValuePack};
+use crate::hil::visitor::{Visitor, walk_region};
+use crate::hil::{ReturnArity, StructuredFunction};
 
 struct ReturnCollector<'a> {
     known: &'a [Option<ReturnArity>],

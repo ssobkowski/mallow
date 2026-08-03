@@ -3,14 +3,14 @@
 //! This build script deliberately keeps validation here (rather than in the
 //! downloader) so a malformed registry can never make it into a release build.
 
-use serde::de::{Error as _, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
-use std::env;
 use std::fmt::Write as _;
-use std::fs;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::{env, fs};
+
+use serde::de::{Error as _, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 /// Registry schema accepted by this build script.
 const SCHEMA: u32 = 1;

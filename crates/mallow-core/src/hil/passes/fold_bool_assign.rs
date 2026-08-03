@@ -16,12 +16,10 @@
 //! ```
 //! is folded to `var = if cond then a else b`.
 
-use crate::hil::{
-    StructuredFunction,
-    cflow::region::RegionNode,
-    ir::{Expr, Stmt},
-    visitor::{VisitorMut, walk_region_mut},
-};
+use crate::hil::StructuredFunction;
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::{Expr, Stmt};
+use crate::hil::visitor::{VisitorMut, walk_region_mut};
 
 #[derive(Default)]
 struct BoolAssignFolding {
@@ -110,13 +108,12 @@ pub fn run(fun: &mut StructuredFunction) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::hil::{
-        cflow::region::RegionNode,
-        ir::{Expr, Stmt},
-        lifter::ssa::Symbol,
-    };
     use id_arena::Arena;
+
+    use super::*;
+    use crate::hil::cflow::region::RegionNode;
+    use crate::hil::ir::{Expr, Stmt};
+    use crate::hil::lifter::ssa::Symbol;
 
     fn assign(lhs: Expr, value: Expr) -> RegionNode {
         RegionNode::BasicBlock {

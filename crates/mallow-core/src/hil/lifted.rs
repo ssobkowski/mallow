@@ -2,21 +2,16 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 
-use crate::{
-    Diagnostics, LogLevel, LogTarget,
-    disasm::Chunk,
-    hil::{
-        cflow::{
-            cfg::{self, BlockExit, ControlFlowGraph},
-            union_find::UnionFind,
-        },
-        ir::{PhiNode, Stmt},
-        lifter::ssa::{FunctionSymbols, SymbolId},
-        ty2::{canonical::TypeId, canonical::TypeScheme, store::TypeStore},
-        visitor::VisitorMut,
-    },
-    il::{Proto, ProtoId},
-};
+use crate::disasm::Chunk;
+use crate::hil::cflow::cfg::{self, BlockExit, ControlFlowGraph};
+use crate::hil::cflow::union_find::UnionFind;
+use crate::hil::ir::{PhiNode, Stmt};
+use crate::hil::lifter::ssa::{FunctionSymbols, SymbolId};
+use crate::hil::ty2::canonical::{TypeId, TypeScheme};
+use crate::hil::ty2::store::TypeStore;
+use crate::hil::visitor::VisitorMut;
+use crate::il::{Proto, ProtoId};
+use crate::{Diagnostics, LogLevel, LogTarget};
 
 /// Stores bytecode and inferred type evidence for one HIL symbol identity.
 #[derive(Debug, Clone)]
@@ -254,8 +249,9 @@ impl LiftedFunction {
         // Debug only for development regressions.
         #[cfg(debug_assertions)]
         {
-            use crate::hil::ir::Expr;
             use std::collections::HashSet;
+
+            use crate::hil::ir::Expr;
 
             let mut symbols = HashSet::new();
             for stmt in cfg.blocks().flat_map(|b| b.stmts()) {
@@ -452,16 +448,16 @@ impl VisitorMut for SymbolCanonicalizer<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, panic::AssertUnwindSafe};
+    use std::collections::HashMap;
+    use std::panic::AssertUnwindSafe;
 
     use id_arena::Arena;
 
     use super::FunctionTypes;
-    use crate::hil::{
-        cflow::union_find::UnionFind,
-        lifter::ssa::Symbol,
-        ty2::{canonical::Type, store::TypeStore},
-    };
+    use crate::hil::cflow::union_find::UnionFind;
+    use crate::hil::lifter::ssa::Symbol;
+    use crate::hil::ty2::canonical::Type;
+    use crate::hil::ty2::store::TypeStore;
 
     /// Cloned metadata owns remapped IDs and rejects IDs from its source graph.
     #[test]

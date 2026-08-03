@@ -9,19 +9,13 @@ pub mod visitor;
 
 use anyhow::Result;
 
-use crate::{
-    hil::{
-        cflow::{
-            cfg::ControlFlowGraph,
-            graph::GraphView,
-            region::{self, RegionNode},
-        },
-        lifted::{FunctionTypes, LiftedFunction},
-        lifter::ssa::FunctionSymbols,
-    },
-    il::ProtoId,
-    logging::{Diagnostics, LogLevel, LogTarget},
-};
+use crate::hil::cflow::cfg::ControlFlowGraph;
+use crate::hil::cflow::graph::GraphView;
+use crate::hil::cflow::region::{self, RegionNode};
+use crate::hil::lifted::{FunctionTypes, LiftedFunction};
+use crate::hil::lifter::ssa::FunctionSymbols;
+use crate::il::ProtoId;
+use crate::logging::{Diagnostics, LogLevel, LogTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturnArity {

@@ -1,11 +1,10 @@
-use std::{fmt::Display, path::PathBuf};
+use std::fmt::Display;
+use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use crate::hil::cflow::{
-    cfg::{Block, BlockExit, ControlFlowGraph},
-    graph::{DominatorTree, GraphView},
-};
+use crate::hil::cflow::cfg::{Block, BlockExit, ControlFlowGraph};
+use crate::hil::cflow::graph::{DominatorTree, GraphView};
 
 const CHAR_W: f64 = 7.2;
 const LINE_H: f64 = 16.0;

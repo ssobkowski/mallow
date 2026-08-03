@@ -1,21 +1,15 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    fmt,
-};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
-use crate::hil::{
-    lifted::LiftedFunction,
-    ty2::{
-        canonical::{
-            GenericBinder, Type, TypeId, TypeLiteral, TypePackId, TypePackTail, TypeScheme,
-        },
-        store::TypeStore,
-    },
+use crate::hil::lifted::LiftedFunction;
+use crate::hil::ty2::canonical::{
+    GenericBinder, Type, TypeId, TypeLiteral, TypePackId, TypePackTail, TypeScheme,
 };
+use crate::hil::ty2::store::TypeStore;
 
 /// Inferred types indexed by named locals from debug information.
 pub struct TypesView {

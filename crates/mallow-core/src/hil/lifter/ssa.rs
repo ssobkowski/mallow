@@ -2,11 +2,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use id_arena::{Arena, Id};
 
-use crate::hil::{
-    cflow::{cfg::Block, graph::GraphView},
-    ir::{PhiNode, Stmt},
-    ty2::canonical::TypeId,
-};
+use crate::hil::cflow::cfg::Block;
+use crate::hil::cflow::graph::GraphView;
+use crate::hil::ir::{PhiNode, Stmt};
+use crate::hil::ty2::canonical::TypeId;
 
 pub type SymbolId = Id<Symbol>;
 

@@ -5,12 +5,10 @@
 
 // TODO: Support `elseif`-shaped folds once `RegionNode` can represent them directly.
 
-use crate::hil::{
-    StructuredFunction,
-    cflow::region::RegionNode,
-    ir::Expr,
-    visitor::{VisitorMut, walk_region_mut},
-};
+use crate::hil::StructuredFunction;
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::Expr;
+use crate::hil::visitor::{VisitorMut, walk_region_mut};
 
 #[derive(Default)]
 struct NestedIfFolding {

@@ -1,29 +1,22 @@
 pub mod common;
 pub mod ssa;
 
+use anyhow::{Context, Result, bail, ensure};
 use smol_str::ToSmolStr;
 use ssa::Ssa;
 
-use anyhow::{Context, Result, bail, ensure};
-
-use crate::{
-    common::ByteString,
-    disasm::Chunk,
-    hil::{
-        cflow::graph::GraphView,
-        ir::{Expr, Number, Stmt, ValuePack},
-        lifter::{
-            common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL},
-            ssa::{Symbol, SymbolId},
-        },
-        ty2::bytecode::ProtoTypeContext,
-    },
-    il::{
-        ChildProtoId, ConstId, Constant, Count, DecodedInstr, ImportPath, Instr, Proto, ProtoId,
-        reg_add, reg_range,
-    },
-    operator::{BinOp, UnOp},
+use crate::common::ByteString;
+use crate::disasm::Chunk;
+use crate::hil::cflow::graph::GraphView;
+use crate::hil::ir::{Expr, Number, Stmt, ValuePack};
+use crate::hil::lifter::common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL};
+use crate::hil::lifter::ssa::{Symbol, SymbolId};
+use crate::hil::ty2::bytecode::ProtoTypeContext;
+use crate::il::{
+    ChildProtoId, ConstId, Constant, Count, DecodedInstr, ImportPath, Instr, Proto, ProtoId,
+    reg_add, reg_range,
 };
+use crate::operator::{BinOp, UnOp};
 
 /// A deferred variadic source that has not yet been consumed.
 ///
@@ -1003,7 +996,8 @@ pub fn lift<'a, 'cfg, G: GraphView>(
 #[cfg(test)]
 mod tests {
     use super::string_key_access;
-    use crate::{common::ByteString, hil::ir::Expr};
+    use crate::common::ByteString;
+    use crate::hil::ir::Expr;
 
     /// Invalid UTF-8 field keys remain byte-exact index expressions.
     #[test]

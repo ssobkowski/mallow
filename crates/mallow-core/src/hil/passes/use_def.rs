@@ -2,15 +2,11 @@ use std::collections::HashMap;
 
 use smallvec::SmallVec;
 
-use crate::{
-    hil::{
-        StructuredFunction,
-        ir::{Expr, PhiNode, Stmt, ValuePack},
-        lifter::ssa::SymbolId,
-        visitor::{Visitor, walk_expr},
-    },
-    il::ProtoId,
-};
+use crate::hil::StructuredFunction;
+use crate::hil::ir::{Expr, PhiNode, Stmt, ValuePack};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::visitor::{Visitor, walk_expr};
+use crate::il::ProtoId;
 
 /// Describes a plain value which can identify a call target.
 #[derive(Debug, Clone)]

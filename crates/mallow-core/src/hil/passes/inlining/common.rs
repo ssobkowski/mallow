@@ -1,11 +1,9 @@
 use std::collections::HashSet;
 
-use crate::hil::{
-    cflow::region::RegionNode,
-    ir::{Expr, PhiNode, Stmt},
-    lifter::ssa::SymbolId,
-    visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut},
-};
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::{Expr, PhiNode, Stmt};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::visitor::{Visitor, VisitorMut, walk_expr, walk_expr_mut};
 
 #[derive(Debug, Default)]
 struct SymbolReadSet {

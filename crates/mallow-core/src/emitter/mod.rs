@@ -9,33 +9,24 @@ use std::collections::HashSet;
 
 use smol_str::SmolStr;
 
-use crate::{
-    DecompileOptions, EmitMode, ast,
-    common::is_valid_luau_identifier,
-    emitter::{
-        collectors::ReadCollector,
-        declarations::DeclarationState,
-        plan::{FunctionPlan, format_ssa_symbol_name},
-        storage::SymbolStorage,
-    },
-    hil::{
-        StructuredFunction,
-        cflow::region::RegionNode,
-        ir as hil,
-        lifter::ssa::SymbolId,
-        ty2::{
-            canonical::{
-                GenericBinder as GraphGenericBinder, Type as GraphType, TypeId, TypeLiteral,
-                TypePackId, TypePackTail as GraphTypePackTail,
-            },
-            store::TypeStore,
-        },
-        visitor::Visitor,
-    },
-    il::ProtoId,
-    logging::{Diagnostics, LogLevel, LogTarget},
-    operator::CompoundBinOp,
+use crate::common::is_valid_luau_identifier;
+use crate::emitter::collectors::ReadCollector;
+use crate::emitter::declarations::DeclarationState;
+use crate::emitter::plan::{FunctionPlan, format_ssa_symbol_name};
+use crate::emitter::storage::SymbolStorage;
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::ty2::canonical::{
+    GenericBinder as GraphGenericBinder, Type as GraphType, TypeId, TypeLiteral, TypePackId,
+    TypePackTail as GraphTypePackTail,
 };
+use crate::hil::ty2::store::TypeStore;
+use crate::hil::visitor::Visitor;
+use crate::hil::{StructuredFunction, ir as hil};
+use crate::il::ProtoId;
+use crate::logging::{Diagnostics, LogLevel, LogTarget};
+use crate::operator::CompoundBinOp;
+use crate::{DecompileOptions, EmitMode, ast};
 
 const MAX_LOCAL_COUNT: usize = 199;
 
@@ -1357,10 +1348,10 @@ mod tests {
     use id_arena::Arena;
 
     use super::{format_phi_operands, materialize_type, open_set_list_fallback};
-    use crate::{
-        ast,
-        hil::{ir::PhiNode, lifter::ssa::Symbol, ty2::store::TypeStore},
-    };
+    use crate::ast;
+    use crate::hil::ir::PhiNode;
+    use crate::hil::lifter::ssa::Symbol;
+    use crate::hil::ty2::store::TypeStore;
 
     /// Phi comments preserve each predecessor-to-symbol association.
     #[test]

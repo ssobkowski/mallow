@@ -2,10 +2,8 @@ use std::path::Path;
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{
-    FnArg, Ident, ItemFn, LitStr, Pat, ReturnType, Token, Type, parse::Parse, parse::ParseStream,
-    parse_macro_input,
-};
+use syn::parse::{Parse, ParseStream};
+use syn::{FnArg, Ident, ItemFn, LitStr, Pat, ReturnType, Token, Type, parse_macro_input};
 
 /// The arguments accepted by [`inference_test`].
 struct InferenceTestArgs {

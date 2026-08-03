@@ -326,8 +326,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{AdjGraph, GraphView, Reversed, SeseGraphView};
     use std::collections::HashMap;
+
+    use super::{AdjGraph, GraphView, Reversed, SeseGraphView};
 
     struct SparseGraph {
         entry: usize,

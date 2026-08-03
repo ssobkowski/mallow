@@ -1,10 +1,8 @@
 //! Generates owned builtin type definitions from Luau's JSON AST.
 
-use std::{
-    collections::{HashMap, HashSet},
-    env, fs,
-    path::{Path, PathBuf},
-};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::{env, fs};
 
 use mallow_luau_toolchain::{BytecodeVersion, Manager};
 use serde::Deserialize;

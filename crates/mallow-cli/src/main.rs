@@ -1,12 +1,10 @@
-use std::{
-    error::Error,
-    fmt,
-    io::{IsTerminal, Write},
-    path::PathBuf,
-    process::Command,
-    sync::OnceLock,
-    time::Instant,
-};
+use std::error::Error;
+use std::fmt;
+use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -15,12 +13,11 @@ use mallow_core::{
     Diagnostics, EmitMode, LogLevel, LogTarget, ProtoSelector, decompile_bytecode_with_diagnostics,
     disassemble_bytecode_with_diagnostics,
 };
-use tracing::{Event, Subscriber, field::Visit};
-use tracing_subscriber::{
-    Layer, Registry,
-    layer::{Context, SubscriberExt},
-    util::SubscriberInitExt,
-};
+use tracing::field::Visit;
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{Layer, Registry};
 
 static START: OnceLock<Instant> = OnceLock::new();
 

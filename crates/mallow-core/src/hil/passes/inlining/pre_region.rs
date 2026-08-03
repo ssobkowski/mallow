@@ -1,17 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    hil::{
-        cflow::cfg::{Block, BlockExit, ControlFlowGraph},
-        cflow::graph::GraphView,
-        ir::{Expr, Stmt},
-        lifter::ssa::{FunctionSymbols, SymbolId},
-        visitor::{Visitor, walk_expr},
-    },
-    scopes::Scope,
-};
-
 use super::common::{expr_read_symbols, replace_symbol_in_expr, stmt_written_symbols};
+use crate::hil::cflow::cfg::{Block, BlockExit, ControlFlowGraph};
+use crate::hil::cflow::graph::GraphView;
+use crate::hil::ir::{Expr, Stmt};
+use crate::hil::lifter::ssa::{FunctionSymbols, SymbolId};
+use crate::hil::visitor::{Visitor, walk_expr};
+use crate::scopes::Scope;
 
 #[derive(Debug, Clone, Default)]
 struct SymbolFacts {

@@ -1,4 +1,5 @@
-use std::{collections::HashMap, hash::Hash};
+use std::collections::HashMap;
+use std::hash::Hash;
 
 /// A structure that groups items into sets and merges them.
 pub(crate) struct UnionFind<T> {

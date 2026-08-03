@@ -1,9 +1,7 @@
-use crate::hil::{
-    StructuredFunction,
-    ir::{Expr, Stmt},
-    lifter::ssa::SymbolId,
-    visitor::{VisitorMut, walk_stmts_mut},
-};
+use crate::hil::StructuredFunction;
+use crate::hil::ir::{Expr, Stmt};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::visitor::{VisitorMut, walk_stmts_mut};
 
 #[derive(Default)]
 struct Rewriter {

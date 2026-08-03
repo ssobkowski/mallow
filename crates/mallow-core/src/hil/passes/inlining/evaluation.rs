@@ -1,9 +1,6 @@
-use crate::hil::{
-    ir::{Expr, Stmt, TableItem, ValuePack},
-    lifter::ssa::SymbolId,
-};
-
 use super::common::count_symbol_reads_in_expr;
+use crate::hil::ir::{Expr, Stmt, TableItem, ValuePack};
+use crate::hil::lifter::ssa::SymbolId;
 
 /// Returns whether a statement can receive the replacement safely.
 pub(super) fn can_substitute_in_stmt(stmt: &Stmt, sym: SymbolId, rhs: &Expr) -> bool {

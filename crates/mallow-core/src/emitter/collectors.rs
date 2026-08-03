@@ -1,11 +1,9 @@
 use std::collections::HashSet;
 
-use crate::hil::{
-    cflow::region::RegionNode,
-    ir::{Expr, ValuePack},
-    lifter::ssa::SymbolId,
-    visitor::{Visitor, walk_expr},
-};
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::{Expr, ValuePack};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::visitor::{Visitor, walk_expr};
 
 #[derive(Default)]
 pub struct ReadCollector {

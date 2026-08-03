@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use smol_str::{SmolStr, format_smolstr};
 
-use crate::{ast::Identifier, hil::lifter::ssa::SymbolId};
+use crate::ast::Identifier;
+use crate::hil::lifter::ssa::SymbolId;
 
 #[derive(Default)]
 pub struct NameAllocator {

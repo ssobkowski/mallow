@@ -1,10 +1,9 @@
-use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, OnceLock};
-use std::thread;
 use std::time::Duration;
+use std::{fs, thread};
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use mallow_luau_toolchain::{BytecodeVersion, Installation, Manager, Release};

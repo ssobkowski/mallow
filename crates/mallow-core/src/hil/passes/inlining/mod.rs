@@ -1,6 +1,6 @@
-use crate::hil::{
-    ReturnArity, StructuredFunction, cflow::cfg::ControlFlowGraph, lifter::ssa::FunctionSymbols,
-};
+use crate::hil::cflow::cfg::ControlFlowGraph;
+use crate::hil::lifter::ssa::FunctionSymbols;
+use crate::hil::{ReturnArity, StructuredFunction};
 
 mod common;
 mod evaluation;

@@ -1,15 +1,16 @@
 //! Download, verify, cache, and run Luau release tools.
 
-use directories::ProjectDirs;
-use fs2::FileExt;
-use reqwest::blocking::Client;
-use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+use directories::ProjectDirs;
+use fs2::FileExt;
+use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zip::ZipArchive;
 
@@ -1318,9 +1319,11 @@ fn set_executable_permissions(_path: &Path) -> Result<(), Error> {
 /// Network-free tests for bytecode conversion and complete archive installation.
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
     use zip::write::SimpleFileOptions;
+
+    use super::*;
 
     /// Creates a ZIP archive containing selected tool entries.
     fn archive<Name>(entries: &[(Name, &[u8])]) -> Vec<u8>

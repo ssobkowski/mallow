@@ -2,16 +2,13 @@ use std::collections::{HashMap, HashSet};
 
 use smol_str::SmolStr;
 
-use crate::{
-    EmitMode,
-    ast::Identifier,
-    emitter::{
-        locals::LocalPlan,
-        name::NamePlan,
-        storage::{SpillSlot, SymbolStorage},
-    },
-    hil::{StructuredFunction, lifter::ssa::SymbolId},
-};
+use crate::EmitMode;
+use crate::ast::Identifier;
+use crate::emitter::locals::LocalPlan;
+use crate::emitter::name::NamePlan;
+use crate::emitter::storage::{SpillSlot, SymbolStorage};
+use crate::hil::StructuredFunction;
+use crate::hil::lifter::ssa::SymbolId;
 
 pub struct FunctionPlan {
     /// Selects source naming or identity-preserving SSA naming.

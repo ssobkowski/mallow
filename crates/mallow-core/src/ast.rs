@@ -1,14 +1,10 @@
-use std::{
-    collections::HashMap,
-    hash::{Hash, Hasher},
-};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use smol_str::SmolStr;
 
-use crate::{
-    common::ByteString,
-    operator::{BinOp, CompoundBinOp, UnOp},
-};
+use crate::common::ByteString;
+use crate::operator::{BinOp, CompoundBinOp, UnOp};
 
 /// A singleton value represented in a source type annotation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

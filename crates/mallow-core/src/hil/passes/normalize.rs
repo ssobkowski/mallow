@@ -4,15 +4,11 @@
 //! 2. Canonicalize binary comparison expressions of the form `[literal] op [expr]` to `[expr] op [literal]`.
 //! 3. Simplify pattern `not (a == b)` into `a ~= b`.
 
-use crate::{
-    hil::{
-        StructuredFunction,
-        cflow::region::RegionNode,
-        ir::Expr,
-        visitor::{VisitorMut, walk_region_mut},
-    },
-    operator::{BinOp, UnOp},
-};
+use crate::hil::StructuredFunction;
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::Expr;
+use crate::hil::visitor::{VisitorMut, walk_region_mut};
+use crate::operator::{BinOp, UnOp};
 
 #[derive(Default)]
 struct Normalizer {

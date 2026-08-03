@@ -1,13 +1,11 @@
-use crate::{
-    common::ByteString,
-    disasm::Chunk,
-    il::{
-        ConstId, Constant, DecodedInstr, FunctionTypeInfo, ImportPath, Instr, LocalDebug,
-        LocalTypeInfo, Proto, ProtoId, ProtoTypeInfo, StringId, TypeTag, UserdataTypeMapping,
-    },
-};
-
 use anyhow::{Context, Result, bail, ensure};
+
+use crate::common::ByteString;
+use crate::disasm::Chunk;
+use crate::il::{
+    ConstId, Constant, DecodedInstr, FunctionTypeInfo, ImportPath, Instr, LocalDebug,
+    LocalTypeInfo, Proto, ProtoId, ProtoTypeInfo, StringId, TypeTag, UserdataTypeMapping,
+};
 
 pub trait FromLeBytes: Sized {
     const SIZE: usize = std::mem::size_of::<Self>();

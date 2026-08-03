@@ -1,25 +1,19 @@
 mod block_lifter;
 
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    ops::Range,
-};
-
-use smallvec::SmallVec;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 
 use anyhow::{Result, anyhow, ensure};
+use smallvec::SmallVec;
 
-use crate::{
-    disasm::Chunk,
-    hil::{
-        cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph},
-        ir::{Expr, PhiNode, Stmt, ValuePack},
-        lifter::ssa::{FunctionSymbols, SymbolId},
-        ty2::{canonical::TypeId, store::TypeStore},
-    },
-    il::{DecodedInstr, Instr, Proto, reg_add, reg_range},
-    operator::BinOp,
-};
+use crate::disasm::Chunk;
+use crate::hil::cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
+use crate::hil::ir::{Expr, PhiNode, Stmt, ValuePack};
+use crate::hil::lifter::ssa::{FunctionSymbols, SymbolId};
+use crate::hil::ty2::canonical::TypeId;
+use crate::hil::ty2::store::TypeStore;
+use crate::il::{DecodedInstr, Instr, Proto, reg_add, reg_range};
+use crate::operator::BinOp;
 
 /// Represents an unlifted block
 #[derive(Debug)]

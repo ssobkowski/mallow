@@ -1,18 +1,12 @@
 use smol_str::SmolStr;
 
-use crate::{
-    common::ByteString,
-    hil::{
-        StructuredFunction,
-        cflow::{
-            cfg::{Block, BlockExit},
-            graph::GraphView,
-            region::RegionNode,
-        },
-        ir::{Expr, Number, PhiNode, Stmt, TableItem, ValuePack},
-        lifter::ssa::SymbolId,
-    },
-};
+use crate::common::ByteString;
+use crate::hil::StructuredFunction;
+use crate::hil::cflow::cfg::{Block, BlockExit};
+use crate::hil::cflow::graph::GraphView;
+use crate::hil::cflow::region::RegionNode;
+use crate::hil::ir::{Expr, Number, PhiNode, Stmt, TableItem, ValuePack};
+use crate::hil::lifter::ssa::SymbolId;
 
 #[allow(dead_code, reason = "might be used in the future")]
 pub trait Visitor {

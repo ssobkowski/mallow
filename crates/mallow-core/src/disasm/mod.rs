@@ -1,9 +1,7 @@
 use anyhow::Result;
 
-use crate::{
-    common::ByteString,
-    il::{Constant, Proto, ProtoId, StringId, UserdataTypeMapping},
-};
+use crate::common::ByteString;
+use crate::il::{Constant, Proto, ProtoId, StringId, UserdataTypeMapping};
 
 mod reader;
 
