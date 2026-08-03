@@ -228,7 +228,10 @@ pub fn walk_block_exit<V: Visitor + ?Sized>(visitor: &mut V, exit: &BlockExit) {
         BlockExit::FornLoop { .. } => {
             // this block carries no valuable info
         }
-        BlockExit::ForgPrep { exprs, .. } => {
+        BlockExit::ForgPrep { vars, exprs, .. } => {
+            for var in vars {
+                visitor.visit_symbol(*var);
+            }
             for expr in exprs {
                 visitor.visit_expr(expr);
             }
@@ -437,7 +440,10 @@ pub fn walk_block_exit_mut<V: VisitorMut + ?Sized>(visitor: &mut V, exit: &mut B
         BlockExit::FornLoop { .. } => {
             // this block carries no valuable info
         }
-        BlockExit::ForgPrep { exprs, .. } => {
+        BlockExit::ForgPrep { vars, exprs, .. } => {
+            for var in vars {
+                visitor.visit_symbol(var);
+            }
             for expr in exprs {
                 visitor.visit_expr(expr);
             }

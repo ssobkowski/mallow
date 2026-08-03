@@ -311,6 +311,7 @@ impl LiftedFunction {
         }
 
         union_phi_versions(&self.cfg, &mut disjoint_set);
+        union_generic_for_versions(&self.cfg, &mut disjoint_set);
         union_version_groups(
             self.symbols
                 .upvalue_version_groups
@@ -360,6 +361,32 @@ fn union_phi_versions(cfg: &ControlFlowGraph, disjoint_set: &mut UnionFind<Symbo
     }
 }
 
+/// Unions generic-for loop versions that represent one source variable.
+fn union_generic_for_versions(cfg: &ControlFlowGraph, disjoint_set: &mut UnionFind<SymbolId>) {
+    for block in cfg.blocks() {
+        let BlockExit::ForgPrep {
+            exit_block,
+            vars: entry_vars,
+            ..
+        } = block.exit()
+        else {
+            continue;
+        };
+
+        let BlockExit::ForgLoop {
+            vars: body_vars, ..
+        } = cfg.get(*exit_block).exit()
+        else {
+            continue;
+        };
+
+        // A body assignment creates a new SSA version of the loop variable.
+        for (entry_var, body_var) in entry_vars.iter().zip(body_vars) {
+            disjoint_set.union(*entry_var, *body_var);
+        }
+    }
+}
+
 /// Unions each nonempty version group into its first symbol.
 fn union_version_groups<I, G>(groups: I, disjoint_set: &mut UnionFind<SymbolId>)
 where
@@ -391,15 +418,8 @@ fn is_loop_header_loop_var_operand(
             body_block, var, ..
         } if *body_block == block_index => *var == target,
         BlockExit::ForgPrep {
-            body_block,
-            exit_block,
-            ..
-        } if *body_block == block_index => {
-            matches!(
-                cfg.get(*exit_block).exit(),
-                BlockExit::ForgLoop { vars, .. } if vars.contains(&target)
-            )
-        }
+            body_block, vars, ..
+        } if *body_block == block_index => vars.contains(&target),
         _ => false,
     }
 }

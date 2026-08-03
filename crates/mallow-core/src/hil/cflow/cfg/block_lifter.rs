@@ -283,10 +283,16 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                     Expr::Symbol(self.ssa.read_reg(block_id, reg_add(base, 2))),
                 ];
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
+                // Capture entry versions before the loop body can assign to them.
+                let vars = exit_writes
+                    .iter()
+                    .map(|reg| self.ssa.read_reg(body_block, *reg))
+                    .collect();
                 Ok(BlockExit::ForgPrep {
                     base,
                     body_block,
                     exit_block,
+                    vars,
                     exprs,
                 })
             }

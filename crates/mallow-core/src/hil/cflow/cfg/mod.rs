@@ -177,6 +177,8 @@ pub enum BlockExit {
         base: u8,
         body_block: usize,
         exit_block: usize,
+        /// Register versions used as generic-for loop variables at body entry.
+        vars: SmallVec<[SymbolId; 3]>,
         /// Iterator, state, and initial-control expressions required by Luau bytecode.
         exprs: [Expr; 3],
     },
@@ -371,6 +373,11 @@ impl ControlFlowGraph {
                     body_block, var, ..
                 } if *body_block == block_idx => {
                     loop_header_targets.insert(*var);
+                }
+                BlockExit::ForgPrep {
+                    body_block, vars, ..
+                } if *body_block == block_idx => {
+                    loop_header_targets.extend(vars.iter().copied());
                 }
                 BlockExit::ForgLoop {
                     body_block, vars, ..

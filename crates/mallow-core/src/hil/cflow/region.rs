@@ -1584,9 +1584,9 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         if let Some(latch) = single_latch
             && let BlockExit::ForgLoop {
                 base,
-                vars,
                 body_block,
                 exit_block,
+                ..
             } = self.cfg.get(latch).exit()
         {
             let prep_block = self
@@ -1599,12 +1599,16 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                 });
 
             if let Some(prep_block) = prep_block
-                && let BlockExit::ForgPrep { exprs, .. } = self.cfg.get(prep_block).exit()
+                && let BlockExit::ForgPrep {
+                    vars: prep_vars,
+                    exprs,
+                    ..
+                } = self.cfg.get(prep_block).exit()
             {
                 trace.line(1, format_args!("kind = GenericFor"));
 
                 return LoopKind::GenericFor {
-                    vars: vars.clone(),
+                    vars: prep_vars.clone(),
                     exprs: ValuePack::Fixed(exprs.to_vec()),
                     body: *body_block,
                     exit: *exit_block,
