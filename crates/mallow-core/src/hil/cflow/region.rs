@@ -413,29 +413,23 @@ impl LoopForest {
         let aggregate_same_header_loops: Vec<_> = by_header
             .iter()
             .filter_map(|(&header, ids)| {
-                let root_ids: Vec<_> = ids
-                    .iter()
-                    .copied()
-                    .filter(|id| loops[id].parent.is_none())
-                    .collect();
-
-                if root_ids.len() < 2 {
+                if ids.len() < 2 {
                     return None;
                 }
 
-                let representative = root_ids
+                let representative = ids
                     .iter()
                     .copied()
                     .max_by_key(|id| (loops[id].body.len(), *id))?;
 
                 let mut body = HashSet::new();
                 let mut latches = HashSet::new();
-                for id in root_ids.iter() {
+                for id in ids {
                     body.extend(loops[id].body.iter().copied());
                     latches.extend(loops[id].latches.iter().copied());
                 }
 
-                Some((header, representative, root_ids, body, latches))
+                Some((header, representative, ids.clone(), body, latches))
             })
             .collect();
 
@@ -1832,6 +1826,19 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             return Some(follow);
         }
 
+        // This tree uses the reversed graph, so dominance here means
+        // that the candidate post-dominates every loop exit.
+        //
+        // TODO: This is O(N^2). Probably not the best way to do it.
+        if let Some(follow) = loop_info.exits.iter().copied().find(|candidate| {
+            loop_info
+                .exits
+                .iter()
+                .all(|exit| self.ipdoms.dominates(*candidate, *exit))
+        }) {
+            return Some(follow);
+        }
+
         let mut follow = None;
         for &exit in &loop_info.exits {
             let target = single_target(self.graph.successors(exit))?;
@@ -1884,7 +1891,10 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                 block_shape
             }
             BlockExit::Jump(target) | BlockExit::Fallthrough(target)
-                if loop_ctx.is_some_and(|ctx| ctx.continue_targets.contains(target)) =>
+                if loop_ctx.is_some_and(|ctx| {
+                    ctx.continue_targets.contains(target)
+                        && !ctx.payload_continue_targets.contains(target)
+                }) =>
             {
                 if suppress_exit == Some(*target) && self.ipdoms.idom(block) == Some(*target) {
                     trace.line(
