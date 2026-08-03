@@ -25,14 +25,31 @@ pub(super) fn is_adjacent_assignment_consumer(
     source_idx: usize,
     use_idx: usize,
 ) -> bool {
-    let Stmt::Assign { left, value } = stmt else {
+    if use_idx != source_idx + 1 {
         return false;
-    };
+    }
 
-    !left.reads_symbol(&sym)
-        && left.is_pure()
-        && use_idx == source_idx + 1
-        && can_inline_effectful_at_occurrence(value, sym, rhs)
+    match stmt {
+        Stmt::Assign { left, value } => {
+            if left.reads_symbol(&sym) {
+                // A closure only allocates its value. Moving it into an
+                // adjacent key keeps the assignment's reads and calls intact.
+                matches!(rhs, Expr::Closure { .. })
+                    && value.is_pure()
+                    && can_inline_effectful_at_occurrence(left, sym, rhs)
+            } else {
+                left.is_pure() && can_inline_effectful_at_occurrence(value, sym, rhs)
+            }
+        }
+        Stmt::SetList { table, values, .. } => {
+            *table != sym
+                && value_pack_occurrence_has_no_prior_effect(values, sym)
+                && !values.tail().is_some_and(|tail| {
+                    tail.reads_symbol(&sym) && rhs.can_produce_multiple_values()
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Returns whether a call statement evaluates the replacement in place.
