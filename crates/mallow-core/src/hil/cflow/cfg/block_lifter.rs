@@ -8,7 +8,7 @@ use crate::{
         cflow::{graph::GraphView, reg_set::RegSet},
         ir::{Expr, PhiNode, Stmt, ValuePack},
         lifter::{
-            LiftContext, MultiRet, flush_multiret, lift,
+            CaptureState, LiftContext, MultiRet, flush_multiret, lift,
             ssa::{FunctionSymbols, NamedLocal, Ssa, Symbol, SymbolId, SymbolKind},
         },
         ty2::{bytecode::ProtoTypeContext, canonical::TypeId, store::TypeStore},
@@ -44,6 +44,27 @@ pub(super) fn lift_blocks<G: GraphView>(
     BlockLifter::new(proto, chunk, raw_blocks, graph).build()
 }
 
+/// Finds the capture state at each basic block entry.
+fn capture_states_at_block_entries(proto: &Proto, raw_blocks: &[RawBlock]) -> Vec<CaptureState> {
+    let mut states = Vec::with_capacity(raw_blocks.len());
+    let mut state = CaptureState::default();
+    let mut instr_index = 0;
+
+    for block in raw_blocks {
+        assert!(
+            instr_index <= block.instr_range.start,
+            "raw blocks must be ordered by instruction index"
+        );
+        for decoded in &proto.instrs[instr_index..block.instr_range.start] {
+            state.note_instruction(decoded.instr);
+        }
+        instr_index = block.instr_range.start;
+        states.push(state);
+    }
+
+    states
+}
+
 /// Mutable state for the SSA-backed CFG block lifting phase.
 struct BlockLifter<'a, G: GraphView> {
     proto: &'a Proto,
@@ -57,12 +78,14 @@ struct BlockLifter<'a, G: GraphView> {
     params: Vec<SymbolId>,
     upvalues: Vec<SymbolId>,
     loop_carried_versions: Vec<(SymbolId, SymbolId)>,
+    capture_states: Vec<CaptureState>,
 }
 
 impl<'a, G: GraphView> BlockLifter<'a, G> {
     fn new(proto: &'a Proto, chunk: &'a Chunk, raw_blocks: &'a [RawBlock], graph: &'a G) -> Self {
         let mut type_store = TypeStore::new();
         let type_context = ProtoTypeContext::from_proto(proto, chunk, &mut type_store);
+        let capture_states = capture_states_at_block_entries(proto, raw_blocks);
 
         Self {
             proto,
@@ -76,6 +99,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             params: Vec::with_capacity(proto.num_params as usize),
             upvalues: Vec::with_capacity(proto.num_upvals as usize),
             loop_carried_versions: Vec::new(),
+            capture_states,
         }
     }
 
@@ -144,6 +168,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             type_context: &self.type_context,
             ssa: &mut self.ssa,
             block_idx: block_id,
+            capture_state: self.capture_states[block_id],
         })?;
 
         let exit = self.lower_exit(block_id, &mut stmts, &mut pending_multiret)?;

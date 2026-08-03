@@ -85,6 +85,61 @@ fn unop_for_instr(instr: &Instr) -> UnOp {
     }
 }
 
+/// Tracks which register slots currently hold open captured storage.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureState {
+    /// Storage generation for each register slot.
+    reg_generations: [u16; 256],
+    /// Open captured generation for each register slot.
+    open_refs: [Option<u16>; 256],
+}
+
+impl Default for CaptureState {
+    fn default() -> Self {
+        Self {
+            reg_generations: [0; 256],
+            open_refs: [None; 256],
+        }
+    }
+}
+
+impl CaptureState {
+    /// Applies capture bookkeeping for one instruction.
+    pub fn note_instruction(&mut self, instr: Instr) {
+        match instr {
+            Instr::Capture {
+                capture_type: CAPTURE_REF,
+                reg,
+            } => self.open_ref(reg),
+            Instr::CloseUpvals { reg } => self.close_refs(reg),
+            _ => {}
+        }
+    }
+
+    /// Returns the open storage generation for one register slot.
+    fn open_generation(&self, reg: u8) -> Option<u16> {
+        self.open_refs[reg as usize]
+    }
+
+    /// Opens captured storage for one register slot.
+    fn open_ref(&mut self, reg: u8) {
+        self.open_refs[reg as usize] = Some(self.reg_generations[reg as usize]);
+    }
+
+    /// Closes captured storage from one register slot through the stack top.
+    fn close_refs(&mut self, from_reg: u8) {
+        for generation in &mut self.reg_generations[from_reg as usize..] {
+            *generation = generation
+                .checked_add(1)
+                .expect("capture generation overflow");
+        }
+
+        for captured in &mut self.open_refs[from_reg as usize..] {
+            *captured = None;
+        }
+    }
+}
+
 pub struct LiftContext<'a, 'cfg, G: GraphView> {
     pub instrs: &'a [DecodedInstr],
     pub chunk: &'a Chunk,
@@ -92,6 +147,7 @@ pub struct LiftContext<'a, 'cfg, G: GraphView> {
     pub type_context: &'a ProtoTypeContext,
     pub ssa: &'a mut Ssa<'cfg, G>,
     pub block_idx: usize,
+    pub capture_state: CaptureState,
 }
 
 pub struct Lifter<'a, 'cfg, G: GraphView> {
@@ -108,8 +164,7 @@ pub struct Lifter<'a, 'cfg, G: GraphView> {
     stmts: Vec<Stmt>,
     pending_multiret: Option<MultiRet>,
 
-    reg_generations: [u16; 256],
-    open_captured_ref: [Option<u16>; 256],
+    capture_state: CaptureState,
 }
 
 impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
@@ -124,8 +179,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             block_idx: ctx.block_idx,
             stmts: Vec::new(),
             pending_multiret: None,
-            reg_generations: [0; 256],
-            open_captured_ref: [None; 256],
+            capture_state: ctx.capture_state,
         }
     }
 
@@ -204,7 +258,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
     }
 
     fn alloc_reg_symbol(&mut self, reg: u8) -> SymbolId {
-        let symbol = match self.open_captured_ref[reg as usize] {
+        let symbol = match self.capture_state.open_generation(reg) {
             Some(generation) => Symbol::captured_reg(reg, generation),
             None => Symbol::reg(reg),
         };
@@ -219,22 +273,17 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
     }
 
     fn note_close_upvals(&mut self, from_reg: u8) {
-        for generation in &mut self.reg_generations[from_reg as usize..] {
-            *generation = generation
-                .checked_add(1)
-                .expect("capture generation overflow");
-        }
-
-        for captured in &mut self.open_captured_ref[from_reg as usize..] {
-            *captured = None;
-        }
+        self.capture_state.close_refs(from_reg);
     }
 
     fn promote_capture_ref(&mut self, reg: u8) -> SymbolId {
-        let generation = self.reg_generations[reg as usize];
-        self.open_captured_ref[reg as usize] = Some(generation);
+        self.capture_state.open_ref(reg);
 
         let sym = self.ssa.read_reg(self.block_idx, reg);
+        let generation = self
+            .capture_state
+            .open_generation(reg)
+            .expect("capture ref should be open after promotion");
         self.ssa.promote_to_captured_reg(sym, reg, generation);
         sym
     }
