@@ -127,18 +127,8 @@ pub(super) fn replace_symbol_in_stmt(stmt: &mut Stmt, sym: SymbolId, replacement
 /// Returns the set of symbols written by a statement.
 pub(super) fn stmt_written_symbols(stmt: &Stmt) -> HashSet<SymbolId> {
     match stmt {
-        Stmt::Assign {
-            left: Expr::Symbol(sym),
-            ..
-        } => HashSet::from([*sym]),
-        Stmt::Assign { .. } => HashSet::new(),
-        Stmt::AssignMany { left, .. } => left
-            .iter()
-            .filter_map(|lvalue| match lvalue {
-                Expr::Symbol(sym) => Some(*sym),
-                _ => None,
-            })
-            .collect(),
+        Stmt::Assign { left, .. } => expr_read_symbols(left),
+        Stmt::AssignMany { left, .. } => left.iter().flat_map(expr_read_symbols).collect(),
         Stmt::SetList { table, .. } => HashSet::from([*table]),
         Stmt::Call(_) => HashSet::new(),
         Stmt::Phi(_) => {
