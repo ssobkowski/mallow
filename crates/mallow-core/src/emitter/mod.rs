@@ -1078,7 +1078,7 @@ impl Emitter<'_> {
                 hil::Number::Integer(i) => ast::Expr::Literal(ast::Literal::Integer(*i)),
                 hil::Number::Float(f) => ast::Expr::Literal(ast::Literal::Float(*f)),
             },
-            hil::Expr::String(s) => ast::Expr::Literal(ast::Literal::String(s.into())),
+            hil::Expr::String(s) => ast::Expr::Literal(ast::Literal::String(s.clone())),
             hil::Expr::Bool(b) => ast::Expr::Literal(ast::Literal::Bool(*b)),
             hil::Expr::Symbol(sym) => self.symbol_expr(*sym),
             hil::Expr::Closure { proto, captures } => self.visit_closure(*proto, captures),
@@ -1103,7 +1103,9 @@ impl Emitter<'_> {
                 } else {
                     ast::Expr::Index {
                         base,
-                        index: Box::new(ast::Expr::Literal(ast::Literal::String(field.clone()))),
+                        index: Box::new(ast::Expr::Literal(ast::Literal::String(
+                            field.clone().into(),
+                        ))),
                     }
                 }
             }
@@ -1186,10 +1188,11 @@ impl Emitter<'_> {
                 hil::TableItem::Index(key, value) => {
                     let value = self.visit_expr(value);
                     if let hil::Expr::String(s) = key
-                        && is_valid_luau_identifier(s)
+                        && let Some(name) = s.as_utf8()
+                        && is_valid_luau_identifier(name)
                     {
                         emitted.push(ast::TableItem::Named {
-                            name: ast::Identifier::new(s.clone()),
+                            name: ast::Identifier::new(name),
                             value,
                         });
                     } else {

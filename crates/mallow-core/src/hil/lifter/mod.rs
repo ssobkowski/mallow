@@ -7,6 +7,7 @@ use ssa::Ssa;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
+    common::ByteString,
     disasm::Chunk,
     hil::{
         cflow::graph::GraphView,
@@ -18,8 +19,8 @@ use crate::{
         ty2::bytecode::ProtoTypeContext,
     },
     il::{
-        ChildProtoId, ConstId, Constant, Count, DecodedInstr, ImportPath, Instr, LuauString, Proto,
-        ProtoId, reg_add, reg_range,
+        ChildProtoId, ConstId, Constant, Count, DecodedInstr, ImportPath, Instr, Proto, ProtoId,
+        reg_add, reg_range,
     },
     operator::{BinOp, UnOp},
 };
@@ -82,6 +83,21 @@ fn unop_for_instr(instr: &Instr) -> UnOp {
         Instr::Length { .. } => UnOp::Length,
         Instr::Not { .. } => UnOp::Not,
         _ => unreachable!("not a unary operator instruction: {:?}", instr),
+    }
+}
+
+/// Builds a field access without losing a non-UTF-8 key.
+fn string_key_access(object: Expr, key: ByteString) -> Expr {
+    if let Some(field) = key.as_utf8() {
+        Expr::GetField {
+            obj: Box::new(object),
+            field: field.into(),
+        }
+    } else {
+        Expr::GetIndex {
+            obj: Box::new(object),
+            index: Box::new(Expr::String(key)),
+        }
     }
 }
 
@@ -356,9 +372,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     self.assign_reg(
                         *dest,
                         Expr::Global(
-                            self.const_string(ConstId(*key))
-                                .with_context(|| format!("invalid string constant {key}"))?
-                                .to_smolstr(),
+                            self.const_name(ConstId(*key))
+                                .with_context(|| format!("invalid string constant {key}"))?,
                         ),
                     );
                 }
@@ -366,9 +381,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     let sym = self.get_reg_symbol(*src);
                     self.assign(
                         Expr::Global(
-                            self.const_string(ConstId(*key))
-                                .with_context(|| format!("invalid string constant {key}"))?
-                                .to_smolstr(),
+                            self.const_name(ConstId(*key))
+                                .with_context(|| format!("invalid string constant {key}"))?,
                         ),
                         Expr::Symbol(sym),
                     );
@@ -417,14 +431,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     dest, table, key, ..
                 } => {
                     let sym = self.get_reg_symbol(*table);
-                    let field = self.const_string(ConstId(*key))?;
-                    self.assign_reg(
-                        *dest,
-                        Expr::GetField {
-                            obj: Box::new(Expr::Symbol(sym)),
-                            field: field.to_smolstr(),
-                        },
-                    );
+                    let key = self.const_string(ConstId(*key))?;
+                    self.assign_reg(*dest, string_key_access(Expr::Symbol(sym), key));
                 }
                 Instr::GetUDataKS {
                     dest,
@@ -433,14 +441,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     ..
                 } => {
                     let sym = self.get_reg_symbol(*userdata);
-                    let field = self.const_string(ConstId(u32::from(*key)))?;
-                    self.assign_reg(
-                        *dest,
-                        Expr::GetField {
-                            obj: Box::new(Expr::Symbol(sym)),
-                            field: field.to_smolstr(),
-                        },
-                    );
+                    let key = self.const_string(ConstId(u32::from(*key)))?;
+                    self.assign_reg(*dest, string_key_access(Expr::Symbol(sym), key));
                 }
                 Instr::GetTable { dest, table, key } => {
                     let table_sym = self.get_reg_symbol(*table);
@@ -468,12 +470,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 } => {
                     let table_sym = self.get_reg_symbol(*table);
                     let value_sym = self.get_reg_symbol(*src);
-                    let field = self.const_string(ConstId(*key))?;
+                    let key = self.const_string(ConstId(*key))?;
                     self.assign(
-                        Expr::GetField {
-                            obj: Box::new(Expr::Symbol(table_sym)),
-                            field: field.to_smolstr(),
-                        },
+                        string_key_access(Expr::Symbol(table_sym), key),
                         Expr::Symbol(value_sym),
                     );
                 }
@@ -482,12 +481,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 } => {
                     let userdata_sym = self.get_reg_symbol(*userdata);
                     let value_sym = self.get_reg_symbol(*src);
-                    let field = self.const_string(ConstId(u32::from(*key)))?;
+                    let key = self.const_string(ConstId(u32::from(*key)))?;
                     self.assign(
-                        Expr::GetField {
-                            obj: Box::new(Expr::Symbol(userdata_sym)),
-                            field: field.to_smolstr(),
-                        },
+                        string_key_access(Expr::Symbol(userdata_sym), key),
                         Expr::Symbol(value_sym),
                     );
                 }
@@ -757,7 +753,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             "malformed bytecode: CALL func reg {func} does not match NAMECALL dest reg {dest}"
         );
 
-        let method = self.const_string(ConstId(method))?;
+        let method = self.const_name(ConstId(method))?;
 
         let first_arg = reg_add(func, 2); // receiver is at func+1, user args start at func+2
         let variadic_args = match Count::from(arg_count) {
@@ -791,7 +787,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
         let method_call = Expr::MethodCall {
             object: Box::new(Expr::Symbol(self.get_reg_symbol(object))),
-            method: method.to_smolstr(),
+            method,
             args,
         };
         self.emit_call_result(func, ret_count, method_call);
@@ -929,7 +925,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
     /// A helper for resolving string constants from the chunk.
     #[inline]
-    fn const_string(&self, id: ConstId) -> Result<LuauString> {
+    fn const_string(&self, id: ConstId) -> Result<ByteString> {
         let ct = self
             .proto
             .get_constant(id)
@@ -940,6 +936,15 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         self.chunk
             .get_string(*sid)
             .with_context(|| format!("invalid string id {:?}", sid))
+    }
+
+    /// Resolves one string constant that must be valid UTF-8 source text.
+    fn const_name(&self, id: ConstId) -> Result<smol_str::SmolStr> {
+        let value = self.const_string(id)?;
+        let value = value
+            .as_utf8()
+            .with_context(|| format!("string constant {id:?} is not valid UTF-8"))?;
+        Ok(value.to_smolstr())
     }
 
     /// A helper for resolving expression constants from the proto.
@@ -993,4 +998,22 @@ pub fn lift<'a, 'cfg, G: GraphView>(
 ) -> Result<(Vec<Stmt>, Option<MultiRet>)> {
     let lifter = Lifter::new(ctx);
     lifter.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::string_key_access;
+    use crate::{common::ByteString, hil::ir::Expr};
+
+    /// Invalid UTF-8 field keys remain byte-exact index expressions.
+    #[test]
+    fn string_key_access_preserves_invalid_utf8() {
+        let key = ByteString::from(vec![0x80, 0xFF]);
+        let access = string_key_access(Expr::Global("object".into()), key.clone());
+
+        assert!(matches!(
+            access,
+            Expr::GetIndex { index, .. } if *index == Expr::String(key)
+        ));
+    }
 }

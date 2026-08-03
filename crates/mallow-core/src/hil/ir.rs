@@ -3,6 +3,7 @@ use std::fmt::Display;
 use anyhow::{Context, Result, bail};
 use smol_str::{SmolStr, ToSmolStr};
 
+use crate::common::ByteString;
 use crate::disasm::Chunk;
 use crate::hil::lifter::ssa::SymbolId;
 use crate::il::{Constant, ImportPath, Proto, ProtoId};
@@ -33,8 +34,8 @@ pub enum Expr {
     Nil,
     /// A numeric literal.
     Number(Number),
-    /// A string literal.
-    String(String),
+    /// A byte-exact string literal.
+    String(ByteString),
     /// A boolean literal.
     Bool(bool),
     /// A symbol, an universal variable reference.
@@ -233,8 +234,7 @@ impl Expr {
             Constant::String(s) => Ok(Self::String(
                 chunk
                     .get_string(*s)
-                    .with_context(|| format!("invalid string key {:?}", *s))?
-                    .to_string(),
+                    .with_context(|| format!("invalid string key {:?}", *s))?,
             )),
             Constant::Import(i) => Self::import(*i, chunk, proto),
             Constant::Table => Ok(Self::Table { items: Vec::new() }),
@@ -284,12 +284,13 @@ impl Expr {
                 bail!("import path component {id:?} is not a string constant");
             };
 
-            names.push(
-                chunk
-                    .get_string(*string_id)
-                    .with_context(|| format!("invalid import string id {string_id:?}"))?
-                    .to_smolstr(),
-            );
+            let name = chunk
+                .get_string(*string_id)
+                .with_context(|| format!("invalid import string id {string_id:?}"))?;
+            let name = name
+                .as_utf8()
+                .with_context(|| format!("import string {string_id:?} is not valid UTF-8"))?;
+            names.push(name.to_smolstr());
         }
 
         let first = names.remove(0);

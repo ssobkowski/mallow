@@ -1,14 +1,17 @@
 use smol_str::SmolStr;
 
-use crate::hil::{
-    StructuredFunction,
-    cflow::{
-        cfg::{Block, BlockExit},
-        graph::GraphView,
-        region::RegionNode,
+use crate::{
+    common::ByteString,
+    hil::{
+        StructuredFunction,
+        cflow::{
+            cfg::{Block, BlockExit},
+            graph::GraphView,
+            region::RegionNode,
+        },
+        ir::{Expr, Number, PhiNode, Stmt, TableItem, ValuePack},
+        lifter::ssa::SymbolId,
     },
-    ir::{Expr, Number, PhiNode, Stmt, TableItem, ValuePack},
-    lifter::ssa::SymbolId,
 };
 
 #[allow(dead_code, reason = "might be used in the future")]
@@ -73,7 +76,7 @@ pub trait Visitor {
 
     fn visit_number(&mut self, _number: Number) {}
 
-    fn visit_string(&mut self, _string: &str) {}
+    fn visit_string(&mut self, _string: &ByteString) {}
 
     fn visit_bool(&mut self, _value: bool) {}
 
@@ -133,7 +136,7 @@ pub trait VisitorMut {
 
     fn visit_number(&mut self, _number: &mut Number) {}
 
-    fn visit_string(&mut self, _string: &mut String) {}
+    fn visit_string(&mut self, _string: &mut ByteString) {}
 
     fn visit_bool(&mut self, _value: &mut bool) {}
 

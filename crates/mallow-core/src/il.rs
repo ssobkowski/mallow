@@ -1,4 +1,4 @@
-use std::{fmt, rc::Rc};
+use std::fmt;
 
 use anyhow::{Result, ensure};
 use smallvec::{SmallVec, smallvec};
@@ -44,27 +44,6 @@ impl ImportPath {
         ];
 
         Ok(ids.into_iter().take(count))
-    }
-}
-
-/// A free-standing Luau string.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct LuauString(pub Rc<[u8]>);
-
-impl LuauString {
-    /// Returns the byte-exact string contents stored in bytecode.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for LuauString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for &byte in self.as_bytes() {
-            write!(f, "{}", char::from(byte))?;
-        }
-        Ok(())
     }
 }
 

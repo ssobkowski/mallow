@@ -1,6 +1,9 @@
 use anyhow::Result;
 
-use crate::il::{Constant, LuauString, Proto, ProtoId, StringId, UserdataTypeMapping};
+use crate::{
+    common::ByteString,
+    il::{Constant, Proto, ProtoId, StringId, UserdataTypeMapping},
+};
 
 mod reader;
 
@@ -10,7 +13,7 @@ pub struct Chunk {
     pub types_version: u8,
     pub userdata_type_mappings: Option<Vec<UserdataTypeMapping>>,
     pub protos: Vec<Proto>,
-    pub strings: Vec<LuauString>,
+    pub strings: Vec<ByteString>,
     pub entry_proto: ProtoId,
 }
 
@@ -21,9 +24,9 @@ impl Chunk {
         self.protos.get(id.0 as usize)
     }
 
-    /// Resolves the [`LuauString`] with the given [`StringId`].
+    /// Resolves the [`ByteString`] with the given [`StringId`].
     #[inline]
-    pub fn get_string(&self, id: StringId) -> Option<LuauString> {
+    pub fn get_string(&self, id: StringId) -> Option<ByteString> {
         let idx = id.0 as usize;
         self.strings.get(idx.checked_sub(1)?).cloned()
     }

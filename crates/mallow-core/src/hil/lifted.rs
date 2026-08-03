@@ -291,7 +291,7 @@ impl LiftedFunction {
             debug_name: proto
                 .debug_name
                 .and_then(|id| chunk.get_string(id))
-                .map(|s| s.to_string()),
+                .and_then(|name| name.as_utf8().map(str::to_owned)),
             cfg,
             symbols,
             types: FunctionTypes::from_facts(symbol_types, HashMap::new(), type_store),

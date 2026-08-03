@@ -1,22 +1,89 @@
-/// Escapes a string for use in Lua string literals.
-pub fn escape_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for ch in s.chars() {
-        let code = u32::from(ch);
-        let byte = u8::try_from(code).unwrap_or(b'?');
+use std::{fmt, rc::Rc};
+
+use smol_str::SmolStr;
+
+/// Owns the exact bytes of one Luau string.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+pub struct ByteString(Rc<[u8]>);
+
+impl ByteString {
+    /// Returns the exact string bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Returns the string as UTF-8 when every byte is valid.
+    #[must_use]
+    pub fn as_utf8(&self) -> Option<&str> {
+        std::str::from_utf8(self.as_bytes()).ok()
+    }
+}
+
+impl fmt::Display for ByteString {
+    /// Formats bytes with the same escapes used by quoted Luau literals.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&escape_bytes(self.as_bytes()))
+    }
+}
+
+impl From<&[u8]> for ByteString {
+    /// Copies bytes into an owned Luau string.
+    fn from(value: &[u8]) -> Self {
+        Self(Rc::from(value))
+    }
+}
+
+impl From<Vec<u8>> for ByteString {
+    /// Moves bytes into an owned Luau string.
+    fn from(value: Vec<u8>) -> Self {
+        Self(Rc::from(value))
+    }
+}
+
+impl From<Rc<[u8]>> for ByteString {
+    /// Reuses shared byte storage for a Luau string.
+    fn from(value: Rc<[u8]>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ByteString {
+    /// Copies UTF-8 text into an owned Luau string.
+    fn from(value: &str) -> Self {
+        Self::from(value.as_bytes())
+    }
+}
+
+impl From<String> for ByteString {
+    /// Moves UTF-8 text into an owned Luau string.
+    fn from(value: String) -> Self {
+        Self::from(value.into_bytes())
+    }
+}
+
+impl From<SmolStr> for ByteString {
+    /// Copies compact UTF-8 text into an owned Luau string.
+    fn from(value: SmolStr) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+/// Escapes bytes for use inside a quoted Luau string literal.
+pub fn escape_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
         match byte {
             b'\\' => out.push_str("\\\\"),
             b'\n' => out.push_str("\\n"),
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
-            b'\0' => out.push_str("\\0"),
+            b'\0' => out.push_str("\\000"),
             b'"' => out.push_str("\\\""),
-            // printable ASCII (space through ~, excluding backslash already handled)
-            0x20..=0x7E => out.push(byte as char),
-            // control chars + high bytes
+            0x20..=0x7E => out.push(char::from(byte)),
             _ => {
                 use std::fmt::Write;
-                write!(out, "\\{byte}").unwrap();
+                write!(out, "\\{byte:03}").unwrap();
             }
         }
     }

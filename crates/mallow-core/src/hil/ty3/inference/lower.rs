@@ -386,16 +386,27 @@ impl<'a> FunctionLowerer<'a> {
                                 },
                             );
                         }
-                        TableItem::Index(Expr::String(field), item_value) => {
+                        TableItem::Index(index @ Expr::String(field), item_value) => {
                             let item_value = self.lower_expr(item_value);
-                            self.program.push_value(
-                                value,
-                                ValueRelation::WriteField {
-                                    field: field.as_str().into(),
-                                    value: item_value,
-                                    definite: true,
-                                },
-                            );
+                            if let Some(field) = field.as_utf8() {
+                                self.program.push_value(
+                                    value,
+                                    ValueRelation::WriteField {
+                                        field: field.into(),
+                                        value: item_value,
+                                        definite: true,
+                                    },
+                                );
+                            } else {
+                                let index = self.lower_expr(index);
+                                self.program.push_value(
+                                    value,
+                                    ValueRelation::WriteIndex {
+                                        index,
+                                        value: item_value,
+                                    },
+                                );
+                            }
                         }
                         TableItem::Index(index, item_value) => {
                             let index = self.lower_expr(index);

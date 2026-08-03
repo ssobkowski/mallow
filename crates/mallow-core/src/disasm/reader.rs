@@ -1,11 +1,9 @@
-use std::rc::Rc;
-
 use crate::{
+    common::ByteString,
     disasm::Chunk,
     il::{
         ConstId, Constant, DecodedInstr, FunctionTypeInfo, ImportPath, Instr, LocalDebug,
-        LocalTypeInfo, LuauString, Proto, ProtoId, ProtoTypeInfo, StringId, TypeTag,
-        UserdataTypeMapping,
+        LocalTypeInfo, Proto, ProtoId, ProtoTypeInfo, StringId, TypeTag, UserdataTypeMapping,
     },
 };
 
@@ -132,7 +130,7 @@ impl<'b> BytecodeReader<'b> {
         })
     }
 
-    fn read_string_table(&mut self) -> Result<Vec<LuauString>> {
+    fn read_string_table(&mut self) -> Result<Vec<ByteString>> {
         let len = self.read_varint()?;
         let mut strings = Vec::with_capacity(len);
         for _ in 0..len {
@@ -161,14 +159,13 @@ impl<'b> BytecodeReader<'b> {
     }
 
     #[inline]
-    fn read_luau_string(&mut self) -> Result<LuauString> {
+    fn read_luau_string(&mut self) -> Result<ByteString> {
         let len = self.read_varint()?;
         if len == 0 {
-            return Ok(LuauString::default());
+            return Ok(ByteString::default());
         }
 
-        let str_bytes = self.read_bytes(len)?;
-        Ok(LuauString(Rc::from(str_bytes)))
+        Ok(ByteString::from(self.read_bytes(len)?))
     }
 
     #[inline]

@@ -3,7 +3,7 @@ use crate::{
         Block, ElseClause, Expr, GenericBinder, If, Literal, Parameter, Stmt, TableItem, Type,
         TypeLiteral, TypePack, TypePackTail, TypePrecedence, Typed,
     },
-    common::escape_string,
+    common::{ByteString, escape_bytes},
     operator::{BinOp, UnOp},
 };
 
@@ -598,7 +598,7 @@ impl AstPrinter {
         match literal {
             TypeLiteral::String(value) => {
                 self.write("\"");
-                self.write(&escape_string(value));
+                self.write(&escape_bytes(value.as_bytes()));
                 self.write("\"");
             }
             TypeLiteral::Boolean(value) => self.write(if *value { "true" } else { "false" }),
@@ -636,17 +636,19 @@ impl AstPrinter {
                 };
                 self.write(&rendered);
             }
-            Literal::String(value) => {
-                if should_use_long_string(value)
-                    && let Some(level) = long_string_level(value)
-                {
-                    self.write_long_string(value, level);
-                    return;
+            Literal::String(value) => match choose_string_style(value) {
+                StringStyle::Quoted => {
+                    self.write("\"");
+                    self.write(&escape_bytes(value.as_bytes()));
+                    self.write("\"");
                 }
-                self.write("\"");
-                self.write(&escape_string(value));
-                self.write("\"");
-            }
+                StringStyle::Long { level } => {
+                    let text = value
+                        .as_utf8()
+                        .expect("long string style requires valid UTF-8");
+                    self.write_long_string(text, level);
+                }
+            },
             Literal::Bool(value) => self.write(if *value { "true" } else { "false" }),
         }
     }
@@ -749,62 +751,82 @@ const fn binary_assoc(op: &BinOp) -> Assoc {
     }
 }
 
-/// Returns the length that `escape_string` would produce for `s`, without allocating.
-///
-/// This mirrors the escaping logic in [`escape_string`] exactly.
-fn escaped_len(s: &str) -> usize {
-    let mut len = 0;
-    for ch in s.chars() {
-        let code = u32::from(ch);
-        let byte = u8::try_from(code).unwrap_or(b'?');
-        len += match byte {
-            // Two-character escape sequences
-            b'\\' | b'\n' | b'\r' | b'\t' | b'\0' | b'"' => 2,
-            // Printable ASCII - emitted verbatim
-            0x20..=0x7E => 1,
-            // Numeric escapes: `\NNN` where NNN is the decimal byte value
-            b => {
-                1 + if b < 10 {
-                    1
-                } else if b < 100 {
-                    2
-                } else {
-                    3
-                }
-            }
-        };
-    }
-    len
+/// Extra style cost for the brackets around a long string.
+const LONG_STRING_STYLE_COST: usize = 8;
+
+/// Extra style cost for each escaped newline in a quoted string.
+const QUOTED_NEWLINE_STYLE_COST: usize = 8;
+
+/// Source form selected for one runtime string literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringStyle {
+    /// A quoted string with byte escapes.
+    Quoted,
+    /// A long string using the given bracket level.
+    Long { level: usize },
 }
 
-/// Returns the minimum long-string bracket level needed to embed `s` as a Lua
-/// long string, or `None` if the string cannot be represented as one at all.
-fn long_string_level(s: &str) -> Option<usize> {
-    if s.contains('\r') || s.contains('\0') {
-        return None;
-    }
+/// Returns the quoted contents length without allocating the escaped string.
+fn escaped_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .map(|byte| match byte {
+            b'\\' | b'\n' | b'\r' | b'\t' | b'"' => 2,
+            0x20..=0x7E => 1,
+            _ => 4,
+        })
+        .sum()
+}
 
-    // probably not the best way to do this
-    for level in 0..=16 {
+/// Returns text when a byte string can be emitted verbatim as a long string.
+fn long_string_text(value: &ByteString) -> Option<&str> {
+    let text = value.as_utf8()?;
+    let safe_controls = value
+        .as_bytes()
+        .iter()
+        .all(|byte| matches!(byte, b'\n' | b'\t' | 0x20..=0x7E) || *byte >= 0x80);
+    safe_controls.then_some(text)
+}
+
+/// Returns the minimum bracket level that does not occur in `text`.
+fn long_string_level(text: &str) -> usize {
+    for level in 0..=text.len() {
         let closing = format!("]{}]", "=".repeat(level));
-        if !s.contains(&closing) {
-            return Some(level);
+        if !text.contains(&closing) {
+            return level;
         }
     }
 
-    None
+    unreachable!("a delimiter longer than the string cannot occur in it")
 }
 
-/// Returns `true` when emitting `s` as a Lua long string would produce
-/// cleaner output than a quoted string with escape sequences.
-fn should_use_long_string(s: &str) -> bool {
-    if s.contains('\r') || s.contains('\0') || s == "\n" || s == "\t" {
-        return false;
+/// Returns the source length of one long string literal.
+fn long_string_len(text: &str, level: usize) -> usize {
+    let delimiters = 4 + level * 2;
+    let leading_newline = usize::from(text.starts_with('\n'));
+    delimiters + leading_newline + text.len()
+}
+
+/// Selects the clearer byte-preserving source form for one string.
+fn choose_string_style(value: &ByteString) -> StringStyle {
+    let Some(text) = long_string_text(value) else {
+        return StringStyle::Quoted;
+    };
+
+    let level = long_string_level(text);
+    let newline_count = value
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    let quoted_cost = 2 + escaped_len(value.as_bytes()) + newline_count * QUOTED_NEWLINE_STYLE_COST;
+    let long_cost = long_string_len(text, level) + LONG_STRING_STYLE_COST;
+
+    if long_cost < quoted_cost {
+        StringStyle::Long { level }
+    } else {
+        StringStyle::Quoted
     }
-    let has_newlines = s.contains('\n');
-    let escape_ratio = escaped_len(s) as f64 / s.len().max(1) as f64;
-    let long_and_escaped = s.len() > 80 && escape_ratio > 1.2;
-    has_newlines || long_and_escaped
 }
 
 #[cfg(test)]
@@ -812,10 +834,14 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        AstPrinter, escape_string, escaped_len, long_string_level, print, should_use_long_string,
+        AstPrinter, StringStyle, choose_string_style, escape_bytes, escaped_len, long_string_level,
+        long_string_text, print,
     };
-    use crate::ast::{
-        Block, Expr, GenericBinder, Literal, Stmt, Type, TypePack, TypePackTail, TypePrecedence,
+    use crate::{
+        ast::{
+            Block, Expr, GenericBinder, Literal, Stmt, Type, TypePack, TypePackTail, TypePrecedence,
+        },
+        common::ByteString,
     };
 
     fn render_type(ty: &Type) -> String {
@@ -925,76 +951,126 @@ mod tests {
         assert_eq!(render_type(&ty), "(string | number) & boolean");
     }
 
+    /// Prints one byte string as a return value.
+    fn render_string(value: ByteString) -> String {
+        let block = Block::with_stmts(vec![Stmt::Return {
+            values: vec![Expr::Literal(Literal::String(value))],
+        }]);
+        print(&block, &[])
+    }
+
     #[test]
     fn escape_preserves_high_byte_values() {
-        let value: String = [b'A', 0x80, 0xFF].into_iter().map(char::from).collect();
-        assert_eq!(escape_string(&value), "A\\128\\255");
+        assert_eq!(escape_bytes(&[b'A', 0x80, 0xFF]), "A\\128\\255");
+    }
+
+    /// Numeric escapes use fixed widths before literal digits.
+    #[test]
+    fn numeric_escapes_cannot_consume_following_digits() {
+        assert_eq!(escape_bytes(&[1, b'2', 0, b'3', 0x80]), "\\0012\\0003\\128");
     }
 
     #[test]
     fn escaped_len_plain_ascii() {
-        assert_eq!(escaped_len("hello"), 5);
+        assert_eq!(escaped_len(b"hello"), 5);
     }
 
     #[test]
     fn escaped_len_special_chars() {
-        assert_eq!(escaped_len("\n"), 2);
-        assert_eq!(escaped_len("\\"), 2); // single backslash → "\\" (2 chars)
-        assert_eq!(escaped_len("\""), 2);
+        assert_eq!(escaped_len(b"\n"), 2);
+        assert_eq!(escaped_len(b"\\"), 2);
+        assert_eq!(escaped_len(b"\""), 2);
     }
 
     #[test]
     fn escaped_len_high_bytes() {
-        // 0x80 (128) → \128 = 4 chars, 0xFF (255) → \255 = 4 chars.
-        let s: String = [0x80u8, 0xFF].into_iter().map(char::from).collect();
-        assert_eq!(escaped_len(&s), 8);
+        assert_eq!(escaped_len(&[0x80, 0xFF]), 8);
     }
 
     #[test]
     fn long_string_level_plain() {
-        assert_eq!(long_string_level("hello world"), Some(0));
+        assert_eq!(long_string_level("hello world"), 0);
     }
 
     #[test]
-    fn long_string_level_contains_level0_close() {
-        // `]]` forces level 1; `]=]` is absent so level 1 is sufficient.
-        assert_eq!(long_string_level("a]]b"), Some(1));
+    fn long_string_level_skips_used_delimiters() {
+        assert_eq!(long_string_level("a]]b]=]c"), 2);
     }
 
+    /// Delimiter selection does not decide whether long syntax is safe.
     #[test]
-    fn long_string_level_rejects_cr() {
-        assert_eq!(long_string_level("line1\r\nline2"), None);
+    fn long_string_level_only_selects_the_delimiter() {
+        assert_eq!(long_string_level("line1\r\nline2\0"), 0);
     }
 
+    /// Unsafe source bytes cannot use long syntax.
     #[test]
-    fn long_string_level_rejects_null() {
-        assert_eq!(long_string_level("has\0null"), None);
+    fn long_string_text_rejects_changed_or_unsafe_bytes() {
+        assert!(long_string_text(&ByteString::from("line1\r\nline2")).is_none());
+        assert!(long_string_text(&ByteString::from("has\0null")).is_none());
+        assert!(long_string_text(&ByteString::from(vec![0xFF])).is_none());
+        assert!(long_string_text(&ByteString::from(vec![1])).is_none());
     }
 
+    /// One short newline does not justify long syntax.
     #[test]
-    fn should_use_long_string_with_newline() {
-        assert!(should_use_long_string("line1\nline2"));
+    fn short_single_newline_uses_quoted_style() {
+        let value = ByteString::from("x\ny");
+
+        assert_eq!(choose_string_style(&value), StringStyle::Quoted);
+        assert_eq!(render_string(value), "return \"x\\ny\"\n");
     }
 
+    /// Text describing escaped source remains quoted.
     #[test]
-    fn should_use_long_string_plain_short() {
-        assert!(!should_use_long_string("hello"));
+    fn escaped_source_text_uses_quoted_style() {
+        let value = ByteString::from("\"x\\ny\"");
+
+        assert_eq!(choose_string_style(&value), StringStyle::Quoted);
+        assert_eq!(render_string(value), "return \"\\\"x\\\\ny\\\"\"\n");
     }
 
+    /// Several lines justify long syntax.
     #[test]
-    fn should_use_long_string_rejects_cr() {
-        assert!(!should_use_long_string("line1\r\nline2"));
+    fn multiline_text_uses_long_style() {
+        let value = ByteString::from("alpha\nbeta\ngamma");
+
+        assert_eq!(choose_string_style(&value), StringStyle::Long { level: 0 });
+        assert_eq!(render_string(value), "return [[alpha\nbeta\ngamma]]\n");
     }
 
+    /// An extra source newline protects a leading value newline.
     #[test]
-    fn should_use_long_string_rejects_null() {
-        assert!(!should_use_long_string("has\0null"));
+    fn leading_newline_is_preserved_in_long_style() {
+        let value = ByteString::from("\nalpha\nbeta");
+
+        assert_eq!(choose_string_style(&value), StringStyle::Long { level: 0 });
+        assert_eq!(render_string(value), "return [[\n\nalpha\nbeta]]\n");
     }
 
+    /// Short UTF-8 text remains byte-exact when quoted.
     #[test]
-    fn should_use_long_string_long_escaped() {
-        // A string of 90 tab characters has an escape ratio of 2.0, well above 1.2.
-        let s = "\t".repeat(90);
-        assert!(should_use_long_string(&s));
+    fn short_utf8_text_uses_byte_preserving_quotes() {
+        let value = ByteString::from("☺");
+
+        assert_eq!(choose_string_style(&value), StringStyle::Quoted);
+        assert_eq!(render_string(value), "return \"\\226\\152\\186\"\n");
+    }
+
+    /// Invalid UTF-8 always uses numeric byte escapes.
+    #[test]
+    fn invalid_utf8_uses_byte_preserving_quotes() {
+        let value = ByteString::from(vec![0x80, 0xFF]);
+
+        assert_eq!(choose_string_style(&value), StringStyle::Quoted);
+        assert_eq!(render_string(value), "return \"\\128\\255\"\n");
+    }
+
+    /// Long text with many escapes benefits from long syntax.
+    #[test]
+    fn heavily_escaped_text_uses_long_style() {
+        let value = ByteString::from("\t".repeat(90));
+
+        assert_eq!(choose_string_style(&value), StringStyle::Long { level: 0 });
     }
 }

@@ -528,8 +528,10 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             .iter()
             .zip(symbols_by_local)
             .filter_map(|(local, symbols)| {
-                self.chunk.get_string(local.name).map(|name| NamedLocal {
-                    name: name.to_string(),
+                let name = self.chunk.get_string(local.name)?;
+                let name = name.as_utf8()?;
+                Some(NamedLocal {
+                    name: name.to_owned(),
                     start_pc: local.start_pc,
                     end_pc: local.end_pc,
                     symbols,

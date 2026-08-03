@@ -5,7 +5,10 @@ use std::{
 
 use smol_str::SmolStr;
 
-use crate::operator::{BinOp, CompoundBinOp, UnOp};
+use crate::{
+    common::ByteString,
+    operator::{BinOp, CompoundBinOp, UnOp},
+};
 
 /// A singleton value represented in a source type annotation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -447,8 +450,8 @@ pub enum Literal {
     Integer(i64),
     /// Float literal.
     Float(f64),
-    /// String literal.
-    String(SmolStr),
+    /// Byte-exact string literal.
+    String(ByteString),
     /// Boolean literal.
     Bool(bool),
 }
