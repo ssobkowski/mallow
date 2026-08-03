@@ -52,7 +52,7 @@ impl Analyzer {
     }
 
     fn note_write(&mut self, sym: SymbolId) {
-        let fact = self.facts.entry(sym).or_insert_with(SymbolFacts::default);
+        let fact = self.facts.entry(sym).or_default();
         fact.writes += 1;
     }
 

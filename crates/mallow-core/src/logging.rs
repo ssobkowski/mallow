@@ -6,6 +6,7 @@ pub const DIAGNOSTIC_EVENT_TARGET: &str = "mallow::diagnostic";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
+    Warning,
     Info,
     Debug,
     Trace,
@@ -95,11 +96,14 @@ impl DiagnosticConfig {
     }
 
     fn enabled(&self, level: LogLevel, target: LogTarget, proto: Option<u16>) -> bool {
-        let Some(configured_level) = self.level else {
-            return false;
+        let level_enabled = match level {
+            LogLevel::Warning => true,
+            level => self
+                .level
+                .is_some_and(|configured_level| configured_level >= level),
         };
 
-        configured_level >= level
+        level_enabled
             && (self.targets.is_empty() || self.targets.contains(&target))
             && self.proto_matches(target, proto)
     }
@@ -217,6 +221,14 @@ fn emit_diagnostic_event(
     let indent = indent as u64;
 
     match level {
+        LogLevel::Warning => tracing::event!(
+            target: DIAGNOSTIC_EVENT_TARGET,
+            tracing::Level::WARN,
+            log_target = target.label(),
+            proto,
+            indent,
+            message = %args
+        ),
         LogLevel::Info => tracing::event!(
             target: DIAGNOSTIC_EVENT_TARGET,
             tracing::Level::INFO,

@@ -325,7 +325,7 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let diagnostic_config = diagnostic_config(&cli);
-    let _tracing_guard = init_tracing(&cli, diagnostic_config.is_enabled());
+    let _tracing_guard = init_tracing(&cli);
     let diagnostics = Diagnostics::new(diagnostic_config);
 
     match cli.command {
@@ -411,17 +411,17 @@ struct TracingGuard {
 }
 
 #[cfg(not(feature = "profile"))]
-fn init_tracing(cli: &Cli, diagnostics_enabled: bool) -> TracingGuard {
+fn init_tracing(cli: &Cli) -> TracingGuard {
     let _ = cli;
-    init_tracing_layers(diagnostics_enabled).unwrap_or_else(|e| {
+    init_tracing_layers().unwrap_or_else(|e| {
         eprintln!("failed to initialize tracing: {e}");
         std::process::exit(1);
     })
 }
 
 #[cfg(feature = "profile")]
-fn init_tracing(cli: &Cli, diagnostics_enabled: bool) -> TracingGuard {
-    init_tracing_layers(diagnostics_enabled, cli.profile_output.clone()).unwrap_or_else(|e| {
+fn init_tracing(cli: &Cli) -> TracingGuard {
+    init_tracing_layers(cli.profile_output.clone()).unwrap_or_else(|e| {
         eprintln!("failed to initialize tracing: {e}");
         std::process::exit(1);
     })
@@ -429,13 +429,9 @@ fn init_tracing(cli: &Cli, diagnostics_enabled: bool) -> TracingGuard {
 
 /// Initializes tracing for CLI diagnostics.
 #[cfg(not(feature = "profile"))]
-fn init_tracing_layers(
-    diagnostics_enabled: bool,
-) -> Result<TracingGuard, Box<dyn Error + Send + Sync>> {
-    if diagnostics_enabled {
-        START.get_or_init(Instant::now);
-        Registry::default().with(DiagnosticLayer).try_init()?;
-    }
+fn init_tracing_layers() -> Result<TracingGuard, Box<dyn Error + Send + Sync>> {
+    START.get_or_init(Instant::now);
+    Registry::default().with(DiagnosticLayer).try_init()?;
 
     Ok(TracingGuard::default())
 }
@@ -443,39 +439,24 @@ fn init_tracing_layers(
 /// Initializes tracing for CLI diagnostics and optional Chrome trace output.
 #[cfg(feature = "profile")]
 fn init_tracing_layers(
-    diagnostics_enabled: bool,
     profile_output: Option<PathBuf>,
 ) -> Result<TracingGuard, Box<dyn Error + Send + Sync>> {
-    if diagnostics_enabled || profile_output.is_some() {
-        START.get_or_init(Instant::now);
-    }
+    START.get_or_init(Instant::now);
 
     let chrome_guard = match profile_output {
         Some(output) => {
-            if diagnostics_enabled {
-                let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
-                    .include_args(true)
-                    .file(output)
-                    .build();
-                Registry::default()
-                    .with(DiagnosticLayer)
-                    .with(chrome_layer)
-                    .try_init()?;
-                Some(guard)
-            } else {
-                let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
-                    .include_args(true)
-                    .file(output)
-                    .build();
-                Registry::default().with(chrome_layer).try_init()?;
-                Some(guard)
-            }
+            let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+                .include_args(true)
+                .file(output)
+                .build();
+            Registry::default()
+                .with(DiagnosticLayer)
+                .with(chrome_layer)
+                .try_init()?;
+            Some(guard)
         }
         None => {
-            if diagnostics_enabled {
-                Registry::default().with(DiagnosticLayer).try_init()?;
-            }
-
+            Registry::default().with(DiagnosticLayer).try_init()?;
             None
         }
     };
@@ -522,7 +503,13 @@ fn fit_target(target: &str) -> &str {
 }
 
 /// Writes one formatted diagnostic line to stderr.
-fn write_diagnostic_line(target: &str, proto: Option<u16>, indent: u64, message: &str) {
+fn write_diagnostic_line(
+    target: &str,
+    proto: Option<u16>,
+    indent: u64,
+    warning: bool,
+    message: &str,
+) {
     let target = fit_target(target);
     let indent_width = (indent * 2) as usize;
     let proto = proto
@@ -530,8 +517,11 @@ fn write_diagnostic_line(target: &str, proto: Option<u16>, indent: u64, message:
         .unwrap_or_default();
 
     if use_color() {
+        let color = if warning { "\x1b[33m" } else { "\x1b[36m" };
+        let message_color = if warning { color } else { "" };
+
         eprintln!(
-            "\x1b[2mT+{:>4}ms\x1b[0m \x1b[36m[{:<TARGET_WIDTH$}]\x1b[0m{proto} {:indent_width$}{}",
+            "\x1b[2mT+{:>4}ms\x1b[0m {color}[{:<TARGET_WIDTH$}]\x1b[0m{proto} {:indent_width$}{message_color}{}\x1b[0m",
             elapsed_ms(),
             target,
             "",
@@ -539,11 +529,10 @@ fn write_diagnostic_line(target: &str, proto: Option<u16>, indent: u64, message:
         );
     } else {
         eprintln!(
-            "T+{:>4}ms [{:<TARGET_WIDTH$}]{proto} {:indent_width$}{}",
+            "T+{:>4}ms [{:<TARGET_WIDTH$}]{proto} {:indent_width$}{message}",
             elapsed_ms(),
             target,
             "",
-            message,
         );
     }
 }
@@ -576,6 +565,7 @@ where
                 .proto
                 .and_then(|proto| (proto >= 0).then_some(proto as u16)),
             diagnostic.indent.unwrap_or(0),
+            event.metadata().level() == &tracing::Level::WARN,
             &message,
         );
     }

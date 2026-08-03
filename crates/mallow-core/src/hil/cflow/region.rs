@@ -2001,27 +2001,35 @@ impl Shape {
     }
 
     /// Lowers the unstructured [`Shape`] into a structured [`RegionNode`], consuming `self`.
-    fn lower(self, cfg: &ControlFlowGraph) -> RegionNode {
+    fn lower(self, cfg: &ControlFlowGraph, block_counts: &mut HashMap<usize, usize>) -> RegionNode {
         match self {
-            Shape::Block(block) => RegionNode::BasicBlock {
-                stmts: cfg.get(block).stmts().to_vec(),
-            },
+            Shape::Block(block) => {
+                *block_counts.entry(block).or_default() += 1;
+                RegionNode::BasicBlock {
+                    stmts: cfg.get(block).stmts().to_vec(),
+                }
+            }
             Shape::Sequence(nodes) => RegionNode::Sequence {
-                nodes: nodes.into_iter().map(|node| node.lower(cfg)).collect(),
+                nodes: nodes
+                    .into_iter()
+                    .map(|node| node.lower(cfg, block_counts))
+                    .collect(),
             },
             Shape::If(shape) => RegionNode::If {
                 condition: shape.condition,
-                then_branch: Box::new(shape.then_branch.lower(cfg)),
-                else_branch: shape.else_branch.map(|branch| Box::new(branch.lower(cfg))),
+                then_branch: Box::new(shape.then_branch.lower(cfg, block_counts)),
+                else_branch: shape
+                    .else_branch
+                    .map(|branch| Box::new(branch.lower(cfg, block_counts))),
             },
             Shape::Loop(shape) => match shape.kind {
                 LoopKind::While { condition, .. } => RegionNode::While {
                     condition,
-                    body: Box::new(shape.body.lower(cfg)),
+                    body: Box::new(shape.body.lower(cfg, block_counts)),
                 },
                 LoopKind::RepeatUntil { condition, .. } => RegionNode::RepeatUntil {
                     condition,
-                    body: Box::new(shape.body.lower(cfg)),
+                    body: Box::new(shape.body.lower(cfg, block_counts)),
                 },
                 LoopKind::NumericFor {
                     var,
@@ -2034,16 +2042,16 @@ impl Shape {
                     start,
                     end,
                     step,
-                    body: Box::new(shape.body.lower(cfg)),
+                    body: Box::new(shape.body.lower(cfg, block_counts)),
                 },
                 LoopKind::GenericFor { vars, exprs, .. } => RegionNode::GenericFor {
                     vars,
                     exprs,
-                    body: Box::new(shape.body.lower(cfg)),
+                    body: Box::new(shape.body.lower(cfg, block_counts)),
                 },
                 LoopKind::Infinite { .. } => RegionNode::While {
                     condition: Expr::Bool(true),
-                    body: Box::new(shape.body.lower(cfg)),
+                    body: Box::new(shape.body.lower(cfg, block_counts)),
                 },
             },
             Shape::Break => RegionNode::Break,
@@ -2136,5 +2144,26 @@ fn conditional_branch_exits(
 
 /// Structures the given [`ControlFlowGraph`] into a [`RegionNode`].
 pub fn structure(cfg: &ControlFlowGraph, diagnostics: &Diagnostics) -> RegionNode {
-    Structurer::new(cfg, diagnostics).structure().lower(cfg)
+    let mut block_counts = HashMap::new();
+    let node = Structurer::new(cfg, diagnostics)
+        .structure()
+        .lower(cfg, &mut block_counts);
+
+    let duplicated_blocks: Vec<_> = block_counts
+        .into_iter()
+        .filter_map(|(block, count)| (count > 1).then_some(block))
+        .collect();
+    if !duplicated_blocks.is_empty() {
+        diagnostics.at(LogLevel::Warning, LogTarget::Region).block(
+            "structuring did not fully reduce",
+            |trace| {
+                trace.line(
+                    1,
+                    format_args!("duplicated blocks = {:?}", duplicated_blocks),
+                );
+            },
+        );
+    }
+
+    node
 }
