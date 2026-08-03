@@ -8,7 +8,7 @@ use crate::emitter::locals::LocalPlan;
 use crate::emitter::name::NamePlan;
 use crate::emitter::storage::{SpillSlot, SymbolStorage};
 use crate::hil::StructuredFunction;
-use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::lifter::ssa::{FunctionSymbols, SymbolId};
 
 pub struct FunctionPlan {
     /// Selects source naming or identity-preserving SSA naming.
@@ -29,6 +29,8 @@ pub struct FunctionPlan {
     forced_named_symbols: HashSet<SymbolId>,
     /// Child upvalues whose parent storage is a spill table access.
     inherited_spills: HashMap<SymbolId, SpillSlot>,
+    /// Upvalue slot used by each SSA version of declared upvalue storage.
+    ssa_upvalue_slots: HashMap<SymbolId, usize>,
 }
 
 impl FunctionPlan {
@@ -37,7 +39,12 @@ impl FunctionPlan {
         let locals = LocalPlan::build(fun, emit == EmitMode::Source);
         let next_fallback_slot = locals.slot_count();
         let forced_named_symbols =
-            identity_named_symbols(&fun.symbols.params, &fun.symbols.upvalues);
+            identity_named_symbols(fun.symbols.params(), fun.symbols.upvalues());
+        let ssa_upvalue_slots = if emit == EmitMode::Ssa {
+            collect_ssa_upvalue_slots(&fun.symbols)
+        } else {
+            HashMap::new()
+        };
         let mut plan = Self {
             emit,
             proto_idx: fun.proto.0,
@@ -47,6 +54,7 @@ impl FunctionPlan {
             next_fallback_slot,
             forced_named_symbols,
             inherited_spills: HashMap::new(),
+            ssa_upvalue_slots,
         };
 
         if emit == EmitMode::Ssa {
@@ -55,8 +63,8 @@ impl FunctionPlan {
                 .symbol_slots()
                 .into_iter()
                 .map(|(symbol, _)| symbol)
-                .chain(fun.symbols.params.iter().copied())
-                .chain(fun.symbols.upvalues.iter().copied())
+                .chain(fun.symbols.params().iter().copied())
+                .chain(fun.symbols.upvalues().iter().copied())
                 .collect();
             symbols.sort_by_key(|symbol| symbol.index());
             symbols.dedup();
@@ -123,6 +131,11 @@ impl FunctionPlan {
             .get(&sym)
             .cloned()
             .map(SymbolStorage::Spilled)
+    }
+
+    /// Returns the declared upvalue slot written by one SSA symbol version.
+    pub fn ssa_upvalue_slot(&self, sym: SymbolId) -> Option<usize> {
+        self.ssa_upvalue_slots.get(&sym).copied()
     }
 
     pub fn inherit_named_upvalue(&mut self, child_upvalue_sym: SymbolId, name: Identifier) {
@@ -206,6 +219,25 @@ fn identity_named_symbols(params: &[SymbolId], upvalues: &[SymbolId]) -> HashSet
     params.iter().chain(upvalues).copied().collect()
 }
 
+/// Maps every surviving upvalue symbol back to its declared upvalue slot.
+fn collect_ssa_upvalue_slots(symbols: &FunctionSymbols) -> HashMap<SymbolId, usize> {
+    let mut slots: HashMap<_, _> = symbols
+        .upvalues()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(slot, symbol)| (symbol, slot))
+        .collect();
+
+    for slot in 0..symbols.upvalues().len() {
+        for symbol in symbols.for_upvalue(slot) {
+            slots.insert(symbol, slot);
+        }
+    }
+
+    slots
+}
+
 /// Formats one SSA symbol with the proto namespace that owns its arena.
 pub(crate) fn format_ssa_symbol_name(proto_idx: u16, sym: SymbolId) -> SmolStr {
     format!("p{}_v{}", proto_idx, sym.index()).into()
@@ -237,6 +269,7 @@ mod tests {
             next_fallback_slot: 0,
             forced_named_symbols: HashSet::new(),
             inherited_spills: HashMap::new(),
+            ssa_upvalue_slots: HashMap::new(),
         }
     }
 
@@ -254,12 +287,36 @@ mod tests {
             next_fallback_slot: 0,
             forced_named_symbols: HashSet::new(),
             inherited_spills: HashMap::new(),
+            ssa_upvalue_slots: HashMap::new(),
         };
 
         let SymbolStorage::Named(name) = plan.storage_for(symbol, 0, true, 0) else {
             panic!("SSA symbols must remain named")
         };
         assert_eq!(name.as_str(), "p7_v2");
+    }
+
+    /// SSA upvalue versions retain their declared slot when earlier slots have no writes.
+    #[test]
+    fn ssa_upvalue_versions_keep_declared_slot() {
+        let mut arena: Arena<Symbol> = Arena::new();
+        let first_entry = arena.alloc(Symbol::upval(0));
+        let second_entry = arena.alloc(Symbol::upval(1));
+        let second_write = arena.alloc(Symbol::upval(1));
+        let symbols = FunctionSymbols::new(
+            Vec::new(),
+            vec![first_entry, second_entry],
+            Vec::new(),
+            vec![vec![second_entry, second_write]],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let slots = collect_ssa_upvalue_slots(&symbols);
+
+        assert_eq!(slots.get(&first_entry), Some(&0));
+        assert_eq!(slots.get(&second_entry), Some(&1));
+        assert_eq!(slots.get(&second_write), Some(&1));
     }
 
     #[test]
@@ -305,6 +362,7 @@ mod tests {
             next_fallback_slot: 0,
             forced_named_symbols: identity_named_symbols(&[param], &[upvalue]),
             inherited_spills: HashMap::new(),
+            ssa_upvalue_slots: HashMap::new(),
         };
 
         let param_storage = plan.storage_for(param, 250, true, 199);

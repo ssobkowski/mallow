@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::hil::cflow::region::RegionNode;
-use crate::hil::ir::{Expr, ValuePack};
+use crate::hil::ir::{Capture, Expr, ValuePack};
 use crate::hil::lifter::ssa::SymbolId;
 use crate::hil::visitor::{Visitor, walk_expr};
 
@@ -60,7 +60,7 @@ impl Visitor for ReadCollector {
         self.symbols.insert(sym);
     }
 
-    fn visit_capture(&mut self, _index: usize, sym: SymbolId) {
-        self.symbols.insert(sym);
+    fn visit_capture(&mut self, _index: usize, capture: Capture) {
+        self.symbols.insert(capture.symbol());
     }
 }

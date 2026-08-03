@@ -2,7 +2,8 @@
 
 use std::cmp::Ordering;
 
-use crate::{hil::lifter::ssa::SymbolId, il::ProtoId};
+use crate::hil::lifter::ssa::SymbolId;
+use crate::il::ProtoId;
 
 /// Stable identity for one scalar value in the inference program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

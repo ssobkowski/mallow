@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::common::{expr_read_symbols, replace_symbol_in_expr, stmt_written_symbols};
 use crate::hil::cflow::cfg::{Block, BlockExit, ControlFlowGraph};
 use crate::hil::cflow::graph::GraphView;
-use crate::hil::ir::{Expr, Stmt};
+use crate::hil::ir::{Capture, Expr, Stmt};
 use crate::hil::lifter::ssa::{FunctionSymbols, SymbolId};
 use crate::hil::visitor::{Visitor, walk_expr};
 use crate::scopes::Scope;
@@ -110,9 +110,9 @@ impl Visitor for Analyzer {
         walk_expr(self, expr);
     }
 
-    fn visit_capture(&mut self, _: usize, sym: SymbolId) {
+    fn visit_capture(&mut self, _: usize, capture: Capture) {
         self.facts
-            .entry(sym)
+            .entry(capture.symbol())
             .or_insert_with(SymbolFacts::disqualified)
             .disqualified = true;
     }
@@ -159,7 +159,7 @@ impl Analyzer {
         let _enter = span.enter();
 
         let mut analyzer = Analyzer::default();
-        analyzer.seed_symbols(&symbols.params, &symbols.upvalues);
+        analyzer.seed_symbols(symbols.params(), symbols.upvalues());
         analyzer.visit_graph(cfg);
 
         analyzer.facts

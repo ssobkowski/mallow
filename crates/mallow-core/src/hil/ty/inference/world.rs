@@ -5,12 +5,10 @@ use std::collections::{HashMap, HashSet};
 use id_arena::{Arena, Id};
 use smol_str::SmolStr;
 
-use crate::{
-    hil::ty2::{builtins::BuiltinPath, canonical::TypeId},
-    il::ProtoId,
-};
-
 use super::keys::{ObjectKey, PackKey, ValueKey};
+use crate::hil::ty::builtins::BuiltinPath;
+use crate::hil::ty::canonical::TypeId;
+use crate::il::ProtoId;
 
 /// Stable handle for one value state.
 pub type ValueId = Id<ValueState>;
@@ -28,18 +26,18 @@ pub struct ValueIdentities {
     pub closures: HashSet<ProtoId>,
     /// Concrete mutable table allocations carried by the value.
     pub objects: HashSet<ObjectId>,
-    /// Concrete builtin schemes carried by the value.
+    /// Concrete builtin identities carried by the value.
     pub builtins: HashSet<BuiltinPath>,
 }
 
-/// Bounds and identities known for one scalar value.
+/// Types and identities known for one scalar value.
 #[derive(Debug, Clone)]
 pub struct ValueState {
-    /// Union of producer evidence.
+    /// Types known to come from this value.
     pub lower: TypeId,
-    /// Intersection of consumer evidence.
+    /// Types this value must be able to support.
     pub upper: TypeId,
-    /// Concrete runtime identities.
+    /// Concrete runtime identities carried by this value.
     pub identities: ValueIdentities,
 }
 
@@ -75,14 +73,23 @@ pub struct ObjectField {
 /// Mutable facts for one table allocation.
 #[derive(Debug)]
 pub struct ObjectState {
-    /// Values observed as dynamic keys.
+    /// Types used as dynamic keys.
     pub keys: ValueId,
-    /// Values observed through dynamic writes.
+    /// Types written through dynamic indexes.
     pub values: ValueId,
     /// Named field storage.
     pub fields: HashMap<SmolStr, ObjectField>,
     /// Table allocations installed as metatables.
     pub metatables: HashSet<ObjectId>,
+}
+
+/// Result of an operation that may change the inference world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldChange<T> {
+    /// The world already contained the returned value.
+    Unchanged(T),
+    /// The operation changed the world and returned this value.
+    Changed(T),
 }
 
 /// All mutable inference facts, split by semantic domain.
@@ -94,9 +101,11 @@ pub struct World {
     pub packs: Arena<PackState>,
     /// Object states.
     pub objects: Arena<ObjectState>,
+
     value_by_key: HashMap<ValueKey, ValueId>,
     pack_by_key: HashMap<PackKey, PackId>,
     object_by_key: HashMap<ObjectKey, ObjectId>,
+
     never: TypeId,
     unknown: TypeId,
 }
@@ -117,43 +126,53 @@ impl World {
     }
 
     /// Returns or creates the value for a stable key.
+    #[inline]
     pub fn value_for_key(&mut self, key: ValueKey) -> ValueId {
-        if let Some(value) = self.value_by_key.get(&key) {
-            return *value;
+        match self.value_by_key.get(&key) {
+            Some(value) => *value,
+            None => {
+                let value = self.fresh_value();
+                self.value_by_key.insert(key, value);
+                value
+            }
         }
-        let value = self.fresh_value();
-        self.value_by_key.insert(key, value);
-        value
     }
 
     /// Returns or creates the pack for a stable key.
+    #[inline]
     pub fn pack_for_key(&mut self, key: PackKey) -> PackId {
-        if let Some(pack) = self.pack_by_key.get(&key) {
-            return *pack;
+        match self.pack_by_key.get(&key) {
+            Some(pack) => *pack,
+            None => {
+                let pack = self.packs.alloc(PackState::default());
+                self.pack_by_key.insert(key, pack);
+                pack
+            }
         }
-        let pack = self.packs.alloc(PackState::default());
-        self.pack_by_key.insert(key, pack);
-        pack
     }
 
     /// Returns or creates the object for a stable key.
+    #[inline]
     pub fn object_for_key(&mut self, key: ObjectKey) -> ObjectId {
-        if let Some(object) = self.object_by_key.get(&key) {
-            return *object;
+        match self.object_by_key.get(&key) {
+            Some(object) => *object,
+            None => {
+                let keys = self.fresh_value();
+                let values = self.fresh_value();
+                let object = self.objects.alloc(ObjectState {
+                    keys,
+                    values,
+                    fields: HashMap::new(),
+                    metatables: HashSet::new(),
+                });
+                self.object_by_key.insert(key, object);
+                object
+            }
         }
-        let keys = self.fresh_value();
-        let values = self.fresh_value();
-        let object = self.objects.alloc(ObjectState {
-            keys,
-            values,
-            fields: HashMap::new(),
-            metatables: HashSet::new(),
-        });
-        self.object_by_key.insert(key, object);
-        object
     }
 
     /// Allocates an anonymous scalar value.
+    #[inline]
     pub fn fresh_value(&mut self) -> ValueId {
         self.values.alloc(ValueState {
             lower: self.never,
@@ -163,75 +182,93 @@ impl World {
     }
 
     /// Allocates an anonymous pack.
+    #[inline]
     pub fn fresh_pack(&mut self) -> PackId {
         self.packs.alloc(PackState::default())
     }
 
     /// Returns a stable positional projection variable.
-    pub fn projection(&mut self, pack: PackId, index: usize) -> (ValueId, bool) {
-        if let Some(value) = self.packs[pack].projections.get(&index) {
-            return (*value, false);
+    #[inline]
+    pub fn projection(&mut self, pack: PackId, index: usize) -> WorldChange<ValueId> {
+        match self.packs[pack].projections.get(&index) {
+            Some(value) => WorldChange::Unchanged(*value),
+            None => {
+                let value = self.fresh_value();
+                self.packs[pack].projections.insert(index, value);
+                WorldChange::Changed(value)
+            }
         }
-        let value = self.fresh_value();
-        self.packs[pack].projections.insert(index, value);
-        (value, true)
     }
 
     /// Returns a stable aggregate variable for values a pack can produce.
-    pub fn pack_values(&mut self, pack: PackId) -> (ValueId, bool) {
-        if let Some(value) = self.packs[pack].values {
-            return (value, false);
+    #[inline]
+    pub fn pack_values(&mut self, pack: PackId) -> WorldChange<ValueId> {
+        match self.packs[pack].values {
+            Some(value) => WorldChange::Unchanged(value),
+            None => {
+                let value = self.fresh_value();
+                self.packs[pack].values = Some(value);
+                WorldChange::Changed(value)
+            }
         }
-        let value = self.fresh_value();
-        self.packs[pack].values = Some(value);
-        (value, true)
     }
 
     /// Adds one sequence alternative to a pack.
-    pub fn add_pack_alternative(&mut self, pack: PackId, alternative: PackAlternative) -> bool {
+    #[inline]
+    pub fn add_pack_alternative(
+        &mut self,
+        pack: PackId,
+        alternative: PackAlternative,
+    ) -> WorldChange<()> {
         if self.packs[pack].alternatives.contains(&alternative) {
-            return false;
+            return WorldChange::Unchanged(());
         }
+
         self.packs[pack].alternatives.push(alternative);
-        true
+        WorldChange::Changed(())
     }
 
     /// Returns or creates a field value in an object.
+    #[inline]
     pub fn object_field(
         &mut self,
         object: ObjectId,
         field: SmolStr,
         definite: bool,
-    ) -> (ValueId, bool) {
-        if let Some(existing) = self.objects[object].fields.get_mut(&field) {
-            let changed = definite && !existing.definite;
-            existing.definite |= definite;
-            return (existing.value, changed);
+    ) -> WorldChange<ValueId> {
+        match self.objects[object].fields.get_mut(&field) {
+            Some(existing) => {
+                if definite && !existing.definite {
+                    existing.definite = true;
+                    WorldChange::Changed(existing.value)
+                } else {
+                    WorldChange::Unchanged(existing.value)
+                }
+            }
+            None => {
+                let value = self.fresh_value();
+                self.objects[object]
+                    .fields
+                    .insert(field, ObjectField { value, definite });
+                WorldChange::Changed(value)
+            }
         }
-        let value = self.fresh_value();
-        self.objects[object]
-            .fields
-            .insert(field, ObjectField { value, definite });
-        (value, true)
     }
 
     /// Returns all stable value keys currently allocated.
-    pub fn value_keys(&self) -> Vec<(ValueKey, ValueId)> {
-        let mut keys: Vec<_> = self
-            .value_by_key
-            .iter()
-            .map(|(key, id)| (*key, *id))
-            .collect();
-        keys.sort_by_key(|(key, _)| *key);
-        keys
+    #[inline]
+    pub fn value_keys(&self) -> impl Iterator<Item = (ValueKey, ValueId)> {
+        self.value_by_key.iter().map(|(key, id)| (*key, *id))
     }
 
     /// Returns the value for a key if it has been allocated.
+    #[inline]
     pub fn get_value_key(&self, key: ValueKey) -> Option<ValueId> {
         self.value_by_key.get(&key).copied()
     }
 
     /// Returns the pack for a key if it has been allocated.
+    #[inline]
     pub fn get_pack_key(&self, key: PackKey) -> Option<PackId> {
         self.pack_by_key.get(&key).copied()
     }

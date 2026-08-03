@@ -1,17 +1,12 @@
-//! Materialization of solved ty3 facts into canonical type schemes.
+//! Materialization of solved inference facts into canonical types.
 
 use std::collections::HashSet;
 
-use crate::{
-    hil::ty2::canonical::{MetamethodType, TypeId, TypePackTail, TypeScheme},
-    il::ProtoId,
-};
-
-use super::{
-    engine::Engine,
-    keys::{PackKey, ValueKey},
-    world::{ObjectId, PackId, ValueId},
-};
+use super::engine::Engine;
+use super::keys::{PackKey, ValueKey};
+use super::world::{ObjectId, PackId, ValueId};
+use crate::hil::ty::canonical::{MetamethodType, TypeId, TypePackTail};
+use crate::il::ProtoId;
 
 impl Engine<'_> {
     /// Creates output views needed by function signatures, then stabilizes them.
@@ -22,7 +17,7 @@ impl Engine<'_> {
             .map(|function| {
                 (
                     function.proto,
-                    function.symbols.params.clone(),
+                    function.symbols.params().to_vec(),
                     function.is_vararg,
                 )
             })
@@ -40,15 +35,15 @@ impl Engine<'_> {
         self.solve();
     }
 
-    /// Resolves one stable value key into a type scheme.
-    pub fn resolved_value_scheme(&mut self, key: ValueKey) -> Option<TypeScheme> {
+    /// Resolves one stable value key into a canonical type.
+    pub fn resolved_value_type(&mut self, key: ValueKey) -> Option<TypeId> {
         let value = self.get_value_key(key)?;
         let ty = self.resolved_value(value, &mut HashSet::new())?;
         if self.types.contains_metatable(ty) {
             return None;
         }
         let ty = self.types.widen_literals(ty);
-        Some(self.types.type_scheme(ty, Vec::new()))
+        Some(ty)
     }
 
     /// Creates currently useful projections for one output pack.
@@ -145,7 +140,7 @@ impl Engine<'_> {
                 .map(|(name, field)| (name.clone(), field.value))
                 .collect();
             for (name, value) in fields {
-                let Ok(method) = crate::hil::ty2::canonical::Metamethod::try_from(name.as_str())
+                let Ok(method) = crate::hil::ty::canonical::Metamethod::try_from(name.as_str())
                 else {
                     continue;
                 };
@@ -168,7 +163,7 @@ impl Engine<'_> {
         let Some(function) = self.functions.get(proto.0 as usize) else {
             return self.types.primitives().function;
         };
-        let params = function.symbols.params.clone();
+        let params = function.symbols.params().to_vec();
         let is_vararg = function.is_vararg;
         let unknown = self.types.primitives().unknown;
         let param_types = params
@@ -193,7 +188,7 @@ impl Engine<'_> {
         &mut self,
         pack: PackId,
         visiting: &mut HashSet<ValueId>,
-    ) -> crate::hil::ty2::canonical::TypePackId {
+    ) -> crate::hil::ty::canonical::TypePackId {
         let mut projections: Vec<_> = self.world.packs[pack]
             .projections
             .iter()

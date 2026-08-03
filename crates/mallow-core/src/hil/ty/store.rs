@@ -1,16 +1,14 @@
 //! Type-specific ownership and canonical graph operations.
 
-use std::{
-    collections::{HashMap, HashSet},
-    hash::{DefaultHasher, Hash, Hasher as _},
-};
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher as _};
 
 use id_arena::{Arena, Id};
 use smol_str::SmolStr;
 
 use super::canonical::{
-    GenericArgument, GenericBinder, MetamethodType, PrimitiveIds, RuntimeKind, Type, TypeId,
-    TypeLiteral, TypePack, TypePackId, TypePackTail, TypeScheme,
+    MetamethodType, PrimitiveIds, RuntimeKind, Type, TypeId, TypeLiteral, TypePack, TypePackId,
+    TypePackTail,
 };
 
 /// Computes the stable per-run bucket fingerprint for one value.
@@ -155,12 +153,6 @@ impl TypeStore {
         self.intern_node(Type::Named(name.into()))
     }
 
-    /// Creates a generic placeholder for a scheme body.
-    #[must_use]
-    pub fn generic(&mut self, name: impl Into<SmolStr>) -> TypeId {
-        self.intern_node(Type::Generic(name.into()))
-    }
-
     /// Creates one literal node and reuses the canonical boolean primitives.
     #[must_use]
     pub fn literal(&mut self, literal: TypeLiteral) -> TypeId {
@@ -232,13 +224,6 @@ impl TypeStore {
         self.import_node(source, id, &mut type_memo, &mut pack_memo)
     }
 
-    /// Imports a polymorphic scheme, preserving its binders and copying body IDs.
-    #[must_use]
-    pub fn import_scheme(&mut self, source: &TypeStore, scheme: &TypeScheme) -> TypeScheme {
-        let body = self.import(source, scheme.body());
-        self.type_scheme(body, scheme.binders().to_vec())
-    }
-
     /// Recursively imports one node with per-operation memoization.
     fn import_node(
         &mut self,
@@ -266,7 +251,6 @@ impl TypeStore {
             Type::Buffer => self.primitives().buffer,
             Type::Named(name) => self.named(name),
             Type::Literal(literal) => self.literal(literal),
-            Type::Generic(name) => self.generic(name),
             Type::Table => self.primitives().table,
             Type::TableShape { fields, indexer } => {
                 let mut imported_fields = Vec::with_capacity(fields.len());
@@ -342,7 +326,6 @@ impl TypeStore {
             TypePackTail::Homogeneous(id) => {
                 TypePackTail::Homogeneous(self.import_node(source, *id, type_memo, pack_memo))
             }
-            TypePackTail::Generic(name) => TypePackTail::Generic(name.clone()),
         });
 
         let target = self.pack(head, tail);
@@ -555,6 +538,11 @@ impl TypeStore {
         }
     }
 
+    /// Returns whether `evidence` contains any value accepted by `expected`.
+    pub fn overlaps(&mut self, evidence: TypeId, expected: TypeId) -> bool {
+        self.meet(evidence, expected) != self.primitives.never
+    }
+
     /// Returns the broad runtime category of a type, following metatable bases.
     #[must_use]
     pub fn runtime_kind(&self, id: TypeId) -> Option<RuntimeKind> {
@@ -571,12 +559,9 @@ impl TypeStore {
             Type::Table | Type::TableShape { .. } => Some(RuntimeKind::Table),
             Type::Function | Type::FunctionSignature { .. } => Some(RuntimeKind::Function),
             Type::WithMetatable { base, .. } => self.runtime_kind(*base),
-            Type::Union(_)
-            | Type::Intersection(_)
-            | Type::Never
-            | Type::Unknown
-            | Type::Any
-            | Type::Generic(_) => None,
+            Type::Union(_) | Type::Intersection(_) | Type::Never | Type::Unknown | Type::Any => {
+                None
+            }
         }
     }
 
@@ -635,219 +620,6 @@ impl TypeStore {
     /// Checks a child pack ID and panics on a foreign ID.
     fn assert_pack(&self, id: TypePackId) {
         let _ = self.get_pack(id);
-    }
-
-    /// Instantiates a polymorphic scheme by replacing each generic placeholder.
-    #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "concrete scheme instantiation is retained for the shared TypeStore representation"
-        )
-    )]
-    pub fn instantiate(&mut self, scheme: &TypeScheme, arguments: &[GenericArgument]) -> TypeId {
-        assert_eq!(
-            scheme.binders().len(),
-            arguments.len(),
-            "scheme argument count must match binders"
-        );
-        let mut type_substitutions = HashMap::new();
-        let mut pack_substitutions = HashMap::new();
-        for (binder, argument) in scheme.binders().iter().zip(arguments) {
-            match (binder, argument) {
-                (GenericBinder::Type(name), GenericArgument::Type(id)) => {
-                    self.assert_type(*id);
-                    type_substitutions.insert(name.clone(), *id);
-                }
-                (GenericBinder::Pack(name), GenericArgument::Pack(id)) => {
-                    self.assert_pack(*id);
-                    pack_substitutions.insert(name.clone(), *id);
-                }
-                (GenericBinder::Type(name), GenericArgument::Pack(_)) => {
-                    panic!("type binder {name} requires a type argument")
-                }
-                (GenericBinder::Pack(name), GenericArgument::Type(_)) => {
-                    panic!("type-pack binder {name} requires a type-pack argument")
-                }
-            }
-        }
-        self.instantiate_node(
-            scheme.body(),
-            &type_substitutions,
-            &pack_substitutions,
-            &mut HashMap::new(),
-            &mut HashMap::new(),
-        )
-    }
-
-    /// Recursively substitutes generic names while preserving graph sharing.
-    fn instantiate_node(
-        &mut self,
-        id: TypeId,
-        type_substitutions: &HashMap<SmolStr, TypeId>,
-        pack_substitutions: &HashMap<SmolStr, TypePackId>,
-        type_memo: &mut HashMap<TypeId, TypeId>,
-        pack_memo: &mut HashMap<TypePackId, TypePackId>,
-    ) -> TypeId {
-        if let Some(result) = type_memo.get(&id) {
-            return *result;
-        }
-        let node = self.get(id).clone();
-        let result = match node {
-            Type::Generic(name) => type_substitutions.get(&name).copied().unwrap_or(id),
-            Type::TableShape { fields, indexer } => {
-                let mut instantiated_fields = Vec::with_capacity(fields.len());
-                for (name, ty) in fields {
-                    let ty = self.instantiate_node(
-                        ty,
-                        type_substitutions,
-                        pack_substitutions,
-                        type_memo,
-                        pack_memo,
-                    );
-                    instantiated_fields.push((name, ty));
-                }
-                let indexer = if let Some((key, value)) = indexer {
-                    let key = self.instantiate_node(
-                        key,
-                        type_substitutions,
-                        pack_substitutions,
-                        type_memo,
-                        pack_memo,
-                    );
-                    let value = self.instantiate_node(
-                        value,
-                        type_substitutions,
-                        pack_substitutions,
-                        type_memo,
-                        pack_memo,
-                    );
-                    Some((key, value))
-                } else {
-                    None
-                };
-                self.table_shape(instantiated_fields, indexer)
-            }
-            Type::FunctionSignature { params, returns } => {
-                let p = self.instantiate_pack(
-                    params,
-                    type_substitutions,
-                    pack_substitutions,
-                    type_memo,
-                    pack_memo,
-                );
-                let r = self.instantiate_pack(
-                    returns,
-                    type_substitutions,
-                    pack_substitutions,
-                    type_memo,
-                    pack_memo,
-                );
-                self.function_signature(p, r)
-            }
-            Type::Union(parts) => {
-                let mut instantiated = Vec::with_capacity(parts.len());
-                for part in parts {
-                    instantiated.push(self.instantiate_node(
-                        part,
-                        type_substitutions,
-                        pack_substitutions,
-                        type_memo,
-                        pack_memo,
-                    ));
-                }
-                self.union_all(instantiated)
-            }
-            Type::Intersection(parts) => {
-                let mut instantiated = Vec::with_capacity(parts.len());
-                for part in parts {
-                    instantiated.push(self.instantiate_node(
-                        part,
-                        type_substitutions,
-                        pack_substitutions,
-                        type_memo,
-                        pack_memo,
-                    ));
-                }
-                self.intersection_all(instantiated)
-            }
-            Type::WithMetatable { base, methods } => {
-                let base = self.instantiate_node(
-                    base,
-                    type_substitutions,
-                    pack_substitutions,
-                    type_memo,
-                    pack_memo,
-                );
-                let mut instantiated_methods = Vec::with_capacity(methods.len());
-                for entry in methods {
-                    instantiated_methods.push(MetamethodType {
-                        method: entry.method,
-                        ty: self.instantiate_node(
-                            entry.ty,
-                            type_substitutions,
-                            pack_substitutions,
-                            type_memo,
-                            pack_memo,
-                        ),
-                    });
-                }
-                self.with_metatable(base, instantiated_methods)
-            }
-            _ => id,
-        };
-        type_memo.insert(id, result);
-        result
-    }
-
-    /// Instantiates every type ID in one pack.
-    fn instantiate_pack(
-        &mut self,
-        id: TypePackId,
-        type_substitutions: &HashMap<SmolStr, TypeId>,
-        pack_substitutions: &HashMap<SmolStr, TypePackId>,
-        type_memo: &mut HashMap<TypeId, TypeId>,
-        pack_memo: &mut HashMap<TypePackId, TypePackId>,
-    ) -> TypePackId {
-        if let Some(result) = pack_memo.get(&id) {
-            return *result;
-        }
-        let pack = self.get_pack(id).clone();
-        let mut head = Vec::with_capacity(pack.head.len());
-        for ty in pack.head {
-            head.push(self.instantiate_node(
-                ty,
-                type_substitutions,
-                pack_substitutions,
-                type_memo,
-                pack_memo,
-            ));
-        }
-        let tail = match pack.tail {
-            Some(TypePackTail::Homogeneous(ty)) => {
-                Some(TypePackTail::Homogeneous(self.instantiate_node(
-                    ty,
-                    type_substitutions,
-                    pack_substitutions,
-                    type_memo,
-                    pack_memo,
-                )))
-            }
-            Some(TypePackTail::Generic(name)) => {
-                if let Some(substitution) = pack_substitutions.get(&name).copied() {
-                    let substitution = self.get_pack(substitution).clone();
-                    head.extend(substitution.head);
-                    substitution.tail
-                } else {
-                    Some(TypePackTail::Generic(name))
-                }
-            }
-            None => None,
-        };
-        let result = self.pack(head, tail);
-        pack_memo.insert(id, result);
-        result
     }
 
     /// Widens singleton literals recursively before source emission.
@@ -910,7 +682,6 @@ impl TypeStore {
         }
         let tail = pack.tail.map(|tail| match tail {
             TypePackTail::Homogeneous(ty) => TypePackTail::Homogeneous(self.widen_literals(ty)),
-            TypePackTail::Generic(name) => TypePackTail::Generic(name),
         });
         self.pack(head, tail)
     }
@@ -1047,70 +818,7 @@ impl TypeStore {
             .any(|ty| self.contains_unknown_inner(*ty, visited))
             || pack.tail.as_ref().is_some_and(|tail| match tail {
                 TypePackTail::Homogeneous(ty) => self.contains_unknown_inner(*ty, visited),
-                TypePackTail::Generic(_) => false,
             })
-    }
-
-    /// Returns whether a graph node contains generic scheme syntax.
-    #[must_use]
-    pub fn contains_generic(&self, id: TypeId) -> bool {
-        let mut visited = HashSet::new();
-        self.contains_generic_inner(id, &mut visited)
-    }
-
-    /// Traverses one node for [`Self::contains_generic`].
-    fn contains_generic_inner(&self, id: TypeId, visited: &mut HashSet<TypeId>) -> bool {
-        if !visited.insert(id) {
-            return false;
-        }
-        match self.get(id) {
-            Type::Generic(_) => true,
-            Type::TableShape { fields, indexer } => {
-                fields
-                    .iter()
-                    .any(|(_, ty)| self.contains_generic_inner(*ty, visited))
-                    || indexer.is_some_and(|(key, value)| {
-                        self.contains_generic_inner(key, visited)
-                            || self.contains_generic_inner(value, visited)
-                    })
-            }
-            Type::FunctionSignature { params, returns } => {
-                self.pack_contains_generic(*params, visited)
-                    || self.pack_contains_generic(*returns, visited)
-            }
-            Type::Union(parts) | Type::Intersection(parts) => parts
-                .iter()
-                .any(|ty| self.contains_generic_inner(*ty, visited)),
-            Type::WithMetatable { base, methods } => {
-                self.contains_generic_inner(*base, visited)
-                    || methods
-                        .iter()
-                        .any(|method| self.contains_generic_inner(method.ty, visited))
-            }
-            _ => false,
-        }
-    }
-
-    /// Returns whether a pack contains generic scheme syntax.
-    fn pack_contains_generic(&self, id: TypePackId, visited: &mut HashSet<TypeId>) -> bool {
-        let pack = self.get_pack(id);
-        pack.head
-            .iter()
-            .any(|ty| self.contains_generic_inner(*ty, visited))
-            || pack.tail.as_ref().is_some_and(|tail| match tail {
-                TypePackTail::Homogeneous(ty) => self.contains_generic_inner(*ty, visited),
-                TypePackTail::Generic(_) => true,
-            })
-    }
-
-    /// Returns whether `nil` is one of a node's accepted values.
-    #[must_use]
-    pub fn accepts_nil(&self, id: TypeId) -> bool {
-        match self.get(id) {
-            Type::Nil => true,
-            Type::Union(parts) => parts.iter().any(|ty| self.accepts_nil(*ty)),
-            _ => false,
-        }
     }
 
     /// Returns whether a node or any child carries metatable behavior.
@@ -1174,7 +882,6 @@ impl TypeStore {
         pack.head.iter().all(|ty| self.is_emittable_annotation(*ty))
             && pack.tail.as_ref().is_none_or(|tail| match tail {
                 TypePackTail::Homogeneous(ty) => self.is_emittable_annotation(*ty),
-                TypePackTail::Generic(_) => true,
             })
     }
 
@@ -1191,113 +898,7 @@ impl TypeStore {
         pack.head.iter().any(|ty| self.contains_metatable(*ty))
             || pack.tail.as_ref().is_some_and(|tail| match tail {
                 TypePackTail::Homogeneous(ty) => self.contains_metatable(*ty),
-                TypePackTail::Generic(_) => false,
             })
-    }
-
-    /// Creates a validated polymorphic scheme over one graph body.
-    ///
-    /// Binders must be unique, and every generic placeholder reachable from
-    /// `body` must be bound by this scheme. This keeps free generic names out
-    /// of solver bounds.
-    #[must_use]
-    pub fn type_scheme(&self, body: TypeId, binders: Vec<GenericBinder>) -> TypeScheme {
-        self.assert_type(body);
-        let mut names = HashSet::with_capacity(binders.len());
-        let mut type_binders = HashSet::new();
-        let mut pack_binders = HashSet::new();
-        for binder in &binders {
-            assert!(
-                names.insert(binder.name().clone()),
-                "scheme binders must be unique"
-            );
-            match binder {
-                GenericBinder::Type(name) => {
-                    type_binders.insert(name.clone());
-                }
-                GenericBinder::Pack(name) => {
-                    pack_binders.insert(name.clone());
-                }
-            }
-        }
-        let mut visited = HashSet::new();
-        self.validate_scheme_generics(body, &type_binders, &pack_binders, &mut visited);
-        TypeScheme::new(binders, body)
-    }
-
-    /// Checks every generic placeholder reachable from a scheme body.
-    fn validate_scheme_generics(
-        &self,
-        id: TypeId,
-        type_binders: &HashSet<SmolStr>,
-        pack_binders: &HashSet<SmolStr>,
-        visited: &mut HashSet<TypeId>,
-    ) {
-        if !visited.insert(id) {
-            return;
-        }
-        match self.get(id) {
-            Type::Generic(name) => assert!(
-                type_binders.contains(name),
-                "scheme body contains an unbound generic"
-            ),
-            Type::TableShape { fields, indexer } => {
-                for (_, ty) in fields {
-                    self.validate_scheme_generics(*ty, type_binders, pack_binders, visited);
-                }
-                if let Some((key, value)) = indexer {
-                    self.validate_scheme_generics(*key, type_binders, pack_binders, visited);
-                    self.validate_scheme_generics(*value, type_binders, pack_binders, visited);
-                }
-            }
-            Type::FunctionSignature { params, returns } => {
-                let params = self.get_pack(*params);
-                for ty in &params.head {
-                    self.validate_scheme_generics(*ty, type_binders, pack_binders, visited);
-                }
-                if let Some(tail) = &params.tail {
-                    self.validate_scheme_tail(tail, type_binders, pack_binders, visited);
-                }
-                let returns = self.get_pack(*returns);
-                for ty in &returns.head {
-                    self.validate_scheme_generics(*ty, type_binders, pack_binders, visited);
-                }
-                if let Some(tail) = &returns.tail {
-                    self.validate_scheme_tail(tail, type_binders, pack_binders, visited);
-                }
-            }
-            Type::Union(parts) | Type::Intersection(parts) => {
-                for ty in parts {
-                    self.validate_scheme_generics(*ty, type_binders, pack_binders, visited);
-                }
-            }
-            Type::WithMetatable { base, methods } => {
-                self.validate_scheme_generics(*base, type_binders, pack_binders, visited);
-                for method in methods {
-                    self.validate_scheme_generics(method.ty, type_binders, pack_binders, visited);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Checks one type-pack tail reachable from a scheme body.
-    fn validate_scheme_tail(
-        &self,
-        tail: &TypePackTail,
-        type_binders: &HashSet<SmolStr>,
-        pack_binders: &HashSet<SmolStr>,
-        visited: &mut HashSet<TypeId>,
-    ) {
-        match tail {
-            TypePackTail::Homogeneous(ty) => {
-                self.validate_scheme_generics(*ty, type_binders, pack_binders, visited);
-            }
-            TypePackTail::Generic(name) => assert!(
-                pack_binders.contains(name),
-                "scheme body contains an unbound generic pack"
-            ),
-        }
     }
 }
 
@@ -1312,10 +913,8 @@ enum CombineMethod {
 mod tests {
     use std::hash::{Hash, Hasher};
 
-    use smol_str::SmolStr;
-
     use super::{HashConsArena, MetamethodType, RuntimeKind, Type, TypeLiteral, TypeStore};
-    use crate::hil::ty2::canonical::{GenericArgument, GenericBinder, Metamethod, TypePackTail};
+    use crate::hil::ty::canonical::{Metamethod, TypePackTail};
 
     /// A test value whose every fingerprint collides.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1459,90 +1058,6 @@ mod tests {
             panic!("nested table shape must be imported")
         };
         assert_eq!(fields.len(), 1);
-    }
-
-    /// Imported schemes preserve binders while moving their graph body.
-    #[test]
-    fn imports_generic_schemes_through_type_store() {
-        let mut source = TypeStore::new();
-        let generic = source.generic("T");
-        let scheme = source.type_scheme(generic, vec!["T".into()]);
-        let mut target = TypeStore::new();
-        let imported = target.import_scheme(&source, &scheme);
-        let argument = target.primitives().string;
-        assert_eq!(
-            target.instantiate(&imported, &[GenericArgument::Type(argument)]),
-            argument
-        );
-        assert_eq!(
-            imported.binders(),
-            &[GenericBinder::Type(SmolStr::new("T"))]
-        );
-    }
-
-    /// Generic pack tails retain their symbolic identity across graph imports.
-    #[test]
-    fn imports_generic_type_pack_tails() {
-        let mut source = TypeStore::new();
-        let params = source.pack(Vec::new(), Some(TypePackTail::Generic(SmolStr::new("T"))));
-        let returns = source.pack(Vec::new(), Some(TypePackTail::Generic(SmolStr::new("T"))));
-        let function = source.function_signature(params, returns);
-
-        let mut target = TypeStore::new();
-        let imported = target.import(&source, function);
-        let Type::FunctionSignature { params, returns } = target.get(imported) else {
-            panic!("imported node must remain a function signature")
-        };
-
-        assert_eq!(
-            target.get_pack(*params).tail,
-            Some(TypePackTail::Generic(SmolStr::new("T")))
-        );
-        assert_eq!(
-            target.get_pack(*returns).tail,
-            Some(TypePackTail::Generic(SmolStr::new("T")))
-        );
-    }
-
-    /// Instantiation substitutes type and pack binders without flattening their kinds.
-    #[test]
-    fn instantiates_generic_type_pack_tails() {
-        let mut store = TypeStore::new();
-        let generic = store.generic("T");
-        let generic_tail = Some(TypePackTail::Generic(SmolStr::new("P")));
-        let params = store.pack(vec![generic], generic_tail.clone());
-        let returns = store.pack(Vec::new(), generic_tail);
-        let function = store.function_signature(params, returns);
-        let scheme = store.type_scheme(
-            function,
-            vec![
-                GenericBinder::Type(SmolStr::new("T")),
-                GenericBinder::Pack(SmolStr::new("P")),
-            ],
-        );
-
-        let string = store.primitives().string;
-        let number = store.primitives().number;
-        let boolean = store.primitives().boolean;
-        let pack = store.pack(vec![number], Some(TypePackTail::Homogeneous(boolean)));
-        let instantiated = store.instantiate(
-            &scheme,
-            &[GenericArgument::Type(string), GenericArgument::Pack(pack)],
-        );
-        let Type::FunctionSignature { params, returns } = store.get(instantiated) else {
-            panic!("instantiated scheme must remain a function signature")
-        };
-
-        assert_eq!(store.get_pack(*params).head, vec![string, number]);
-        assert_eq!(
-            store.get_pack(*params).tail,
-            Some(TypePackTail::Homogeneous(boolean))
-        );
-        assert_eq!(store.get_pack(*returns).head, vec![number]);
-        assert_eq!(
-            store.get_pack(*returns).tail,
-            Some(TypePackTail::Homogeneous(boolean))
-        );
     }
 
     /// Broad table/function nodes remain distinct from empty structural nodes.

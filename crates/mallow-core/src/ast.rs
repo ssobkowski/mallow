@@ -23,7 +23,7 @@ pub enum TypeLiteral {
 pub struct TypePack {
     /// Fixed positional elements before an optional variadic tail.
     pub head: Vec<Type>,
-    /// Variadic or generic tail, when the pack is open.
+    /// Variadic tail, when the pack is open.
     pub tail: Option<TypePackTail>,
 }
 
@@ -32,27 +32,6 @@ pub struct TypePack {
 pub enum TypePackTail {
     /// A homogeneous `...T` tail that repeats one element type.
     Homogeneous(Box<Type>),
-    /// A generic `T...` tail that substitutes an entire type pack.
-    Generic(SmolStr),
-}
-
-/// One generic binder printed on a function declaration or function type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum GenericBinder {
-    /// Binds a single type such as `T`.
-    Type(SmolStr),
-    /// Binds a type pack such as `T...`.
-    Pack(SmolStr),
-}
-
-impl GenericBinder {
-    /// Returns the binder name without pack punctuation.
-    #[must_use]
-    pub fn name(&self) -> &SmolStr {
-        match self {
-            Self::Type(name) | Self::Pack(name) => name,
-        }
-    }
 }
 
 /// A source-level Luau type annotation.
@@ -75,8 +54,6 @@ pub enum Type {
     },
     /// A structural function signature.
     Function {
-        /// Generic binders declared by the function.
-        generics: Vec<GenericBinder>,
         /// Positional and variadic parameters.
         params: TypePack,
         /// Positional and variadic returns; an empty pack prints `()`.
@@ -102,8 +79,6 @@ pub enum Type {
     Named(SmolStr),
     /// A singleton literal type.
     Literal(TypeLiteral),
-    /// A named generic type parameter.
-    Generic(SmolStr),
     /// A structural union.
     Union(Vec<Type>),
     /// A structural intersection.
@@ -128,16 +103,11 @@ impl Hash for Type {
                 fields.hash(state);
                 array.hash(state);
             }
-            Self::Function {
-                generics,
-                params,
-                returns,
-            } => {
-                generics.hash(state);
+            Self::Function { params, returns } => {
                 params.hash(state);
                 returns.hash(state);
             }
-            Self::Named(name) | Self::Generic(name) => name.hash(state),
+            Self::Named(name) => name.hash(state),
             Self::Literal(literal) => literal.hash(state),
             Self::Union(types) | Self::Intersection(types) => types.hash(state),
             Self::WithMetatable { base, metatable } => {
@@ -285,8 +255,6 @@ pub enum Stmt {
     LocalFunction {
         /// Function name.
         name: Identifier,
-        /// Generic parameters declared by the function.
-        generics: Vec<GenericBinder>,
         /// Function parameters.
         params: Vec<Typed<Parameter>>,
         /// Function body.
@@ -405,8 +373,6 @@ pub enum Expr {
     },
     /// Anonymous function expression.
     AnonymousFunction {
-        /// Generic parameters declared by the function expression.
-        generics: Vec<GenericBinder>,
         /// Function parameters.
         params: Vec<Typed<Parameter>>,
         /// Function body.

@@ -8,10 +8,10 @@ use ssa::Ssa;
 use crate::common::ByteString;
 use crate::disasm::Chunk;
 use crate::hil::cflow::graph::GraphView;
-use crate::hil::ir::{Expr, Number, Stmt, ValuePack};
+use crate::hil::ir::{Capture, Expr, Number, Stmt, ValuePack};
 use crate::hil::lifter::common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL};
 use crate::hil::lifter::ssa::{Symbol, SymbolId};
-use crate::hil::ty2::bytecode::ProtoTypeContext;
+use crate::hil::ty::bytecode::ProtoTypeContext;
 use crate::il::{
     ChildProtoId, ConstId, Constant, Count, DecodedInstr, ImportPath, Instr, Proto, ProtoId,
     reg_add, reg_range,
@@ -874,7 +874,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
     /// Consume `count` CAPTURE instructions immediately following the current
     /// cursor position.
-    fn consume_captures(&mut self, count: u8) -> Result<Vec<SymbolId>> {
+    fn consume_captures(&mut self, count: u8) -> Result<Vec<Capture>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -883,13 +883,13 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         for i in 0..count {
             match self.next() {
                 Some(Instr::Capture { capture_type, reg }) => {
-                    let symbol = match capture_type {
-                        CAPTURE_VAL => self.ssa.read_reg(self.block_idx, reg),
-                        CAPTURE_REF => self.promote_capture_ref(reg),
-                        CAPTURE_UPVAL => self.ssa.read_upval(self.block_idx, reg),
+                    let capture = match capture_type {
+                        CAPTURE_VAL => Capture::Value(self.ssa.read_reg(self.block_idx, reg)),
+                        CAPTURE_REF => Capture::Ref(self.promote_capture_ref(reg)),
+                        CAPTURE_UPVAL => Capture::Upvalue(self.ssa.read_upval(self.block_idx, reg)),
                         _ => unreachable!("unknown capture type: {capture_type}"),
                     };
-                    captures.push(symbol);
+                    captures.push(capture);
                 }
                 Some(other) => {
                     bail!(

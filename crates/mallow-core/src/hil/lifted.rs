@@ -5,10 +5,10 @@ use anyhow::Result;
 use crate::disasm::Chunk;
 use crate::hil::cflow::cfg::{self, BlockExit, ControlFlowGraph};
 use crate::hil::cflow::union_find::UnionFind;
-use crate::hil::ir::{PhiNode, Stmt};
+use crate::hil::ir::{Capture, PhiNode, Stmt};
 use crate::hil::lifter::ssa::{FunctionSymbols, SymbolId};
-use crate::hil::ty2::canonical::{TypeId, TypeScheme};
-use crate::hil::ty2::store::TypeStore;
+use crate::hil::ty::canonical::TypeId;
+use crate::hil::ty::store::TypeStore;
 use crate::hil::visitor::VisitorMut;
 use crate::il::{Proto, ProtoId};
 use crate::{Diagnostics, LogLevel, LogTarget};
@@ -18,8 +18,8 @@ use crate::{Diagnostics, LogLevel, LogTarget};
 pub struct SymbolTypeFacts {
     /// Canonical graph node decoded from bytecode metadata, when present.
     bytecode: Option<TypeId>,
-    /// Inferred graph-backed scheme, including any quantified binders.
-    inferred: Option<TypeScheme>,
+    /// Inferred graph-backed type.
+    inferred: Option<TypeId>,
 }
 
 impl SymbolTypeFacts {
@@ -31,11 +31,11 @@ impl SymbolTypeFacts {
         }
     }
 
-    /// Creates facts containing only inferred scheme evidence.
-    fn from_inferred(scheme: TypeScheme) -> Self {
+    /// Creates facts containing only inferred type evidence.
+    fn from_inferred(ty: TypeId) -> Self {
         Self {
             bytecode: None,
-            inferred: Some(scheme),
+            inferred: Some(ty),
         }
     }
 }
@@ -60,8 +60,7 @@ impl Clone for FunctionTypes {
                     .map(|id| type_store.import(&self.type_store, id));
                 let inferred = facts
                     .inferred
-                    .as_ref()
-                    .map(|scheme| type_store.import_scheme(&self.type_store, scheme));
+                    .map(|type_id| type_store.import(&self.type_store, type_id));
 
                 (*symbol, SymbolTypeFacts { bytecode, inferred })
             })
@@ -78,25 +77,19 @@ impl FunctionTypes {
     /// Combines bytecode and inferred facts in one durable canonical graph.
     fn from_facts(
         bytecode_symbol_types: HashMap<SymbolId, TypeId>,
-        inferred_symbol_types: HashMap<SymbolId, TypeScheme>,
+        inferred_symbol_types: HashMap<SymbolId, TypeId>,
         type_store: TypeStore,
     ) -> Self {
-        for type_id in bytecode_symbol_types.values() {
-            assert!(
-                !type_store.contains_generic(*type_id),
-                "bytecode type facts must be monomorphic"
-            );
-        }
         let mut symbol_types: HashMap<_, _> = bytecode_symbol_types
             .into_iter()
             .map(|(sym, type_id)| (sym, SymbolTypeFacts::from_bytecode(type_id)))
             .collect();
 
-        for (sym, scheme) in inferred_symbol_types {
+        for (sym, type_id) in inferred_symbol_types {
             symbol_types
                 .entry(sym)
-                .and_modify(|facts| facts.inferred = Some(scheme.clone()))
-                .or_insert_with(|| SymbolTypeFacts::from_inferred(scheme));
+                .and_modify(|facts| facts.inferred = Some(type_id))
+                .or_insert_with(|| SymbolTypeFacts::from_inferred(type_id));
         }
 
         Self {
@@ -110,13 +103,10 @@ impl FunctionTypes {
         self.symbol_types.get(&sym).and_then(|facts| facts.bytecode)
     }
 
-    /// Returns only bytecode evidence, which is the monomorphic input allowed
-    /// to seed a later inference run.
+    /// Returns only bytecode evidence, which seeds a later inference run.
     ///
-    /// Inferred facts remain schemes because their bodies may contain generic
-    /// placeholders. Keeping this iterator tied to the bytecode field makes
-    /// that provenance explicit instead of selecting a scheme body and
-    /// accidentally treating it as a solver bound.
+    /// Inferred facts are kept separate so a later run does not seed itself
+    /// with its own previous output.
     pub fn monomorphic_symbol_types(&self) -> impl Iterator<Item = (SymbolId, TypeId)> + '_ {
         self.symbol_types
             .iter()
@@ -129,8 +119,7 @@ impl FunctionTypes {
         let inferred = self
             .symbol_types
             .get(&sym)
-            .and_then(|facts| facts.inferred.as_ref())
-            .map(TypeScheme::body)
+            .and_then(|facts| facts.inferred)
             .filter(|id| self.type_store.is_meaningful(*id));
 
         match (bytecode, inferred) {
@@ -141,11 +130,9 @@ impl FunctionTypes {
         }
     }
 
-    /// Returns the inferred generic scheme for a symbol, when one exists.
-    pub fn symbol_type_scheme(&self, sym: SymbolId) -> Option<&TypeScheme> {
-        self.symbol_types
-            .get(&sym)
-            .and_then(|facts| facts.inferred.as_ref())
+    /// Returns the inferred type for a symbol, when one exists.
+    pub fn inferred_symbol_type(&self, sym: SymbolId) -> Option<TypeId> {
+        self.symbol_types.get(&sym).and_then(|facts| facts.inferred)
     }
 
     /// Returns all currently known best canonical graph IDs.
@@ -171,8 +158,8 @@ impl FunctionTypes {
             let inferred = members
                 .iter()
                 .find(|(symbol, _)| *symbol == canonical)
-                .and_then(|(_, facts)| facts.inferred.clone())
-                .or_else(|| members.iter().find_map(|(_, facts)| facts.inferred.clone()));
+                .and_then(|(_, facts)| facts.inferred)
+                .or_else(|| members.iter().find_map(|(_, facts)| facts.inferred));
             let bytecode = members
                 .into_iter()
                 .filter_map(|(_, facts)| facts.bytecode)
@@ -188,15 +175,15 @@ impl FunctionTypes {
         }
     }
 
-    /// Records an inferred graph-backed scheme for one HIL symbol.
-    pub fn set_inferred_symbol_type(&mut self, sym: SymbolId, scheme: TypeScheme) {
-        // the body must exist
-        let _ = self.type_store.get(scheme.body());
+    /// Records an inferred graph type for one HIL symbol.
+    pub fn set_inferred_symbol_type(&mut self, sym: SymbolId, type_id: TypeId) {
+        // The type ID must belong to this store.
+        let _ = self.type_store.get(type_id);
 
         self.symbol_types
             .entry(sym)
-            .and_modify(|facts| facts.inferred = Some(scheme.clone()))
-            .or_insert_with(|| SymbolTypeFacts::from_inferred(scheme));
+            .and_modify(|facts| facts.inferred = Some(type_id))
+            .or_insert_with(|| SymbolTypeFacts::from_inferred(type_id));
     }
 
     /// Imports and records one inferred graph node produced by another store.
@@ -204,10 +191,10 @@ impl FunctionTypes {
         &mut self,
         sym: SymbolId,
         source: &TypeStore,
-        scheme: &TypeScheme,
+        type_id: TypeId,
     ) {
-        let scheme = self.type_store.import_scheme(source, scheme);
-        self.set_inferred_symbol_type(sym, scheme);
+        let type_id = self.type_store.import(source, type_id);
+        self.set_inferred_symbol_type(sym, type_id);
     }
 
     /// Returns the graph owned by this function's durable metadata.
@@ -302,29 +289,30 @@ impl LiftedFunction {
     /// versions of mutable storage are equated during constraint collection.
     pub(crate) fn destruct_ssa(&mut self) {
         let mut disjoint_set = UnionFind::new();
-        for (target, source) in self.symbols.loop_carried_versions.drain(..) {
+        for (target, source) in self.symbols.take_loop_carried_links() {
             disjoint_set.union(target, source);
         }
 
         union_phi_versions(&self.cfg, &mut disjoint_set);
         union_generic_for_versions(&self.cfg, &mut disjoint_set);
-        union_version_groups(
-            self.symbols
-                .upvalue_version_groups
-                .drain(..)
-                .chain(self.symbols.captured_version_groups.drain(..))
-                .map(|versions| versions.into_iter()),
-            &mut disjoint_set,
-        );
+        for storage in self.symbols.take_storage_members() {
+            let mut symbols = storage.into_iter();
+            let Some(first) = symbols.next() else {
+                continue;
+            };
+            for symbol in symbols {
+                disjoint_set.union(first, symbol);
+            }
+        }
 
-        for symbol in &mut self.symbols.params {
+        for symbol in self.symbols.params_mut() {
             *symbol = disjoint_set.find(*symbol);
         }
-        for symbol in &mut self.symbols.upvalues {
+        for symbol in self.symbols.upvalues_mut() {
             *symbol = disjoint_set.find(*symbol);
         }
         self.types.canonicalize_symbols(&mut disjoint_set);
-        for local in &mut self.symbols.named_locals {
+        for local in self.symbols.debug_locals_mut() {
             for symbol in &mut local.symbols {
                 *symbol = disjoint_set.find(*symbol);
             }
@@ -383,23 +371,6 @@ fn union_generic_for_versions(cfg: &ControlFlowGraph, disjoint_set: &mut UnionFi
     }
 }
 
-/// Unions each nonempty version group into its first symbol.
-fn union_version_groups<I, G>(groups: I, disjoint_set: &mut UnionFind<SymbolId>)
-where
-    I: IntoIterator<Item = G>,
-    G: IntoIterator<Item = SymbolId>,
-{
-    for group in groups {
-        let mut versions = group.into_iter();
-        let Some(first) = versions.next() else {
-            continue;
-        };
-        for version in versions {
-            disjoint_set.union(first, version);
-        }
-    }
-}
-
 /// Returns whether an operand is the source-level initializer of a loop variable.
 fn is_loop_header_loop_var_operand(
     cfg: &ControlFlowGraph,
@@ -433,8 +404,8 @@ impl VisitorMut for SymbolCanonicalizer<'_> {
     }
 
     /// Rewrites a closure capture owned by the enclosing function.
-    fn visit_capture(&mut self, _index: usize, symbol: &mut SymbolId) {
-        self.visit_symbol(symbol);
+    fn visit_capture(&mut self, _index: usize, capture: &mut Capture) {
+        self.visit_symbol(capture.symbol_mut());
     }
 
     /// Rewrites both sides of a synthetic Phi statement.
@@ -456,8 +427,8 @@ mod tests {
     use super::FunctionTypes;
     use crate::hil::cflow::union_find::UnionFind;
     use crate::hil::lifter::ssa::Symbol;
-    use crate::hil::ty2::canonical::Type;
-    use crate::hil::ty2::store::TypeStore;
+    use crate::hil::ty::canonical::Type;
+    use crate::hil::ty::store::TypeStore;
 
     /// Cloned metadata owns remapped IDs and rejects IDs from its source graph.
     #[test]
@@ -467,20 +438,19 @@ mod tests {
         let inferred_symbol = symbols.alloc(Symbol::reg(1));
         let mut type_store = TypeStore::new();
         let bytecode = type_store.named("BytecodeType");
-        let generic = type_store.generic("T");
-        let scheme = type_store.type_scheme(generic, vec!["T".into()]);
+        let inferred = type_store.named("InferredType");
         let mut original = FunctionTypes::from_facts(
             HashMap::from([(bytecode_symbol, bytecode)]),
-            HashMap::from([(inferred_symbol, scheme)]),
+            HashMap::from([(inferred_symbol, inferred)]),
             type_store,
         );
 
         let mut cloned = original.clone();
         let cloned_bytecode = cloned.bytecode_symbol_type(bytecode_symbol).unwrap();
-        let cloned_generic = cloned.symbol_type_scheme(inferred_symbol).unwrap().body();
+        let cloned_inferred = cloned.inferred_symbol_type(inferred_symbol).unwrap();
 
         assert_ne!(bytecode, cloned_bytecode);
-        assert_ne!(generic, cloned_generic);
+        assert_ne!(inferred, cloned_inferred);
         assert_eq!(
             original.type_store.get(bytecode),
             &Type::Named("BytecodeType".into())
@@ -490,8 +460,8 @@ mod tests {
             &Type::Named("BytecodeType".into())
         );
         assert_eq!(
-            original.type_store.get(generic),
-            cloned.type_store.get(cloned_generic)
+            original.type_store.get(inferred),
+            cloned.type_store.get(cloned_inferred)
         );
 
         let source_only = original.type_store.named("SourceOnly");
@@ -506,8 +476,8 @@ mod tests {
         );
     }
 
-    /// Deferred coalescing keeps the Phi root's inferred scheme and merges
-    /// monomorphic evidence from every member of its version class.
+    /// Deferred coalescing keeps the Phi root's inferred type and merges
+    /// bytecode evidence from every member of its version class.
     #[test]
     fn canonicalized_facts_prefer_root_inference_and_merge_bytecode() {
         let mut symbols: Arena<Symbol> = Arena::new();
@@ -519,14 +489,12 @@ mod tests {
         let string = type_store.primitives().string;
         let target_type = type_store.named("PhiTarget");
         let operand_type = type_store.named("Operand");
-        let target_scheme = type_store.type_scheme(target_type, Vec::new());
-        let operand_scheme = type_store.type_scheme(operand_type, Vec::new());
         let mut facts = FunctionTypes::from_facts(
             HashMap::from([(left, number), (right, string)]),
             HashMap::from([
-                (target, target_scheme),
-                (left, operand_scheme.clone()),
-                (right, operand_scheme),
+                (target, target_type),
+                (left, operand_type),
+                (right, operand_type),
             ]),
             type_store,
         );
@@ -537,10 +505,7 @@ mod tests {
         facts.canonicalize_symbols(&mut disjoint_set);
 
         assert_eq!(facts.symbol_types.len(), 1);
-        assert_eq!(
-            facts.symbol_type_scheme(target).unwrap().body(),
-            target_type
-        );
+        assert_eq!(facts.inferred_symbol_type(target), Some(target_type));
         let bytecode = facts.bytecode_symbol_type(target).unwrap();
         let Type::Union(members) = facts.type_store.get(bytecode) else {
             panic!("coalesced bytecode evidence must remain a union");
@@ -552,44 +517,33 @@ mod tests {
         assert!(facts.symbol_type_id(right).is_none());
     }
 
-    /// Repeated inference seeds only durable bytecode evidence, never a
-    /// generic placeholder retained in an inferred scheme.
+    /// Inferred types override bytecode types while bytecode seeds remain stable.
     #[test]
-    fn monomorphic_seeds_exclude_inferred_generic_schemes() {
+    fn inferred_types_override_bytecode_types() {
         let mut symbols: Arena<Symbol> = Arena::new();
         let bytecode_symbol = symbols.alloc(Symbol::reg(0));
         let inferred_only_symbol = symbols.alloc(Symbol::reg(1));
 
-        let mut type_store = TypeStore::new();
+        let type_store = TypeStore::new();
         let bytecode = type_store.primitives().number;
-        let generic = type_store.generic("T");
-        let generic_scheme = type_store.type_scheme(generic, vec!["T".into()]);
+        let inferred = type_store.primitives().string;
         let facts = FunctionTypes::from_facts(
             HashMap::from([(bytecode_symbol, bytecode)]),
             HashMap::from([
-                (bytecode_symbol, generic_scheme.clone()),
-                (inferred_only_symbol, generic_scheme),
+                (bytecode_symbol, inferred),
+                (inferred_only_symbol, inferred),
             ]),
             type_store,
         );
 
-        assert_eq!(facts.symbol_type_id(bytecode_symbol), Some(generic));
-        let seeds: Vec<_> = facts.monomorphic_symbol_types().collect();
-        assert_eq!(seeds, vec![(bytecode_symbol, bytecode)]);
-        assert!(
-            seeds
-                .iter()
-                .all(|(_, type_id)| !facts.type_store.contains_generic(*type_id))
+        assert_eq!(facts.symbol_type_id(bytecode_symbol), Some(inferred));
+        assert_eq!(
+            facts.monomorphic_symbol_types().collect::<Vec<_>>(),
+            vec![(bytecode_symbol, bytecode)]
         );
-        assert!(
-            facts
-                .symbol_type_scheme(bytecode_symbol)
-                .is_some_and(|scheme| facts.type_store.contains_generic(scheme.body()))
-        );
-        assert!(
-            facts
-                .symbol_type_scheme(inferred_only_symbol)
-                .is_some_and(|scheme| facts.type_store.contains_generic(scheme.body()))
+        assert_eq!(
+            facts.inferred_symbol_type(inferred_only_symbol),
+            Some(inferred)
         );
     }
 }

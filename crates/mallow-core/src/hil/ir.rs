@@ -27,6 +27,33 @@ impl std::fmt::Display for Number {
     }
 }
 
+/// A captured symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Capture {
+    /// Symbol captured as a reference.
+    Ref(SymbolId),
+    /// Symbol captured as a value, ie. through a copy.
+    Value(SymbolId),
+    /// Symbol captured as a pre-captured upvalue.
+    Upvalue(SymbolId),
+}
+
+impl Capture {
+    /// Returns the symbol used to initialize or share this capture.
+    pub const fn symbol(self) -> SymbolId {
+        match self {
+            Self::Ref(symbol) | Self::Value(symbol) | Self::Upvalue(symbol) => symbol,
+        }
+    }
+
+    /// Returns a mutable reference to the captured symbol.
+    pub fn symbol_mut(&mut self) -> &mut SymbolId {
+        match self {
+            Self::Ref(symbol) | Self::Value(symbol) | Self::Upvalue(symbol) => symbol,
+        }
+    }
+}
+
 /// An expression in the high-level intermediate representation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -43,7 +70,7 @@ pub enum Expr {
     /// A closure literal and the proto/captures needed to rebuild nested functions.
     Closure {
         proto: ProtoId,
-        captures: Vec<SymbolId>,
+        captures: Vec<Capture>,
     },
     /// A global variable, identified by its name.
     Global(SmolStr),

@@ -301,16 +301,17 @@ impl GraphView for AdjGraph<'_> {
 }
 
 /// Builds forward/backward adjacency lists based on the given block exits.
-pub fn build_graph<I>(exits_iter: I) -> (Vec<Vec<usize>>, Vec<Vec<usize>>)
+pub fn build_graph<I, T>(exits_iter: I) -> (Vec<Vec<usize>>, Vec<Vec<usize>>)
 where
-    I: IntoIterator<Item = [Option<usize>; 2]>,
+    I: IntoIterator<Item = T>,
     I::IntoIter: ExactSizeIterator,
+    T: IntoIterator<Item = usize>,
 {
     let iter = exits_iter.into_iter();
     let len = iter.len();
 
     let successors: Vec<Vec<_>> = iter
-        .map(|targets| targets.into_iter().flatten().filter(|&t| t < len).collect())
+        .map(|targets| targets.into_iter().filter(|&t| t < len).collect())
         .collect();
 
     let mut predecessors = vec![Vec::new(); len];

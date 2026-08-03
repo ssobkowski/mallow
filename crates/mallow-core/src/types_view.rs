@@ -6,10 +6,8 @@ use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::hil::lifted::LiftedFunction;
-use crate::hil::ty2::canonical::{
-    GenericBinder, Type, TypeId, TypeLiteral, TypePackId, TypePackTail, TypeScheme,
-};
-use crate::hil::ty2::store::TypeStore;
+use crate::hil::ty::canonical::{Type, TypeId, TypeLiteral, TypePackId, TypePackTail};
+use crate::hil::ty::store::TypeStore;
 
 /// Inferred types indexed by named locals from debug information.
 pub struct TypesView {
@@ -21,7 +19,7 @@ pub struct TypesView {
     locals_by_name: HashMap<String, SmallVec<[usize; 2]>>,
 }
 
-/// One named source declaration and its inferred scheme.
+/// One named source declaration and its inferred type.
 struct LocalType {
     /// Source name from the bytecode debug record.
     name: String,
@@ -32,7 +30,7 @@ struct LocalType {
     /// First bytecode PC after this declaration.
     end_pc: u32,
     /// Type produced solely by whole-program inference.
-    scheme: Option<TypeScheme>,
+    type_id: Option<TypeId>,
 }
 
 impl TypesView {
@@ -42,21 +40,21 @@ impl TypesView {
         let mut locals = Vec::new();
 
         for function in functions {
-            for local in &function.symbols.named_locals {
-                let schemes: Vec<_> = local
+            for local in function.symbols.debug_locals() {
+                let types: Vec<_> = local
                     .symbols
                     .iter()
-                    .filter_map(|symbol| function.types.symbol_type_scheme(*symbol))
-                    .map(|scheme| store.import_scheme(function.types.type_store(), scheme))
+                    .filter_map(|symbol| function.types.inferred_symbol_type(*symbol))
+                    .map(|type_id| store.import(function.types.type_store(), type_id))
                     .collect();
 
-                let scheme = merge_schemes(&mut store, schemes);
+                let type_id = merge_types(&mut store, types);
                 locals.push(LocalType {
                     name: local.name.clone(),
                     proto: function.proto.0,
                     start_pc: local.start_pc,
                     end_pc: local.end_pc,
-                    scheme,
+                    type_id,
                 });
             }
         }
@@ -101,7 +99,7 @@ impl TypesView {
             panic!("named local `{name}` is ambiguous: {locations}");
         };
         let local = &self.locals[*index];
-        let scheme = local.scheme.clone().unwrap_or_else(|| {
+        let type_id = local.type_id.unwrap_or_else(|| {
             panic!(
                 "named local `{name}` at proto {} PCs {}..{} has no inferred type",
                 local.proto, local.start_pc, local.end_pc,
@@ -110,7 +108,7 @@ impl TypesView {
 
         TypeView {
             owner: self,
-            scheme,
+            type_id,
         }
     }
 
@@ -120,19 +118,18 @@ impl TypesView {
         TypeFactory { owner: self }
     }
 
-    /// Wraps one monomorphic graph node as a type view.
-    fn monomorphic(&self, body: TypeId) -> TypeView<'_> {
-        let scheme = self.store.borrow().type_scheme(body, Vec::new());
+    /// Wraps one graph node as a type view.
+    fn monomorphic(&self, type_id: TypeId) -> TypeView<'_> {
         TypeView {
             owner: self,
-            scheme,
+            type_id,
         }
     }
 }
 
 /// Combines inferred SSA versions that belong to one source declaration.
-fn merge_schemes(store: &mut TypeStore, schemes: Vec<TypeScheme>) -> Option<TypeScheme> {
-    let distinct: HashSet<_> = schemes.into_iter().collect();
+fn merge_types(store: &mut TypeStore, types: Vec<TypeId>) -> Option<TypeId> {
+    let distinct: HashSet<_> = types.into_iter().collect();
 
     if distinct.is_empty() {
         return None;
@@ -140,27 +137,23 @@ fn merge_schemes(store: &mut TypeStore, schemes: Vec<TypeScheme>) -> Option<Type
     if distinct.len() == 1 {
         return distinct.into_iter().next();
     }
-    if distinct.iter().any(|scheme| !scheme.binders().is_empty()) {
-        return None;
-    }
 
-    let body = store.union_all(distinct.into_iter().map(|scheme| scheme.body()));
-    Some(store.type_scheme(body, Vec::new()))
+    Some(store.union_all(distinct))
 }
 
-/// One canonical type scheme owned by a [`TypesView`].
-#[derive(Clone)]
+/// One canonical type owned by a [`TypesView`].
+#[derive(Clone, Copy)]
 pub struct TypeView<'a> {
-    /// View whose graph owns `scheme`.
+    /// View whose graph owns `type_id`.
     owner: &'a TypesView,
-    /// Generic binders and canonical root node.
-    scheme: TypeScheme,
+    /// Canonical root node.
+    type_id: TypeId,
 }
 
 impl PartialEq for TypeView<'_> {
-    /// Compares canonical schemes from the same graph.
+    /// Compares canonical types from the same graph.
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.owner, other.owner) && self.scheme == other.scheme
+        std::ptr::eq(self.owner, other.owner) && self.type_id == other.type_id
     }
 }
 
@@ -170,21 +163,7 @@ impl fmt::Debug for TypeView<'_> {
     /// Formats the complete canonical type instead of its arena IDs.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let store = self.owner.store.borrow();
-        if !self.scheme.binders().is_empty() {
-            formatter.write_str("<")?;
-            for (index, binder) in self.scheme.binders().iter().enumerate() {
-                if index != 0 {
-                    formatter.write_str(", ")?;
-                }
-                match binder {
-                    GenericBinder::Type(name) => write!(formatter, "{name}"),
-                    GenericBinder::Pack(name) => write!(formatter, "{name}..."),
-                }?;
-            }
-            formatter.write_str("> ")?;
-        }
-
-        TypeFormatter::new(&store).format(self.scheme.body(), formatter)
+        TypeFormatter::new(&store).format(self.type_id, formatter)
     }
 }
 
@@ -253,9 +232,9 @@ impl<'a> TypeFactory<'a> {
         self.owner.monomorphic(id)
     }
 
-    /// Returns one generic placeholder for a later [`Self::forall`] call.
-    pub fn generic(self, name: impl Into<SmolStr>) -> TypeView<'a> {
-        let id = self.owner.store.borrow_mut().generic(name);
+    /// Returns the canonical `vector` type.
+    pub fn vector(self) -> TypeView<'a> {
+        let id = self.owner.store.borrow().primitives().vector;
         self.owner.monomorphic(id)
     }
 
@@ -358,20 +337,6 @@ impl<'a> TypeFactory<'a> {
         self.owner.monomorphic(id)
     }
 
-    /// Quantifies generic placeholders contained in `body`.
-    pub fn forall<const N: usize>(self, binders: [&str; N], body: TypeView<'a>) -> TypeView<'a> {
-        let body = self.checked_body(body);
-        let binders = binders
-            .into_iter()
-            .map(|name| GenericBinder::Type(SmolStr::new(name)))
-            .collect();
-        let scheme = self.owner.store.borrow().type_scheme(body, binders);
-        TypeView {
-            owner: self.owner,
-            scheme,
-        }
-    }
-
     /// Checks that a type pack belongs to this factory.
     fn check_pack(self, pack: TypePackView<'a>) {
         assert!(
@@ -386,11 +351,7 @@ impl<'a> TypeFactory<'a> {
             std::ptr::eq(self.owner, ty.owner),
             "expected type belongs to another TypesView"
         );
-        assert!(
-            ty.scheme.binders().is_empty(),
-            "a nested expected type cannot carry its own generic binders"
-        );
-        ty.scheme.body()
+        ty.type_id
     }
 }
 
@@ -430,7 +391,7 @@ impl<'a> TypeFormatter<'a> {
             Type::Vector => formatter.write_str("vector"),
             Type::Integer => formatter.write_str("integer"),
             Type::Buffer => formatter.write_str("buffer"),
-            Type::Named(name) | Type::Generic(name) => write!(formatter, "{name}"),
+            Type::Named(name) => write!(formatter, "{name}"),
             Type::Literal(TypeLiteral::String(value)) => write!(formatter, "{value:?}"),
             Type::Literal(TypeLiteral::Boolean(value)) => write!(formatter, "{value}"),
             Type::Table => formatter.write_str("table"),
@@ -501,7 +462,6 @@ impl<'a> TypeFormatter<'a> {
                     formatter.write_str("...")?;
                     self.format(*ty, formatter)?;
                 }
-                TypePackTail::Generic(name) => write!(formatter, "{name}...")?,
             }
         }
         formatter.write_str(")")

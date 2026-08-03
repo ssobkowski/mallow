@@ -5,123 +5,26 @@ use std::hash::Hash;
 use id_arena::Id;
 use smol_str::SmolStr;
 
-use crate::operator::BinOp;
-
 /// Stable identity for one canonical type node.
 pub type TypeId = Id<Type>;
 
 /// Stable identity for one canonical type pack.
 pub type TypePackId = Id<TypePack>;
 
-/// One generic declaration quantified by a [`TypeScheme`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum GenericBinder {
-    /// Binds a single type such as `T`.
-    Type(SmolStr),
-    /// Binds a type pack such as `T...`.
-    Pack(SmolStr),
-}
-
-impl GenericBinder {
-    /// Returns the source-level name of this binder without pack punctuation.
-    #[must_use]
-    pub fn name(&self) -> &SmolStr {
-        match self {
-            Self::Type(name) | Self::Pack(name) => name,
-        }
-    }
-}
-
-impl From<SmolStr> for GenericBinder {
-    /// Treats a bare name as a single-type binder.
-    fn from(name: SmolStr) -> Self {
-        Self::Type(name)
-    }
-}
-
-impl From<&str> for GenericBinder {
-    /// Treats a string literal as a single-type binder.
-    fn from(name: &str) -> Self {
-        Self::Type(name.into())
-    }
-}
-
-/// One concrete argument supplied while instantiating a [`TypeScheme`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "concrete scheme instantiation is a TypeStore API without a production caller yet"
-    )
-)]
-pub enum GenericArgument {
-    /// Substitutes one type binder.
-    Type(TypeId),
-    /// Substitutes one type-pack binder.
-    Pack(TypePackId),
-}
-
-/// Defines a reusable polymorphic type over a canonical graph body.
-///
-/// Generic nodes in `body` are placeholders scoped by `binders`. Each use of
-/// the scheme instantiates those binders independently, so inferred types from
-/// one call site cannot affect another while the canonical body remains shared.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TypeScheme {
-    /// Declares the typed generic parameters available in `body`, in substitution order.
-    binders: Vec<GenericBinder>,
-    /// Identifies the shared type graph containing the bound generic placeholders.
-    body: TypeId,
-}
-
-impl TypeScheme {
-    /// Creates a scheme from its binders and graph body.
-    #[must_use]
-    pub(crate) fn new(binders: Vec<GenericBinder>, body: TypeId) -> Self {
-        Self { binders, body }
-    }
-
-    /// Returns the names bound by this scheme.
-    #[must_use]
-    pub fn binders(&self) -> &[GenericBinder] {
-        &self.binders
-    }
-
-    /// Returns the graph body of this scheme.
-    #[must_use]
-    pub const fn body(&self) -> TypeId {
-        self.body
-    }
-}
-
 /// A fixed prefix and optional open tail of type arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TypePack {
     /// Positional elements in the pack.
     pub head: Vec<TypeId>,
-    /// The homogeneous or generic tail after the fixed prefix.
+    /// The homogeneous tail after the fixed prefix.
     pub tail: Option<TypePackTail>,
 }
 
-/// A tail of a type pack, either a homogeneous variadic tail or a generic type pack.
+/// A homogeneous variadic tail of a type pack.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypePackTail {
     /// `...T`: repeats one type.
     Homogeneous(TypeId),
-    /// `T...`: substitutes an entire type pack.
-    Generic(SmolStr),
-}
-
-impl TypePackTail {
-    /// Returns the repeated element type when this is a homogeneous tail.
-    #[must_use]
-    pub const fn homogeneous_type(&self) -> Option<TypeId> {
-        match self {
-            Self::Homogeneous(ty) => Some(*ty),
-            Self::Generic(_) => None,
-        }
-    }
 }
 
 /// Identifies a Luau metamethod by its runtime operation.
@@ -169,25 +72,6 @@ impl Metamethod {
             Self::Le => "__le",
             Self::Len => "__len",
             Self::Iter => "__iter",
-        }
-    }
-}
-
-impl TryFrom<BinOp> for Metamethod {
-    type Error = ();
-
-    /// Converts an operator with a binary metamethod into that metamethod.
-    fn try_from(op: BinOp) -> Result<Self, Self::Error> {
-        match op {
-            BinOp::Add => Ok(Self::Add),
-            BinOp::Sub => Ok(Self::Sub),
-            BinOp::Mul => Ok(Self::Mul),
-            BinOp::Div => Ok(Self::Div),
-            BinOp::IDiv => Ok(Self::IDiv),
-            BinOp::Mod => Ok(Self::Mod),
-            BinOp::Pow => Ok(Self::Pow),
-            BinOp::Concat => Ok(Self::Concat),
-            _ => Err(()),
         }
     }
 }
@@ -270,7 +154,7 @@ pub enum TypeLiteral {
 ///
 /// Every recursive edge is an ID. Nodes therefore have one owner and one
 /// canonical identity, while graph construction remains centralized in
-/// [`crate::hil::ty2::store::TypeStore`].
+/// [`crate::hil::ty::store::TypeStore`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// The empty type and lattice bottom.
@@ -301,9 +185,6 @@ pub enum Type {
     Named(SmolStr),
     /// An exact singleton literal.
     Literal(TypeLiteral),
-    /// A generic placeholder used only by
-    /// [`TypeScheme`] bodies.
-    Generic(SmolStr),
     /// The broad table type with no structural information.
     Table,
     /// A table with canonical ordered fields and an optional indexer.

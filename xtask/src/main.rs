@@ -14,7 +14,7 @@ const BUILTIN_SOURCES: &[&str] = &[
 ];
 
 /// The Rust module committed for hermetic mallow-core builds.
-const GENERATED_FILE: &str = "../crates/mallow-core/src/hil/ty2/builtin_definitions.rs";
+const GENERATED_FILE: &str = "../crates/mallow-core/src/hil/ty/builtin_definitions.rs";
 
 /// Parses the checked-in declarations and updates their owned Rust representation.
 fn main() {

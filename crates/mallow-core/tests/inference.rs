@@ -43,7 +43,6 @@ fn toolchain() -> &'static Installation {
 }
 
 /// A truthy cache hit narrows the function's observable return to `number`.
-#[ignore = "not yet supported by the ty3 inference engine"]
 #[inference_test(fixture = "truthiness01")]
 fn inferred_index_read_narrows_after_truthiness_check(view: TypesView) {
     let ty = view.types();
@@ -51,6 +50,83 @@ fn inferred_index_read_narrows_after_truthiness_check(view: TypesView) {
     assert_eq!(
         view.local("lookup"),
         ty.function([ty.number()], [ty.number()])
+    );
+}
+
+/// A truthy fact survives an inner branch and its join.
+#[inference_test(fixture = "truthiness02")]
+fn truthiness_propagates_through_nested_join(view: TypesView) {
+    let ty = view.types();
+
+    assert_eq!(
+        view.local("through_join"),
+        ty.function([ty.optional(ty.number()), ty.boolean()], [ty.number()])
+    );
+}
+
+/// A contradictory nested branch does not contribute an impossible return.
+#[inference_test(fixture = "truthiness03")]
+fn contradictory_truthiness_branch_is_unreachable(view: TypesView) {
+    let ty = view.types();
+
+    assert_eq!(
+        view.local("nested_truthiness"),
+        ty.function([ty.optional(ty.number())], [ty.number()])
+    );
+}
+
+/// A call can invalidate the truthiness of a captured local.
+#[inference_test(fixture = "truthiness04")]
+fn call_invalidates_captured_local_truthiness(view: TypesView) {
+    let ty = view.types();
+
+    assert_eq!(
+        view.local("clear_after_check"),
+        ty.function([ty.optional(ty.number())], [ty.optional(ty.number())])
+    );
+}
+
+/// A by-value capture does not invalidate the parent's branch fact.
+#[inference_test(fixture = "truthiness05")]
+fn value_capture_preserves_parent_truthiness(view: TypesView) {
+    let ty = view.types();
+
+    assert_eq!(
+        view.local("observe_after_call"),
+        ty.function([ty.optional(ty.number())], [ty.number()])
+    );
+}
+
+/// A reference to an enclosing upvalue shares writes through nested closures.
+#[inference_test(fixture = "truthiness06")]
+fn upvalue_capture_propagates_shared_storage(view: TypesView) {
+    let ty = view.types();
+
+    assert_eq!(
+        view.local("clear_after_check"),
+        ty.function([], [ty.optional(ty.number())])
+    );
+}
+
+/// A call does not invalidate a read-only by-value upvalue's truthiness.
+#[inference_test(fixture = "truthiness07")]
+fn call_preserves_value_upvalue_truthiness(view: TypesView) {
+    let ty = view.types();
+
+    assert_eq!(
+        view.local("read_after_call"),
+        ty.function([ty.optional(ty.number())], [ty.number()])
+    );
+}
+
+/// A transitive upvalue capture preserves its read-only value origin.
+#[inference_test(fixture = "truthiness08")]
+fn call_preserves_transitive_value_upvalue_truthiness(view: TypesView) {
+    let ty = view.types();
+
+    assert_eq!(
+        view.local("read_after_nested_call"),
+        ty.function([ty.optional(ty.number())], [ty.number()])
     );
 }
 
@@ -63,7 +139,7 @@ fn named_vararg_local_keeps_inferred_type(view: TypesView) {
 }
 
 /// Metamethod-dependent values retain the result type of their operation.
-#[ignore = "not yet supported by the ty3 inference engine"]
+#[ignore = "not yet supported"]
 #[inference_test(fixture = "metatables01")]
 fn addition_uses_metatable_method(view: TypesView) {
     let ty = view.types();
@@ -75,7 +151,6 @@ fn addition_uses_metatable_method(view: TypesView) {
 }
 
 /// Writes through deferred upvalue versions remain optional.
-#[ignore = "not yet supported by the ty3 inference engine"]
 #[inference_test(fixture = "upvalues01")]
 fn mutable_upvalue_versions_remain_optional(view: TypesView) {
     let ty = view.types();
@@ -98,33 +173,8 @@ fn escaped_table_write_remains_optional(view: TypesView) {
     );
 }
 
-/// Identity remains correlated when an argument is omitted.
-#[ignore = "not yet supported by the ty3 inference engine"]
-#[inference_test(fixture = "generics01")]
-fn identity_with_omitted_argument_recovers_optional_generic(view: TypesView) {
-    let ty = view.types();
-    let generic = ty.generic("T");
-    let identity = ty.function([ty.optional(generic.clone())], [ty.optional(generic)]);
-
-    assert_eq!(view.local("id"), ty.forall(["T"], identity));
-    assert_eq!(view.local("a"), ty.number());
-    assert_eq!(view.local("b"), ty.nil());
-}
-
-/// An unconstrained truthy branch remains in the return type.
-#[ignore = "not yet supported by the ty3 inference engine"]
-#[inference_test(fixture = "generics02")]
-fn unconstrained_truthy_return_is_preserved(view: TypesView) {
-    let ty = view.types();
-    let generic = ty.generic("T");
-    let result = ty.union([generic.clone(), ty.number()]);
-    let select = ty.function([generic], [result]);
-
-    assert_eq!(view.local("selectTruthy"), ty.forall(["T"], select));
-}
-
 /// Callable `__index` supplies the indexed result type.
-#[ignore = "not yet supported by the ty3 inference engine"]
+#[ignore = "not yet supported"]
 #[inference_test(fixture = "metatables02")]
 fn dynamic_index_uses_callable_metamethod(view: TypesView) {
     let ty = view.types();
@@ -133,7 +183,7 @@ fn dynamic_index_uses_callable_metamethod(view: TypesView) {
 }
 
 /// A late `__index` link reconnects a named read.
-#[ignore = "not yet supported by the ty3 inference engine"]
+#[ignore = "not yet supported"]
 #[inference_test(fixture = "metatables03")]
 fn late_metatable_link_reconnects_named_read(view: TypesView) {
     let ty = view.types();
@@ -142,7 +192,7 @@ fn late_metatable_link_reconnects_named_read(view: TypesView) {
 }
 
 /// Table-valued `__index` supplies the indexed result type.
-#[ignore = "not yet supported by the ty3 inference engine"]
+#[ignore = "not yet supported"]
 #[inference_test(fixture = "metatables04")]
 fn dynamic_index_uses_table_metamethod(view: TypesView) {
     let ty = view.types();
@@ -150,35 +200,9 @@ fn dynamic_index_uses_table_metamethod(view: TypesView) {
     assert_eq!(view.local("resolved"), ty.number());
 }
 
-/// Generic results remain independent at each call site.
-#[ignore = "not yet supported by the ty3 inference engine"]
-#[inference_test(fixture = "generics03")]
-fn direct_generic_results_do_not_pool_callsite_types(view: TypesView) {
-    let ty = view.types();
-    let generic = ty.generic("T");
-    let identity = ty.function([generic.clone()], [generic]);
-
-    assert_eq!(view.local("id"), ty.forall(["T"], identity));
-    assert_eq!(view.local("number_value"), ty.number());
-    assert_eq!(view.local("string_value"), ty.string());
-}
-
-/// Aliases and harmless uses preserve an identity relation.
-#[ignore = "not yet supported by the ty3 inference engine"]
-#[inference_test(fixture = "generics04")]
-fn identity_relation_comes_from_body_value_flow(view: TypesView) {
-    let ty = view.types();
-    let generic = ty.generic("T");
-    let identity = ty.function([generic.clone()], [generic]);
-
-    assert_eq!(view.local("id"), ty.forall(["T"], identity));
-    assert_eq!(view.local("number_value"), ty.number());
-    assert_eq!(view.local("string_value"), ty.string());
-}
-
-/// Body requirements prevent false identity generics.
-#[inference_test(fixture = "generics05")]
-fn body_constraints_prevent_false_identity_generics(view: TypesView) {
+/// Body requirements prevent false identity relations.
+#[inference_test(fixture = "constraints01")]
+fn body_constraints_prevent_false_identity_relations(view: TypesView) {
     let ty = view.types();
 
     assert_eq!(
@@ -194,8 +218,34 @@ fn body_constraints_prevent_false_identity_generics(view: TypesView) {
     );
 }
 
+/// Additive branches retain both matching number and vector operands.
+#[ignore = "not yet supported"]
+#[inference_test(fixture = "arithmetic01")]
+fn additive_branches_keep_matching_number_and_vector_types(view: TypesView) {
+    let ty = view.types();
+
+    assert_eq!(
+        view.local("add"),
+        ty.function([ty.boolean()], [ty.union([ty.number(), ty.vector()])])
+    );
+    assert_eq!(
+        view.local("subtract"),
+        ty.function([ty.boolean()], [ty.union([ty.number(), ty.vector()])])
+    );
+    assert_eq!(view.local("add_lhs"), ty.union([ty.number(), ty.vector()]));
+    assert_eq!(view.local("add_rhs"), ty.union([ty.number(), ty.vector()]));
+    assert_eq!(
+        view.local("subtract_lhs"),
+        ty.union([ty.number(), ty.vector()])
+    );
+    assert_eq!(
+        view.local("subtract_rhs"),
+        ty.union([ty.number(), ty.vector()])
+    );
+}
+
 /// Fixed heads and open tails retain their positional behavior.
-#[ignore = "not yet supported by the ty3 inference engine"]
+#[ignore = "not yet supported"]
 #[inference_test(fixture = "packs01")]
 fn value_packs_preserve_positional_flow(view: TypesView) {
     let ty = view.types();

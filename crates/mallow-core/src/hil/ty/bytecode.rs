@@ -1,10 +1,7 @@
-use crate::{
-    disasm::Chunk,
-    il::{BytecodeType, Proto, TypeTag},
-};
-
 use super::canonical::TypeId;
 use super::store::TypeStore;
+use crate::disasm::Chunk;
+use crate::il::{BytecodeType, Proto, TypeTag};
 
 /// Decodes one compact bytecode tag into a canonical graph ID.
 ///
@@ -32,7 +29,7 @@ fn decode_type_tag(tag: TypeTag, chunk: &Chunk, store: &mut TypeStore) -> Option
                     .find(|mapping| mapping.index == index)
                     .and_then(|mapping| mapping.name)
                     .and_then(|name| chunk.get_string(name))
-                    .map(|name| name.to_string())
+                    .and_then(|name| name.as_utf8().map(str::to_owned))
             })?;
 
             store.named(name)

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use smallvec::SmallVec;
 
 use crate::hil::StructuredFunction;
-use crate::hil::ir::{Expr, PhiNode, Stmt, ValuePack};
+use crate::hil::ir::{Capture, Expr, PhiNode, Stmt, ValuePack};
 use crate::hil::lifter::ssa::SymbolId;
 use crate::hil::visitor::{Visitor, walk_expr};
 use crate::il::ProtoId;
@@ -115,10 +115,10 @@ impl FunctionUseDef {
         let _enter = span.enter();
 
         let mut analysis = Self::default();
-        for param in &fun.symbols.params {
+        for param in fun.symbols.params() {
             analysis.symbols.entry(*param).or_default().poisoned = true;
         }
-        for upvalue in &fun.symbols.upvalues {
+        for upvalue in fun.symbols.upvalues() {
             analysis.symbols.entry(*upvalue).or_default().poisoned = true;
         }
         analysis.visit_region(&fun.root);
@@ -242,8 +242,8 @@ impl Visitor for FunctionUseDef {
         }
     }
 
-    fn visit_capture(&mut self, _: usize, sym: SymbolId) {
-        self.symbols.entry(sym).or_default().poisoned = true;
+    fn visit_capture(&mut self, _: usize, capture: Capture) {
+        self.symbols.entry(capture.symbol()).or_default().poisoned = true;
     }
 
     fn visit_symbol(&mut self, sym: SymbolId) {

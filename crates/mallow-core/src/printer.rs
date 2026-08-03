@@ -1,6 +1,6 @@
 use crate::ast::{
-    Block, ElseClause, Expr, GenericBinder, If, Literal, Parameter, Stmt, TableItem, Type,
-    TypeLiteral, TypePack, TypePackTail, TypePrecedence, Typed,
+    Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Type, TypeLiteral, TypePack,
+    TypePackTail, TypePrecedence, Typed,
 };
 use crate::common::{ByteString, escape_bytes};
 use crate::operator::{BinOp, UnOp};
@@ -127,14 +127,12 @@ impl AstPrinter {
             }
             Stmt::LocalFunction {
                 name,
-                generics,
                 params,
                 body,
                 returns,
             } => {
                 self.write("local function ");
                 self.write(name.as_str());
-                self.write_generics(generics);
                 self.write("(");
                 self.write_params(params);
                 self.write(")");
@@ -360,18 +358,13 @@ impl AstPrinter {
                     self.write(")");
                 }
             }
-            Expr::AnonymousFunction {
-                generics,
-                params,
-                body,
-            } => {
+            Expr::AnonymousFunction { params, body } => {
                 let prec = 1;
                 let needs_parens = prec < parent_prec;
                 if needs_parens {
                     self.write("(");
                 }
                 self.write("function");
-                self.write_generics(generics);
                 self.write("(");
                 self.write_params(params);
                 self.write(")");
@@ -444,21 +437,6 @@ impl AstPrinter {
         });
     }
 
-    /// Writes a generic parameter declaration when one is present.
-    fn write_generics(&mut self, generics: &[GenericBinder]) {
-        if generics.is_empty() {
-            return;
-        }
-        self.write("<");
-        self.write_punctuated(generics, ", ", |printer, generic| {
-            printer.write(generic.name().as_str());
-            if matches!(generic, GenericBinder::Pack(_)) {
-                printer.write("...");
-            }
-        });
-        self.write(">");
-    }
-
     fn write_type(&mut self, ty: &Type, parent_prec: TypePrecedence) {
         let prec = ty.precedence();
         let needs_parens = prec < parent_prec;
@@ -496,21 +474,7 @@ impl AstPrinter {
                 }
                 self.write(" }");
             }
-            Type::Function {
-                generics,
-                params,
-                returns,
-            } => {
-                if !generics.is_empty() {
-                    self.write("<");
-                    self.write_punctuated(generics, ", ", |p, generic| {
-                        p.write(generic.name().as_str());
-                        if matches!(generic, GenericBinder::Pack(_)) {
-                            p.write("...");
-                        }
-                    });
-                    self.write(">");
-                }
+            Type::Function { params, returns } => {
                 self.write("(");
                 self.write_punctuated(&params.head, ", ", |p, ty| {
                     p.write_type(ty, TypePrecedence::Lowest)
@@ -532,7 +496,7 @@ impl AstPrinter {
             Type::Unknown => self.write("unknown"),
             Type::Never => self.write("never"),
             Type::Any => self.write("any"),
-            Type::Named(name) | Type::Generic(name) => self.write(name.as_str()),
+            Type::Named(name) => self.write(name.as_str()),
             Type::Literal(literal) => self.write_type_literal(literal),
             Type::Union(types) => {
                 self.write_punctuated(types, " | ", |p, ty| {
@@ -554,16 +518,12 @@ impl AstPrinter {
         }
     }
 
-    /// Writes one homogeneous or generic type-pack tail.
+    /// Writes one homogeneous type-pack tail.
     fn write_type_pack_tail(&mut self, tail: &TypePackTail) {
         match tail {
             TypePackTail::Homogeneous(ty) => {
                 self.write("...");
                 self.write_type(ty, TypePrecedence::Lowest);
-            }
-            TypePackTail::Generic(name) => {
-                self.write(name.as_str());
-                self.write("...");
             }
         }
     }
@@ -835,9 +795,7 @@ mod tests {
         AstPrinter, StringStyle, choose_string_style, escape_bytes, escaped_len, long_string_level,
         long_string_text, print,
     };
-    use crate::ast::{
-        Block, Expr, GenericBinder, Literal, Stmt, Type, TypePack, TypePackTail, TypePrecedence,
-    };
+    use crate::ast::{Block, Expr, Literal, Stmt, Type, TypePack, TypePackTail, TypePrecedence};
     use crate::common::ByteString;
 
     fn render_type(ty: &Type) -> String {
@@ -864,7 +822,6 @@ mod tests {
 
     fn unknown_function_type() -> Type {
         Type::Function {
-            generics: Vec::new(),
             params: TypePack {
                 head: Vec::new(),
                 tail: Some(TypePackTail::Homogeneous(Box::new(Type::Unknown))),
@@ -908,7 +865,6 @@ mod tests {
     #[test]
     fn prints_function_return_union_without_changing_function_type() {
         let ty = Type::Function {
-            generics: Vec::new(),
             params: TypePack::default(),
             returns: TypePack {
                 head: vec![Type::Union(vec![Type::Unknown, Type::Nil])],
@@ -919,24 +875,7 @@ mod tests {
         assert_eq!(render_type(&ty), "() -> unknown | nil");
     }
 
-    /// Generic pack binders and tails retain Luau's postfix ellipsis syntax.
-    #[test]
-    fn prints_generic_type_pack_tails() {
-        let ty = Type::Function {
-            generics: vec![GenericBinder::Pack("T".into())],
-            params: TypePack {
-                head: Vec::new(),
-                tail: Some(TypePackTail::Generic("T".into())),
-            },
-            returns: TypePack {
-                head: Vec::new(),
-                tail: Some(TypePackTail::Generic("T".into())),
-            },
-        };
-
-        assert_eq!(render_type(&ty), "<T...>(T...) -> T...");
-    }
-
+    /// Unions nested in intersections retain the required parentheses.
     #[test]
     fn prints_union_child_of_intersection_parenthesized() {
         let ty = Type::Intersection(vec![

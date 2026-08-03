@@ -16,11 +16,10 @@ use crate::emitter::plan::{FunctionPlan, format_ssa_symbol_name};
 use crate::emitter::storage::SymbolStorage;
 use crate::hil::cflow::region::RegionNode;
 use crate::hil::lifter::ssa::SymbolId;
-use crate::hil::ty2::canonical::{
-    GenericBinder as GraphGenericBinder, Type as GraphType, TypeId, TypeLiteral, TypePackId,
-    TypePackTail as GraphTypePackTail,
+use crate::hil::ty::canonical::{
+    Type as GraphType, TypeId, TypeLiteral, TypePackId, TypePackTail as GraphTypePackTail,
 };
-use crate::hil::ty2::store::TypeStore;
+use crate::hil::ty::store::TypeStore;
 use crate::hil::visitor::Visitor;
 use crate::hil::{StructuredFunction, ir as hil};
 use crate::il::ProtoId;
@@ -29,65 +28,6 @@ use crate::operator::CompoundBinOp;
 use crate::{DecompileOptions, EmitMode, ast};
 
 const MAX_LOCAL_COUNT: usize = 199;
-
-/// Collects generic binders referenced by one emitted type annotation.
-fn collect_generic_binders(ty: &ast::Type, binders: &mut HashSet<ast::GenericBinder>) {
-    match ty {
-        ast::Type::Generic(name) => {
-            binders.insert(ast::GenericBinder::Type(name.clone()));
-        }
-        ast::Type::Table { fields, array } => {
-            for field in fields.values() {
-                collect_generic_binders(field, binders);
-            }
-            if let Some(array) = array {
-                collect_generic_binders(&array.0, binders);
-                collect_generic_binders(&array.1, binders);
-            }
-        }
-        ast::Type::Function {
-            params, returns, ..
-        } => {
-            for ty in &params.head {
-                collect_generic_binders(ty, binders);
-            }
-            if let Some(tail) = &params.tail {
-                collect_pack_tail_generic_binders(tail, binders);
-            }
-            for ty in &returns.head {
-                collect_generic_binders(ty, binders);
-            }
-            if let Some(tail) = &returns.tail {
-                collect_pack_tail_generic_binders(tail, binders);
-            }
-        }
-        ast::Type::Union(types) | ast::Type::Intersection(types) => {
-            for ty in types {
-                collect_generic_binders(ty, binders);
-            }
-        }
-        ast::Type::WithMetatable { base, metatable } => {
-            collect_generic_binders(base, binders);
-            for (_, method) in metatable {
-                collect_generic_binders(method, binders);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Collects generic binders referenced by one emitted type-pack tail.
-fn collect_pack_tail_generic_binders(
-    tail: &ast::TypePackTail,
-    binders: &mut HashSet<ast::GenericBinder>,
-) {
-    match tail {
-        ast::TypePackTail::Homogeneous(ty) => collect_generic_binders(ty, binders),
-        ast::TypePackTail::Generic(name) => {
-            binders.insert(ast::GenericBinder::Pack(name.clone()));
-        }
-    }
-}
 
 /// Materializes one canonical graph node as a printer-owned AST type.
 fn materialize_type(store: &TypeStore, id: TypeId) -> ast::Type {
@@ -105,7 +45,6 @@ fn materialize_type(store: &TypeStore, id: TypeId) -> ast::Type {
         GraphType::Integer => ast::Type::Integer,
         GraphType::Buffer => ast::Type::Buffer,
         GraphType::Named(name) => ast::Type::Named(name.clone()),
-        GraphType::Generic(name) => ast::Type::Generic(name.clone()),
         GraphType::Literal(literal) => ast::Type::Literal(match literal {
             TypeLiteral::String(value) => ast::TypeLiteral::String(value.clone()),
             TypeLiteral::Boolean(value) => ast::TypeLiteral::Boolean(*value),
@@ -127,7 +66,6 @@ fn materialize_type(store: &TypeStore, id: TypeId) -> ast::Type {
             }),
         },
         GraphType::Function => ast::Type::Function {
-            generics: Vec::new(),
             params: ast::TypePack {
                 head: Vec::new(),
                 tail: Some(ast::TypePackTail::Homogeneous(Box::new(ast::Type::Unknown))),
@@ -138,7 +76,6 @@ fn materialize_type(store: &TypeStore, id: TypeId) -> ast::Type {
             },
         },
         GraphType::FunctionSignature { params, returns } => ast::Type::Function {
-            generics: Vec::new(),
             params: materialize_pack(store, *params),
             returns: materialize_pack(store, *returns),
         },
@@ -182,7 +119,6 @@ fn materialize_pack(store: &TypeStore, id: TypePackId) -> ast::TypePack {
             GraphTypePackTail::Homogeneous(ty) => {
                 ast::TypePackTail::Homogeneous(Box::new(materialize_type(store, *ty)))
             }
-            GraphTypePackTail::Generic(name) => ast::TypePackTail::Generic(name.clone()),
         }),
     }
 }
@@ -234,6 +170,15 @@ struct FunctionContext {
 struct AssignManyTarget {
     storage: SymbolStorage,
     slot_was_declared: bool,
+}
+
+/// Describes whether one emitted SSA assignment writes storage or merges paths.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssignmentMeaning {
+    /// The assignment represents a value write from lifted bytecode.
+    ValueWrite,
+    /// The assignment represents a control-flow Phi merge.
+    PhiMerge,
 }
 
 /// Formats the predecessor-to-symbol mapping for one SSA phi node.
@@ -292,12 +237,12 @@ impl Emitter<'_> {
         let fun = self.functions[proto_idx].clone();
 
         self.declarations.push_scope();
-        for &sym in &fun.symbols.params {
+        for &sym in fun.symbols.params() {
             let slot = self.declare_symbol(sym);
             self.bind_slot_to_symbol_name(slot, sym);
             self.declare_slot(slot);
         }
-        for &sym in &fun.symbols.upvalues {
+        for &sym in fun.symbols.upvalues() {
             let slot = self.declare_symbol(sym);
             self.bind_slot_to_symbol_name(slot, sym);
             self.declare_slot(slot);
@@ -306,21 +251,21 @@ impl Emitter<'_> {
         let upvalue_str = if self.options.emit == crate::EmitMode::Ssa {
             let sources = self.contexts[self.current_ctx].ssa_upvalue_sources.clone();
             fun.symbols
-                .upvalues
+                .upvalues()
                 .iter()
                 .enumerate()
                 .map(|(index, upvalue)| {
                     let name = self.get_symbol_name(upvalue).0;
                     sources
                         .get(index)
-                        .map(|source| format!("{name} <- {}", source.as_str()))
-                        .unwrap_or_else(|| name.to_string())
+                        .map(|source| format!("upvalue {index}: {name} <- {}", source.as_str()))
+                        .unwrap_or_else(|| format!("upvalue {index}: {name}"))
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
             fun.symbols
-                .upvalues
+                .upvalues()
                 .iter()
                 .map(|upvalue| self.get_symbol_name(upvalue).0)
                 .collect::<Vec<_>>()
@@ -365,7 +310,7 @@ impl Emitter<'_> {
 
     fn get_symbol_name_for(&mut self, ctx_idx: usize, sym: SymbolId) -> ast::Identifier {
         let proto_idx = self.contexts[ctx_idx].proto_idx;
-        let is_param = self.functions[proto_idx].symbols.params.contains(&sym);
+        let is_param = self.functions[proto_idx].symbols.params().contains(&sym);
         self.contexts[ctx_idx].plan.get_symbol_name(sym, is_param)
     }
 
@@ -373,16 +318,7 @@ impl Emitter<'_> {
     fn symbol_ast_type(&self, proto_idx: usize, sym: SymbolId) -> Option<ast::Type> {
         let function = &self.functions[proto_idx];
         let id = function.types.symbol_type_id(sym)?;
-        let mut ty = materialize_type(function.types.type_store(), id);
-        if let ast::Type::Function { generics, .. } = &mut ty
-            && let Some(scheme) = function.types.symbol_type_scheme(sym)
-        {
-            generics.extend(scheme.binders().iter().map(|binder| match binder {
-                GraphGenericBinder::Type(name) => ast::GenericBinder::Type(name.clone()),
-                GraphGenericBinder::Pack(name) => ast::GenericBinder::Pack(name.clone()),
-            }));
-        }
-        Some(ty)
+        Some(materialize_type(function.types.type_store(), id))
     }
 
     /// Materializes one symbol annotation only when its graph is source-safe.
@@ -446,7 +382,7 @@ impl Emitter<'_> {
 
     fn bind_slot_to_symbol_name(&mut self, slot: usize, sym: SymbolId) {
         let proto_idx = self.current_context().proto_idx;
-        let is_param = self.functions[proto_idx].symbols.params.contains(&sym);
+        let is_param = self.functions[proto_idx].symbols.params().contains(&sym);
         self.current_context_mut()
             .plan
             .bind_slot_to_symbol_name(slot, sym, is_param);
@@ -799,7 +735,8 @@ impl Emitter<'_> {
             return;
         };
 
-        if self.declarations.contains_symbol(sym) || !captures.iter().any(|capture| capture == sym)
+        if self.declarations.contains_symbol(sym)
+            || !captures.iter().any(|capture| capture.symbol() == *sym)
         {
             return;
         }
@@ -820,100 +757,128 @@ impl Emitter<'_> {
         }
     }
 
+    /// Emits one assignment while preserving its SSA storage meaning.
+    fn visit_assign(
+        &mut self,
+        left: &hil::Expr,
+        value: &hil::Expr,
+        meaning: AssignmentMeaning,
+        buf: &mut Vec<ast::Stmt>,
+    ) {
+        let mut needs_declaration = false;
+        let mut named_closure = false;
+
+        let left_expr = match left {
+            hil::Expr::Symbol(sym) => {
+                if !self.declarations.contains_symbol(sym) {
+                    // If value is a named closure, reserve its debug_name
+                    // as the symbol name before declaring/symbol_expr.
+                    if let hil::Expr::Closure { proto, .. } = value {
+                        let debug_name = self.functions[proto.0 as usize].debug_name.clone();
+                        if let Some(name) = debug_name {
+                            self.current_context_mut()
+                                .plan
+                                .reserve_symbol_name_exact(*sym, name.into());
+                            named_closure = true;
+                        }
+                    }
+                    let slot = self.declare_symbol(*sym);
+                    needs_declaration = !self.declarations.contains_slot(slot);
+                    if needs_declaration {
+                        self.declare_slot(slot);
+                    }
+                }
+                self.symbol_expr(*sym)
+            }
+            _ => self.visit_expr(left),
+        };
+        let right = match value {
+            hil::Expr::Closure { proto, captures } => self.visit_closure(*proto, captures),
+            _ => self.visit_expr(value),
+        };
+        let right = self.show_ssa_upvalue_write(left, right, meaning);
+
+        if needs_declaration {
+            let hil::Expr::Symbol(sym) = left else {
+                unreachable!("non-symbol lvalues are never declarations");
+            };
+
+            if named_closure
+                && let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
+                && let ast::Expr::AnonymousFunction { params, body } = right
+            {
+                buf.push(ast::Stmt::LocalFunction {
+                    name,
+                    params,
+                    body,
+                    returns: self.local_function_return_pack(self.current_proto_idx(), *sym),
+                });
+                return;
+            }
+
+            match self
+                .symbol_storage(*sym)
+                .expect("symbol was just declared in scope")
+            {
+                SymbolStorage::Named(name) => {
+                    buf.push(ast::Stmt::LocalDeclaration {
+                        names: vec![ast::Typed::untyped(name)],
+                        values: vec![right],
+                    });
+                }
+                SymbolStorage::Spilled(_) => buf.push(ast::Stmt::Assignment {
+                    lhs: vec![left_expr],
+                    rhs: vec![right],
+                }),
+            }
+        } else {
+            if let ast::Expr::Binary { lhs, op, rhs } = &right
+                && left.is_pure()
+                && lhs.as_ref() == &left_expr
+                && let Ok(compound_op) = CompoundBinOp::try_from(*op)
+            {
+                buf.push(ast::Stmt::CompoundAssignment {
+                    lhs: left_expr,
+                    op: compound_op,
+                    rhs: rhs.as_ref().clone(),
+                });
+                return;
+            }
+
+            buf.push(ast::Stmt::Assignment {
+                lhs: vec![left_expr],
+                rhs: vec![right],
+            });
+        }
+    }
+
+    /// Marks an SSA assignment that creates a new declared-upvalue version.
+    fn show_ssa_upvalue_write(
+        &self,
+        left: &hil::Expr,
+        right: ast::Expr,
+        meaning: AssignmentMeaning,
+    ) -> ast::Expr {
+        if self.options.emit != EmitMode::Ssa || meaning == AssignmentMeaning::PhiMerge {
+            return right;
+        }
+        let hil::Expr::Symbol(symbol) = left else {
+            return right;
+        };
+        let Some(slot) = self.current_context().plan.ssa_upvalue_slot(*symbol) else {
+            return right;
+        };
+
+        ast::Expr::FunctionCall {
+            func: Box::new(ast::Expr::Named(ast::Identifier::new("@set_upvalue"))),
+            args: vec![ast::Expr::Literal(ast::Literal::Float(slot as f64)), right],
+        }
+    }
+
     fn visit_stmt(&mut self, stmt: &hil::Stmt, buf: &mut Vec<ast::Stmt>) {
         match stmt {
             hil::Stmt::Assign { left, value } => {
-                let mut needs_declaration = false;
-                let mut named_closure = false;
-
-                let left_expr = match left {
-                    hil::Expr::Symbol(sym) => {
-                        if !self.declarations.contains_symbol(sym) {
-                            // If value is a named closure, reserve its debug_name
-                            // as the symbol name before declaring/symbol_expr.
-                            if let hil::Expr::Closure { proto, .. } = value {
-                                let debug_name =
-                                    self.functions[proto.0 as usize].debug_name.clone();
-                                if let Some(name) = debug_name {
-                                    self.current_context_mut()
-                                        .plan
-                                        .reserve_symbol_name_exact(*sym, name.into());
-                                    named_closure = true;
-                                }
-                            }
-                            let slot = self.declare_symbol(*sym);
-                            needs_declaration = !self.declarations.contains_slot(slot);
-                            if needs_declaration {
-                                self.declare_slot(slot);
-                            }
-                        }
-                        self.symbol_expr(*sym)
-                    }
-                    _ => self.visit_expr(left),
-                };
-                let right = match value {
-                    hil::Expr::Closure { proto, captures } => self.visit_closure(*proto, captures),
-                    _ => self.visit_expr(value),
-                };
-
-                if needs_declaration {
-                    let hil::Expr::Symbol(sym) = left else {
-                        unreachable!("non-symbol lvalues are never declarations");
-                    };
-
-                    if named_closure
-                        && let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
-                        && let ast::Expr::AnonymousFunction {
-                            generics,
-                            params,
-                            body,
-                        } = right
-                    {
-                        buf.push(ast::Stmt::LocalFunction {
-                            name,
-                            generics,
-                            params,
-                            body,
-                            returns: self
-                                .local_function_return_pack(self.current_proto_idx(), *sym),
-                        });
-                        return;
-                    }
-
-                    match self
-                        .symbol_storage(*sym)
-                        .expect("symbol was just declared in scope")
-                    {
-                        SymbolStorage::Named(name) => {
-                            buf.push(ast::Stmt::LocalDeclaration {
-                                names: vec![ast::Typed::untyped(name)],
-                                values: vec![right],
-                            });
-                        }
-                        SymbolStorage::Spilled(_) => buf.push(ast::Stmt::Assignment {
-                            lhs: vec![left_expr],
-                            rhs: vec![right],
-                        }),
-                    }
-                } else {
-                    if let ast::Expr::Binary { lhs, op, rhs } = &right
-                        && left.is_pure()
-                        && lhs.as_ref() == &left_expr
-                        && let Ok(compound_op) = CompoundBinOp::try_from(*op)
-                    {
-                        buf.push(ast::Stmt::CompoundAssignment {
-                            lhs: left_expr,
-                            op: compound_op,
-                            rhs: rhs.as_ref().clone(),
-                        });
-                        return;
-                    }
-
-                    buf.push(ast::Stmt::Assignment {
-                        lhs: vec![left_expr],
-                        rhs: vec![right],
-                    });
-                }
+                self.visit_assign(left, value, AssignmentMeaning::ValueWrite, buf);
             }
             hil::Stmt::AssignMany { left, values } => {
                 let right = self.visit_value_pack(values);
@@ -1045,19 +1010,17 @@ impl Emitter<'_> {
                 buf.push(ast::Stmt::Comment {
                     text: format_phi_operands(proto_idx, phi),
                 });
-                let assignment = hil::Stmt::Assign {
-                    left: hil::Expr::Symbol(phi.target),
-                    value: hil::Expr::Call {
-                        fun: Box::new(hil::Expr::Global("@phi".into())),
-                        args: hil::ValuePack::Fixed(
-                            phi.operands
-                                .iter()
-                                .map(|(_, symbol)| hil::Expr::Symbol(*symbol))
-                                .collect(),
-                        ),
-                    },
+                let left = hil::Expr::Symbol(phi.target);
+                let value = hil::Expr::Call {
+                    fun: Box::new(hil::Expr::Global("@phi".into())),
+                    args: hil::ValuePack::Fixed(
+                        phi.operands
+                            .iter()
+                            .map(|(_, symbol)| hil::Expr::Symbol(*symbol))
+                            .collect(),
+                    ),
                 };
-                self.visit_stmt(&assignment, buf);
+                self.visit_assign(&left, &value, AssignmentMeaning::PhiMerge, buf);
             }
         }
     }
@@ -1199,35 +1162,28 @@ impl Emitter<'_> {
     }
 
     /// Emits one closure with the best inferred parameter annotations available.
-    fn visit_closure(&mut self, proto_idx: ProtoId, captures: &[SymbolId]) -> ast::Expr {
+    fn visit_closure(&mut self, proto_idx: ProtoId, captures: &[hil::Capture]) -> ast::Expr {
         let proto_idx = proto_idx.0 as usize;
-        let mut generic_binders = HashSet::new();
-        for symbol in &self.functions[proto_idx].symbols.params {
-            if let Some(ty) = self.symbol_ast_type(proto_idx, *symbol) {
-                collect_generic_binders(&ty, &mut generic_binders);
-            }
-        }
-        let mut generics: Vec<_> = generic_binders.into_iter().collect();
-        generics.sort_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
         let ssa_upvalue_sources = if self.options.emit == EmitMode::Ssa {
             captures
                 .iter()
-                .map(|symbol| self.get_symbol_name(symbol))
+                .map(|capture| self.get_symbol_name(&capture.symbol()))
                 .collect()
         } else {
             Vec::new()
         };
         let parent_bindings: Vec<_> = captures
             .iter()
-            .map(|sym| {
-                self.symbol_storage(*sym)
-                    .unwrap_or_else(|| SymbolStorage::Named(self.get_symbol_name(sym)))
+            .map(|capture| {
+                let symbol = capture.symbol();
+                self.symbol_storage(symbol)
+                    .unwrap_or_else(|| SymbolStorage::Named(self.get_symbol_name(&symbol)))
             })
             .collect();
 
         let child_ctx = self.create_context(proto_idx);
         self.contexts[child_ctx].ssa_upvalue_sources = ssa_upvalue_sources;
-        let child_upvalues = self.functions[proto_idx].symbols.upvalues.clone();
+        let child_upvalues = self.functions[proto_idx].symbols.upvalues().to_vec();
         for (i, binding) in parent_bindings.into_iter().enumerate() {
             if let Some(&child_upval_sym) = child_upvalues.get(i) {
                 match binding {
@@ -1247,7 +1203,7 @@ impl Emitter<'_> {
 
         let old_declarations = std::mem::take(&mut self.declarations);
 
-        let param_symbols = self.functions[proto_idx].symbols.params.clone();
+        let param_symbols = self.functions[proto_idx].symbols.params().to_vec();
         let is_vararg = self.functions[proto_idx].is_vararg;
         let mut params: Vec<_> = param_symbols
             .into_iter()
@@ -1264,11 +1220,7 @@ impl Emitter<'_> {
 
         self.declarations = old_declarations;
 
-        ast::Expr::AnonymousFunction {
-            generics,
-            params,
-            body,
-        }
+        ast::Expr::AnonymousFunction { params, body }
     }
 }
 
@@ -1351,7 +1303,7 @@ mod tests {
     use crate::ast;
     use crate::hil::ir::PhiNode;
     use crate::hil::lifter::ssa::Symbol;
-    use crate::hil::ty2::store::TypeStore;
+    use crate::hil::ty::store::TypeStore;
 
     /// Phi comments preserve each predecessor-to-symbol association.
     #[test]

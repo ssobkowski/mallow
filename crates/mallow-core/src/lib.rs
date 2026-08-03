@@ -230,7 +230,7 @@ pub fn infer_bytecode_types_with_diagnostics(
     let span = tracing::info_span!("infer_bytecode_types", byte_len = bytecode.len());
     let _enter = span.enter();
     let mut program = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    hil::ty3::inference::run(&mut program.functions);
+    hil::ty::inference::run(&mut program.functions);
     Ok(TypesView::from_inferred(&program.functions))
 }
 
@@ -265,7 +265,7 @@ pub fn decompile_bytecode_with_diagnostics(
     let diagnostics = diagnostics.with_entry_proto(entry_proto);
 
     if options.infer_types {
-        hil::ty3::inference::run(&mut program.functions);
+        hil::ty::inference::run(&mut program.functions);
     }
 
     let mut functions: Vec<_> = if options.emit == EmitMode::Ssa {

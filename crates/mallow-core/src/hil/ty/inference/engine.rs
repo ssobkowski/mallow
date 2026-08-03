@@ -1,150 +1,213 @@
-//! Agenda-based fixed-point engine.
+//! Queue-based fixed-point engine.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use smol_str::SmolStr;
 
-use crate::{
-    hil::{
-        lifted::LiftedFunction,
-        ty2::{
-            builtins::{BuiltinEnvironment, BuiltinPath},
-            canonical::{Type, TypeId},
-            store::TypeStore,
-        },
-    },
-    il::ProtoId,
-    operator::{BinOp, UnOp},
-};
+use super::keys::{BranchPredicate, PackKey, ValueKey};
+use super::program::{InferenceProgram, PackRelation, ValueRelation};
+use super::world::{ObjectId, PackAlternative, PackId, ValueId, World, WorldChange};
+use crate::hil::lifted::LiftedFunction;
+use crate::hil::lifter::ssa::SymbolId;
+use crate::hil::ty::builtins::{BuiltinEnvironment, BuiltinPath};
+use crate::hil::ty::canonical::TypeId;
+use crate::hil::ty::store::TypeStore;
+use crate::il::ProtoId;
+use crate::operator::{BinOp, UnOp};
 
-use super::{
-    keys::{BranchPredicate, PackKey, ValueKey},
-    program::{InferenceProgram, PackRelation, ValueRelation},
-    world::{ObjectId, PackAlternative, PackId, ValueId, World},
-};
-
-/// One semantic rule applied by the engine.
+/// One propagation rule applied by the engine.
+///
+/// Most rules come from a [`ValueRelation`]. The engine also creates some
+/// rules while it discovers pack projections and concrete object identities.
 #[derive(Debug, Clone)]
 enum Rule {
-    /// Adds producer evidence.
-    Observe { value: ValueId, ty: TypeId },
-    /// Adds consumer evidence.
+    /// Adds `ty` to the types known to come from `value`.
+    Produce { value: ValueId, ty: TypeId },
+    /// Records that `value` must fit within `ty`.
     Require { value: ValueId, ty: TypeId },
-    /// Copies value facts from `source` to `target`.
+    /// Sends type and identity facts from `source` to `target`.
     Flow { source: ValueId, target: ValueId },
-    /// Copies value facts except `nil` from `source` to `target`.
+    /// Sends produced types from `source` to `target`, except `nil`.
     NonNilFlow { source: ValueId, target: ValueId },
-    /// Copies facts both ways between two values.
+    /// Treats two values as aliases and sends facts in both directions.
     Same { lhs: ValueId, rhs: ValueId },
-    /// Applies a branch filter.
+    /// Sends possible contents of one mutable storage cell in both directions.
+    SameStorage { lhs: ValueId, rhs: ValueId },
+    /// Sends the truthy or falsy part of `source` to `target`.
     Filter {
+        /// Value being tested by the branch.
         source: ValueId,
+        /// Value used inside the branch.
         target: ValueId,
+        /// Branch test to apply.
         predicate: BranchPredicate,
     },
-    /// Adds one table identity.
+    /// Adds one concrete table identity to `value`.
     IncludeObject { value: ValueId, object: ObjectId },
-    /// Adds one closure identity.
+    /// Adds one concrete closure identity to `value`.
     IncludeClosure { value: ValueId, proto: ProtoId },
-    /// Adds one builtin identity.
+    /// Adds one known builtin identity to `value`.
     IncludeBuiltin { value: ValueId, path: BuiltinPath },
-    /// Maintains one pack projection.
+    /// Keeps `output` equal to position `index` of every `pack` alternative.
     ProjectPack {
+        /// Pack being read.
         pack: PackId,
+        /// Zero-based position being read.
         index: usize,
+        /// Value receiving the position.
         output: ValueId,
     },
-    /// Maintains one aggregate pack value.
-    PackValues { pack: PackId, output: ValueId },
-    /// Writes a named object field.
+    /// Collects every value that `pack` can produce into `output`.
+    PackValues {
+        /// Pack being collected.
+        pack: PackId,
+        /// Value receiving the collected types.
+        output: ValueId,
+    },
+    /// Writes `value` into a named field on every known object.
     WriteField {
+        /// Value carrying the objects.
         object: ValueId,
+        /// Name of the field being written.
         field: SmolStr,
+        /// Value written to the field.
         value: ValueId,
+        /// Whether table construction definitely created the field.
         definite: bool,
     },
-    /// Reads a named object field.
+    /// Reads a named field from every known object into `output`.
     ReadField {
+        /// Value carrying the objects.
         object: ValueId,
+        /// Name of the field being read.
         field: SmolStr,
+        /// Value receiving the field contents.
         output: ValueId,
     },
-    /// Writes a dynamic object index.
+    /// Writes a dynamic index and value into every known object.
     WriteIndex {
+        /// Value carrying the objects.
         object: ValueId,
+        /// Value used as the index.
         index: ValueId,
+        /// Value written at the index.
         value: ValueId,
     },
-    /// Reads a dynamic object index.
+    /// Reads the dynamic values from every known object into `output`.
     ReadIndex {
+        /// Value carrying the objects.
         object: ValueId,
+        /// Value used as the index.
         index: ValueId,
+        /// Value receiving the table contents.
         output: ValueId,
     },
-    /// Connects a callable value to known callable identities.
+    /// Connects a call to every closure identity known for its callee.
     Call {
+        /// Value being called.
         callee: ValueId,
+        /// Arguments supplied at the call site.
         args: PackId,
+        /// Results received at the call site.
         returns: PackId,
     },
-    /// Applies primitive binary operator facts.
+    /// Applies the type behavior of a binary operator.
     Binary {
+        /// Left-hand value.
         lhs: ValueId,
+        /// Operation being evaluated.
         op: BinOp,
+        /// Right-hand value.
         rhs: ValueId,
+        /// Value receiving the result.
         output: ValueId,
     },
-    /// Applies primitive unary operator facts.
+    /// Applies the type behavior of a unary operator.
     Unary {
+        /// Value being operated on.
         operand: ValueId,
+        /// Operation being evaluated.
         op: UnOp,
+        /// Value receiving the result.
         output: ValueId,
     },
 }
 
-/// One dynamic connection that must be installed once.
+/// One concrete connection installed by a dynamic rule.
+///
+/// A rule can say "for every object" or "for every closure" before the
+/// engine knows which objects or closures exist. This set remembers each
+/// connection that has already been installed, so running the rule again does
+/// not install the same connection twice.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Activation {
-    /// A call argument has been linked to a formal parameter.
+    /// Connects one call argument to one closure parameter.
     CallParameter {
+        /// Rule that owns the connection.
         rule: usize,
+        /// Closure receiving the argument.
         proto: ProtoId,
+        /// Zero-based parameter position.
         index: usize,
     },
-    /// A call result projection has been linked to a closure return.
+    /// Connects one closure result to one call result.
     CallReturn {
+        /// Rule that owns the connection.
         rule: usize,
+        /// Closure producing the result.
         proto: ProtoId,
+        /// Zero-based result position.
         index: usize,
     },
-    /// A named write has been linked to one object.
-    WriteField { rule: usize, object: ObjectId },
-    /// A named read has been linked to one object.
-    ReadField { rule: usize, object: ObjectId },
-    /// A dynamic write has been linked to one object.
-    WriteIndex { rule: usize, object: ObjectId },
-    /// A dynamic read has been linked to one object.
-    ReadIndex { rule: usize, object: ObjectId },
+    /// Connects one named write to one concrete object.
+    WriteField {
+        /// Rule that owns the connection.
+        rule: usize,
+        /// Object receiving the field write.
+        object: ObjectId,
+    },
+    /// Connects one named read to one concrete object.
+    ReadField {
+        /// Rule that owns the connection.
+        rule: usize,
+        /// Object providing the field value.
+        object: ObjectId,
+    },
+    /// Connects one dynamic write to one concrete object.
+    WriteIndex {
+        /// Rule that owns the connection.
+        rule: usize,
+        /// Object receiving the indexed write.
+        object: ObjectId,
+    },
+    /// Connects one dynamic read to one concrete object.
+    ReadIndex {
+        /// Rule that owns the connection.
+        rule: usize,
+        /// Object providing the indexed value.
+        object: ObjectId,
+    },
 }
 
 /// Flow rule variant used for deduplication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FlowKind {
-    /// Ordinary producer and consumer flow.
+    /// Sends all known types and identities.
     Full,
-    /// Producer flow that removes `nil`.
+    /// Sends known types after removing `nil`.
     NonNil,
 }
 
 /// Pending rule queue with duplicate suppression.
 #[derive(Debug, Default)]
-struct Agenda {
+struct RuleQueue {
     queue: VecDeque<usize>,
     queued: HashSet<usize>,
 }
 
-impl Agenda {
+impl RuleQueue {
     /// Adds one rule to the queue if it is not already pending.
+    #[inline]
     fn push(&mut self, rule: usize) {
         if self.queued.insert(rule) {
             self.queue.push_back(rule);
@@ -152,10 +215,19 @@ impl Agenda {
     }
 
     /// Removes the next pending rule.
+    #[inline]
     fn pop(&mut self) -> Option<usize> {
         let rule = self.queue.pop_front()?;
         self.queued.remove(&rule);
         Some(rule)
+    }
+
+    /// Extends the queue with the given rules.
+    #[inline]
+    fn extend(&mut self, rules: impl IntoIterator<Item = usize>) {
+        for rule in rules {
+            self.push(rule);
+        }
     }
 }
 
@@ -190,9 +262,10 @@ pub struct Engine<'a> {
     pub(super) world: World,
     pub(super) functions: &'a [LiftedFunction],
     builtins: &'a BuiltinEnvironment,
+
     rules: Vec<Rule>,
     subscriptions: Subscriptions,
-    agenda: Agenda,
+    queue: RuleQueue,
     activations: HashSet<Activation>,
     flow_rules: HashSet<(ValueId, ValueId, FlowKind)>,
 }
@@ -205,15 +278,15 @@ impl<'a> Engine<'a> {
         builtins: &'a BuiltinEnvironment,
         types: &'a mut TypeStore,
     ) -> Self {
-        let primitives = *types.primitives();
+        let (never, unknown) = (types.primitives().never, types.primitives().unknown);
         let mut engine = Self {
             types,
-            world: World::new(primitives.never, primitives.unknown),
+            world: World::new(never, unknown),
             functions,
             builtins,
             rules: Vec::new(),
             subscriptions: Subscriptions::default(),
-            agenda: Agenda::default(),
+            queue: RuleQueue::default(),
             activations: HashSet::new(),
             flow_rules: HashSet::new(),
         };
@@ -221,19 +294,19 @@ impl<'a> Engine<'a> {
         engine
     }
 
-    /// Runs the agenda until no subscribed fact changes.
+    /// Runs the queue until no subscribed fact changes.
     pub fn solve(&mut self) {
-        while let Some(rule_id) = self.agenda.pop() {
+        while let Some(rule_id) = self.queue.pop() {
+            // TODO: Figure out a way to get rid of this clone.
             let rule = self.rules[rule_id].clone();
             self.apply(rule_id, rule);
         }
     }
 
     /// Returns every allocated symbol key.
-    pub fn symbol_keys(&self) -> Vec<(ProtoId, crate::hil::lifter::ssa::SymbolId, ValueKey)> {
+    pub fn symbol_keys(&self) -> Vec<(ProtoId, SymbolId, ValueKey)> {
         self.world
             .value_keys()
-            .into_iter()
             .filter_map(|(key, _)| match key {
                 ValueKey::Symbol(proto, symbol) => Some((proto, symbol, key)),
                 ValueKey::Temp(_, _) | ValueKey::Occurrence(_, _, _) => None,
@@ -242,42 +315,43 @@ impl<'a> Engine<'a> {
     }
 
     /// Returns or creates the value for `key`.
+    #[inline]
     pub(super) fn value_for_key(&mut self, key: ValueKey) -> ValueId {
         self.world.value_for_key(key)
     }
 
     /// Returns or creates the pack for `key`.
+    #[inline]
     pub(super) fn pack_for_key(&mut self, key: PackKey) -> PackId {
         self.world.pack_for_key(key)
     }
 
     /// Returns the value ID for a key if it exists.
+    #[inline]
     pub(super) fn get_value_key(&self, key: ValueKey) -> Option<ValueId> {
         self.world.get_value_key(key)
     }
 
-    /// Returns the pack ID for a key if it exists.
-    pub(super) fn get_pack_key(&self, key: PackKey) -> Option<PackId> {
-        self.world.get_pack_key(key)
-    }
-
     /// Adds one rule and subscribes it to its direct inputs.
+    #[inline]
     fn add_rule(&mut self, rule: Rule) -> usize {
         let id = self.rules.len();
         self.subscribe_rule(id, &rule);
         self.rules.push(rule);
-        self.agenda.push(id);
+        self.queue.push(id);
         id
     }
 
     /// Adds a flow rule once.
+    #[inline]
     fn add_flow_rule(&mut self, source: ValueId, target: ValueId) {
         if self.flow_rules.insert((source, target, FlowKind::Full)) {
             self.add_rule(Rule::Flow { source, target });
         }
     }
 
-    /// Adds a non-nil producer flow rule once.
+    /// Adds a non-nil flow rule once.
+    #[inline]
     fn add_non_nil_flow_rule(&mut self, source: ValueId, target: ValueId) {
         if self.flow_rules.insert((source, target, FlowKind::NonNil)) {
             self.add_rule(Rule::NonNilFlow { source, target });
@@ -285,9 +359,10 @@ impl<'a> Engine<'a> {
     }
 
     /// Registers the facts that can wake `rule`.
+    #[inline]
     fn subscribe_rule(&mut self, id: usize, rule: &Rule) {
         match rule {
-            Rule::Observe { .. }
+            Rule::Produce { .. }
             | Rule::Require { .. }
             | Rule::IncludeObject { .. }
             | Rule::IncludeClosure { .. }
@@ -296,7 +371,7 @@ impl<'a> Engine<'a> {
                 self.subscriptions.value(*source, id);
                 self.subscriptions.value(*target, id);
             }
-            Rule::Same { lhs, rhs } => {
+            Rule::Same { lhs, rhs } | Rule::SameStorage { lhs, rhs } => {
                 self.subscriptions.value(*lhs, id);
                 self.subscriptions.value(*rhs, id);
             }
@@ -354,11 +429,12 @@ impl<'a> Engine<'a> {
                 match relation {
                     PackRelation::Sequence { head, tail } => {
                         let head = head
-                            .into_iter()
+                            .iter()
+                            .copied()
                             .map(|key| self.world.value_for_key(key))
                             .collect();
-                        let tail = tail.map(|key| self.world.pack_for_key(key));
-                        if self
+                        let tail = tail.as_ref().map(|key| self.world.pack_for_key(*key));
+                        if let WorldChange::Changed(()) = self
                             .world
                             .add_pack_alternative(pack, PackAlternative { head, tail })
                         {
@@ -379,78 +455,92 @@ impl<'a> Engine<'a> {
         for (key, types) in program.seeds() {
             let value = self.world.value_for_key(key);
             for ty in types {
-                self.add_rule(Rule::Observe { value, ty });
-                self.add_rule(Rule::Require { value, ty });
+                self.add_rule(Rule::Produce { value, ty: *ty });
+                self.add_rule(Rule::Require { value, ty: *ty });
             }
         }
     }
 
     /// Installs one scalar relation as one or more engine rules.
-    fn install_value_relation(&mut self, value: ValueId, relation: ValueRelation) {
+    #[inline]
+    fn install_value_relation(&mut self, value: ValueId, relation: &ValueRelation) {
         match relation {
-            ValueRelation::Observe(ty) => {
-                self.add_rule(Rule::Observe { value, ty });
+            ValueRelation::Produce(ty) => {
+                self.add_rule(Rule::Produce { value, ty: *ty });
             }
             ValueRelation::Require(ty) => {
-                self.add_rule(Rule::Require { value, ty });
+                self.add_rule(Rule::Require { value, ty: *ty });
             }
             ValueRelation::FlowFrom(source) => {
-                let source = self.world.value_for_key(source);
+                let source = self.world.value_for_key(*source);
                 self.add_flow_rule(source, value);
             }
             ValueRelation::SameAs(other) => {
-                let other = self.world.value_for_key(other);
+                let other = self.world.value_for_key(*other);
                 self.add_rule(Rule::Same {
                     lhs: value,
                     rhs: other,
                 });
             }
+            ValueRelation::SameStorage(other) => {
+                let other = self.world.value_for_key(*other);
+                self.add_rule(Rule::SameStorage {
+                    lhs: value,
+                    rhs: other,
+                });
+            }
             ValueRelation::FromPack { pack, index } => {
-                let pack = self.world.pack_for_key(pack);
-                let projection = self.ensure_projection(pack, index);
+                let pack = self.world.pack_for_key(*pack);
+                let projection = self.ensure_projection(pack, *index);
                 self.add_flow_rule(projection, value);
             }
             ValueRelation::FromPackValues { pack } => {
-                let pack = self.world.pack_for_key(pack);
+                let pack = self.world.pack_for_key(*pack);
                 let aggregate = self.ensure_pack_values(pack);
                 self.add_flow_rule(aggregate, value);
             }
             ValueRelation::Filter { source, predicate } => {
-                let source = self.world.value_for_key(source);
+                let source = self.world.value_for_key(*source);
                 self.add_rule(Rule::Filter {
                     source,
                     target: value,
-                    predicate,
+                    predicate: *predicate,
                 });
             }
             ValueRelation::NewObject(key) => {
-                let object = self.world.object_for_key(key);
+                let object = self.world.object_for_key(*key);
                 self.add_rule(Rule::IncludeObject { value, object });
             }
             ValueRelation::Closure(proto) => {
-                self.add_rule(Rule::IncludeClosure { value, proto });
+                self.add_rule(Rule::IncludeClosure {
+                    value,
+                    proto: *proto,
+                });
             }
             ValueRelation::Builtin(path) => {
-                self.add_rule(Rule::IncludeBuiltin { value, path });
+                self.add_rule(Rule::IncludeBuiltin {
+                    value,
+                    path: path.clone(),
+                });
             }
             ValueRelation::WriteField {
                 field,
                 value: source,
                 definite,
             } => {
-                let source = self.world.value_for_key(source);
+                let source = self.world.value_for_key(*source);
                 self.add_rule(Rule::WriteField {
                     object: value,
-                    field,
+                    field: field.clone(),
                     value: source,
-                    definite,
+                    definite: *definite,
                 });
             }
             ValueRelation::ReadField { field, output } => {
-                let output = self.world.value_for_key(output);
+                let output = self.world.value_for_key(*output);
                 self.add_rule(Rule::ReadField {
                     object: value,
-                    field,
+                    field: field.clone(),
                     output,
                 });
             }
@@ -458,8 +548,8 @@ impl<'a> Engine<'a> {
                 index,
                 value: source,
             } => {
-                let index = self.world.value_for_key(index);
-                let source = self.world.value_for_key(source);
+                let index = self.world.value_for_key(*index);
+                let source = self.world.value_for_key(*source);
                 self.add_rule(Rule::WriteIndex {
                     object: value,
                     index,
@@ -467,8 +557,8 @@ impl<'a> Engine<'a> {
                 });
             }
             ValueRelation::ReadIndex { index, output } => {
-                let index = self.world.value_for_key(index);
-                let output = self.world.value_for_key(output);
+                let index = self.world.value_for_key(*index);
+                let output = self.world.value_for_key(*output);
                 self.add_rule(Rule::ReadIndex {
                     object: value,
                     index,
@@ -476,8 +566,8 @@ impl<'a> Engine<'a> {
                 });
             }
             ValueRelation::Call { args, returns } => {
-                let args = self.world.pack_for_key(args);
-                let returns = self.world.pack_for_key(returns);
+                let args = self.world.pack_for_key(*args);
+                let returns = self.world.pack_for_key(*returns);
                 self.add_rule(Rule::Call {
                     callee: value,
                     args,
@@ -485,20 +575,20 @@ impl<'a> Engine<'a> {
                 });
             }
             ValueRelation::Binary { op, rhs, output } => {
-                let rhs = self.world.value_for_key(rhs);
-                let output = self.world.value_for_key(output);
+                let rhs = self.world.value_for_key(*rhs);
+                let output = self.world.value_for_key(*output);
                 self.add_rule(Rule::Binary {
                     lhs: value,
-                    op,
+                    op: *op,
                     rhs,
                     output,
                 });
             }
             ValueRelation::Unary { op, output } => {
-                let output = self.world.value_for_key(output);
+                let output = self.world.value_for_key(*output);
                 self.add_rule(Rule::Unary {
                     operand: value,
-                    op,
+                    op: *op,
                     output,
                 });
             }
@@ -506,17 +596,18 @@ impl<'a> Engine<'a> {
     }
 
     /// Applies one rule.
+    #[inline]
     fn apply(&mut self, rule_id: usize, rule: Rule) {
         match rule {
-            Rule::Observe { value, ty } => {
-                self.observe(value, ty);
+            Rule::Produce { value, ty } => {
+                self.produce(value, ty);
             }
             Rule::Require { value, ty } => {
                 self.require(value, ty);
             }
             Rule::Flow { source, target } => self.flow(source, target),
             Rule::NonNilFlow { source, target } => self.non_nil_flow(source, target),
-            Rule::Same { lhs, rhs } => {
+            Rule::Same { lhs, rhs } | Rule::SameStorage { lhs, rhs } => {
                 self.flow(lhs, rhs);
                 self.flow(rhs, lhs);
             }
@@ -580,35 +671,36 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Adds producer evidence to one value.
-    fn observe(&mut self, value: ValueId, ty: TypeId) -> bool {
+    /// Adds one produced type to a value.
+    #[inline]
+    fn produce(&mut self, value: ValueId, ty: TypeId) {
         let old = self.world.values[value].lower;
         let next = self.types.join(old, ty);
         if old == next {
-            return false;
+            return;
         }
         self.world.values[value].lower = next;
         self.value_changed(value);
-        true
     }
 
-    /// Adds consumer evidence to one value.
-    fn require(&mut self, value: ValueId, ty: TypeId) -> bool {
+    /// Adds one type that a value must support.
+    #[inline]
+    fn require(&mut self, value: ValueId, ty: TypeId) {
         let old = self.world.values[value].upper;
         let next = self.types.meet(old, ty);
         if old == next {
-            return false;
+            return;
         }
         self.world.values[value].upper = next;
         self.value_changed(value);
-        true
     }
 
     /// Copies facts from `source` to `target`.
+    #[inline]
     fn flow(&mut self, source: ValueId, target: ValueId) {
         let source_state = self.world.values[source].clone();
         let target_upper = self.world.values[target].upper;
-        self.observe(target, source_state.lower);
+        self.produce(target, source_state.lower);
         self.require(source, target_upper);
         for object in source_state.identities.objects {
             self.include_object(target, object);
@@ -622,20 +714,22 @@ impl<'a> Engine<'a> {
     }
 
     /// Copies producer facts after removing `nil`.
+    #[inline]
     fn non_nil_flow(&mut self, source: ValueId, target: ValueId) {
         let lower = self.world.values[source].lower;
         let non_nil = self.types.exclude(lower, &[self.types.primitives().nil]);
-        self.observe(target, non_nil);
+        self.produce(target, non_nil);
     }
 
-    /// Applies branch filtering when producer evidence exists.
+    /// Applies branch filtering when a produced type exists.
+    #[inline]
     fn filter(&mut self, source: ValueId, target: ValueId, predicate: BranchPredicate) {
         if let Some(source_ty) = self.evidence_type(source) {
             let filtered = match predicate {
                 BranchPredicate::Truthy => self.types.truthy_part(source_ty),
                 BranchPredicate::Falsy => self.types.falsy_part(source_ty),
             };
-            self.observe(target, filtered);
+            self.produce(target, filtered);
         }
         if predicate == BranchPredicate::Truthy {
             let identities = self.world.values[source].identities.clone();
@@ -652,36 +746,37 @@ impl<'a> Engine<'a> {
     }
 
     /// Adds one object identity to a value.
-    fn include_object(&mut self, value: ValueId, object: ObjectId) -> bool {
+    #[inline]
+    fn include_object(&mut self, value: ValueId, object: ObjectId) {
         if !self.world.values[value].identities.objects.insert(object) {
-            return false;
+            return;
         }
         self.value_changed(value);
-        true
     }
 
     /// Adds one closure identity to a value.
-    fn include_closure(&mut self, value: ValueId, proto: ProtoId) -> bool {
+    #[inline]
+    fn include_closure(&mut self, value: ValueId, proto: ProtoId) {
         if !self.world.values[value].identities.closures.insert(proto) {
-            return false;
+            return;
         }
         self.value_changed(value);
-        true
     }
 
     /// Adds one builtin identity to a value.
-    fn include_builtin(&mut self, value: ValueId, path: BuiltinPath) -> bool {
+    #[inline]
+    fn include_builtin(&mut self, value: ValueId, path: BuiltinPath) {
         if self.builtins.get_path(&path).is_none() {
-            return false;
+            return;
         }
         if !self.world.values[value].identities.builtins.insert(path) {
-            return false;
+            return;
         }
         self.value_changed(value);
-        true
     }
 
     /// Wires a pack projection to every current alternative.
+    #[inline]
     fn project_pack(&mut self, _rule_id: usize, pack: PackId, index: usize, output: ValueId) {
         let alternatives = self.world.packs[pack].alternatives.clone();
         if alternatives.is_empty() {
@@ -694,12 +789,13 @@ impl<'a> Engine<'a> {
                 let source = self.ensure_projection(tail, index - alternative.head.len());
                 self.add_flow_rule(source, output);
             } else {
-                self.observe(output, self.types.primitives().nil);
+                self.produce(output, self.types.primitives().nil);
             }
         }
     }
 
     /// Wires an aggregate pack value to every current alternative.
+    #[inline]
     fn pack_values(&mut self, _rule_id: usize, pack: PackId, output: ValueId) {
         let alternatives = self.world.packs[pack].alternatives.clone();
         for alternative in alternatives {
@@ -735,10 +831,12 @@ impl<'a> Engine<'a> {
             }) {
                 continue;
             }
-            let (field_value, changed) = self.world.object_field(target, field.clone(), definite);
-            self.add_flow_rule(value, field_value);
-            if changed {
-                self.object_changed(target);
+            match self.world.object_field(target, field.clone(), definite) {
+                WorldChange::Unchanged(field_value) => self.add_flow_rule(value, field_value),
+                WorldChange::Changed(field_value) => {
+                    self.add_flow_rule(value, field_value);
+                    self.object_changed(target);
+                }
             }
         }
     }
@@ -758,12 +856,14 @@ impl<'a> Engine<'a> {
             }) {
                 continue;
             }
-            let (field_value, changed) = self.world.object_field(source, field.clone(), false);
-            self.add_flow_rule(field_value, output);
-            self.observe(output, self.types.primitives().nil);
-            if changed {
-                self.object_changed(source);
+            match self.world.object_field(source, field.clone(), false) {
+                WorldChange::Unchanged(field_value) => self.add_flow_rule(field_value, output),
+                WorldChange::Changed(field_value) => {
+                    self.add_flow_rule(field_value, output);
+                    self.object_changed(source);
+                }
             }
+            self.produce(output, self.types.primitives().nil);
         }
     }
 
@@ -807,7 +907,7 @@ impl<'a> Engine<'a> {
             }
             let values = self.world.objects[source].values;
             self.add_flow_rule(values, output);
-            self.observe(output, self.types.primitives().nil);
+            self.produce(output, self.types.primitives().nil);
         }
     }
 
@@ -827,7 +927,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
-            for (index, parameter) in function.symbols.params.iter().copied().enumerate() {
+            for (index, parameter) in function.symbols.params().iter().copied().enumerate() {
                 if self.activations.insert(Activation::CallParameter {
                     rule: rule_id,
                     proto,
@@ -859,13 +959,16 @@ impl<'a> Engine<'a> {
     }
 
     /// Applies primitive binary operator facts.
+    #[inline]
     fn binary(&mut self, lhs: ValueId, op: BinOp, rhs: ValueId, output: ValueId) {
-        let primitives = *self.types.primitives();
         match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte => {
-                self.observe(output, primitives.boolean);
+                self.produce(output, self.types.primitives().boolean);
                 if matches!(op, BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte) {
-                    let accepted = self.types.union(primitives.number, primitives.string);
+                    let accepted = self.types.union(
+                        self.types.primitives().number,
+                        self.types.primitives().string,
+                    );
                     self.require(lhs, accepted);
                     self.require(rhs, accepted);
                 }
@@ -877,148 +980,155 @@ impl<'a> Engine<'a> {
             | BinOp::IDiv
             | BinOp::Mod
             | BinOp::Pow => {
-                self.require(lhs, primitives.number);
-                self.require(rhs, primitives.number);
-                self.observe(output, primitives.number);
+                let number = self.types.primitives().number;
+                let vector = self.types.primitives().vector;
+
+                match op {
+                    BinOp::Add | BinOp::Sub => {
+                        let accepted = self.types.union(number, vector);
+                        self.require(lhs, accepted);
+                        self.require(rhs, accepted);
+                        self.require_matching_additive_operands(lhs, rhs);
+                    }
+                    BinOp::Mul | BinOp::Div | BinOp::IDiv => {
+                        let accepted = self.types.union(number, vector);
+                        self.require(lhs, accepted);
+                        self.require(rhs, accepted);
+                    }
+                    BinOp::Mod | BinOp::Pow => {
+                        self.require(lhs, number);
+                        self.require(rhs, number);
+                    }
+                    _ => unreachable!("checked in the parent match"),
+                }
+
+                self.produce_arithmetic_result(lhs, op, rhs, output);
             }
             BinOp::Concat => {
-                let accepted = self.types.union(primitives.string, primitives.number);
+                let accepted = self.types.union(
+                    self.types.primitives().string,
+                    self.types.primitives().number,
+                );
                 self.require(lhs, accepted);
                 self.require(rhs, accepted);
-                self.observe(output, primitives.string);
+                self.produce(output, self.types.primitives().string);
             }
             BinOp::And => {
                 if let Some(lhs_ty) = self.evidence_type(lhs) {
                     let falsy = self.types.falsy_part(lhs_ty);
-                    self.observe(output, falsy);
+                    self.produce(output, falsy);
                 }
                 if let Some(rhs_ty) = self.evidence_type(rhs) {
-                    self.observe(output, rhs_ty);
+                    self.produce(output, rhs_ty);
                 }
             }
             BinOp::Or => {
                 if let Some(lhs_ty) = self.evidence_type(lhs) {
                     let truthy = self.types.truthy_part(lhs_ty);
-                    self.observe(output, truthy);
+                    self.produce(output, truthy);
                 }
                 if let Some(rhs_ty) = self.evidence_type(rhs) {
-                    self.observe(output, rhs_ty);
+                    self.produce(output, rhs_ty);
                 }
             }
         }
     }
 
     /// Applies primitive unary operator facts.
+    #[inline]
     fn unary(&mut self, operand: ValueId, op: UnOp, output: ValueId) {
-        let primitives = *self.types.primitives();
         match op {
             UnOp::Not => {
-                self.observe(output, primitives.boolean);
+                self.produce(output, self.types.primitives().boolean);
             }
             UnOp::Minus => {
-                self.require(operand, primitives.number);
-                self.observe(output, primitives.number);
+                self.require(operand, self.types.primitives().number);
+                self.produce(output, self.types.primitives().number);
             }
             UnOp::Length => {
-                let accepted = self.types.union(primitives.string, primitives.table);
+                let accepted = self.types.union(
+                    self.types.primitives().string,
+                    self.types.primitives().table,
+                );
                 self.require(operand, accepted);
-                self.observe(output, primitives.number);
+                self.produce(output, self.types.primitives().number);
             }
         }
     }
 
     /// Returns a stable projection and installs its maintenance rule.
+    #[inline]
     pub(super) fn ensure_projection(&mut self, pack: PackId, index: usize) -> ValueId {
-        let (value, created) = self.world.projection(pack, index);
-        if created {
-            self.add_rule(Rule::ProjectPack {
-                pack,
-                index,
-                output: value,
-            });
-            self.pack_changed(pack);
+        match self.world.projection(pack, index) {
+            WorldChange::Unchanged(value) => value,
+            WorldChange::Changed(value) => {
+                self.add_rule(Rule::ProjectPack {
+                    pack,
+                    index,
+                    output: value,
+                });
+                self.pack_changed(pack);
+                value
+            }
         }
-        value
     }
 
     /// Returns a stable aggregate value and installs its maintenance rule.
-    pub(super) fn ensure_pack_values(&mut self, pack: PackId) -> ValueId {
-        let (value, created) = self.world.pack_values(pack);
-        if created {
-            self.add_rule(Rule::PackValues {
-                pack,
-                output: value,
-            });
-            self.pack_changed(pack);
+    #[inline]
+    fn ensure_pack_values(&mut self, pack: PackId) -> ValueId {
+        match self.world.pack_values(pack) {
+            WorldChange::Unchanged(value) => value,
+            WorldChange::Changed(value) => {
+                self.add_rule(Rule::PackValues {
+                    pack,
+                    output: value,
+                });
+                self.pack_changed(pack);
+                value
+            }
         }
-        value
     }
 
-    /// Returns producer evidence with broad markers for identity-only values.
-    pub(super) fn evidence_type(&mut self, value: ValueId) -> Option<TypeId> {
+    /// Returns the types known to come from a value, including identity types.
+    #[inline]
+    fn evidence_type(&mut self, value: ValueId) -> Option<TypeId> {
         let state = self.world.values[value].clone();
-        let primitives = *self.types.primitives();
         let mut evidence = state.lower;
         if !state.identities.objects.is_empty() {
-            evidence = self.types.join(evidence, primitives.table);
+            evidence = self.types.join(evidence, self.types.primitives().table);
         }
         if !state.identities.closures.is_empty() || !state.identities.builtins.is_empty() {
-            evidence = self.types.join(evidence, primitives.function);
+            evidence = self.types.join(evidence, self.types.primitives().function);
         }
-        (evidence != primitives.never).then_some(evidence)
+        (evidence != self.types.primitives().never).then_some(evidence)
     }
 
     /// Re-enqueues every rule subscribed to a changed value.
+    #[inline]
     fn value_changed(&mut self, value: ValueId) {
-        let rules = self
-            .subscriptions
-            .values
-            .get(&value)
-            .cloned()
-            .unwrap_or_default();
-        for rule in rules {
-            self.agenda.push(rule);
+        if let Some(rules) = self.subscriptions.values.get(&value) {
+            self.queue.extend(rules.iter().copied());
         }
     }
 
     /// Re-enqueues every rule subscribed to a changed pack.
+    #[inline]
     fn pack_changed(&mut self, pack: PackId) {
-        let rules = self
-            .subscriptions
-            .packs
-            .get(&pack)
-            .cloned()
-            .unwrap_or_default();
-        for rule in rules {
-            self.agenda.push(rule);
+        if let Some(rules) = self.subscriptions.packs.get(&pack) {
+            self.queue.extend(rules.iter().copied());
         }
     }
 
     /// Re-enqueues every rule subscribed to a changed object.
+    #[inline]
     fn object_changed(&mut self, object: ObjectId) {
-        let rules = self
-            .subscriptions
-            .objects
-            .get(&object)
-            .cloned()
-            .unwrap_or_default();
-        for rule in rules {
-            self.agenda.push(rule);
+        if let Some(rules) = self.subscriptions.objects.get(&object) {
+            self.queue.extend(rules.iter().copied());
         }
-    }
-
-    /// Returns a produced type when lower and upper bounds are consistent.
-    pub(super) fn produced_type(&self, value: ValueId) -> Option<TypeId> {
-        let state = &self.world.values[value];
-        if state.lower == self.types.primitives().never
-            || !self.types.is_subtype(state.lower, state.upper)
-        {
-            return None;
-        }
-        Some(state.lower)
     }
 
     /// Returns the best materializable candidate for one value.
+    #[inline]
     pub(super) fn candidate_type(&self, value: ValueId) -> Option<TypeId> {
         let state = &self.world.values[value];
         if state.lower != self.types.primitives().never {
@@ -1032,53 +1142,78 @@ impl<'a> Engine<'a> {
             .then_some(state.upper)
     }
 
-    /// Collects concrete function signatures contained in `ty`.
-    pub(super) fn collect_function_signatures(&self, ty: TypeId, output: &mut Vec<TypeId>) {
-        match self.types.get(ty) {
-            Type::FunctionSignature { .. } => output.push(ty),
-            Type::Union(members) | Type::Intersection(members) => {
-                for member in members {
-                    self.collect_function_signatures(*member, output);
+    /// Produces results for arithmetic overloads supported by current evidence.
+    fn produce_arithmetic_result(
+        &mut self,
+        lhs: ValueId,
+        op: BinOp,
+        rhs: ValueId,
+        output: ValueId,
+    ) {
+        let Some(lhs) = self.evidence_type(lhs) else {
+            return;
+        };
+        let Some(rhs) = self.evidence_type(rhs) else {
+            return;
+        };
+
+        let number = self.types.primitives().number;
+        let vector = self.types.primitives().vector;
+
+        let lhs_number = self.types.overlaps(lhs, number);
+        let lhs_vector = self.types.overlaps(lhs, vector);
+        let rhs_number = self.types.overlaps(rhs, number);
+        let rhs_vector = self.types.overlaps(rhs, vector);
+
+        match op {
+            BinOp::Add | BinOp::Sub => {
+                if lhs_number && rhs_number {
+                    self.produce(output, number);
+                }
+                if lhs_vector && rhs_vector {
+                    self.produce(output, vector);
                 }
             }
-            Type::WithMetatable { methods, .. } => {
-                for method in methods {
-                    self.collect_function_signatures(method.ty, output);
+            BinOp::Mul | BinOp::Div | BinOp::IDiv => {
+                if lhs_number && rhs_number {
+                    self.produce(output, number);
+                }
+                if (lhs_vector && (rhs_number || rhs_vector))
+                    || (rhs_vector && (lhs_number || lhs_vector))
+                {
+                    self.produce(output, vector);
                 }
             }
-            _ => {}
+            BinOp::Mod | BinOp::Pow => {
+                if lhs_number && rhs_number {
+                    self.produce(output, number);
+                }
+            }
+            _ => unreachable!("guarded by caller"),
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use crate::hil::ty2::{builtins::BuiltinEnvironment, store::TypeStore};
-    use crate::hil::ty3::inference::{
-        engine::Engine,
-        keys::ValueKey,
-        program::{InferenceProgram, ValueRelation},
-    };
-    use crate::il::ProtoId;
+    /// Narrows additive operands when either operand has concrete evidence.
+    fn require_matching_additive_operands(&mut self, lhs: ValueId, rhs: ValueId) {
+        let number = self.types.primitives().number;
+        let vector = self.types.primitives().vector;
 
-    /// Basic value flow reaches a fixed point through the agenda.
-    #[test]
-    fn value_flow_propagates_producer_evidence() {
-        let mut store = TypeStore::new();
-        let builtins = BuiltinEnvironment::new(&mut store);
-        let source = ValueKey::Temp(ProtoId(0), 0);
-        let target = ValueKey::Temp(ProtoId(0), 1);
-        let number = store.primitives().number;
-        let mut program = InferenceProgram::default();
-        program.push_value(source, ValueRelation::Observe(number));
-        program.push_value(target, ValueRelation::FlowFrom(source));
+        if let Some(lhs_ty) = self.evidence_type(lhs) {
+            if self.types.overlaps(lhs_ty, number) {
+                self.require(rhs, number);
+            }
+            if self.types.overlaps(lhs_ty, vector) {
+                self.require(rhs, vector);
+            }
+        }
 
-        let mut engine = Engine::new(program, &[], &builtins, &mut store);
-        engine.solve();
-        let target = engine
-            .get_value_key(target)
-            .expect("target value should be allocated");
-
-        assert_eq!(engine.produced_type(target), Some(number));
+        if let Some(rhs_ty) = self.evidence_type(rhs) {
+            if self.types.overlaps(rhs_ty, number) {
+                self.require(lhs, number);
+            }
+            if self.types.overlaps(rhs_ty, vector) {
+                self.require(lhs, vector);
+            }
+        }
     }
 }

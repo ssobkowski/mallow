@@ -2,21 +2,17 @@ use std::collections::HashMap;
 
 use smol_str::SmolStr;
 
-use crate::hil::{
-    ir::Expr,
-    ty2::{
-        canonical::{GenericBinder, TypeId, TypeLiteral, TypePackId, TypePackTail, TypeScheme},
-        store::TypeStore,
-    },
-};
+use crate::hil::ir::Expr;
+use crate::hil::ty::canonical::{TypeId, TypeLiteral, TypePackId, TypePackTail};
+use crate::hil::ty::store::TypeStore;
 
-/// Immutable builtin type schemes allocated once for an inference session.
+/// Immutable builtin types allocated once for an inference session.
 #[derive(Debug)]
 pub struct BuiltinEnvironment {
-    /// Global names mapped to their polymorphic graph schemes.
-    globals: HashMap<&'static str, TypeScheme>,
-    /// Static namespace and field names mapped to their graph schemes.
-    namespace_fields: HashMap<&'static str, HashMap<&'static str, TypeScheme>>,
+    /// Global names mapped to their lowered graph types.
+    globals: HashMap<&'static str, TypeId>,
+    /// Static namespace and field names mapped to their lowered graph types.
+    namespace_fields: HashMap<&'static str, HashMap<&'static str, TypeId>>,
 }
 
 /// Stable symbolic reference into a [`BuiltinEnvironment`].
@@ -31,85 +27,6 @@ pub enum BuiltinPath {
         /// Field selected from the namespace.
         field: SmolStr,
     },
-}
-
-/// One argument source used by a builtin indexed-write effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BuiltinIndex {
-    /// Uses the argument at this zero-based call position.
-    Argument(usize),
-    /// Synthesizes the numeric array index used by append-like operations.
-    Number,
-}
-
-/// A heap effect attached to one builtin call shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BuiltinCallEffect {
-    /// Writes one value into an indexed table slot.
-    SetIndex {
-        /// Zero-based argument containing the mutated table.
-        table_argument: usize,
-        /// Source of the written index.
-        index: BuiltinIndex,
-        /// Zero-based argument containing the written value.
-        value_argument: usize,
-    },
-    /// Attaches one metatable and returns the base table.
-    SetMetatable {
-        /// Zero-based argument containing the base table.
-        table_argument: usize,
-        /// Zero-based argument containing the metatable.
-        metatable_argument: usize,
-    },
-}
-
-impl BuiltinPath {
-    /// Returns every heap effect possible for an argument arity range.
-    pub(super) fn call_effects(
-        &self,
-        minimum: usize,
-        maximum: Option<usize>,
-    ) -> Vec<BuiltinCallEffect> {
-        let includes =
-            |arity: usize| minimum <= arity && maximum.is_none_or(|maximum| arity <= maximum);
-        let reaches = |arity: usize| maximum.is_none_or(|maximum| maximum >= arity);
-        match self {
-            Self::Global(name) if name == "setmetatable" && reaches(2) => {
-                vec![BuiltinCallEffect::SetMetatable {
-                    table_argument: 0,
-                    metatable_argument: 1,
-                }]
-            }
-            Self::Global(name) if name == "rawset" && reaches(3) => {
-                vec![BuiltinCallEffect::SetIndex {
-                    table_argument: 0,
-                    index: BuiltinIndex::Argument(1),
-                    value_argument: 2,
-                }]
-            }
-            Self::NamespaceField { namespace, field }
-                if namespace == "table" && field == "insert" =>
-            {
-                let mut effects = Vec::new();
-                if includes(2) {
-                    effects.push(BuiltinCallEffect::SetIndex {
-                        table_argument: 0,
-                        index: BuiltinIndex::Number,
-                        value_argument: 1,
-                    });
-                }
-                if includes(3) {
-                    effects.push(BuiltinCallEffect::SetIndex {
-                        table_argument: 0,
-                        index: BuiltinIndex::Argument(1),
-                        value_argument: 2,
-                    });
-                }
-                effects
-            }
-            _ => Vec::new(),
-        }
-    }
 }
 
 impl BuiltinPath {
@@ -133,7 +50,7 @@ impl BuiltinPath {
 }
 
 impl BuiltinEnvironment {
-    /// Builds every builtin type scheme exactly once.
+    /// Builds every builtin type exactly once.
     #[must_use]
     pub fn new(type_store: &mut TypeStore) -> Self {
         let definitions = generated_builtin_definitions();
@@ -163,15 +80,16 @@ impl BuiltinEnvironment {
         }
     }
 
-    /// Returns the type scheme at a previously recognized builtin path.
+    /// Returns the lowered type at a previously recognized builtin path.
     #[must_use]
-    pub fn get_path(&self, path: &BuiltinPath) -> Option<&TypeScheme> {
+    pub fn get_path(&self, path: &BuiltinPath) -> Option<TypeId> {
         match path {
-            BuiltinPath::Global(name) => self.globals.get(name.as_str()),
+            BuiltinPath::Global(name) => self.globals.get(name.as_str()).copied(),
             BuiltinPath::NamespaceField { namespace, field } => self
                 .namespace_fields
                 .get(namespace.as_str())?
-                .get(field.as_str()),
+                .get(field.as_str())
+                .copied(),
         }
     }
 }
@@ -181,7 +99,7 @@ impl BuiltinEnvironment {
 struct BuiltinDefinition {
     /// Global name.
     name: &'static str,
-    /// Global type scheme.
+    /// Global generated type definition.
     scheme: BuiltinSchemeDefinition,
     /// Direct namespace field schemes.
     fields: &'static [BuiltinFieldDefinition],
@@ -196,10 +114,11 @@ struct BuiltinFieldDefinition {
     scheme: BuiltinSchemeDefinition,
 }
 
-/// One owned type body and its build-time-computed binders.
+/// One generated builtin type body and its retained binder definitions.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct BuiltinSchemeDefinition {
-    /// Type and type-pack binders in declaration order.
+    /// Generic binders retained for the future inference rewrite.
     binders: &'static [BuiltinBinderDefinition],
     /// Owned type tree to intern.
     body: BuiltinType,
@@ -207,6 +126,7 @@ struct BuiltinSchemeDefinition {
 
 /// One generated generic binder retained with its substitution kind.
 #[derive(Debug)]
+#[allow(dead_code)]
 enum BuiltinBinderDefinition {
     /// A binder substituted by one type.
     Type(&'static str),
@@ -215,22 +135,9 @@ enum BuiltinBinderDefinition {
 }
 
 impl BuiltinSchemeDefinition {
-    /// Interns this owned definition and validates its precomputed binders.
-    fn intern(&self, store: &mut TypeStore) -> TypeScheme {
-        let body = self.body.intern(store);
-        let binders = self
-            .binders
-            .iter()
-            .map(|binder| match binder {
-                BuiltinBinderDefinition::Type(name) => {
-                    GenericBinder::Type(SmolStr::new_static(name))
-                }
-                BuiltinBinderDefinition::Pack(name) => {
-                    GenericBinder::Pack(SmolStr::new_static(name))
-                }
-            })
-            .collect();
-        store.type_scheme(body, binders)
+    /// Lowers this generated definition into a monomorphic graph type.
+    fn intern(&self, store: &mut TypeStore) -> TypeId {
+        self.body.intern(store)
     }
 }
 
@@ -242,7 +149,7 @@ enum BuiltinType {
     Primitive(BuiltinPrimitive),
     /// A host-provided nominal type.
     Named(&'static str),
-    /// A generic placeholder covered by its generated scheme.
+    /// A generic placeholder covered by its generated definition.
     Generic(&'static str),
     /// An exact singleton literal.
     Literal(BuiltinLiteral),
@@ -272,7 +179,10 @@ impl BuiltinType {
         match self {
             Self::Primitive(primitive) => primitive.id(store),
             Self::Named(name) => store.named(*name),
-            Self::Generic(name) => store.generic(*name),
+            Self::Generic(_) => {
+                // TODO: Rework builtin generic instantiation with the new generic engine.
+                store.primitives().any
+            }
             Self::Literal(literal) => store.literal(literal.to_owned()),
             Self::Table { fields, indexer } => {
                 let fields = fields
@@ -288,17 +198,11 @@ impl BuiltinType {
                 store.function_signature(params, returns)
             }
             Self::Union(members) => {
-                let members = members
-                    .into_iter()
-                    .map(|ty| ty.intern(store))
-                    .collect::<Vec<_>>();
+                let members: Vec<_> = members.into_iter().map(|ty| ty.intern(store)).collect();
                 store.union_all(members)
             }
             Self::Intersection(members) => {
-                let members = members
-                    .into_iter()
-                    .map(|ty| ty.intern(store))
-                    .collect::<Vec<_>>();
+                let members: Vec<_> = members.into_iter().map(|ty| ty.intern(store)).collect();
                 store.intersection_all(members)
             }
         }
@@ -405,7 +309,10 @@ impl BuiltinPackTail {
     fn intern(&self, store: &mut TypeStore) -> TypePackTail {
         match self {
             Self::Homogeneous(ty) => TypePackTail::Homogeneous(ty.intern(store)),
-            Self::Generic(name) => TypePackTail::Generic(SmolStr::new_static(name)),
+            Self::Generic(_) => {
+                // TODO: Support generics.
+                TypePackTail::Homogeneous(store.primitives().any)
+            }
         }
     }
 }

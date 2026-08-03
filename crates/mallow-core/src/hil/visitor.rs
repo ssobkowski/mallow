@@ -5,7 +5,7 @@ use crate::hil::StructuredFunction;
 use crate::hil::cflow::cfg::{Block, BlockExit};
 use crate::hil::cflow::graph::GraphView;
 use crate::hil::cflow::region::RegionNode;
-use crate::hil::ir::{Expr, Number, PhiNode, Stmt, TableItem, ValuePack};
+use crate::hil::ir::{Capture, Expr, Number, PhiNode, Stmt, TableItem, ValuePack};
 use crate::hil::lifter::ssa::SymbolId;
 
 #[allow(dead_code, reason = "might be used in the future")]
@@ -64,7 +64,7 @@ pub trait Visitor {
 
     fn visit_phi(&mut self, _phi: &PhiNode) {}
 
-    fn visit_capture(&mut self, _index: usize, _sym: SymbolId) {}
+    fn visit_capture(&mut self, _index: usize, _capture: Capture) {}
 
     fn visit_symbol(&mut self, _sym: SymbolId) {}
 
@@ -124,7 +124,7 @@ pub trait VisitorMut {
 
     fn visit_phi(&mut self, _phi: &mut PhiNode) {}
 
-    fn visit_capture(&mut self, _index: usize, _sym: &mut SymbolId) {}
+    fn visit_capture(&mut self, _index: usize, _capture: &mut Capture) {}
 
     fn visit_symbol(&mut self, _sym: &mut SymbolId) {}
 
@@ -279,8 +279,8 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
         Expr::Bool(value) => visitor.visit_bool(*value),
         Expr::Symbol(symbol) => visitor.visit_symbol(*symbol),
         Expr::Closure { captures, .. } => {
-            for (index, capture) in captures.iter().enumerate() {
-                visitor.visit_capture(index, *capture);
+            for (index, capture) in captures.iter().copied().enumerate() {
+                visitor.visit_capture(index, capture);
             }
         }
         Expr::Global(name) => visitor.visit_global(name),

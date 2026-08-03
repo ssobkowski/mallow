@@ -5,7 +5,7 @@ use id_arena::{Arena, Id};
 use crate::hil::cflow::cfg::Block;
 use crate::hil::cflow::graph::GraphView;
 use crate::hil::ir::{PhiNode, Stmt};
-use crate::hil::ty2::canonical::TypeId;
+use crate::hil::ty::canonical::TypeId;
 
 pub type SymbolId = Id<Symbol>;
 
@@ -27,34 +27,34 @@ pub enum SymbolKind {
     Param(u8),
 }
 
-/// One named local and its SSA versions.
+/// One named local and its SSA symbols.
 #[derive(Debug, Clone)]
-pub struct NamedLocal {
+pub(crate) struct NamedLocal {
     /// Name stored in Luau debug information.
-    pub name: String,
+    pub(crate) name: String,
     /// First bytecode PC covered by the local.
-    pub start_pc: u32,
+    pub(crate) start_pc: u32,
     /// First bytecode PC after the local's lifetime.
-    pub end_pc: u32,
-    /// SSA versions associated with this local.
-    pub symbols: Vec<SymbolId>,
+    pub(crate) end_pc: u32,
+    /// SSA symbols associated with this local.
+    pub(crate) symbols: Vec<SymbolId>,
 }
 
 /// Stores the symbols and storage links found while building SSA.
 #[derive(Debug, Clone)]
-pub struct FunctionSymbols {
-    /// Entry versions for the function parameters.
-    pub params: Vec<SymbolId>,
-    /// Entry versions for the declared upvalues.
-    pub upvalues: Vec<SymbolId>,
+pub(crate) struct FunctionSymbols {
+    /// Entry symbol for each formal parameter, in parameter order.
+    params: Vec<SymbolId>,
+    /// Entry symbol for each declared upvalue slot, in slot order.
+    upvalues: Vec<SymbolId>,
     /// Named locals recovered from Luau debug information.
-    pub named_locals: Vec<NamedLocal>,
-    /// Version groups for declared upvalue storage.
-    pub(crate) upvalue_version_groups: Vec<Vec<SymbolId>>,
-    /// Version groups for captured register storage.
-    pub(crate) captured_version_groups: Vec<Vec<SymbolId>>,
-    /// Version pairs that must use one source local after inference.
-    pub(crate) loop_carried_versions: Vec<(SymbolId, SymbolId)>,
+    debug_locals: Vec<NamedLocal>,
+    /// Symbols that share one declared upvalue storage location.
+    upvalue_storage: Vec<Vec<SymbolId>>,
+    /// Symbols that share one captured register storage location.
+    captured_storage: Vec<Vec<SymbolId>>,
+    /// Pairs of symbols that represent one loop-carried local.
+    loop_carried_links: Vec<(SymbolId, SymbolId)>,
 }
 
 impl FunctionSymbols {
@@ -62,32 +62,112 @@ impl FunctionSymbols {
     pub(crate) fn new(
         params: Vec<SymbolId>,
         upvalues: Vec<SymbolId>,
-        named_locals: Vec<NamedLocal>,
-        upvalue_version_groups: Vec<Vec<SymbolId>>,
-        captured_version_groups: Vec<Vec<SymbolId>>,
-        loop_carried_versions: Vec<(SymbolId, SymbolId)>,
+        debug_locals: Vec<NamedLocal>,
+        upvalue_storage: Vec<Vec<SymbolId>>,
+        captured_storage: Vec<Vec<SymbolId>>,
+        loop_carried_links: Vec<(SymbolId, SymbolId)>,
     ) -> Self {
         Self {
             params,
             upvalues,
-            named_locals,
-            upvalue_version_groups,
-            captured_version_groups,
-            loop_carried_versions,
+            debug_locals,
+            upvalue_storage,
+            captured_storage,
+            loop_carried_links,
         }
     }
 
-    /// Returns all versions of declared upvalue storage.
-    pub(crate) fn upvalue_version_groups(&self) -> impl Iterator<Item = &[SymbolId]> {
-        self.upvalue_version_groups.iter().map(Vec::as_slice)
+    /// Returns the entry symbol for each formal parameter, in parameter order.
+    pub(crate) fn params(&self) -> &[SymbolId] {
+        &self.params
     }
 
-    /// Returns all version groups for mutable storage.
-    pub(crate) fn storage_version_groups(&self) -> impl Iterator<Item = &[SymbolId]> {
-        self.upvalue_version_groups
+    /// Returns mutable parameter symbols for SSA canonicalization.
+    pub(crate) fn params_mut(&mut self) -> &mut [SymbolId] {
+        &mut self.params
+    }
+
+    /// Returns the entry symbol for each declared upvalue slot, in slot order.
+    pub(crate) fn upvalues(&self) -> &[SymbolId] {
+        &self.upvalues
+    }
+
+    /// Returns mutable upvalue symbols for SSA canonicalization.
+    pub(crate) fn upvalues_mut(&mut self) -> &mut [SymbolId] {
+        &mut self.upvalues
+    }
+
+    /// Returns named locals recovered from Luau debug information.
+    pub(crate) fn debug_locals(&self) -> &[NamedLocal] {
+        &self.debug_locals
+    }
+
+    /// Returns mutable debug locals for SSA canonicalization.
+    pub(crate) fn debug_locals_mut(&mut self) -> &mut [NamedLocal] {
+        &mut self.debug_locals
+    }
+
+    /// Returns the declared upvalue slot containing `symbol`.
+    pub(crate) fn slot_for_upvalue(&self, symbol: SymbolId) -> Option<usize> {
+        self.upvalues
             .iter()
-            .chain(&self.captured_version_groups)
-            .map(Vec::as_slice)
+            .position(|&entry| entry == symbol)
+            .or_else(|| {
+                self.upvalue_storage
+                    .iter()
+                    .find(|symbols| symbols.contains(&symbol))
+                    .and_then(|symbols| {
+                        self.upvalues
+                            .iter()
+                            .position(|entry| symbols.contains(entry))
+                    })
+            })
+    }
+
+    /// Returns every symbol that uses one declared upvalue's storage.
+    pub(crate) fn for_upvalue(&self, slot: usize) -> impl Iterator<Item = SymbolId> + '_ {
+        let entry = *self
+            .upvalues
+            .get(slot)
+            .expect("upvalue slot must index a declared upvalue");
+        let storage = self
+            .upvalue_storage
+            .iter()
+            .find(|symbols| symbols.contains(&entry));
+        let members = storage
+            .into_iter()
+            .flat_map(|symbols| symbols.iter().copied());
+        let fallback = storage.is_none().then_some(entry);
+        members.chain(fallback)
+    }
+
+    /// Returns every symbol in captured storage with multiple surviving symbols.
+    pub(crate) fn captured_storage_symbols(&self) -> impl Iterator<Item = SymbolId> + '_ {
+        self.captured_storage.iter().flatten().copied()
+    }
+
+    /// Returns pairs of symbols that must use the same storage.
+    pub(crate) fn same_storage_links(&self) -> impl Iterator<Item = (SymbolId, SymbolId)> + '_ {
+        self.upvalue_storage
+            .iter()
+            .chain(&self.captured_storage)
+            .flat_map(|symbols| {
+                let mut symbols = symbols.iter().copied();
+                let first = symbols.next();
+                symbols.filter_map(move |symbol| first.map(|first| (first, symbol)))
+            })
+    }
+
+    /// Takes the symbol lists for shared storage locations.
+    pub(crate) fn take_storage_members(&mut self) -> impl Iterator<Item = Vec<SymbolId>> {
+        std::mem::take(&mut self.upvalue_storage)
+            .into_iter()
+            .chain(std::mem::take(&mut self.captured_storage))
+    }
+
+    /// Takes the pairs of symbols that represent loop-carried locals.
+    pub(crate) fn take_loop_carried_links(&mut self) -> impl Iterator<Item = (SymbolId, SymbolId)> {
+        std::mem::take(&mut self.loop_carried_links).into_iter()
     }
 }
 

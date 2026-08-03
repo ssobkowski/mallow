@@ -10,8 +10,8 @@ use crate::disasm::Chunk;
 use crate::hil::cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
 use crate::hil::ir::{Expr, PhiNode, Stmt, ValuePack};
 use crate::hil::lifter::ssa::{FunctionSymbols, SymbolId};
-use crate::hil::ty2::canonical::TypeId;
-use crate::hil::ty2::store::TypeStore;
+use crate::hil::ty::canonical::TypeId;
+use crate::hil::ty::store::TypeStore;
 use crate::il::{DecodedInstr, Instr, Proto, reg_add, reg_range};
 use crate::operator::BinOp;
 
@@ -67,7 +67,7 @@ pub enum RawBlockExit {
 impl RawBlockExit {
     /// Returns successor targets encoded in one block exit.
     #[must_use]
-    fn targets(&self) -> [Option<usize>; 2] {
+    fn targets(&self) -> impl Iterator<Item = usize> {
         match self {
             RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => [Some(*target), None],
             RawBlockExit::CondJump {
@@ -93,6 +93,8 @@ impl RawBlockExit {
             } => [Some(*body_block), Some(*exit_block)],
             RawBlockExit::Return { .. } => [None, None],
         }
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -115,11 +117,6 @@ impl Block {
     /// Returns whether the block is empty.
     pub fn is_empty(&self) -> bool {
         self.stmts.is_empty()
-    }
-
-    /// Returns the exit targets of this block.
-    pub fn exit_targets(&self) -> [Option<usize>; 2] {
-        self.exit.targets()
     }
 
     /// Returns an iterator over the statements of this block.
@@ -188,7 +185,7 @@ pub enum BlockExit {
 impl BlockExit {
     /// Returns successor targets encoded in one block exit.
     #[must_use]
-    pub fn targets(&self) -> [Option<usize>; 2] {
+    pub fn targets(&self) -> impl Iterator<Item = usize> {
         match self {
             BlockExit::Jump(target) | BlockExit::Fallthrough(target) => [Some(*target), None],
             BlockExit::CondJump {
@@ -214,6 +211,8 @@ impl BlockExit {
             } => [Some(*body_block), Some(*exit_block)],
             BlockExit::Return { .. } => [None, None],
         }
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -291,7 +290,7 @@ pub fn build_from_proto(proto: &Proto, chunk: &Chunk) -> Result<CfgBuild> {
     }
 
     loop {
-        let (_, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
+        let (_, predecessors) = build_graph(blocks.iter().map(|b| b.exit.targets()));
         let changed = fold_condition_chains(&mut blocks, &predecessors);
 
         if !changed {
@@ -300,7 +299,7 @@ pub fn build_from_proto(proto: &Proto, chunk: &Chunk) -> Result<CfgBuild> {
     }
 
     // Rebuild after folding
-    let (successors, predecessors) = build_graph(blocks.iter().map(|b| b.exit_targets()));
+    let (successors, predecessors) = build_graph(blocks.iter().map(|b| b.exit.targets()));
     let idoms = AdjGraph::new(0, &successors, &predecessors).build_idoms();
 
     let cfg = ControlFlowGraph {
@@ -334,7 +333,7 @@ impl ControlFlowGraph {
         }
 
         loop {
-            let (_, predecessors) = build_graph(self.blocks.iter().map(|b| b.exit_targets()));
+            let (_, predecessors) = build_graph(self.blocks.iter().map(|b| b.exit.targets()));
             let changed = fold_condition_chains(&mut self.blocks, &predecessors);
 
             if !changed {
@@ -342,7 +341,7 @@ impl ControlFlowGraph {
             }
         }
 
-        let (successors, predecessors) = build_graph(self.blocks.iter().map(|b| b.exit_targets()));
+        let (successors, predecessors) = build_graph(self.blocks.iter().map(|b| b.exit.targets()));
         let idoms = self.build_idoms();
 
         self.successors = successors;
@@ -965,6 +964,18 @@ fn fold_condition_chains(blocks: &mut [Block], predecessors: &[Vec<usize>]) -> b
     was_changed
 }
 
+/// Helper to find a foldable jump target if the target block is empty.
+fn fold_target(blocks: &[Block], target: usize) -> Option<usize> {
+    let target_block = &blocks[target];
+    if target_block.stmts.is_empty()
+        && let BlockExit::Jump(next) | BlockExit::Fallthrough(next) = target_block.exit
+        && next != target
+    {
+        return Some(next);
+    }
+    None
+}
+
 /// Folds blocks with no statements and single jump exits.
 ///
 /// # Returns
@@ -972,30 +983,9 @@ fn fold_condition_chains(blocks: &mut [Block], predecessors: &[Vec<usize>]) -> b
 fn thread_jumps(blocks: &mut [Block]) -> bool {
     let mut was_changed = false;
     for block_idx in 0..blocks.len() {
-        if !matches!(
-            &blocks[block_idx].exit,
-            BlockExit::Jump(_) | BlockExit::Fallthrough(_) | BlockExit::CondJump { .. },
-        ) {
-            continue;
-        }
-
-        let folded = blocks[block_idx].exit_targets().map(|target| {
-            let target_block = &blocks[target?];
-            if target_block.stmts.is_empty() {
-                match target_block.exit {
-                    BlockExit::Jump(next) | BlockExit::Fallthrough(next) if next != target? => {
-                        return Some(next);
-                    }
-                    _ => {}
-                }
-            }
-
-            None
-        });
-
         match &blocks[block_idx].exit {
-            BlockExit::Jump(_) | BlockExit::Fallthrough(_) => {
-                if let Some(folded_jump) = folded[0] {
+            BlockExit::Jump(target) | BlockExit::Fallthrough(target) => {
+                if let Some(folded_jump) = fold_target(blocks, *target) {
                     blocks[block_idx].exit = BlockExit::Jump(folded_jump);
                     was_changed = true;
                 }
@@ -1005,20 +995,19 @@ fn thread_jumps(blocks: &mut [Block]) -> bool {
                 then_block,
                 else_block,
             } => {
-                let then_block = *then_block;
-                let else_block = *else_block;
+                let folded_then = fold_target(blocks, *then_block);
+                let folded_else = fold_target(blocks, *else_block);
 
-                let [folded_then, folded_else] = folded;
                 if folded_then.is_some() || folded_else.is_some() {
                     blocks[block_idx].exit = BlockExit::CondJump {
                         cond: cond.clone(),
-                        then_block: folded_then.unwrap_or(then_block),
-                        else_block: folded_else.unwrap_or(else_block),
+                        then_block: folded_then.unwrap_or(*then_block),
+                        else_block: folded_else.unwrap_or(*else_block),
                     };
                     was_changed = true;
                 }
             }
-            _ => unreachable!(),
+            _ => {}
         }
     }
     was_changed

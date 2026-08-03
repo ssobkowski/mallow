@@ -5,7 +5,7 @@ use crate::hil::StructuredFunction;
 use crate::hil::cflow::region::RegionNode;
 use crate::hil::ir::{Expr, Stmt, ValuePack};
 use crate::hil::lifter::ssa::SymbolId;
-use crate::hil::ty2::canonical::TypeId;
+use crate::hil::ty::canonical::TypeId;
 use crate::hil::visitor::{Visitor, walk_expr};
 
 #[derive(Default)]
@@ -68,8 +68,8 @@ struct LifetimeAnalysis {
 impl LifetimeAnalysis {
     fn new(fun: &StructuredFunction) -> Self {
         let mut pinned = HashSet::new();
-        pinned.extend(fun.symbols.params.iter().copied());
-        pinned.extend(fun.symbols.upvalues.iter().copied());
+        pinned.extend(fun.symbols.params().iter().copied());
+        pinned.extend(fun.symbols.upvalues().iter().copied());
 
         Self {
             events: Vec::new(),
@@ -404,7 +404,8 @@ impl CaptureCollector {
 impl Visitor for CaptureCollector {
     fn visit_expr(&mut self, expr: &Expr) {
         if let Expr::Closure { captures, .. } = expr {
-            self.captures.extend(captures.iter().copied());
+            self.captures
+                .extend(captures.iter().map(|capture| capture.symbol()));
         }
 
         walk_expr(self, expr);

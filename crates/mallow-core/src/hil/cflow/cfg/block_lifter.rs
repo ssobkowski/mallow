@@ -6,12 +6,12 @@ use super::{Block, BlockExit, Cond, CondRhs, RawBlock, RawBlockExit};
 use crate::disasm::Chunk;
 use crate::hil::cflow::graph::GraphView;
 use crate::hil::cflow::reg_set::RegSet;
-use crate::hil::ir::{Expr, PhiNode, Stmt, ValuePack};
+use crate::hil::ir::{Capture, Expr, PhiNode, Stmt, ValuePack};
 use crate::hil::lifter::ssa::{FunctionSymbols, NamedLocal, Ssa, Symbol, SymbolId, SymbolKind};
 use crate::hil::lifter::{CaptureState, LiftContext, MultiRet, flush_multiret, lift};
-use crate::hil::ty2::bytecode::ProtoTypeContext;
-use crate::hil::ty2::canonical::TypeId;
-use crate::hil::ty2::store::TypeStore;
+use crate::hil::ty::bytecode::ProtoTypeContext;
+use crate::hil::ty::canonical::TypeId;
+use crate::hil::ty::store::TypeStore;
 use crate::hil::visitor::{Visitor, VisitorMut};
 use crate::il::{ConstId, Count, Proto, reg_add, reg_range};
 
@@ -73,7 +73,7 @@ struct BlockLifter<'a, G: GraphView> {
     ssa: Ssa<'a, G>,
     params: Vec<SymbolId>,
     upvalues: Vec<SymbolId>,
-    loop_carried_versions: Vec<(SymbolId, SymbolId)>,
+    loop_carried_links: Vec<(SymbolId, SymbolId)>,
     capture_states: Vec<CaptureState>,
 }
 
@@ -94,7 +94,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             ssa: Ssa::new(graph, proto.max_stack_size, proto.num_upvals),
             params: Vec::with_capacity(proto.num_params as usize),
             upvalues: Vec::with_capacity(proto.num_upvals as usize),
-            loop_carried_versions: Vec::new(),
+            loop_carried_links: Vec::new(),
             capture_states,
         }
     }
@@ -103,18 +103,18 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     fn build(mut self) -> Result<BuildResult> {
         self.initialize_entry_symbols();
         self.lift_blocks()?;
-        self.collect_loop_carried_versions();
+        self.collect_loop_carried_links();
         let symbol_types = self.finish_ssa();
         let named_locals = self.named_locals();
-        let (upvalue_version_groups, captured_version_groups) = self.storage_version_groups();
+        let (upvalue_storage, captured_storage) = self.storage_members();
 
         let symbols = FunctionSymbols::new(
             self.params,
             self.upvalues,
             named_locals,
-            upvalue_version_groups,
-            captured_version_groups,
-            self.loop_carried_versions,
+            upvalue_storage,
+            captured_storage,
+            self.loop_carried_links,
         );
 
         Ok(BuildResult {
@@ -409,8 +409,8 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
         flush_multiret(multiret, block_id, &mut self.ssa, stmts);
     }
 
-    /// Finds loop-carried register versions that should canonicalize together.
-    fn collect_loop_carried_versions(&mut self) {
+    /// Finds loop-carried register symbols that should canonicalize together.
+    fn collect_loop_carried_links(&mut self) {
         let live_in_regs =
             compute_live_in_registers(&self.blocks, self.raw_blocks, self.graph, &self.ssa);
 
@@ -446,7 +446,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                         let target_sym = self.ssa.read_reg(target, reg);
                         let source_sym = self.ssa.read_reg(src, reg);
                         if target_sym != source_sym {
-                            self.loop_carried_versions.push((target_sym, source_sym));
+                            self.loop_carried_links.push((target_sym, source_sym));
                         }
                     }
                 }
@@ -492,11 +492,11 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
         for symbol in &mut self.upvalues {
             *symbol = self.ssa.resolve(*symbol);
         }
-        for (target, source) in &mut self.loop_carried_versions {
+        for (target, source) in &mut self.loop_carried_links {
             *target = self.ssa.resolve(*target);
             *source = self.ssa.resolve(*source);
         }
-        self.loop_carried_versions
+        self.loop_carried_links
             .retain(|(target, source)| target != source);
 
         self.ssa
@@ -542,34 +542,34 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             .collect()
     }
 
-    /// Groups surviving versions by declared-upvalue or captured-register storage.
-    fn storage_version_groups(&self) -> (Vec<Vec<SymbolId>>, Vec<Vec<SymbolId>>) {
-        let mut upvalue_versions: BTreeMap<u8, Vec<_>> = BTreeMap::new();
-        let mut captured_versions: BTreeMap<(u8, u16), Vec<_>> = BTreeMap::new();
+    /// Finds surviving symbols that share declared-upvalue or captured-register storage.
+    fn storage_members(&self) -> (Vec<Vec<SymbolId>>, Vec<Vec<SymbolId>>) {
+        let mut upvalue_storage: BTreeMap<u8, Vec<_>> = BTreeMap::new();
+        let mut captured_storage: BTreeMap<(u8, u16), Vec<_>> = BTreeMap::new();
 
         for (id, symbol) in self.ssa.arena().iter() {
             let resolved = self.ssa.resolve(id);
-            let versions = match symbol.kind {
-                SymbolKind::Upvalue(index) => upvalue_versions.entry(index).or_default(),
+            let members = match symbol.kind {
+                SymbolKind::Upvalue(index) => upvalue_storage.entry(index).or_default(),
                 SymbolKind::CapturedRegister { reg, generation } => {
-                    captured_versions.entry((reg, generation)).or_default()
+                    captured_storage.entry((reg, generation)).or_default()
                 }
                 SymbolKind::Register(_) | SymbolKind::Param(_) => continue,
             };
-            if !versions.contains(&resolved) {
-                versions.push(resolved);
+            if !members.contains(&resolved) {
+                members.push(resolved);
             }
         }
 
-        let upvalue_versions = upvalue_versions
+        let upvalue_storage = upvalue_storage
             .into_values()
-            .filter(|versions| versions.len() > 1)
+            .filter(|members| members.len() > 1)
             .collect();
-        let captured_versions = captured_versions
+        let captured_storage = captured_storage
             .into_values()
-            .filter(|versions| versions.len() > 1)
+            .filter(|members| members.len() > 1)
             .collect();
-        (upvalue_versions, captured_versions)
+        (upvalue_storage, captured_storage)
     }
 
     /// Applies exit writes to the SSA block, writing each register in `exit_writes` to a fresh symbol.
@@ -606,8 +606,8 @@ impl<G: GraphView> VisitorMut for SsaAliasResolver<'_, '_, G> {
     }
 
     /// Resolves a closure capture owned by the enclosing function.
-    fn visit_capture(&mut self, _index: usize, symbol: &mut SymbolId) {
-        self.visit_symbol(symbol);
+    fn visit_capture(&mut self, _index: usize, capture: &mut Capture) {
+        self.visit_symbol(capture.symbol_mut());
     }
 
     /// Resolves the target and operands of a synthetic Phi statement.
@@ -670,8 +670,8 @@ impl Visitor for RegUseCollector<'_, '_> {
         }
     }
 
-    fn visit_capture(&mut self, _index: usize, sym: SymbolId) {
-        self.visit_symbol(sym);
+    fn visit_capture(&mut self, _index: usize, capture: Capture) {
+        self.visit_symbol(capture.symbol());
     }
 }
 
@@ -717,8 +717,8 @@ impl Visitor for RegUseDefCollector<'_, '_, '_> {
     }
 
     /// Captures read their captured symbol for live-in purposes.
-    fn visit_capture(&mut self, _index: usize, sym: SymbolId) {
-        self.note_use(sym);
+    fn visit_capture(&mut self, _index: usize, capture: Capture) {
+        self.note_use(capture.symbol());
     }
 
     /// Applies statement-level use/def ordering before expression traversal.

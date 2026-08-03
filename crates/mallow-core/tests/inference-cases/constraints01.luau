@@ -5,7 +5,7 @@ local function mixed(value, condition)
     return 1
 end
 local function numeric(value)
-    local unused = value + 1
+    local _unused = value + 1
     return value
 end
 print(mixed("x", true), numeric(2))
