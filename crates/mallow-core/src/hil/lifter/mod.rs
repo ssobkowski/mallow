@@ -138,7 +138,7 @@ impl CaptureState {
     }
 
     /// Opens captured storage for one register slot.
-    fn open_ref(&mut self, reg: u8) {
+    pub(crate) fn open_ref(&mut self, reg: u8) {
         self.open_refs[reg as usize] = Some(self.reg_generations[reg as usize]);
     }
 
@@ -238,17 +238,29 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             .collect()
     }
 
-    /// Allocates assignment targets for a range of registers.
-    fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<Expr> {
-        reg_range(start, count)
+    /// Writes one fixed result pack into a register range.
+    fn assign_regs(&mut self, start: u8, count: u8, values: ValuePack) {
+        let mut cell_stores = Vec::new();
+        let left = reg_range(start, count)
             .map(|reg| {
-                assert!(
-                    self.open_cell(reg).is_none(),
-                    "multi-value writes to captured registers need explicit stores"
-                );
-                Expr::Symbol(self.alloc_reg_symbol(reg))
+                let symbol = if let Some(cell) = self.open_cell(reg) {
+                    let symbol = self.alloc_value_symbol(reg);
+                    cell_stores.push((cell, symbol));
+                    symbol
+                } else {
+                    self.alloc_reg_symbol(reg)
+                };
+                Expr::Symbol(symbol)
             })
-            .collect()
+            .collect();
+
+        self.push(Stmt::AssignMany { left, values });
+        for (cell, symbol) in cell_stores {
+            self.push(Stmt::StoreCell {
+                cell,
+                value: Expr::Symbol(symbol),
+            });
+        }
     }
 
     /// Returns a chained concatenated expression of the values of the given register range.
@@ -723,14 +735,14 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                         });
                     }
                     Count::Number(n) => {
-                        let left = self.alloc_regs(*dest, n);
-                        self.push(Stmt::AssignMany {
-                            left,
-                            values: ValuePack::Open {
+                        self.assign_regs(
+                            *dest,
+                            n,
+                            ValuePack::Open {
                                 head: Vec::new(),
                                 tail: Box::new(Expr::VarArgs),
                             },
-                        });
+                        );
                     }
                 },
 
@@ -882,18 +894,14 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             }
             Count::Number(1) => self.assign_reg(dest, expr),
             Count::Number(n) => {
-                assert!(
-                    reg_range(dest, n).all(|reg| self.open_cell(reg).is_none()),
-                    "multi-return writes to captured registers are unsupported"
-                );
-                let left = self.alloc_regs(dest, n);
-                self.push(Stmt::AssignMany {
-                    left,
-                    values: ValuePack::Open {
+                self.assign_regs(
+                    dest,
+                    n,
+                    ValuePack::Open {
                         head: Vec::new(),
                         tail: Box::new(expr),
                     },
-                });
+                );
             }
             Count::Variadic => {
                 debug_assert!(self.pending_multiret.is_none());

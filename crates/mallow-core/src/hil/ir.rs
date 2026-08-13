@@ -421,14 +421,6 @@ impl ValuePack {
         head.iter_mut().chain(tail)
     }
 
-    /// Returns the expressions adjusted to exactly one value each.
-    pub fn head(&self) -> &[Expr] {
-        match self {
-            Self::Fixed(values) => values,
-            Self::Open { head, .. } => head,
-        }
-    }
-
     /// Returns the final expression evaluated in multivalue context.
     pub fn tail(&self) -> Option<&Expr> {
         match self {

@@ -118,11 +118,6 @@ impl FunctionSymbols {
             .map(|(cell, symbol)| (*cell, *symbol))
     }
 
-    /// Returns the transitional name for one declared upvalue slot.
-    pub(crate) fn for_upvalue(&self, slot: usize) -> impl Iterator<Item = SymbolId> + '_ {
-        std::iter::once(self.upvalues[slot])
-    }
-
     /// Returns all mutable cells owned by this function.
     pub(crate) fn cells(&self) -> &Arena<Cell> {
         &self.cells

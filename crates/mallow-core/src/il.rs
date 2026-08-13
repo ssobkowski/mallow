@@ -80,6 +80,13 @@ impl Count {
             n => Count::Number(n - 1),
         }
     }
+
+    /// Returns whether this count is variadic.
+    #[inline]
+    #[must_use]
+    pub const fn is_variadic(&self) -> bool {
+        matches!(self, Count::Variadic)
+    }
 }
 
 impl From<u8> for Count {
@@ -219,7 +226,7 @@ pub enum Instr {
     AndK { dest: u8, reg: u8, k: u8 },
     /// dest = reg or const
     OrK { dest: u8, reg: u8, k: u8 },
-    /// dest = a .. b
+    /// dest = concat(R(a), R(a+1), ..., R(b))
     Concat { dest: u8, a: u8, b: u8 },
     /// dest = not reg
     Not { dest: u8, reg: u8 },

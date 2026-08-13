@@ -19,12 +19,12 @@ use crate::operator::BinOp;
 #[derive(Debug)]
 pub struct RawBlock {
     /// The range of instructions indices that belong to this block, excluding the potential exit instruction.
-    instr_range: Range<usize>,
+    pub(crate) instr_range: Range<usize>,
     /// Program counter for the instruction lowered as this block's exit.
-    exit_pc: Option<u32>,
+    pub(crate) exit_pc: Option<u32>,
     /// Registers written by an unlifted terminator instruction.
-    exit_writes: SmallVec<[u8; 4]>,
-    exit: RawBlockExit,
+    pub(crate) exit_writes: SmallVec<[u8; 4]>,
+    pub(crate) exit: RawBlockExit,
 }
 
 /// Represents an unlifted terminating edge in the block.
@@ -67,7 +67,7 @@ pub enum RawBlockExit {
 impl RawBlockExit {
     /// Returns successor targets encoded in one block exit.
     #[must_use]
-    fn targets(&self) -> impl Iterator<Item = usize> {
+    pub(crate) fn targets(&self) -> impl Iterator<Item = usize> {
         match self {
             RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => [Some(*target), None],
             RawBlockExit::CondJump {
@@ -266,10 +266,7 @@ pub struct CfgBuild {
 }
 
 pub fn build_from_proto(proto: &Proto, chunk: &Chunk) -> Result<CfgBuild> {
-    let instrs = proto.instrs.as_slice();
-
-    let entries = find_block_entries(instrs)?;
-    let raw_blocks = build_raw_blocks(&entries, instrs)?;
+    let raw_blocks = build_raw_from_proto(proto)?;
 
     let (successors, predecessors) = build_graph(raw_blocks.iter().map(|b| b.exit.targets()));
     let graph = AdjGraph::new(0, &successors, &predecessors);
@@ -316,6 +313,12 @@ pub fn build_from_proto(proto: &Proto, chunk: &Chunk) -> Result<CfgBuild> {
         symbol_types,
         type_store,
     })
+}
+
+/// Builds the bytecode-level blocks shared by flat and structured lifting.
+pub(crate) fn build_raw_from_proto(proto: &Proto) -> Result<Vec<RawBlock>> {
+    let entries = find_block_entries(&proto.instrs)?;
+    build_raw_blocks(&entries, &proto.instrs)
 }
 
 impl ControlFlowGraph {

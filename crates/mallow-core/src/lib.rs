@@ -1,9 +1,9 @@
 mod ast;
 mod common;
 mod disasm;
-mod emitter;
 mod hil;
 mod il;
+mod ir;
 mod logging;
 mod operator;
 mod printer;
@@ -17,8 +17,9 @@ pub use logging::{
 pub use types_view::{TypeFactory, TypePackView, TypeView, TypesView};
 
 use crate::disasm::Chunk;
-use crate::hil::StructuredFunction;
 use crate::hil::lifted::LiftedFunction;
+#[cfg(feature = "visualize")]
+use crate::il::ProtoId;
 use crate::il::{BytecodeType, ProtoTypeInfo, TypeTag};
 use crate::logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget};
 
@@ -26,10 +27,10 @@ use crate::logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EmitMode {
     /// Emit cleaned Luau source code.
-    #[default]
     Source,
-    /// Emit regioned SSA without destroying symbols or running cleanup passes.
-    Ssa,
+    /// Emit flat intermediate representation without source structuring.
+    #[default]
+    Ir,
 }
 
 /// Default maximum number of post-region pass iterations per function.
@@ -184,12 +185,13 @@ fn format_type_tag(tag: TypeTag, chunk: &Chunk) -> String {
     base
 }
 
-/// Lifted functions and the entry proto shared by public bytecode pipelines.
+/// Lifted functions shared by public bytecode pipelines.
 struct LiftedProgram {
+    /// Entry proto selected by the bytecode chunk.
+    #[cfg(feature = "visualize")]
+    entry_proto: ProtoId,
     /// Functions indexed by their proto IDs.
     functions: Vec<LiftedFunction>,
-    /// Proto that starts execution for this chunk.
-    entry_proto: u16,
 }
 
 /// Disassembles and lifts bytecode without structuring its control flow.
@@ -198,7 +200,6 @@ fn lift_bytecode_with_diagnostics(
     diagnostics: &Diagnostics,
 ) -> Result<LiftedProgram> {
     let disassembled = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let entry_proto = disassembled.entry_proto.0;
     let diagnostics = diagnostics.with_entry_proto(disassembled.entry_proto.0);
     let functions = {
         let span = tracing::info_span!("lift_protos", proto_count = disassembled.protos.len());
@@ -212,8 +213,9 @@ fn lift_bytecode_with_diagnostics(
     };
 
     Ok(LiftedProgram {
+        #[cfg(feature = "visualize")]
+        entry_proto: disassembled.entry_proto,
         functions,
-        entry_proto,
     })
 }
 
@@ -234,7 +236,7 @@ pub fn infer_bytecode_types_with_diagnostics(
     Ok(TypesView::from_inferred(&program.functions))
 }
 
-/// Emits Luau bytecode as cleaned source or regioned SSA text.
+/// Emits Luau bytecode as cleaned source or flat IR text.
 pub fn decompile_bytecode(bytecode: &[u8], options: DecompileOptions) -> Result<String> {
     decompile_bytecode_with_diagnostics(bytecode, options, &Diagnostics::default())
 }
@@ -255,78 +257,30 @@ pub fn decompile_bytecode_with_diagnostics(
     );
     let _enter = span.enter();
 
+    // TODO: NonZeroUsize?
     ensure!(
         options.max_pass_iterations > 0,
         "max pass iterations must be greater than zero"
     );
-
-    let mut program = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let entry_proto = program.entry_proto;
-    let diagnostics = diagnostics.with_entry_proto(entry_proto);
-
-    if options.infer_types {
-        hil::ty::inference::run(&mut program.functions);
-    }
-
-    let mut functions: Vec<_> = if options.emit == EmitMode::Ssa {
-        program
-            .functions
-            .into_iter()
-            .map(|fun| StructuredFunction::from_lifted_ssa(fun, &diagnostics))
-            .collect()
-    } else {
-        program
-            .functions
-            .into_iter()
-            .map(|fun| StructuredFunction::from_lifted(fun, &diagnostics))
-            .collect::<Result<_, _>>()?
-    };
-
-    let pass_errors = if options.emit == EmitMode::Source {
-        diagnostics
-            .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
-            .line(0, format_args!("running passes..."));
-        let span = tracing::info_span!("run_post_region_passes", function_count = functions.len());
-        let _enter = span.enter();
-        hil::passes::run(&mut functions, options.max_pass_iterations)
-    } else {
-        Vec::new()
-    };
-
-    for error in &pass_errors {
-        diagnostics
-            .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
-            .line(0, format_args!("warning: {error}"));
-    }
-
-    diagnostics
-        .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
-        .line(0, format_args!("emitting AST..."));
-    let ast = {
-        let span = tracing::info_span!("emit_ast", entry_proto);
-        let _enter = span.enter();
-        emitter::emit_ast(functions, entry_proto as usize, options, &diagnostics)
-    };
-
-    let mut comments = vec![format!(
-        "Decompiled by mallow {}",
-        env!("CARGO_PKG_VERSION")
-    )];
-    comments.extend(
-        pass_errors
-            .into_iter()
-            .map(|error| format!("Pass warning: {error}")),
+    ensure!(
+        options.emit == EmitMode::Ir,
+        "source emission is disabled while the IR pipeline is being rebuilt"
     );
 
-    diagnostics
-        .at(DiagnosticLevel::Info, DiagnosticTarget::Driver)
-        .line(0, format_args!("done"));
-    let source = {
-        let span = tracing::info_span!("print_ast");
-        let _enter = span.enter();
-        printer::print(&ast, &comments)
-    };
-    Ok(source)
+    let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    let functions = ir::lift(&chunk)?;
+
+    use core::fmt::Write;
+
+    let mut out = String::new();
+    let mut iter = functions.into_iter();
+    if let Some(first) = iter.next() {
+        write!(out, "{}", first).expect("writing should not fail here");
+        for f in iter {
+            write!(out, "\n\n{}", f).expect("writing should not fail here");
+        }
+    }
+    Ok(out)
 }
 
 /// Generates a control-flow graph visualization from Luau bytecode.
@@ -350,7 +304,7 @@ pub fn visualize_bytecode(
 
     dump_cfgs(
         &cfgs,
-        program.entry_proto as usize,
+        program.entry_proto.0 as usize,
         output.as_ref().to_path_buf(),
     );
     Ok(())

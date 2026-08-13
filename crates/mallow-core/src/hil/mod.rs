@@ -45,26 +45,6 @@ pub struct StructuredFunction {
 }
 
 impl StructuredFunction {
-    /// Structures a lifted function without destroying SSA or running passes.
-    pub(crate) fn from_lifted_ssa(lifted: LiftedFunction, diagnostics: &Diagnostics) -> Self {
-        let diagnostics = diagnostics.for_proto(lifted.proto.0);
-        let info = diagnostics.at(LogLevel::Info, LogTarget::Hil);
-
-        dump_cfg(&lifted.cfg, &diagnostics);
-        info.line(1, format_args!("structuring SSA region..."));
-        let root = region::structure(&lifted.cfg, &diagnostics);
-
-        Self {
-            proto: lifted.proto,
-            debug_name: lifted.debug_name,
-            root,
-            symbols: lifted.symbols,
-            types: lifted.types,
-            is_vararg: lifted.is_vararg,
-            return_arity: None,
-        }
-    }
-
     pub fn from_lifted(mut lifted: LiftedFunction, diagnostics: &Diagnostics) -> Result<Self> {
         let diagnostics = diagnostics.for_proto(lifted.proto.0);
         let info = diagnostics.at(LogLevel::Info, LogTarget::Hil);

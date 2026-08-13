@@ -103,8 +103,8 @@ struct Cli {
 enum Emit {
     /// Emit cleaned Luau source code.
     Source,
-    /// Emit regioned SSA with its original symbol IDs.
-    Ssa,
+    /// Emit flat intermediate representation.
+    Ir,
 }
 
 impl Emit {
@@ -112,7 +112,7 @@ impl Emit {
     const fn mode(self) -> EmitMode {
         match self {
             Self::Source => EmitMode::Source,
-            Self::Ssa => EmitMode::Ssa,
+            Self::Ir => EmitMode::Ir,
         }
     }
 }
@@ -125,7 +125,7 @@ struct DecompileArgs {
     output: Option<PathBuf>,
 
     /// Output form to emit
-    #[arg(long, value_enum, default_value = "source")]
+    #[arg(long, value_enum, default_value = "ir")]
     emit: Emit,
 
     /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded
@@ -269,7 +269,7 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Emit a bytecode file as cleaned Luau or regioned SSA
+    /// Emit a bytecode file as cleaned Luau or flat IR
     Decompile {
         /// Path to the input bytecode file
         #[arg(short, long)]
@@ -279,7 +279,7 @@ enum Commands {
         #[command(flatten)]
         decompile: DecompileArgs,
     },
-    /// Compile a Luau source file and emit cleaned Luau or regioned SSA
+    /// Compile a Luau source file and emit cleaned Luau or flat IR
     Roundtrip {
         /// Path to the input Luau source file
         #[arg(short, long)]
