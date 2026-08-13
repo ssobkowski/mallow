@@ -1,6 +1,6 @@
 //! Capture storage resolution for whole-program inference.
 
-use crate::hil::ir::{Capture, Expr};
+use crate::hil::ir::{Capture, CellOrigin, Expr};
 use crate::hil::lifted::LiftedFunction;
 use crate::hil::visitor::{Visitor, walk_expr};
 use crate::il::ProtoId;
@@ -67,10 +67,12 @@ impl CaptureResolver {
 
         let mut resolutions: Vec<_> = functions
             .iter()
-            .map(|function| vec![StorageResolution::Unresolved; function.symbols.upvalues().len()])
+            .map(|function| {
+                vec![StorageResolution::Unresolved; function.symbols.upvalue_cells().len()]
+            })
             .collect();
         for (proto, function) in functions.iter().enumerate() {
-            for slot in 0..function.symbols.upvalues().len() {
+            for slot in 0..function.symbols.upvalue_cells().len() {
                 Self::resolve(proto, slot, &layouts, &mut resolutions);
             }
         }
@@ -152,16 +154,11 @@ impl CaptureLayoutCollector<'_> {
     /// Resolves one HIL capture to its storage origin.
     fn origin(&self, capture: Capture) -> CaptureOrigin {
         match capture {
-            Capture::Value(_) => CaptureOrigin::Value,
-            Capture::Ref(_) => CaptureOrigin::Ref,
-            Capture::Upvalue(symbol) => {
-                let slot = self
-                    .parent
-                    .symbols
-                    .slot_for_upvalue(symbol)
-                    .expect("upvalue capture must use a declared parent upvalue");
-                CaptureOrigin::Upvalue(slot)
-            }
+            Capture::Copy(_) => CaptureOrigin::Value,
+            Capture::Share(cell) => match self.parent.symbols.cells()[cell].origin {
+                CellOrigin::CapturedRegister { .. } => CaptureOrigin::Ref,
+                CellOrigin::Upvalue(slot) => CaptureOrigin::Upvalue(slot as usize),
+            },
         }
     }
 }
@@ -177,7 +174,7 @@ impl Visitor for CaptureLayoutCollector<'_> {
                 .expect("closure proto must index its lifted function");
             assert_eq!(
                 captures.len(),
-                child.symbols.upvalues().len(),
+                child.symbols.upvalue_cells().len(),
                 "closure captures must match child upvalues"
             );
 

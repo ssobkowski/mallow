@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::disasm::Chunk;
 use crate::hil::cflow::cfg::{self, BlockExit, ControlFlowGraph};
 use crate::hil::cflow::union_find::UnionFind;
-use crate::hil::ir::{Capture, PhiNode, Stmt};
+use crate::hil::ir::{Capture, CellId, Expr, PhiNode, Stmt};
 use crate::hil::lifter::ssa::{FunctionSymbols, SymbolId};
 use crate::hil::ty::canonical::TypeId;
 use crate::hil::ty::store::TypeStore;
@@ -285,8 +285,8 @@ impl LiftedFunction {
     /// Coalesces SSA versions into the logical symbols expected by structuring.
     ///
     /// When enabled, whole-program inference must run before this method. The
-    /// explicit Phi targets carry merged inferred schemes, while distinct
-    /// versions of mutable storage are equated during constraint collection.
+    /// explicit Phi targets carry merged inferred schemes. Mutable cells keep
+    /// their own identities and are not part of SSA coalescing.
     pub(crate) fn destruct_ssa(&mut self) {
         let mut disjoint_set = UnionFind::new();
         for (target, source) in self.symbols.take_loop_carried_links() {
@@ -295,20 +295,12 @@ impl LiftedFunction {
 
         union_phi_versions(&self.cfg, &mut disjoint_set);
         union_generic_for_versions(&self.cfg, &mut disjoint_set);
-        for storage in self.symbols.take_storage_members() {
-            let mut symbols = storage.into_iter();
-            let Some(first) = symbols.next() else {
-                continue;
-            };
-            for symbol in symbols {
-                disjoint_set.union(first, symbol);
+        for (cell, symbol) in self.symbols.cell_names() {
+            if let Some(initial) = cell_initial_symbol(&self.cfg, cell) {
+                disjoint_set.union(symbol, initial);
             }
         }
-
         for symbol in self.symbols.params_mut() {
-            *symbol = disjoint_set.find(*symbol);
-        }
-        for symbol in self.symbols.upvalues_mut() {
             *symbol = disjoint_set.find(*symbol);
         }
         self.types.canonicalize_symbols(&mut disjoint_set);
@@ -327,6 +319,22 @@ impl LiftedFunction {
             canonicalizer.visit_block(block);
         }
     }
+}
+
+/// Returns the symbol that initialized one captured register cell.
+fn cell_initial_symbol(cfg: &ControlFlowGraph, cell: CellId) -> Option<SymbolId> {
+    cfg.blocks()
+        .flat_map(|block| block.stmts())
+        .find_map(|statement| {
+            let Stmt::OpenCell {
+                cell: opened,
+                value: Expr::Symbol(symbol),
+            } = statement
+            else {
+                return None;
+            };
+            (*opened == cell).then_some(*symbol)
+        })
 }
 
 /// Unions nontrivial Phi versions except source-level loop initializers.
@@ -403,9 +411,11 @@ impl VisitorMut for SymbolCanonicalizer<'_> {
         *symbol = self.disjoint_set.find(*symbol);
     }
 
-    /// Rewrites a closure capture owned by the enclosing function.
+    /// Rewrites an immutable value copied into a closure.
     fn visit_capture(&mut self, _index: usize, capture: &mut Capture) {
-        self.visit_symbol(capture.symbol_mut());
+        if let Capture::Copy(symbol) = capture {
+            self.visit_symbol(symbol);
+        }
     }
 
     /// Rewrites both sides of a synthetic Phi statement.

@@ -222,6 +222,15 @@ impl Visitor for FunctionUseDef {
                 self.note_effect_at(pos);
             }
             Stmt::Call(expr) => self.visit_expr(expr),
+            Stmt::OpenCell { value, .. } | Stmt::StoreCell { value, .. } => {
+                self.visit_expr(value);
+                let pos = self.alloc_pos();
+                self.note_effect_at(pos);
+            }
+            Stmt::LoadCell { target, .. } => {
+                let pos = self.note_unknown_write(*target);
+                self.note_effect_at(pos);
+            }
             Stmt::Phi(_) => {
                 unreachable!("phi nodes should have been unfolded at this point")
             }
@@ -243,7 +252,9 @@ impl Visitor for FunctionUseDef {
     }
 
     fn visit_capture(&mut self, _: usize, capture: Capture) {
-        self.symbols.entry(capture.symbol()).or_default().poisoned = true;
+        if let Capture::Copy(symbol) = capture {
+            self.symbols.entry(symbol).or_default().poisoned = true;
+        }
     }
 
     fn visit_symbol(&mut self, sym: SymbolId) {
@@ -307,6 +318,10 @@ impl BlockUseDef {
                 reads.visit_value_pack(values);
             }
             Stmt::Call(expr) => reads.visit_expr(expr),
+            Stmt::OpenCell { value, .. } | Stmt::StoreCell { value, .. } => reads.visit_expr(value),
+            Stmt::LoadCell { target, .. } => {
+                self.writes.entry(*target).or_default().push(pos);
+            }
             Stmt::Phi(_) => {
                 unreachable!("phi nodes should have been unfolded at this point")
             }
@@ -389,7 +404,11 @@ fn stmt_has_effect(stmt: &Stmt) -> bool {
             left.iter().any(|left| !matches!(left, Expr::Symbol(_)))
                 || values.iter().any(|value| !value.is_pure())
         }
-        Stmt::SetList { .. } | Stmt::Call(_) => true,
+        Stmt::SetList { .. }
+        | Stmt::Call(_)
+        | Stmt::OpenCell { .. }
+        | Stmt::LoadCell { .. }
+        | Stmt::StoreCell { .. } => true,
         Stmt::Phi(_) => unreachable!("phi nodes should have been unfolded at this point"),
     }
 }

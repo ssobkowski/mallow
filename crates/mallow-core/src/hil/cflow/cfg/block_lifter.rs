@@ -1,19 +1,21 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
+use id_arena::Arena;
 
 use super::{Block, BlockExit, Cond, CondRhs, RawBlock, RawBlockExit};
 use crate::disasm::Chunk;
 use crate::hil::cflow::graph::GraphView;
 use crate::hil::cflow::reg_set::RegSet;
-use crate::hil::ir::{Capture, Expr, PhiNode, Stmt, ValuePack};
+use crate::hil::ir::{Capture, Cell, CellId, CellOrigin, Expr, PhiNode, Stmt, ValuePack};
+use crate::hil::lifter::common::CAPTURE_REF;
 use crate::hil::lifter::ssa::{FunctionSymbols, NamedLocal, Ssa, Symbol, SymbolId, SymbolKind};
 use crate::hil::lifter::{CaptureState, LiftContext, MultiRet, flush_multiret, lift};
 use crate::hil::ty::bytecode::ProtoTypeContext;
 use crate::hil::ty::canonical::TypeId;
 use crate::hil::ty::store::TypeStore;
 use crate::hil::visitor::{Visitor, VisitorMut};
-use crate::il::{ConstId, Count, Proto, reg_add, reg_range};
+use crate::il::{ConstId, Count, Instr, Proto, reg_add, reg_range};
 
 /// Blocks and SSA metadata produced by one block-lifting run.
 pub(super) struct BuildResult {
@@ -72,7 +74,11 @@ struct BlockLifter<'a, G: GraphView> {
     blocks: Vec<Block>,
     ssa: Ssa<'a, G>,
     params: Vec<SymbolId>,
+    cells: Arena<Cell>,
     upvalues: Vec<SymbolId>,
+    upvalue_cells: Vec<CellId>,
+    cell_names: HashMap<CellId, SymbolId>,
+    captured_cells: HashMap<(u8, u16), CellId>,
     loop_carried_links: Vec<(SymbolId, SymbolId)>,
     capture_states: Vec<CaptureState>,
 }
@@ -91,9 +97,13 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             type_store,
             type_context,
             blocks: vec![Block::dummy(); raw_blocks.len()],
-            ssa: Ssa::new(graph, proto.max_stack_size, proto.num_upvals),
+            ssa: Ssa::new(graph, proto.max_stack_size),
             params: Vec::with_capacity(proto.num_params as usize),
+            cells: Arena::new(),
             upvalues: Vec::with_capacity(proto.num_upvals as usize),
+            upvalue_cells: Vec::with_capacity(proto.num_upvals as usize),
+            cell_names: HashMap::new(),
+            captured_cells: HashMap::new(),
             loop_carried_links: Vec::new(),
             capture_states,
         }
@@ -102,18 +112,20 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
     /// Runs SSA-backed lifting through non-destructive alias resolution.
     fn build(mut self) -> Result<BuildResult> {
         self.initialize_entry_symbols();
+        self.prepare_all_captured_cells();
         self.lift_blocks()?;
         self.collect_loop_carried_links();
         let symbol_types = self.finish_ssa();
+        self.update_cell_names();
         let named_locals = self.named_locals();
-        let (upvalue_storage, captured_storage) = self.storage_members();
 
         let symbols = FunctionSymbols::new(
             self.params,
             self.upvalues,
+            self.upvalue_cells,
+            self.cells,
+            self.cell_names,
             named_locals,
-            upvalue_storage,
-            captured_storage,
             self.loop_carried_links,
         );
 
@@ -137,12 +149,16 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             self.params.push(sym);
         }
 
-        for i in 0..self.proto.num_upvals {
-            let sym = self
-                .ssa
-                .alloc_symbol(Symbol::upval(i).with_type(self.type_context.upvalue(i)));
-            self.ssa.write_upval(self.graph.entry(), i, sym);
-            self.upvalues.push(sym);
+        for index in 0..self.proto.num_upvals {
+            let cell = self.cells.alloc(Cell {
+                origin: CellOrigin::Upvalue(index),
+            });
+            let name = self.ssa.alloc_symbol(
+                Symbol::upvalue_name(index).with_type(self.type_context.upvalue(index)),
+            );
+            self.upvalues.push(name);
+            self.upvalue_cells.push(cell);
+            self.cell_names.insert(cell, name);
         }
     }
 
@@ -154,10 +170,40 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
         Ok(())
     }
 
+    /// Returns or creates the cell for one captured register generation.
+    fn captured_cell(&mut self, reg: u8, generation: u16) -> CellId {
+        if let Some(cell) = self.captured_cells.get(&(reg, generation)) {
+            return *cell;
+        }
+
+        let cell = self.cells.alloc(Cell {
+            origin: CellOrigin::CapturedRegister { reg, generation },
+        });
+        let name = self.ssa.alloc_symbol(Symbol::reg(reg));
+        self.cell_names.insert(cell, name);
+        self.captured_cells.insert((reg, generation), cell);
+        cell
+    }
+
+    /// Allocates every captured register cell before control-flow lifting.
+    fn prepare_all_captured_cells(&mut self) {
+        let mut state = CaptureState::default();
+        for decoded in &self.proto.instrs {
+            if let Instr::Capture {
+                capture_type: CAPTURE_REF,
+                reg,
+            } = decoded.instr
+            {
+                self.captured_cell(reg, state.generation(reg));
+            }
+            state.note_instruction(decoded.instr);
+        }
+    }
+
     /// Lifts one raw block body and lowers its raw terminator into a HIL exit.
     fn lift_block(&mut self, block_id: usize) -> Result<()> {
         let raw_block = &self.raw_blocks[block_id];
-        let (mut stmts, mut pending_multiret) = lift(LiftContext {
+        let (mut stmts, mut pending_multiret, capture_state) = lift(LiftContext {
             instrs: &self.proto.instrs[raw_block.instr_range.clone()],
             chunk: self.chunk,
             proto: self.proto,
@@ -165,9 +211,12 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             ssa: &mut self.ssa,
             block_idx: block_id,
             capture_state: self.capture_states[block_id],
+            captured_cells: &self.captured_cells,
+            upvalue_cells: &self.upvalue_cells,
         })?;
 
         let exit = self.lower_exit(block_id, &mut stmts, &mut pending_multiret)?;
+        self.capture_states[block_id] = capture_state;
 
         debug_assert!(
             pending_multiret.is_none(),
@@ -218,7 +267,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                 else_block,
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
-                let cond = self.lower_cond(block_id, cond)?;
+                let cond = self.lower_cond(block_id, cond, stmts)?;
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 Ok(BlockExit::CondJump {
                     cond,
@@ -234,9 +283,9 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
 
                 // These are current-block reads. They must happen before exit_writes.
-                let start = self.ssa.read_reg(block_id, reg_add(base, 2));
-                let end = self.ssa.read_reg(block_id, reg_add(base, 0));
-                let step = self.ssa.read_reg(block_id, reg_add(base, 1));
+                let start = self.read_reg_value(block_id, reg_add(base, 2), stmts);
+                let end = self.read_reg_value(block_id, reg_add(base, 0), stmts);
+                let step = self.read_reg_value(block_id, reg_add(base, 1), stmts);
 
                 // These are terminator/edge writes.
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
@@ -249,9 +298,9 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                     body_block,
                     exit_block,
                     var,
-                    start: Expr::Symbol(start),
-                    end: Expr::Symbol(end),
-                    step: Expr::Symbol(step),
+                    start,
+                    end,
+                    step,
                 })
             }
             RawBlockExit::FornLoop {
@@ -274,9 +323,9 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
             } => {
                 self.flush_pending_multiret(block_id, stmts, pending_multiret);
                 let exprs = [
-                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(base, 0))),
-                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(base, 1))),
-                    Expr::Symbol(self.ssa.read_reg(block_id, reg_add(base, 2))),
+                    self.read_reg_value(block_id, reg_add(base, 0), stmts),
+                    self.read_reg_value(block_id, reg_add(base, 1), stmts),
+                    self.read_reg_value(block_id, reg_add(base, 2), stmts),
                 ];
                 self.apply_exit_writes(block_id, exit_pc, exit_writes);
                 // Capture entry versions before the loop body can assign to them.
@@ -337,8 +386,8 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                         );
 
                         let mut head = Vec::new();
-                        for i in base..multiret.base {
-                            head.push(Expr::Symbol(self.ssa.read_reg(block_id, i)));
+                        for reg in base..multiret.base {
+                            head.push(self.read_reg_value(block_id, reg, stmts));
                         }
 
                         Ok(BlockExit::Return(ValuePack::Open {
@@ -356,7 +405,7 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
 
                         let rets = ValuePack::Fixed(
                             reg_range(base, n)
-                                .map(|i| Expr::Symbol(self.ssa.read_reg(block_id, i)))
+                                .map(|reg| self.read_reg_value(block_id, reg, stmts))
                                 .collect(),
                         );
 
@@ -367,14 +416,25 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
         }
     }
 
+    /// Reads one register for a block exit.
+    fn read_reg_value(&mut self, block_id: usize, reg: u8, stmts: &mut Vec<Stmt>) -> Expr {
+        let Some(generation) = self.capture_states[block_id].open_generation(reg) else {
+            return Expr::Symbol(self.ssa.read_reg(block_id, reg));
+        };
+        let cell = self.captured_cells[&(reg, generation)];
+        let target = self.ssa.alloc_symbol(Symbol::reg(reg));
+        stmts.push(Stmt::LoadCell { target, cell });
+        Expr::Symbol(target)
+    }
+
     /// Converts a raw register/constant condition into a HIL expression.
-    fn lower_cond(&mut self, block_id: usize, cond: &Cond) -> Result<Expr> {
+    fn lower_cond(&mut self, block_id: usize, cond: &Cond, stmts: &mut Vec<Stmt>) -> Result<Expr> {
         Ok(match cond {
-            Cond::Unary(reg) => Expr::Symbol(self.ssa.read_reg(block_id, *reg)),
+            Cond::Unary(reg) => self.read_reg_value(block_id, *reg, stmts),
             Cond::Binary { lhs, op, rhs } => {
-                let lhs = Expr::Symbol(self.ssa.read_reg(block_id, *lhs));
+                let lhs = self.read_reg_value(block_id, *lhs, stmts);
                 let rhs = match rhs {
-                    CondRhs::Reg(reg) => Expr::Symbol(self.ssa.read_reg(block_id, *reg)),
+                    CondRhs::Reg(reg) => self.read_reg_value(block_id, *reg, stmts),
                     CondRhs::Const(idx) => Expr::from_constant(
                         self.proto
                             .get_constant(ConstId(*idx))
@@ -434,10 +494,6 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                 let loop_live_out =
                     compute_loop_live_out_regs(&loop_body, &self.graph, &live_in_regs);
 
-                for u in 0..self.proto.num_upvals {
-                    let _ = self.ssa.read_upval(target, u);
-                }
-
                 for reg in written_regs.iter() {
                     if live_in_regs[target].contains(reg)
                         || loop_live_out.contains(reg)
@@ -489,9 +545,6 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
         for symbol in &mut self.params {
             *symbol = self.ssa.resolve(*symbol);
         }
-        for symbol in &mut self.upvalues {
-            *symbol = self.ssa.resolve(*symbol);
-        }
         for (target, source) in &mut self.loop_carried_links {
             *target = self.ssa.resolve(*target);
             *source = self.ssa.resolve(*source);
@@ -510,6 +563,21 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                     .or_insert(ty);
                 facts
             })
+    }
+
+    /// Uses the initial register symbol as the emitter name for captured cells.
+    fn update_cell_names(&mut self) {
+        for block in &self.blocks {
+            for statement in block.stmts() {
+                if let Stmt::OpenCell {
+                    cell,
+                    value: Expr::Symbol(symbol),
+                } = statement
+                {
+                    self.cell_names.insert(*cell, *symbol);
+                }
+            }
+        }
     }
 
     /// Builds named locals from debug records and their surviving SSA versions.
@@ -540,36 +608,6 @@ impl<'a, G: GraphView> BlockLifter<'a, G> {
                 })
             })
             .collect()
-    }
-
-    /// Finds surviving symbols that share declared-upvalue or captured-register storage.
-    fn storage_members(&self) -> (Vec<Vec<SymbolId>>, Vec<Vec<SymbolId>>) {
-        let mut upvalue_storage: BTreeMap<u8, Vec<_>> = BTreeMap::new();
-        let mut captured_storage: BTreeMap<(u8, u16), Vec<_>> = BTreeMap::new();
-
-        for (id, symbol) in self.ssa.arena().iter() {
-            let resolved = self.ssa.resolve(id);
-            let members = match symbol.kind {
-                SymbolKind::Upvalue(index) => upvalue_storage.entry(index).or_default(),
-                SymbolKind::CapturedRegister { reg, generation } => {
-                    captured_storage.entry((reg, generation)).or_default()
-                }
-                SymbolKind::Register(_) | SymbolKind::Param(_) => continue,
-            };
-            if !members.contains(&resolved) {
-                members.push(resolved);
-            }
-        }
-
-        let upvalue_storage = upvalue_storage
-            .into_values()
-            .filter(|members| members.len() > 1)
-            .collect();
-        let captured_storage = captured_storage
-            .into_values()
-            .filter(|members| members.len() > 1)
-            .collect();
-        (upvalue_storage, captured_storage)
     }
 
     /// Applies exit writes to the SSA block, writing each register in `exit_writes` to a fresh symbol.
@@ -605,9 +643,11 @@ impl<G: GraphView> VisitorMut for SsaAliasResolver<'_, '_, G> {
         *symbol = self.ssa.resolve(*symbol);
     }
 
-    /// Resolves a closure capture owned by the enclosing function.
+    /// Resolves an immutable value copied into a closure.
     fn visit_capture(&mut self, _index: usize, capture: &mut Capture) {
-        self.visit_symbol(capture.symbol_mut());
+        if let Capture::Copy(symbol) = capture {
+            self.visit_symbol(symbol);
+        }
     }
 
     /// Resolves the target and operands of a synthetic Phi statement.
@@ -624,8 +664,8 @@ fn symbol_register_map<G: GraphView>(ssa: &Ssa<'_, G>) -> HashMap<SymbolId, u8> 
     ssa.arena()
         .iter()
         .filter_map(|(id, sym)| match sym.kind {
-            SymbolKind::Register(reg) | SymbolKind::CapturedRegister { reg, .. } => Some((id, reg)),
-            _ => None,
+            SymbolKind::Register(reg) => Some((id, reg)),
+            SymbolKind::Param(_) | SymbolKind::UpvalueName(_) => None,
         })
         .collect()
 }
@@ -671,7 +711,9 @@ impl Visitor for RegUseCollector<'_, '_> {
     }
 
     fn visit_capture(&mut self, _index: usize, capture: Capture) {
-        self.visit_symbol(capture.symbol());
+        if let Capture::Copy(symbol) = capture {
+            self.visit_symbol(symbol);
+        }
     }
 }
 
@@ -718,7 +760,9 @@ impl Visitor for RegUseDefCollector<'_, '_, '_> {
 
     /// Captures read their captured symbol for live-in purposes.
     fn visit_capture(&mut self, _index: usize, capture: Capture) {
-        self.note_use(capture.symbol());
+        if let Capture::Copy(symbol) = capture {
+            self.note_use(symbol);
+        }
     }
 
     /// Applies statement-level use/def ordering before expression traversal.
@@ -739,6 +783,10 @@ impl Visitor for RegUseDefCollector<'_, '_, '_> {
                 self.note_use(*table);
                 self.visit_value_pack(values);
             }
+            Stmt::OpenCell { value, .. } | Stmt::StoreCell { value, .. } => {
+                self.visit_expr(value);
+            }
+            Stmt::LoadCell { target, .. } => self.note_def(*target),
             Stmt::Phi(phi) => self.note_def(phi.target),
         }
     }

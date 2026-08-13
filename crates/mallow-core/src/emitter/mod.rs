@@ -736,7 +736,9 @@ impl Emitter<'_> {
         };
 
         if self.declarations.contains_symbol(sym)
-            || !captures.iter().any(|capture| capture.symbol() == *sym)
+            || !captures
+                .iter()
+                .any(|capture| matches!(capture, hil::Capture::Copy(symbol) if symbol == sym))
         {
             return;
         }
@@ -997,6 +999,51 @@ impl Emitter<'_> {
             hil::Stmt::Call(expr) => buf.push(ast::Stmt::Expression {
                 expr: self.visit_expr(expr),
             }),
+            hil::Stmt::OpenCell { cell, value } => {
+                let symbol = self.functions[self.current_proto_idx()]
+                    .symbols
+                    .name_for_cell(*cell);
+                if matches!(value, hil::Expr::Closure { .. })
+                    && !self.declarations.contains_symbol(&symbol)
+                {
+                    let slot = self.declare_symbol(symbol);
+                    self.declare_slot(slot);
+                    if let Some(SymbolStorage::Named(name)) = self.symbol_storage(symbol) {
+                        buf.push(ast::Stmt::LocalDeclaration {
+                            names: vec![self.typed_identifier(symbol, name)],
+                            values: Vec::new(),
+                        });
+                    }
+                }
+                self.visit_assign(
+                    &hil::Expr::Symbol(symbol),
+                    value,
+                    AssignmentMeaning::ValueWrite,
+                    buf,
+                );
+            }
+            hil::Stmt::StoreCell { cell, value } => {
+                let symbol = self.functions[self.current_proto_idx()]
+                    .symbols
+                    .name_for_cell(*cell);
+                self.visit_assign(
+                    &hil::Expr::Symbol(symbol),
+                    value,
+                    AssignmentMeaning::ValueWrite,
+                    buf,
+                );
+            }
+            hil::Stmt::LoadCell { target, cell } => {
+                let symbol = self.functions[self.current_proto_idx()]
+                    .symbols
+                    .name_for_cell(*cell);
+                self.visit_assign(
+                    &hil::Expr::Symbol(*target),
+                    &hil::Expr::Symbol(symbol),
+                    AssignmentMeaning::ValueWrite,
+                    buf,
+                );
+            }
             hil::Stmt::Phi(phi) => {
                 assert_eq!(
                     self.options.emit,
@@ -1164,20 +1211,28 @@ impl Emitter<'_> {
     /// Emits one closure with the best inferred parameter annotations available.
     fn visit_closure(&mut self, proto_idx: ProtoId, captures: &[hil::Capture]) -> ast::Expr {
         let proto_idx = proto_idx.0 as usize;
+        let capture_symbols: Vec<_> = captures
+            .iter()
+            .map(|capture| match capture {
+                hil::Capture::Copy(symbol) => *symbol,
+                hil::Capture::Share(cell) => self.functions[self.current_proto_idx()]
+                    .symbols
+                    .name_for_cell(*cell),
+            })
+            .collect();
         let ssa_upvalue_sources = if self.options.emit == EmitMode::Ssa {
-            captures
+            capture_symbols
                 .iter()
-                .map(|capture| self.get_symbol_name(&capture.symbol()))
+                .map(|symbol| self.get_symbol_name(symbol))
                 .collect()
         } else {
             Vec::new()
         };
-        let parent_bindings: Vec<_> = captures
+        let parent_bindings: Vec<_> = capture_symbols
             .iter()
-            .map(|capture| {
-                let symbol = capture.symbol();
-                self.symbol_storage(symbol)
-                    .unwrap_or_else(|| SymbolStorage::Named(self.get_symbol_name(&symbol)))
+            .map(|symbol| {
+                self.symbol_storage(*symbol)
+                    .unwrap_or_else(|| SymbolStorage::Named(self.get_symbol_name(symbol)))
             })
             .collect();
 

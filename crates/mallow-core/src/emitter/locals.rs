@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::emitter::collectors::ReadCollector;
 use crate::hil::StructuredFunction;
 use crate::hil::cflow::region::RegionNode;
-use crate::hil::ir::{Expr, Stmt, ValuePack};
+use crate::hil::ir::{Capture, Expr, Stmt, ValuePack};
 use crate::hil::lifter::ssa::SymbolId;
 use crate::hil::ty::canonical::TypeId;
 use crate::hil::visitor::{Visitor, walk_expr};
@@ -253,6 +253,12 @@ impl Visitor for LifetimeAnalysis {
                 self.record_event(reads, HashSet::new());
             }
             Stmt::Call(expr) => self.record_expr_event(expr),
+            Stmt::OpenCell { value, .. } | Stmt::StoreCell { value, .. } => {
+                self.record_expr_event(value)
+            }
+            Stmt::LoadCell { target, .. } => {
+                self.record_event(HashSet::new(), [*target].into_iter().collect())
+            }
             Stmt::Phi(phi) => {
                 let reads = phi.operands.iter().map(|(_, symbol)| *symbol).collect();
                 self.record_event(reads, [phi.target].into_iter().collect());
@@ -405,7 +411,10 @@ impl Visitor for CaptureCollector {
     fn visit_expr(&mut self, expr: &Expr) {
         if let Expr::Closure { captures, .. } = expr {
             self.captures
-                .extend(captures.iter().map(|capture| capture.symbol()));
+                .extend(captures.iter().filter_map(|capture| match capture {
+                    Capture::Copy(symbol) => Some(*symbol),
+                    Capture::Share(_) => None,
+                }));
         }
 
         walk_expr(self, expr);

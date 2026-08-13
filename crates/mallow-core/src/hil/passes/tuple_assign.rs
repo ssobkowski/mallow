@@ -111,7 +111,10 @@ fn stmt_mentions_symbol(stmt: &Stmt, sym: SymbolId) -> bool {
         Stmt::SetList { table, values, .. } => {
             *table == sym || values.iter().any(|expr| expr.reads_symbol(&sym))
         }
-        Stmt::Call(expr) => expr.reads_symbol(&sym),
+        Stmt::Call(expr)
+        | Stmt::OpenCell { value: expr, .. }
+        | Stmt::StoreCell { value: expr, .. } => expr.reads_symbol(&sym),
+        Stmt::LoadCell { target, .. } => *target == sym,
         Stmt::Phi(node) => {
             node.target == sym || node.operands.iter().any(|(_, operand)| *operand == sym)
         }

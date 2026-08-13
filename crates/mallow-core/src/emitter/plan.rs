@@ -296,18 +296,18 @@ mod tests {
         assert_eq!(name.as_str(), "p7_v2");
     }
 
-    /// SSA upvalue versions retain their declared slot when earlier slots have no writes.
+    /// Transitional upvalue names retain their declared slots.
     #[test]
-    fn ssa_upvalue_versions_keep_declared_slot() {
+    fn ssa_upvalue_names_keep_declared_slot() {
         let mut arena: Arena<Symbol> = Arena::new();
-        let first_entry = arena.alloc(Symbol::upval(0));
-        let second_entry = arena.alloc(Symbol::upval(1));
-        let second_write = arena.alloc(Symbol::upval(1));
+        let first_entry = arena.alloc(Symbol::upvalue_name(0));
+        let second_entry = arena.alloc(Symbol::upvalue_name(1));
         let symbols = FunctionSymbols::new(
             Vec::new(),
             vec![first_entry, second_entry],
             Vec::new(),
-            vec![vec![second_entry, second_write]],
+            Arena::new(),
+            HashMap::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -316,7 +316,6 @@ mod tests {
 
         assert_eq!(slots.get(&first_entry), Some(&0));
         assert_eq!(slots.get(&second_entry), Some(&1));
-        assert_eq!(slots.get(&second_write), Some(&1));
     }
 
     #[test]

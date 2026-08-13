@@ -5,7 +5,7 @@ use crate::hil::StructuredFunction;
 use crate::hil::cflow::cfg::{Block, BlockExit};
 use crate::hil::cflow::graph::GraphView;
 use crate::hil::cflow::region::RegionNode;
-use crate::hil::ir::{Capture, Expr, Number, PhiNode, Stmt, TableItem, ValuePack};
+use crate::hil::ir::{Capture, CellId, Expr, Number, PhiNode, Stmt, TableItem, ValuePack};
 use crate::hil::lifter::ssa::SymbolId;
 
 #[allow(dead_code, reason = "might be used in the future")]
@@ -64,9 +64,16 @@ pub trait Visitor {
 
     fn visit_phi(&mut self, _phi: &PhiNode) {}
 
-    fn visit_capture(&mut self, _index: usize, _capture: Capture) {}
+    fn visit_capture(&mut self, _index: usize, capture: Capture) {
+        match capture {
+            Capture::Copy(symbol) => self.visit_symbol(symbol),
+            Capture::Share(cell) => self.visit_cell(cell),
+        }
+    }
 
     fn visit_symbol(&mut self, _sym: SymbolId) {}
+
+    fn visit_cell(&mut self, _cell: CellId) {}
 
     fn visit_number(&mut self, _number: Number) {}
 
@@ -124,9 +131,16 @@ pub trait VisitorMut {
 
     fn visit_phi(&mut self, _phi: &mut PhiNode) {}
 
-    fn visit_capture(&mut self, _index: usize, _capture: &mut Capture) {}
+    fn visit_capture(&mut self, _index: usize, capture: &mut Capture) {
+        match capture {
+            Capture::Copy(symbol) => self.visit_symbol(symbol),
+            Capture::Share(cell) => self.visit_cell(cell),
+        }
+    }
 
     fn visit_symbol(&mut self, _sym: &mut SymbolId) {}
+
+    fn visit_cell(&mut self, _cell: &mut CellId) {}
 
     fn visit_number(&mut self, _number: &mut Number) {}
 
@@ -267,6 +281,14 @@ pub fn walk_stmt<V: Visitor + ?Sized>(visitor: &mut V, stmt: &Stmt) {
             visitor.visit_value_pack(values);
         }
         Stmt::Call(expr) => visitor.visit_expr(expr),
+        Stmt::OpenCell { cell, value } | Stmt::StoreCell { cell, value } => {
+            visitor.visit_cell(*cell);
+            visitor.visit_expr(value);
+        }
+        Stmt::LoadCell { target, cell } => {
+            visitor.visit_symbol(*target);
+            visitor.visit_cell(*cell);
+        }
         Stmt::Phi(phi) => visitor.visit_phi(phi),
     }
 }
@@ -479,6 +501,14 @@ pub fn walk_stmt_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmt: &mut Stmt) {
             visitor.visit_value_pack(values);
         }
         Stmt::Call(expr) => visitor.visit_expr(expr),
+        Stmt::OpenCell { cell, value } | Stmt::StoreCell { cell, value } => {
+            visitor.visit_cell(cell);
+            visitor.visit_expr(value);
+        }
+        Stmt::LoadCell { target, cell } => {
+            visitor.visit_symbol(target);
+            visitor.visit_cell(cell);
+        }
         Stmt::Phi(phi) => visitor.visit_phi(phi),
     }
 }

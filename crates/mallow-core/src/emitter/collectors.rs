@@ -61,6 +61,8 @@ impl Visitor for ReadCollector {
     }
 
     fn visit_capture(&mut self, _index: usize, capture: Capture) {
-        self.symbols.insert(capture.symbol());
+        if let Capture::Copy(symbol) = capture {
+            self.symbols.insert(symbol);
+        }
     }
 }

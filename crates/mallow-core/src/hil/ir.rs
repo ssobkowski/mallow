@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use anyhow::{Context, Result, bail};
+use id_arena::Id;
 use smol_str::{SmolStr, ToSmolStr};
 
 use crate::common::ByteString;
@@ -27,31 +28,32 @@ impl std::fmt::Display for Number {
     }
 }
 
-/// A captured symbol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Capture {
-    /// Symbol captured as a reference.
-    Ref(SymbolId),
-    /// Symbol captured as a value, ie. through a copy.
-    Value(SymbolId),
-    /// Symbol captured as a pre-captured upvalue.
-    Upvalue(SymbolId),
+/// Stable identity for one mutable HIL storage cell.
+pub type CellId = Id<Cell>;
+
+/// One mutable storage cell used by closure upvalues.
+#[derive(Debug, Clone)]
+pub struct Cell {
+    /// Bytecode storage that introduced this cell.
+    pub origin: CellOrigin,
 }
 
-impl Capture {
-    /// Returns the symbol used to initialize or share this capture.
-    pub const fn symbol(self) -> SymbolId {
-        match self {
-            Self::Ref(symbol) | Self::Value(symbol) | Self::Upvalue(symbol) => symbol,
-        }
-    }
+/// The bytecode storage represented by one cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CellOrigin {
+    /// One declared upvalue slot in the current function.
+    Upvalue(u8),
+    /// One generation of an open captured register.
+    CapturedRegister { reg: u8, generation: u16 },
+}
 
-    /// Returns a mutable reference to the captured symbol.
-    pub fn symbol_mut(&mut self) -> &mut SymbolId {
-        match self {
-            Self::Ref(symbol) | Self::Value(symbol) | Self::Upvalue(symbol) => symbol,
-        }
-    }
+/// A value or cell captured by a closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Capture {
+    /// Copies one immutable value into the child upvalue.
+    Copy(SymbolId),
+    /// Shares one mutable cell with the child upvalue.
+    Share(CellId),
 }
 
 /// An expression in the high-level intermediate representation.
@@ -511,6 +513,12 @@ pub enum Stmt {
     },
     /// A call statement.
     Call(Expr),
+    /// Opens a captured register cell with its current value.
+    OpenCell { cell: CellId, value: Expr },
+    /// Loads the current contents of a cell into one immutable symbol.
+    LoadCell { target: SymbolId, cell: CellId },
+    /// Stores a new value in a mutable cell.
+    StoreCell { cell: CellId, value: Expr },
     /// A "Phi-Node", used for merging symbols between region blocks.
     Phi(PhiNode),
 }
@@ -542,6 +550,15 @@ impl Display for Stmt {
                 write!(f, "]")
             }
             Stmt::Call(expr) => write!(f, "{}", expr),
+            Stmt::OpenCell { cell, value } => {
+                write!(f, "open cell{} = {}", cell.index(), value)
+            }
+            Stmt::LoadCell { target, cell } => {
+                write!(f, "v{} = load cell{}", target.index(), cell.index())
+            }
+            Stmt::StoreCell { cell, value } => {
+                write!(f, "store cell{} = {}", cell.index(), value)
+            }
             Stmt::Phi(_) => Ok(()),
         }
     }

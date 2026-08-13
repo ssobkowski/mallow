@@ -111,10 +111,12 @@ impl Visitor for Analyzer {
     }
 
     fn visit_capture(&mut self, _: usize, capture: Capture) {
-        self.facts
-            .entry(capture.symbol())
-            .or_insert_with(SymbolFacts::disqualified)
-            .disqualified = true;
+        if let Capture::Copy(symbol) = capture {
+            self.facts
+                .entry(symbol)
+                .or_insert_with(SymbolFacts::disqualified)
+                .disqualified = true;
+        }
     }
 
     fn visit_block_exit(&mut self, exit: &BlockExit) {
@@ -396,8 +398,12 @@ fn substitute_in_stmt_rvalues(
                 substitute_available_expr(value, available, removable);
             }
         }
-        Stmt::Call(expr) => substitute_available_expr(expr, available, removable),
-        Stmt::Phi(_) => {}
+        Stmt::Call(expr)
+        | Stmt::OpenCell { value: expr, .. }
+        | Stmt::StoreCell { value: expr, .. } => {
+            substitute_available_expr(expr, available, removable)
+        }
+        Stmt::LoadCell { .. } | Stmt::Phi(_) => {}
     }
 }
 

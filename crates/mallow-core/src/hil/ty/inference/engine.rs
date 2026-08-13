@@ -309,7 +309,7 @@ impl<'a> Engine<'a> {
             .value_keys()
             .filter_map(|(key, _)| match key {
                 ValueKey::Symbol(proto, symbol) => Some((proto, symbol, key)),
-                ValueKey::Temp(_, _) | ValueKey::Occurrence(_, _, _) => None,
+                ValueKey::Cell(_, _) | ValueKey::Temp(_, _) | ValueKey::Occurrence(_, _, _) => None,
             })
             .collect()
     }

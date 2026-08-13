@@ -1,6 +1,8 @@
 pub mod common;
 pub mod ssa;
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail, ensure};
 use smol_str::ToSmolStr;
 use ssa::Ssa;
@@ -8,7 +10,7 @@ use ssa::Ssa;
 use crate::common::ByteString;
 use crate::disasm::Chunk;
 use crate::hil::cflow::graph::GraphView;
-use crate::hil::ir::{Capture, Expr, Number, Stmt, ValuePack};
+use crate::hil::ir::{Capture, CellId, Expr, Number, Stmt, ValuePack};
 use crate::hil::lifter::common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL};
 use crate::hil::lifter::ssa::{Symbol, SymbolId};
 use crate::hil::ty::bytecode::ProtoTypeContext;
@@ -126,8 +128,13 @@ impl CaptureState {
     }
 
     /// Returns the open storage generation for one register slot.
-    fn open_generation(&self, reg: u8) -> Option<u16> {
+    pub(crate) fn open_generation(&self, reg: u8) -> Option<u16> {
         self.open_refs[reg as usize]
+    }
+
+    /// Returns the current storage generation for one register slot.
+    pub(crate) fn generation(&self, reg: u8) -> u16 {
+        self.reg_generations[reg as usize]
     }
 
     /// Opens captured storage for one register slot.
@@ -157,6 +164,10 @@ pub struct LiftContext<'a, 'cfg, G: GraphView> {
     pub ssa: &'a mut Ssa<'cfg, G>,
     pub block_idx: usize,
     pub capture_state: CaptureState,
+    /// Cells for captured register generations in this function.
+    pub captured_cells: &'a HashMap<(u8, u16), CellId>,
+    /// Cells for declared upvalue slots in this function.
+    pub upvalue_cells: &'a [CellId],
 }
 
 pub struct Lifter<'a, 'cfg, G: GraphView> {
@@ -174,6 +185,8 @@ pub struct Lifter<'a, 'cfg, G: GraphView> {
     pending_multiret: Option<MultiRet>,
 
     capture_state: CaptureState,
+    captured_cells: &'a HashMap<(u8, u16), CellId>,
+    upvalue_cells: &'a [CellId],
 }
 
 impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
@@ -189,6 +202,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             stmts: Vec::new(),
             pending_multiret: None,
             capture_state: ctx.capture_state,
+            captured_cells: ctx.captured_cells,
+            upvalue_cells: ctx.upvalue_cells,
         }
     }
 
@@ -216,17 +231,23 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         self.stmts.push(stmt);
     }
 
-    /// Reads the values of the given register range from the SSA table.
+    /// Reads the values of the given register range.
     fn read_regs(&mut self, start: u8, count: u8) -> Vec<Expr> {
         reg_range(start, count)
-            .map(|reg| Expr::Symbol(self.get_reg_symbol(reg)))
+            .map(|reg| self.read_reg(reg))
             .collect()
     }
 
-    /// Allocates a range of registers and returns their symbolic expressions.
+    /// Allocates assignment targets for a range of registers.
     fn alloc_regs(&mut self, start: u8, count: u8) -> Vec<Expr> {
         reg_range(start, count)
-            .map(|reg| Expr::Symbol(self.alloc_reg_symbol(reg)))
+            .map(|reg| {
+                assert!(
+                    self.open_cell(reg).is_none(),
+                    "multi-value writes to captured registers need explicit stores"
+                );
+                Expr::Symbol(self.alloc_reg_symbol(reg))
+            })
             .collect()
     }
 
@@ -237,10 +258,10 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             "invalid CONCAT register range: {start}..{end}"
         );
 
-        let mut expr = Expr::Symbol(self.get_reg_symbol(end));
+        let mut expr = self.read_reg(end);
         for reg in (start..end).rev() {
             expr = Expr::Binary {
-                lhs: Box::new(Expr::Symbol(self.get_reg_symbol(reg))),
+                lhs: Box::new(self.read_reg(reg)),
                 op: BinOp::Concat,
                 rhs: Box::new(expr),
             };
@@ -253,48 +274,94 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         self.push(Stmt::Assign { left, value });
     }
 
-    /// Emits a plain assignment statement and allocates a new register symbol.
+    /// Emits a register write.
     fn assign_reg(&mut self, reg: u8, value: Expr) {
-        let sym = self.alloc_reg_symbol(reg);
-        self.push(Stmt::Assign {
-            left: Expr::Symbol(sym),
-            value,
-        });
+        if let Some(cell) = self.open_cell(reg) {
+            self.push(Stmt::StoreCell { cell, value });
+        } else {
+            let sym = self.alloc_reg_symbol(reg);
+            self.push(Stmt::Assign {
+                left: Expr::Symbol(sym),
+                value,
+            });
+        }
     }
 
-    fn get_reg_symbol(&mut self, reg: u8) -> SymbolId {
-        self.ssa.read_reg(self.block_idx, reg)
+    /// Reads one register, loading mutable captured storage when needed.
+    fn read_reg(&mut self, reg: u8) -> Expr {
+        let Some(cell) = self.open_cell(reg) else {
+            return Expr::Symbol(self.ssa.read_reg(self.block_idx, reg));
+        };
+
+        let target = self.alloc_value_symbol(reg);
+        self.push(Stmt::LoadCell { target, cell });
+        Expr::Symbol(target)
+    }
+
+    /// Returns the open cell for one register.
+    fn open_cell(&self, reg: u8) -> Option<CellId> {
+        let generation = self.capture_state.open_generation(reg)?;
+        Some(
+            *self
+                .captured_cells
+                .get(&(reg, generation))
+                .expect("open captured register must have an allocated cell"),
+        )
+    }
+
+    /// Allocates a symbol for one register value without changing register SSA state.
+    fn alloc_value_symbol(&mut self, reg: u8) -> SymbolId {
+        let pc = self.current_pc();
+        self.ssa.alloc_symbol(
+            Symbol::reg(reg)
+                .with_type(self.type_context.local_at(reg, pc))
+                .with_local_index(self.proto.local_index_after(reg, pc)),
+        )
     }
 
     fn alloc_reg_symbol(&mut self, reg: u8) -> SymbolId {
-        let symbol = match self.capture_state.open_generation(reg) {
-            Some(generation) => Symbol::captured_reg(reg, generation),
-            None => Symbol::reg(reg),
-        };
-        let pc = self.current_pc();
-        let symbol = symbol
-            .with_type(self.type_context.local_at(reg, pc))
-            .with_local_index(self.proto.local_index_after(reg, pc));
-
-        let sym = self.ssa.alloc_symbol(symbol);
+        let sym = self.alloc_value_symbol(reg);
         self.ssa.write_reg(self.block_idx, reg, sym);
         sym
+    }
+
+    /// Allocates one source value before storing it into an open cell.
+    fn store_reg_from_value(&mut self, reg: u8, value: Expr) {
+        let cell = self
+            .open_cell(reg)
+            .expect("captured register store needs an open cell");
+        let target = self.alloc_value_symbol(reg);
+        self.push(Stmt::Assign {
+            left: Expr::Symbol(target),
+            value,
+        });
+        self.push(Stmt::StoreCell {
+            cell,
+            value: Expr::Symbol(target),
+        });
     }
 
     fn note_close_upvals(&mut self, from_reg: u8) {
         self.capture_state.close_refs(from_reg);
     }
 
-    fn promote_capture_ref(&mut self, reg: u8) -> SymbolId {
-        self.capture_state.open_ref(reg);
+    /// Opens one captured register cell and records its initial value.
+    fn open_capture_cell(&mut self, reg: u8) -> CellId {
+        if let Some(cell) = self.open_cell(reg) {
+            return cell;
+        }
 
-        let sym = self.ssa.read_reg(self.block_idx, reg);
-        let generation = self
-            .capture_state
-            .open_generation(reg)
-            .expect("capture ref should be open after promotion");
-        self.ssa.promote_to_captured_reg(sym, reg, generation);
-        sym
+        let generation = self.capture_state.generation(reg);
+        let cell = *self
+            .captured_cells
+            .get(&(reg, generation))
+            .expect("reference capture must have an allocated cell");
+        let symbol = self.ssa.read_reg(self.block_idx, reg);
+        let value = Expr::Symbol(symbol);
+        self.capture_state.open_ref(reg);
+        self.ssa.write_reg(self.block_idx, reg, symbol);
+        self.push(Stmt::OpenCell { cell, value });
+        cell
     }
 
     fn instr_consumes_pending_multiret(&self, instr: Instr) -> bool {
@@ -338,7 +405,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
     }
 
     /// Lifts all instructions into HIL statements in bytecode order.
-    pub fn run(mut self) -> Result<(Vec<Stmt>, Option<MultiRet>)> {
+    pub fn run(mut self) -> Result<(Vec<Stmt>, Option<MultiRet>, CaptureState)> {
         while let Some(instr) = self.next() {
             self.flush_pending_before(instr);
 
@@ -358,8 +425,8 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     self.assign_reg(*reg, value);
                 }
                 Instr::Move { dest, src } => {
-                    let sym = self.get_reg_symbol(*src);
-                    self.assign_reg(*dest, Expr::Symbol(sym))
+                    let value = self.read_reg(*src);
+                    self.assign_reg(*dest, value)
                 }
                 Instr::GetGlobal { dest, key, .. } => {
                     self.assign_reg(
@@ -371,26 +438,25 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     );
                 }
                 Instr::SetGlobal { src, key, .. } => {
-                    let sym = self.get_reg_symbol(*src);
+                    let value = self.read_reg(*src);
                     self.assign(
                         Expr::Global(
                             self.const_name(ConstId(*key))
                                 .with_context(|| format!("invalid string constant {key}"))?,
                         ),
-                        Expr::Symbol(sym),
+                        value,
                     );
                 }
                 Instr::GetUpval { dest, upval } => {
-                    let upval_sym = self.ssa.read_upval(self.block_idx, *upval);
-                    self.assign_reg(*dest, Expr::Symbol(upval_sym));
+                    let cell = self.upvalue_cells[*upval as usize];
+                    let target = self.alloc_value_symbol(*dest);
+                    self.push(Stmt::LoadCell { target, cell });
+                    self.assign_reg(*dest, Expr::Symbol(target));
                 }
                 Instr::SetUpval { src, upval } => {
-                    let upval_sym = self.ssa.alloc_symbol(Symbol::upval(*upval));
-                    self.ssa.write_upval(self.block_idx, *upval, upval_sym);
-
-                    let src_sym = self.get_reg_symbol(*src);
-
-                    self.assign(Expr::Symbol(upval_sym), Expr::Symbol(src_sym))
+                    let cell = self.upvalue_cells[*upval as usize];
+                    let value = self.read_reg(*src);
+                    self.push(Stmt::StoreCell { cell, value });
                 }
                 Instr::GetImport { dest, path, .. } => {
                     self.assign_reg(
@@ -423,9 +489,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 Instr::GetTableKS {
                     dest, table, key, ..
                 } => {
-                    let sym = self.get_reg_symbol(*table);
+                    let table = self.read_reg(*table);
                     let key = self.const_string(ConstId(*key))?;
-                    self.assign_reg(*dest, string_key_access(Expr::Symbol(sym), key));
+                    self.assign_reg(*dest, string_key_access(table, key));
                 }
                 Instr::GetUDataKS {
                     dest,
@@ -433,27 +499,27 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                     key,
                     ..
                 } => {
-                    let sym = self.get_reg_symbol(*userdata);
+                    let userdata = self.read_reg(*userdata);
                     let key = self.const_string(ConstId(u32::from(*key)))?;
-                    self.assign_reg(*dest, string_key_access(Expr::Symbol(sym), key));
+                    self.assign_reg(*dest, string_key_access(userdata, key));
                 }
                 Instr::GetTable { dest, table, key } => {
-                    let table_sym = self.get_reg_symbol(*table);
-                    let key_sym = self.get_reg_symbol(*key);
+                    let table = self.read_reg(*table);
+                    let key = self.read_reg(*key);
                     self.assign_reg(
                         *dest,
                         Expr::GetIndex {
-                            obj: Box::new(Expr::Symbol(table_sym)),
-                            index: Box::new(Expr::Symbol(key_sym)),
+                            obj: Box::new(table),
+                            index: Box::new(key),
                         },
                     );
                 }
                 Instr::GetTableN { dest, table, index } => {
-                    let sym = self.get_reg_symbol(*table);
+                    let table = self.read_reg(*table);
                     self.assign_reg(
                         *dest,
                         Expr::GetIndex {
-                            obj: Box::new(Expr::Symbol(sym)),
+                            obj: Box::new(table),
                             index: Box::new(Expr::Number(Number::Float(*index as f64))),
                         },
                     );
@@ -461,46 +527,40 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 Instr::SetTableKS {
                     src, table, key, ..
                 } => {
-                    let table_sym = self.get_reg_symbol(*table);
-                    let value_sym = self.get_reg_symbol(*src);
+                    let table = self.read_reg(*table);
+                    let value = self.read_reg(*src);
                     let key = self.const_string(ConstId(*key))?;
-                    self.assign(
-                        string_key_access(Expr::Symbol(table_sym), key),
-                        Expr::Symbol(value_sym),
-                    );
+                    self.assign(string_key_access(table, key), value);
                 }
                 Instr::SetUDataKS {
                     src, userdata, key, ..
                 } => {
-                    let userdata_sym = self.get_reg_symbol(*userdata);
-                    let value_sym = self.get_reg_symbol(*src);
+                    let userdata = self.read_reg(*userdata);
+                    let value = self.read_reg(*src);
                     let key = self.const_string(ConstId(u32::from(*key)))?;
-                    self.assign(
-                        string_key_access(Expr::Symbol(userdata_sym), key),
-                        Expr::Symbol(value_sym),
-                    );
+                    self.assign(string_key_access(userdata, key), value);
                 }
                 Instr::SetTableN { src, table, index } => {
-                    let table_sym = self.get_reg_symbol(*table);
-                    let value_sym = self.get_reg_symbol(*src);
+                    let table = self.read_reg(*table);
+                    let value = self.read_reg(*src);
                     self.assign(
                         Expr::GetIndex {
-                            obj: Box::new(Expr::Symbol(table_sym)),
+                            obj: Box::new(table),
                             index: Box::new(Expr::Number(Number::Float(*index as f64))),
                         },
-                        Expr::Symbol(value_sym),
+                        value,
                     );
                 }
                 Instr::SetTable { src, table, key } => {
-                    let table_sym = self.get_reg_symbol(*table);
-                    let key_sym = self.get_reg_symbol(*key);
-                    let value_sym = self.get_reg_symbol(*src);
+                    let table = self.read_reg(*table);
+                    let key = self.read_reg(*key);
+                    let value = self.read_reg(*src);
                     self.assign(
                         Expr::GetIndex {
-                            obj: Box::new(Expr::Symbol(table_sym)),
-                            index: Box::new(Expr::Symbol(key_sym)),
+                            obj: Box::new(table),
+                            index: Box::new(key),
                         },
-                        Expr::Symbol(value_sym),
+                        value,
                     );
                 }
 
@@ -514,14 +574,14 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 | Instr::Pow { dest, a, b }
                 | Instr::And { dest, a, b }
                 | Instr::Or { dest, a, b } => {
-                    let lhs_sym = self.get_reg_symbol(*a);
-                    let rhs_sym = self.get_reg_symbol(*b);
+                    let lhs = self.read_reg(*a);
+                    let rhs = self.read_reg(*b);
                     self.assign_reg(
                         *dest,
                         Expr::Binary {
-                            lhs: Box::new(Expr::Symbol(lhs_sym)),
+                            lhs: Box::new(lhs),
                             op: binop_for_instr(&instr),
-                            rhs: Box::new(Expr::Symbol(rhs_sym)),
+                            rhs: Box::new(rhs),
                         },
                     );
                 }
@@ -540,11 +600,11 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                             "*K arithmetic instructions can only reference number constants, got {other:?} instead",
                         ),
                     };
-                    let lhs_sym = self.get_reg_symbol(*reg);
+                    let lhs = self.read_reg(*reg);
                     self.assign_reg(
                         *dest,
                         Expr::Binary {
-                            lhs: Box::new(Expr::Symbol(lhs_sym)),
+                            lhs: Box::new(lhs),
                             op: binop_for_instr(&instr),
                             rhs: Box::new(Expr::Number(Number::Float(num))),
                         },
@@ -559,24 +619,24 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                             "*RK arithmetic instructions can only reference number constants, got {other:?} instead",
                         ),
                     };
-                    let rhs_sym = self.get_reg_symbol(*reg);
+                    let rhs = self.read_reg(*reg);
                     self.assign_reg(
                         *dest,
                         Expr::Binary {
                             lhs: Box::new(Expr::Number(Number::Float(num))),
                             op: binop_for_instr(&instr),
-                            rhs: Box::new(Expr::Symbol(rhs_sym)),
+                            rhs: Box::new(rhs),
                         },
                     );
                 }
 
                 // reg op const(any) — And/Or can short-circuit against any constant type.
                 Instr::AndK { dest, reg, k } | Instr::OrK { dest, reg, k } => {
-                    let lhs_sym = self.get_reg_symbol(*reg);
+                    let lhs = self.read_reg(*reg);
                     self.assign_reg(
                         *dest,
                         Expr::Binary {
-                            lhs: Box::new(Expr::Symbol(lhs_sym)),
+                            lhs: Box::new(lhs),
                             op: binop_for_instr(&instr),
                             rhs: Box::new(self.const_expr(ConstId(*k as u32))?),
                         },
@@ -591,12 +651,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 Instr::Not { dest, reg }
                 | Instr::Minus { dest, reg }
                 | Instr::Length { dest, reg } => {
-                    let sym = self.get_reg_symbol(*reg);
+                    let value = self.read_reg(*reg);
                     self.assign_reg(
                         *dest,
                         Expr::Unary {
                             op: unop_for_instr(&instr),
-                            expr: Box::new(Expr::Symbol(sym)),
+                            expr: Box::new(value),
                         },
                     )
                 }
@@ -702,7 +762,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             }
         }
 
-        Ok((self.stmts, self.pending_multiret))
+        Ok((self.stmts, self.pending_multiret, self.capture_state))
     }
 
     fn lift_call(&mut self, func: u8, arg_count: u8, ret_count: u8) {
@@ -714,8 +774,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 ValuePack::empty()
             }),
         };
+        let fun = self.read_reg(func);
         let call = Expr::Call {
-            fun: Box::new(Expr::Symbol(self.get_reg_symbol(func))),
+            fun: Box::new(fun),
             args,
         };
         self.emit_call_result(func, ret_count, call);
@@ -778,8 +839,9 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             _ => ValuePack::empty(),
         };
 
+        let object = self.read_reg(object);
         let method_call = Expr::MethodCall {
-            object: Box::new(Expr::Symbol(self.get_reg_symbol(object))),
+            object: Box::new(object),
             method,
             args,
         };
@@ -796,9 +858,12 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
             }),
         };
 
-        let table_sym = self.get_reg_symbol(table);
+        let table = self.read_reg(table);
+        let Expr::Symbol(table) = table else {
+            unreachable!("SETLIST table loads must produce a symbol")
+        };
         self.push(Stmt::SetList {
-            table: table_sym,
+            table,
             index,
             values,
         });
@@ -812,8 +877,15 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
         );
         match Count::from(ret_count) {
             Count::Number(0) => self.push(Stmt::Call(expr)),
+            Count::Number(1) if self.open_cell(dest).is_some() => {
+                self.store_reg_from_value(dest, expr)
+            }
             Count::Number(1) => self.assign_reg(dest, expr),
             Count::Number(n) => {
+                assert!(
+                    reg_range(dest, n).all(|reg| self.open_cell(reg).is_none()),
+                    "multi-return writes to captured registers are unsupported"
+                );
                 let left = self.alloc_regs(dest, n);
                 self.push(Stmt::AssignMany {
                     left,
@@ -835,23 +907,27 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
     }
 
     fn lift_closure(&mut self, dest: u8, proto_id: ProtoId) -> Result<()> {
-        let sym = self.alloc_reg_symbol(dest);
         let proto = self
             .chunk
             .get_proto(proto_id)
             .with_context(|| format!("did not find proto {proto_id:?}"))?;
 
-        let captures = self.consume_captures(proto.num_upvals)?;
-        let local_index = self.proto.local_index_after(dest, self.current_pc());
-        self.ssa.set_local_index(sym, local_index);
+        let (captures, recursive_cell) = self.consume_captures(proto.num_upvals, dest)?;
+        let value = Expr::Closure {
+            proto: proto.id,
+            captures,
+        };
+        if let Some(cell) = recursive_cell {
+            self.push(Stmt::OpenCell { cell, value });
+        } else {
+            self.assign_reg(dest, value);
 
-        self.stmts.push(Stmt::Assign {
-            left: Expr::Symbol(sym),
-            value: Expr::Closure {
-                proto: proto.id,
-                captures,
-            },
-        });
+            if self.open_cell(dest).is_none() {
+                let sym = self.ssa.read_reg(self.block_idx, dest);
+                let local_index = self.proto.local_index_after(dest, self.current_pc());
+                self.ssa.set_local_index(sym, local_index);
+            }
+        }
 
         Ok(())
     }
@@ -874,19 +950,37 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
 
     /// Consume `count` CAPTURE instructions immediately following the current
     /// cursor position.
-    fn consume_captures(&mut self, count: u8) -> Result<Vec<Capture>> {
+    fn consume_captures(
+        &mut self,
+        count: u8,
+        closure_dest: u8,
+    ) -> Result<(Vec<Capture>, Option<CellId>)> {
         if count == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
 
         let mut captures = Vec::with_capacity(count as usize);
+        let mut recursive_cell = None;
         for i in 0..count {
             match self.next() {
                 Some(Instr::Capture { capture_type, reg }) => {
                     let capture = match capture_type {
-                        CAPTURE_VAL => Capture::Value(self.ssa.read_reg(self.block_idx, reg)),
-                        CAPTURE_REF => Capture::Ref(self.promote_capture_ref(reg)),
-                        CAPTURE_UPVAL => Capture::Upvalue(self.ssa.read_upval(self.block_idx, reg)),
+                        CAPTURE_VAL => {
+                            let value = self.read_reg(reg);
+                            let Expr::Symbol(value) = value else {
+                                unreachable!("register reads must produce symbols")
+                            };
+                            Capture::Copy(value)
+                        }
+                        CAPTURE_REF if reg == closure_dest && self.open_cell(reg).is_none() => {
+                            let generation = self.capture_state.generation(reg);
+                            let cell = self.captured_cells[&(reg, generation)];
+                            self.capture_state.open_ref(reg);
+                            recursive_cell = Some(cell);
+                            Capture::Share(cell)
+                        }
+                        CAPTURE_REF => Capture::Share(self.open_capture_cell(reg)),
+                        CAPTURE_UPVAL => Capture::Share(self.upvalue_cells[reg as usize]),
                         _ => unreachable!("unknown capture type: {capture_type}"),
                     };
                     captures.push(capture);
@@ -903,7 +997,7 @@ impl<'a, 'cfg, G: GraphView> Lifter<'a, 'cfg, G> {
                 }
             }
         }
-        Ok(captures)
+        Ok((captures, recursive_cell))
     }
 
     /// Flush the pending multiret to `self.stmts` as a standalone call-stmt or
@@ -988,7 +1082,7 @@ pub fn flush_multiret<G: GraphView>(
 /// Lifts one instruction slice into raw HIL statements.
 pub fn lift<'a, 'cfg, G: GraphView>(
     ctx: LiftContext<'a, 'cfg, G>,
-) -> Result<(Vec<Stmt>, Option<MultiRet>)> {
+) -> Result<(Vec<Stmt>, Option<MultiRet>, CaptureState)> {
     let lifter = Lifter::new(ctx);
     lifter.run()
 }

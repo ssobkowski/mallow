@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 
+use crate::hil::ir::CellId;
 use crate::hil::lifter::ssa::SymbolId;
 use crate::il::ProtoId;
 
@@ -10,6 +11,8 @@ use crate::il::ProtoId;
 pub enum ValueKey {
     /// One SSA symbol in one proto.
     Symbol(ProtoId, SymbolId),
+    /// One mutable storage cell in one proto.
+    Cell(ProtoId, CellId),
     /// One expression result created while lowering a proto.
     Temp(ProtoId, u32),
     /// One block-local symbol occurrence refined by a branch.
@@ -23,15 +26,18 @@ impl Ord for ValueKey {
             (Self::Symbol(lhs_proto, lhs), Self::Symbol(rhs_proto, rhs)) => {
                 (lhs_proto.0, 0u8, lhs.index(), 0usize).cmp(&(rhs_proto.0, 0, rhs.index(), 0))
             }
+            (Self::Cell(lhs_proto, lhs), Self::Cell(rhs_proto, rhs)) => {
+                (lhs_proto.0, 1u8, lhs.index(), 0usize).cmp(&(rhs_proto.0, 1, rhs.index(), 0))
+            }
             (Self::Temp(lhs_proto, lhs), Self::Temp(rhs_proto, rhs)) => {
-                (lhs_proto.0, 1u8, *lhs, 0usize).cmp(&(rhs_proto.0, 1, *rhs, 0))
+                (lhs_proto.0, 2u8, *lhs, 0usize).cmp(&(rhs_proto.0, 2, *rhs, 0))
             }
             (
                 Self::Occurrence(lhs_proto, lhs_block, lhs),
                 Self::Occurrence(rhs_proto, rhs_block, rhs),
-            ) => (lhs_proto.0, 2u8, lhs.index(), *lhs_block).cmp(&(
+            ) => (lhs_proto.0, 3u8, lhs.index(), *lhs_block).cmp(&(
                 rhs_proto.0,
-                2,
+                3,
                 rhs.index(),
                 *rhs_block,
             )),
@@ -127,8 +133,9 @@ impl std::ops::Not for BranchPredicate {
 fn value_kind(key: &ValueKey) -> (u16, u8) {
     match key {
         ValueKey::Symbol(proto, _) => (proto.0, 0),
-        ValueKey::Temp(proto, _) => (proto.0, 1),
-        ValueKey::Occurrence(proto, _, _) => (proto.0, 2),
+        ValueKey::Cell(proto, _) => (proto.0, 1),
+        ValueKey::Temp(proto, _) => (proto.0, 2),
+        ValueKey::Occurrence(proto, _, _) => (proto.0, 3),
     }
 }
 

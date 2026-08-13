@@ -2,12 +2,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::captures::{CaptureResolver, StorageMutability};
+use super::captures::CaptureResolver;
 use super::keys::{ObjectKey, PackKey, ValueKey};
 use super::program::{InferenceProgram, PackRelation, ValueRelation};
 use crate::hil::cflow::cfg::{Block, BlockExit, ControlFlowGraph};
 use crate::hil::cflow::graph::GraphView as _;
-use crate::hil::ir::{Capture, Expr, Stmt, TableItem, ValuePack};
+use crate::hil::ir::{Capture, CellId, Expr, Stmt, TableItem, ValuePack};
 use crate::hil::lifted::LiftedFunction;
 use crate::hil::lifter::ssa::SymbolId;
 use crate::hil::ty::builtins::{BuiltinEnvironment, BuiltinPath};
@@ -84,15 +84,8 @@ impl<'a> FunctionLowerer<'a> {
         for parameter in self.function.symbols.params() {
             self.program.touch_value(self.symbol_value(*parameter));
         }
-        for upvalue in self.function.symbols.upvalues() {
-            self.program.touch_value(self.symbol_value(*upvalue));
-        }
-        for (first, version) in self.function.symbols.same_storage_links() {
-            let first = self.symbol_value(first);
-            self.program.push_value(
-                first,
-                ValueRelation::SameStorage(self.symbol_value(version)),
-            );
+        for upvalue in self.function.symbols.upvalue_cells() {
+            self.program.touch_value(self.cell_value(*upvalue));
         }
 
         for i in 0..self.function.cfg.len() {
@@ -124,6 +117,11 @@ impl<'a> FunctionLowerer<'a> {
     /// Returns the key for a symbol in the current proto.
     fn symbol_value(&self, symbol: SymbolId) -> ValueKey {
         ValueKey::Symbol(self.function.proto, symbol)
+    }
+
+    /// Returns the key for a mutable cell in the current proto.
+    fn cell_value(&self, cell: CellId) -> ValueKey {
+        ValueKey::Cell(self.function.proto, cell)
     }
 
     /// Allocates a temporary scalar value.
@@ -239,6 +237,18 @@ impl BlockLowerer<'_, '_> {
             }
             Stmt::Call(call) => {
                 self.lower_call(call);
+            }
+            Stmt::OpenCell { cell, value } | Stmt::StoreCell { cell, value } => {
+                let value = self.lower_expr(value);
+                self.flw
+                    .program
+                    .push_value(self.flw.cell_value(*cell), ValueRelation::FlowFrom(value));
+            }
+            Stmt::LoadCell { target, cell } => {
+                self.flw.program.push_value(
+                    self.flw.symbol_value(*target),
+                    ValueRelation::FlowFrom(self.flw.cell_value(*cell)),
+                );
             }
             Stmt::Phi(phi) => {
                 let target = self.flw.symbol_value(phi.target);
@@ -418,20 +428,18 @@ impl BlockLowerer<'_, '_> {
                     .expect("closure proto must index its lifted function");
                 assert_eq!(
                     captures.len(),
-                    function.symbols.upvalues().len(),
+                    function.symbols.upvalue_cells().len(),
                     "closure captures must match child upvalues"
                 );
-                for (&capture, &upvalue) in captures.iter().zip(function.symbols.upvalues()) {
-                    let parent = match capture {
-                        Capture::Value(symbol) => self.lower_expr(&Expr::Symbol(symbol)),
-                        Capture::Ref(symbol) | Capture::Upvalue(symbol) => {
-                            self.flw.symbol_value(symbol)
-                        }
-                    };
-                    let child = ValueKey::Symbol(*proto, upvalue);
+                for (&capture, &upvalue) in captures.iter().zip(function.symbols.upvalue_cells()) {
+                    let child = ValueKey::Cell(*proto, upvalue);
                     let relation = match capture {
-                        Capture::Value(_) => ValueRelation::FlowFrom(parent),
-                        Capture::Ref(_) | Capture::Upvalue(_) => ValueRelation::SameStorage(parent),
+                        Capture::Copy(symbol) => {
+                            ValueRelation::FlowFrom(self.lower_expr(&Expr::Symbol(symbol)))
+                        }
+                        Capture::Share(cell) => {
+                            ValueRelation::SameStorage(self.flw.cell_value(cell))
+                        }
                     };
                     self.flw.program.push_value(child, relation);
                 }
@@ -752,30 +760,34 @@ struct MutableSymbolCollector {
 }
 
 impl MutableSymbolCollector {
-    /// Returns mutable binding symbols used by one function.
+    /// Returns load symbols for mutable cells used by one function.
     fn collect(function: &LiftedFunction, captures: &CaptureResolver) -> HashSet<SymbolId> {
-        let mut collector = Self::default();
-
-        for slot in 0..function.symbols.upvalues().len() {
-            if captures.storage(function.proto, slot) == StorageMutability::Mutable {
-                collector.symbols.extend(function.symbols.for_upvalue(slot));
+        let mutable_upvalues: HashSet<_> = function
+            .symbols
+            .upvalue_cells()
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, cell)| {
+                (captures.storage(function.proto, slot)
+                    == super::captures::StorageMutability::Mutable)
+                    .then_some(*cell)
+            })
+            .collect();
+        let mut symbols = HashSet::new();
+        for block in function.cfg.blocks() {
+            for statement in block.stmts() {
+                if let Stmt::LoadCell { target, cell } = statement
+                    && (mutable_upvalues.contains(cell)
+                        || matches!(
+                            function.symbols.cells()[*cell].origin,
+                            crate::hil::ir::CellOrigin::CapturedRegister { .. }
+                        ))
+                {
+                    symbols.insert(*target);
+                }
             }
         }
-        collector
-            .symbols
-            .extend(function.symbols.captured_storage_symbols());
-        collector.visit_graph(&function.cfg);
-
-        collector.symbols
-    }
-}
-
-impl Visitor for MutableSymbolCollector {
-    /// Records a local binding captured through a reference.
-    fn visit_capture(&mut self, _index: usize, capture: Capture) {
-        if let Capture::Ref(symbol) = capture {
-            self.symbols.insert(symbol);
-        }
+        symbols
     }
 }
 
@@ -844,13 +856,20 @@ impl SymbolMap {
         mutable_symbols: &HashSet<SymbolId>,
     ) -> Self {
         let mut map = Self::default();
-        for slot in 0..function.symbols.upvalues().len() {
-            if captures.storage(function.proto, slot) == StorageMutability::ReadOnly {
-                map.alias_group(function.symbols.for_upvalue(slot));
+        let _ = captures;
+        let mut loads_by_cell: HashMap<CellId, Vec<SymbolId>> = HashMap::new();
+        for block in function.cfg.blocks() {
+            for statement in block.stmts() {
+                if let Stmt::LoadCell { target, cell } = statement {
+                    loads_by_cell.entry(*cell).or_default().push(*target);
+                }
             }
         }
-        // Upvalue reads become direct assignments to fresh register symbols.
-        // Stable copies must use one branch key across those reads.
+        for loads in loads_by_cell.into_values() {
+            map.alias_group(loads);
+        }
+
+        // Stable symbol copies use one branch key across those reads.
         for block in function.cfg.blocks() {
             for statement in block.stmts() {
                 let Stmt::Assign {
@@ -869,7 +888,7 @@ impl SymbolMap {
         map
     }
 
-    /// Gives every symbol in one read-only binding the same branch key.
+    /// Gives every load from one cell the same branch key.
     fn alias_group<I>(&mut self, symbols: I)
     where
         I: IntoIterator<Item = SymbolId>,

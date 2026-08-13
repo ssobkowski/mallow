@@ -128,7 +128,8 @@ pub(super) fn stmt_written_symbols(stmt: &Stmt) -> HashSet<SymbolId> {
         Stmt::Assign { left, .. } => expr_read_symbols(left),
         Stmt::AssignMany { left, .. } => left.iter().flat_map(expr_read_symbols).collect(),
         Stmt::SetList { table, .. } => HashSet::from([*table]),
-        Stmt::Call(_) => HashSet::new(),
+        Stmt::Call(_) | Stmt::OpenCell { .. } | Stmt::StoreCell { .. } => HashSet::new(),
+        Stmt::LoadCell { target, .. } => HashSet::from([*target]),
         Stmt::Phi(_) => {
             unreachable!("phi nodes should have been unfolded at this point")
         }
