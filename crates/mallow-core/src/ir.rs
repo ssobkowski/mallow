@@ -1,6 +1,7 @@
 //! Flat intermediate representation used before source structuring.
 
 mod lifter;
+pub(crate) mod region;
 mod ssa;
 
 use std::collections::HashSet;
@@ -12,6 +13,7 @@ use smallvec::{SmallVec, smallvec};
 use smol_str::SmolStr;
 
 use crate::common::ByteString;
+use crate::hil::cflow::graph::build_graph;
 use crate::hil::ir::{Cell, CellId, CellOrigin, Number};
 use crate::il::ProtoId;
 use crate::operator::{BinOp, UnOp};
@@ -23,6 +25,11 @@ pub type ValueId = Id<Value>;
 
 /// Stable identity for one IR value pack.
 pub type PackId = Id<Pack>;
+
+// TODO: Once type inference gets solved, see whether those two structs will hold the types,
+//       or the types will be held in the centralized type store and indexed dynamically.
+//       If the latter, then remove these structs and arena allocators for them, and use
+//       a monotonically increasing counter instead.
 
 /// One immutable IR value identity.
 #[derive(Debug, Clone, Default)]
@@ -197,9 +204,13 @@ pub enum BlockExit {
     },
     /// Starts a generic loop.
     GenericFor {
+        /// First block in the loop body.
         body_block: usize,
-        exit_block: usize,
+        /// Block containing the generic loop operation.
+        loop_block: usize,
+        /// Values produced for the source loop variables.
         variables: SmallVec<[ValueId; 3]>,
+        /// Iterator, state, and initial control values.
         values: [ValueId; 3],
     },
     /// Continues a generic loop.
@@ -248,6 +259,7 @@ impl Function {
         let mut value_defs = HashSet::new();
         let mut value_uses = HashSet::new();
         let mut pack_defs = HashSet::new();
+        let (_, predecessors) = build_graph(self.blocks.iter().map(|block| block.exit.targets()));
 
         for &parameter in &self.params {
             ensure!(
@@ -293,6 +305,25 @@ impl Function {
                         pack_defs.insert(pack),
                         "pack %pack{} is defined twice",
                         pack.index()
+                    );
+                }
+                if let Instr::Phi { inputs, .. } = instr {
+                    let mut input_predecessors = HashSet::new();
+                    for &(predecessor, _) in inputs {
+                        ensure!(
+                            predecessor < self.blocks.len(),
+                            "phi in bb{block_index} references invalid predecessor bb{predecessor}"
+                        );
+                        ensure!(
+                            input_predecessors.insert(predecessor),
+                            "phi in bb{block_index} lists predecessor bb{predecessor} twice"
+                        );
+                    }
+                    let actual_predecessors: HashSet<_> =
+                        predecessors[block_index].iter().copied().collect();
+                    ensure!(
+                        input_predecessors == actual_predecessors,
+                        "phi in bb{block_index} does not describe every predecessor"
                     );
                 }
                 for cell in instr.cells() {
@@ -645,12 +676,12 @@ impl fmt::Display for DisplayBlockExit<'_> {
             } => write!(formatter, "forn.loop bb{body_block}, bb{exit_block}"),
             BlockExit::GenericFor {
                 body_block,
-                exit_block,
+                loop_block,
                 variables,
                 values,
             } => write!(
                 formatter,
-                "forg.prep [{}] in [{}] -> bb{body_block}, bb{exit_block}",
+                "forg.prep [{}] in [{}] -> bb{body_block}, loop bb{loop_block}",
                 Punctuated::new(variables, DisplayValue),
                 Punctuated::new(values, DisplayValue)
             ),
@@ -849,7 +880,7 @@ impl BlockExit {
     }
 
     /// Returns successor blocks referenced by this block exit.
-    fn targets(&self) -> SmallVec<[usize; 3]> {
+    pub(crate) fn targets(&self) -> SmallVec<[usize; 3]> {
         match self {
             Self::Fallthrough(target) | Self::Jump(target) => smallvec![*target],
             Self::Branch {
@@ -866,16 +897,12 @@ impl BlockExit {
                 body_block: then_block,
                 exit_block: else_block,
             }
-            | Self::GenericFor {
-                body_block: then_block,
-                exit_block: else_block,
-                ..
-            }
             | Self::GenericForLoop {
                 body_block: then_block,
                 exit_block: else_block,
                 ..
             } => smallvec![*then_block, *else_block],
+            Self::GenericFor { body_block, .. } => smallvec![*body_block],
             Self::Return(_) => SmallVec::new(),
         }
     }

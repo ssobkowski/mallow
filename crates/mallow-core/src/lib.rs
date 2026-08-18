@@ -5,6 +5,7 @@ mod hil;
 mod il;
 mod ir;
 mod logging;
+mod nir;
 mod operator;
 mod printer;
 mod scopes;
@@ -31,6 +32,8 @@ pub enum EmitMode {
     /// Emit flat intermediate representation without source structuring.
     #[default]
     Ir,
+    /// Emit the nested intermediate representation as debug text.
+    Nir,
 }
 
 /// Default maximum number of post-region pass iterations per function.
@@ -236,7 +239,7 @@ pub fn infer_bytecode_types_with_diagnostics(
     Ok(TypesView::from_inferred(&program.functions))
 }
 
-/// Emits Luau bytecode as cleaned source or flat IR text.
+/// Emits Luau bytecode as cleaned source or intermediate representation text.
 pub fn decompile_bytecode(bytecode: &[u8], options: DecompileOptions) -> Result<String> {
     decompile_bytecode_with_diagnostics(bytecode, options, &Diagnostics::default())
 }
@@ -263,7 +266,7 @@ pub fn decompile_bytecode_with_diagnostics(
         "max pass iterations must be greater than zero"
     );
     ensure!(
-        options.emit == EmitMode::Ir,
+        options.emit != EmitMode::Source,
         "source emission is disabled while the IR pipeline is being rebuilt"
     );
 
@@ -273,12 +276,20 @@ pub fn decompile_bytecode_with_diagnostics(
     use core::fmt::Write;
 
     let mut out = String::new();
-    let mut iter = functions.into_iter();
-    if let Some(first) = iter.next() {
-        write!(out, "{}", first).expect("writing should not fail here");
-        for f in iter {
-            write!(out, "\n\n{}", f).expect("writing should not fail here");
+    for (index, function) in functions.into_iter().enumerate() {
+        if index != 0 {
+            out.push_str("\n\n");
         }
+        match options.emit {
+            EmitMode::Ir => write!(out, "{function}"),
+            EmitMode::Nir => {
+                let diagnostics = diagnostics.for_proto(function.proto.0);
+                let function = nir::materialize::lower(&function, &diagnostics)?;
+                write!(out, "{function:#?}")
+            }
+            EmitMode::Source => unreachable!("source mode was rejected above"),
+        }
+        .expect("writing should not fail here");
     }
     Ok(out)
 }

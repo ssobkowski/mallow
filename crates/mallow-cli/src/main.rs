@@ -105,6 +105,8 @@ enum Emit {
     Source,
     /// Emit flat intermediate representation.
     Ir,
+    /// Emit nested intermediate representation debug text.
+    Nir,
 }
 
 impl Emit {
@@ -113,6 +115,7 @@ impl Emit {
         match self {
             Self::Source => EmitMode::Source,
             Self::Ir => EmitMode::Ir,
+            Self::Nir => EmitMode::Nir,
         }
     }
 }
@@ -269,7 +272,7 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Emit a bytecode file as cleaned Luau or flat IR
+    /// Emit a bytecode file in the selected output form
     Decompile {
         /// Path to the input bytecode file
         #[arg(short, long)]
@@ -279,7 +282,7 @@ enum Commands {
         #[command(flatten)]
         decompile: DecompileArgs,
     },
-    /// Compile a Luau source file and emit cleaned Luau or flat IR
+    /// Compile a Luau source file and emit the selected output form
     Roundtrip {
         /// Path to the input Luau source file
         #[arg(short, long)]

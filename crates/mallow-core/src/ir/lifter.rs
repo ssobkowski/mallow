@@ -1394,7 +1394,7 @@ fn lower_exit(
                 .collect();
             BlockExit::GenericFor {
                 body_block: *body_block,
-                exit_block: *exit_block,
+                loop_block: *exit_block,
                 variables,
                 values,
             }

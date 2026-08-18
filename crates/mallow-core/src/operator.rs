@@ -1,3 +1,5 @@
+// TODO: Concat is not a binary operator. While properly represented in the IR, it might still make sense to include it here for AST purposes. Needs research after writing a proper emitter.
+
 use std::fmt::Display;
 
 /// A Luau binary operator shared by the compiler representations.
