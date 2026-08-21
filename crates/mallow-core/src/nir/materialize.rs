@@ -314,14 +314,14 @@ impl<'a> Materializer<'a> {
             .map(|storage| self.initialization(*storage))
             .collect::<Result<_>>()?;
         let body = self.region(shape)?;
-        let mut function = Function {
+        let function = Function {
             locals: self.locals,
             packs: self.packs,
             params,
             prologue,
             body,
         };
-        inline_control_values(&mut function.body);
+        // inline_control_values(&mut function.body);
 
         #[cfg(debug_assertions)]
         function.verify(self.function)?;
