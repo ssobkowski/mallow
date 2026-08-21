@@ -241,6 +241,8 @@ pub struct Function {
     pub proto: ProtoId,
     /// Formal parameter values in source order.
     pub params: Vec<ValueId>,
+    /// Whether the function accepts variadic arguments.
+    pub is_vararg: bool,
     /// Declared upvalue cells in slot order.
     pub upvalues: Vec<CellId>,
     /// Immutable values owned by this function.

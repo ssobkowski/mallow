@@ -2693,6 +2693,7 @@ mod tests {
             Function {
                 proto: ProtoId(0),
                 params,
+                is_vararg: false,
                 upvalues: Vec::new(),
                 values,
                 packs,

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 
 use super::*;
 use crate::ir;
@@ -10,6 +10,18 @@ use crate::ir;
 impl Function {
     /// Verifies NIR identities and exact reachable FIR instruction ownership.
     pub(crate) fn verify(&self, fir: &ir::Function) -> Result<()> {
+        ensure!(
+            self.id == fir.proto,
+            "NIR function prototype does not match FIR"
+        );
+        ensure!(
+            self.upvalues == fir.upvalues,
+            "NIR upvalue order does not match FIR"
+        );
+        ensure!(
+            self.is_vararg == fir.is_vararg,
+            "NIR vararg metadata does not match FIR"
+        );
         for parameter in &self.params {
             ensure!(
                 self.locals.get(*parameter).is_some(),
@@ -182,7 +194,7 @@ impl Verifier<'_> {
                 self.expr(table)?;
                 self.expr(key)?;
             }
-            Place::Global(_) => {}
+            Place::Global(_) | Place::Discard => {}
         }
         Ok(())
     }
@@ -190,15 +202,7 @@ impl Verifier<'_> {
     /// Verifies one statement.
     fn stmt(&mut self, stmt: &Stmt) -> Result<()> {
         match stmt {
-            Stmt::Let { local, value } => {
-                self.local(*local)?;
-                self.expr(value)?;
-            }
-            Stmt::LetPack { local, value } => {
-                self.pack_local(*local)?;
-                self.pack_expr(value)?;
-            }
-            Stmt::Assign {
+            Stmt::Bind {
                 origin,
                 target,
                 value,
@@ -208,6 +212,16 @@ impl Verifier<'_> {
                 }
                 self.place(target)?;
                 self.expr(value)?;
+            }
+            Stmt::BindMany { .. } => {
+                bail!("BindMany is constructed by NIR passes after verification")
+            }
+            Stmt::Eval { .. } => {
+                bail!("Eval is constructed by NIR passes after verification")
+            }
+            Stmt::BindPack { local, value } => {
+                self.pack_local(*local)?;
+                self.pack_expr(value)?;
             }
             Stmt::OpenCell {
                 origin,

@@ -105,19 +105,25 @@ impl UseCounts {
                 self.expr(table);
                 self.expr(key);
             }
-            Place::Cell(_) | Place::Global(_) => {}
+            Place::Cell(_) | Place::Global(_) | Place::Discard => {}
         }
     }
 
     /// Records reads in one statement.
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { value, .. } => self.expr(value),
-            Stmt::LetPack { value, .. } => self.pack_expr(value),
-            Stmt::Assign { target, value, .. } => {
+            Stmt::Bind { target, value, .. } => {
                 self.place(target);
                 self.expr(value);
             }
+            Stmt::BindMany { targets, values } => {
+                for target in targets {
+                    self.place(target);
+                }
+                self.pack_expr(values);
+            }
+            Stmt::BindPack { value, .. } => self.pack_expr(value),
+            Stmt::Eval { value } => self.pack_expr(value),
             Stmt::OpenCell { value, .. } => self.expr(value),
             Stmt::SetList { table, values, .. } => {
                 self.expr(table);
@@ -238,10 +244,14 @@ fn inline_stmts_into_region_once(
     };
 
     let changed = match source {
-        Stmt::Let { local, value } if counts.locals.get(&local) == Some(&1) => {
+        Stmt::Bind {
+            origin: None,
+            target: Place::Local(local),
+            value,
+        } if counts.locals.get(&local) == Some(&1) => {
             replace_local_in_region_target(target, local, value)
         }
-        Stmt::LetPack { local, value } if counts.packs.get(&local) == Some(&1) => {
+        Stmt::BindPack { local, value } if counts.packs.get(&local) == Some(&1) => {
             replace_pack_in_region_target(target, local, value)
         }
         _ => false,
@@ -261,10 +271,12 @@ fn inline_tail_into_expr_once(body: &mut Region, condition: &mut Expr, counts: &
         return false;
     };
     let changed = match source {
-        Stmt::Let { local, value } if counts.locals.get(&local) == Some(&1) => {
-            replace_local(condition, local, value)
-        }
-        Stmt::LetPack { local, value } if counts.packs.get(&local) == Some(&1) => {
+        Stmt::Bind {
+            origin: None,
+            target: Place::Local(local),
+            value,
+        } if counts.locals.get(&local) == Some(&1) => replace_local(condition, local, value),
+        Stmt::BindPack { local, value } if counts.packs.get(&local) == Some(&1) => {
             replace_pack_in_expr(condition, local, value)
         }
         _ => false,

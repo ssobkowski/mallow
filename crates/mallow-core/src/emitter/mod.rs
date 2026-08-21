@@ -1,1292 +1,801 @@
-mod collectors;
-mod declarations;
-mod locals;
 mod name;
 mod plan;
 mod storage;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
+use anyhow::{Result, bail, ensure};
+use name::{Namer, PlainNamer};
+use plan::{BindingKey, FunctionPlan};
 use smol_str::SmolStr;
+use storage::Storage;
 
+use crate::ast::Identifier;
 use crate::common::is_valid_luau_identifier;
-use crate::emitter::collectors::ReadCollector;
-use crate::emitter::declarations::DeclarationState;
-use crate::emitter::plan::FunctionPlan;
-use crate::emitter::storage::SymbolStorage;
-use crate::hil::cflow::region::RegionNode;
-use crate::hil::lifter::ssa::SymbolId;
-use crate::hil::ty::canonical::{
-    Type as GraphType, TypeId, TypeLiteral, TypePackId, TypePackTail as GraphTypePackTail,
-};
-use crate::hil::ty::store::TypeStore;
-use crate::hil::visitor::Visitor;
-use crate::hil::{StructuredFunction, ir as hil};
+use crate::hil::ir::{CellId, Number};
 use crate::il::ProtoId;
-use crate::logging::{Diagnostics, LogLevel, LogTarget};
-use crate::operator::CompoundBinOp;
+use crate::ir::Constant;
+use crate::nir::{self, LocalId};
+use crate::operator::BinOp;
 use crate::{DecompileOptions, ast};
 
-const MAX_LOCAL_COUNT: usize = 199;
-
-/// Materializes one canonical graph node as a printer-owned AST type.
-fn materialize_type(store: &TypeStore, id: TypeId) -> ast::Type {
-    match store.get(id) {
-        GraphType::Never => ast::Type::Never,
-        GraphType::Unknown => ast::Type::Unknown,
-        GraphType::Any => ast::Type::Any,
-        GraphType::Nil => ast::Type::Nil,
-        GraphType::String => ast::Type::String,
-        GraphType::Number => ast::Type::Number,
-        GraphType::Boolean => ast::Type::Boolean,
-        GraphType::Thread => ast::Type::Thread,
-        GraphType::Userdata => ast::Type::Userdata,
-        GraphType::Vector => ast::Type::Vector,
-        GraphType::Integer => ast::Type::Integer,
-        GraphType::Buffer => ast::Type::Buffer,
-        GraphType::Named(name) => ast::Type::Named(name.clone()),
-        GraphType::Literal(literal) => ast::Type::Literal(match literal {
-            TypeLiteral::String(value) => ast::TypeLiteral::String(value.clone()),
-            TypeLiteral::Boolean(value) => ast::TypeLiteral::Boolean(*value),
-        }),
-        GraphType::Table => ast::Type::Table {
-            fields: std::collections::HashMap::new(),
-            array: Some(Box::new((ast::Type::Unknown, ast::Type::Unknown))),
-        },
-        GraphType::TableShape { fields, indexer } => ast::Type::Table {
-            fields: fields
-                .iter()
-                .map(|(name, ty)| (name.clone(), materialize_type(store, *ty)))
-                .collect(),
-            array: indexer.as_ref().map(|(key, value)| {
-                Box::new((
-                    materialize_type(store, *key),
-                    materialize_type(store, *value),
-                ))
-            }),
-        },
-        GraphType::Function => ast::Type::Function {
-            params: ast::TypePack {
-                head: Vec::new(),
-                tail: Some(ast::TypePackTail::Homogeneous(Box::new(ast::Type::Unknown))),
-            },
-            returns: ast::TypePack {
-                head: Vec::new(),
-                tail: Some(ast::TypePackTail::Homogeneous(Box::new(ast::Type::Unknown))),
-            },
-        },
-        GraphType::FunctionSignature { params, returns } => ast::Type::Function {
-            params: materialize_pack(store, *params),
-            returns: materialize_pack(store, *returns),
-        },
-        GraphType::Union(types) => ast::Type::Union(
-            types
-                .iter()
-                .map(|ty| materialize_type(store, *ty))
-                .collect(),
-        ),
-        GraphType::Intersection(types) => ast::Type::Intersection(
-            types
-                .iter()
-                .map(|ty| materialize_type(store, *ty))
-                .collect(),
-        ),
-        GraphType::WithMetatable { base, methods } => ast::Type::WithMetatable {
-            base: Box::new(materialize_type(store, *base)),
-            metatable: methods
-                .iter()
-                .map(|method| {
-                    (
-                        SmolStr::new(method.method.field()),
-                        materialize_type(store, method.ty),
-                    )
-                })
-                .collect(),
-        },
-    }
-}
-
-/// Materializes one canonical function type pack for AST printing.
-fn materialize_pack(store: &TypeStore, id: TypePackId) -> ast::TypePack {
-    let pack = store.get_pack(id);
-    ast::TypePack {
-        head: pack
-            .head
-            .iter()
-            .map(|ty| materialize_type(store, *ty))
-            .collect(),
-        tail: pack.tail.as_ref().map(|tail| match tail {
-            GraphTypePackTail::Homogeneous(ty) => {
-                ast::TypePackTail::Homogeneous(Box::new(materialize_type(store, *ty)))
-            }
-        }),
-    }
-}
-
-#[derive(Default)]
-struct AssignCollector {
-    symbols: HashSet<SymbolId>,
-}
-
-impl AssignCollector {
-    fn collect_assigned_symbols(node: &RegionNode) -> HashSet<SymbolId> {
-        let mut collector = AssignCollector::default();
-        collector.visit_region(node);
-        collector.symbols
-    }
-}
-
-impl Visitor for AssignCollector {
-    fn visit_stmt(&mut self, stmt: &hil::Stmt) {
-        match stmt {
-            hil::Stmt::Assign {
-                left: hil::Expr::Symbol(sym),
-                ..
-            } => {
-                self.symbols.insert(*sym);
-            }
-            hil::Stmt::AssignMany { left, .. } => {
-                self.symbols.extend(left.iter().filter_map(|lv| {
-                    if let hil::Expr::Symbol(s) = lv {
-                        Some(*s)
-                    } else {
-                        None
-                    }
-                }));
-            }
-            _ => {}
-        }
-    }
-}
-
-struct FunctionContext {
-    proto_idx: usize,
-    plan: FunctionPlan,
-    anomalies: Vec<String>,
-}
-
-struct AssignManyTarget {
-    storage: SymbolStorage,
-    slot_was_declared: bool,
-}
-
-struct Emitter<'a> {
-    functions: Vec<StructuredFunction>,
-    entry: usize,
+/// Emits a materialized NIR program with the default naming policy.
+pub(crate) fn emit_ast(
+    functions: Vec<nir::Function>,
+    entry: ProtoId,
     options: DecompileOptions,
-    diagnostics: &'a Diagnostics,
-
-    declarations: DeclarationState,
-    contexts: Vec<FunctionContext>,
-    current_ctx: usize,
+) -> Result<ast::Block> {
+    emit_ast_with_namer(functions, entry, options, PlainNamer)
 }
 
-impl Emitter<'_> {
-    fn visit_entry(&mut self) -> ast::Block {
-        let entry_ctx = self.create_context(self.entry);
-        self.visit_function(entry_ctx)
-    }
+/// Emits a materialized NIR program with a caller-provided naming policy.
+pub(crate) fn emit_ast_with_namer<N: Namer>(
+    functions: Vec<nir::Function>,
+    entry: ProtoId,
+    options: DecompileOptions,
+    mut namer: N,
+) -> Result<ast::Block> {
+    let EmittedFunction { body, .. } =
+        emit_function(&functions, options, &mut namer, entry, HashMap::new())?;
+    Ok(body)
+}
 
-    fn create_context(&mut self, proto_idx: usize) -> usize {
-        let ctx = FunctionContext {
-            proto_idx,
-            plan: FunctionPlan::new(&self.functions[proto_idx]),
-            anomalies: Vec::new(),
-        };
-        self.contexts.push(ctx);
-        self.contexts.len() - 1
-    }
+/// Emits one function under the storage aliases supplied by its closure.
+fn emit_function<N: Namer>(
+    functions: &[nir::Function],
+    options: DecompileOptions,
+    namer: &mut N,
+    id: ProtoId,
+    inherited_cells: HashMap<CellId, Storage>,
+) -> Result<EmittedFunction> {
+    let function = &functions[id.0 as usize];
+    let plan = FunctionPlan::build(function, &inherited_cells, options.spill_locals, namer)?;
+    FunctionEmitter::new(functions, options, namer, function, plan).emit()
+}
 
-    fn current_proto_idx(&self) -> usize {
-        self.contexts[self.current_ctx].proto_idx
-    }
+/// AST parts produced for one function prototype.
+struct EmittedFunction {
+    params: Vec<ast::Typed<ast::Parameter>>,
+    body: ast::Block,
+}
 
-    fn visit_function(&mut self, ctx_idx: usize) -> ast::Block {
-        let old_ctx = self.current_ctx;
-        self.current_ctx = ctx_idx;
+/// Lowers one fully planned NIR function into AST nodes.
+struct FunctionEmitter<'f, 'n, N: Namer> {
+    functions: &'f [nir::Function],
+    options: DecompileOptions,
+    namer: &'n mut N,
+    function: &'f nir::Function,
+    plan: FunctionPlan,
+    /// Placeholder claimed once for every discard slot in this function.
+    discard: Option<ast::Identifier>,
+    next_scope: usize,
+}
 
-        let proto_idx = self.current_proto_idx();
-        let fun = self.functions[proto_idx].clone();
-
-        self.declarations.push_scope();
-        for &sym in fun.symbols.params() {
-            let slot = self.declare_symbol(sym);
-            self.bind_slot_to_symbol_name(slot, sym);
-            self.declare_slot(slot);
+impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
+    /// Creates one mechanical function lowerer.
+    fn new(
+        functions: &'f [nir::Function],
+        options: DecompileOptions,
+        namer: &'n mut N,
+        function: &'f nir::Function,
+        plan: FunctionPlan,
+    ) -> Self {
+        Self {
+            functions,
+            options,
+            namer,
+            function,
+            plan,
+            discard: None,
+            next_scope: 1,
         }
-        for &sym in fun.symbols.upvalues() {
-            let slot = self.declare_symbol(sym);
-            self.bind_slot_to_symbol_name(slot, sym);
-            self.declare_slot(slot);
-        }
+    }
 
-        let upvalue_str = fun
-            .symbols
-            .upvalues()
+    /// Emits parameters, prologue statements, and structured body.
+    fn emit(mut self) -> Result<EmittedFunction> {
+        let params = self
+            .function
+            .params
             .iter()
-            .map(|upvalue| self.get_symbol_name(upvalue).0)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut block = if self.entry != proto_idx {
-            ast::Block::with_stmts(vec![ast::Stmt::Comment {
-                text: format!("proto {}: upvalues = [{}]", proto_idx, upvalue_str),
-            }])
-        } else {
-            ast::Block::with_stmts(Vec::new())
-        };
-        block.stmts.extend(self.visit_region(&fun.root).stmts);
-        for (idx, anomaly) in self.contexts[self.current_ctx].anomalies.iter().enumerate() {
-            block.stmts.insert(
-                idx + 1,
-                ast::Stmt::Comment {
-                    text: format!("anomaly: {anomaly}"),
-                },
-            );
-        }
-        if let Some(table) = self.contexts[self.current_ctx].plan.spill_table() {
-            block.stmts.insert(
-                1 + self.contexts[self.current_ctx].anomalies.len(),
-                ast::Stmt::LocalDeclaration {
-                    names: vec![ast::Typed::untyped(table)],
-                    values: vec![ast::Expr::Table { items: Vec::new() }],
-                },
-            );
-        }
-        self.dump_symbol_names(ctx_idx, proto_idx);
-
-        self.declarations.pop_scope();
-
-        self.current_ctx = old_ctx;
-        block
-    }
-
-    fn get_symbol_name(&mut self, sym: &SymbolId) -> ast::Identifier {
-        self.get_symbol_name_for(self.current_ctx, *sym)
-    }
-
-    fn get_symbol_name_for(&mut self, ctx_idx: usize, sym: SymbolId) -> ast::Identifier {
-        let proto_idx = self.contexts[ctx_idx].proto_idx;
-        let is_param = self.functions[proto_idx].symbols.params().contains(&sym);
-        self.contexts[ctx_idx].plan.get_symbol_name(sym, is_param)
-    }
-
-    /// Materializes one symbol's graph type for AST annotation decisions.
-    fn symbol_ast_type(&self, proto_idx: usize, sym: SymbolId) -> Option<ast::Type> {
-        let function = &self.functions[proto_idx];
-        let id = function.types.symbol_type_id(sym)?;
-        Some(materialize_type(function.types.type_store(), id))
-    }
-
-    /// Materializes one symbol annotation only when its graph is source-safe.
-    fn emittable_symbol_ast_type(&self, proto_idx: usize, sym: SymbolId) -> Option<ast::Type> {
-        let function = &self.functions[proto_idx];
-        let id = function.types.symbol_type_id(sym)?;
-        function
-            .types
-            .type_store()
-            .is_emittable_annotation(id)
-            .then(|| self.symbol_ast_type(proto_idx, sym))
-            .flatten()
-    }
-
-    /// Materializes the complete return pack of one inferred local function.
-    fn local_function_return_pack(&self, proto_idx: usize, sym: SymbolId) -> Option<ast::TypePack> {
-        let function = &self.functions[proto_idx];
-        let store = function.types.type_store();
-        let id = function.types.symbol_type_id(sym)?;
-        let GraphType::FunctionSignature { returns, .. } = store.get(id) else {
-            return None;
-        };
-        store
-            .is_emittable_return_pack(*returns)
-            .then(|| materialize_pack(store, *returns))
-    }
-
-    fn typed_identifier_for(
-        &self,
-        proto_idx: usize,
-        sym: SymbolId,
-        name: ast::Identifier,
-    ) -> ast::Typed<ast::Identifier> {
-        if let Some(ty) = self.emittable_symbol_ast_type(proto_idx, sym) {
-            ast::Typed::new(name, ty)
-        } else {
-            ast::Typed::untyped(name)
-        }
-    }
-
-    fn typed_identifier(
-        &self,
-        sym: SymbolId,
-        name: ast::Identifier,
-    ) -> ast::Typed<ast::Identifier> {
-        self.typed_identifier_for(self.current_proto_idx(), sym, name)
-    }
-
-    fn typed_parameter_for(
-        &self,
-        proto_idx: usize,
-        sym: SymbolId,
-        parameter: ast::Parameter,
-    ) -> ast::Typed<ast::Parameter> {
-        if let Some(ty) = self.emittable_symbol_ast_type(proto_idx, sym) {
-            ast::Typed::new(parameter, ty)
-        } else {
-            ast::Typed::untyped(parameter)
-        }
-    }
-
-    fn bind_slot_to_symbol_name(&mut self, slot: usize, sym: SymbolId) {
-        let proto_idx = self.current_context().proto_idx;
-        let is_param = self.functions[proto_idx].symbols.params().contains(&sym);
-        self.current_context_mut()
-            .plan
-            .bind_slot_to_symbol_name(slot, sym, is_param);
-    }
-
-    fn current_context(&self) -> &FunctionContext {
-        &self.contexts[self.current_ctx]
-    }
-
-    fn current_context_mut(&mut self) -> &mut FunctionContext {
-        &mut self.contexts[self.current_ctx]
-    }
-
-    /// Dumps the final SymbolId-to-emitted-name map for one function context.
-    fn dump_symbol_names(&self, ctx_idx: usize, proto_idx: usize) {
-        let diagnostics = self.diagnostics.for_proto(proto_idx as u16);
-        let sink = diagnostics.at(LogLevel::Debug, LogTarget::Emitter);
-        sink.block("symbol names:", |sink| {
-            for (sym, name) in self.contexts[ctx_idx].plan.emitted_name_map() {
-                sink.line(
-                    1,
-                    format_args!("SymbolId({}) -> {}", sym.index(), name.as_str()),
-                );
-            }
-        });
-    }
-
-    fn fresh_temp_local(&mut self) -> ast::Identifier {
-        self.current_context_mut().plan.fresh_temp_local()
-    }
-
-    fn declare_symbol_slot(&mut self, sym: SymbolId) -> usize {
-        self.current_context_mut().plan.symbol_slot(sym)
-    }
-
-    fn declare_symbol(&mut self, sym: SymbolId) -> usize {
-        let slot = self.declare_symbol_slot(sym);
-        self.declarations.declare_symbol(sym, slot);
-        slot
-    }
-
-    fn declare_slot(&mut self, slot: usize) {
-        self.declarations.declare_slot(slot);
-    }
-
-    fn prepare_assign_many_targets(&mut self, symbols: Vec<SymbolId>) -> Vec<AssignManyTarget> {
-        for &sym in &symbols {
-            if !self.declarations.contains_symbol(&sym) {
-                self.declare_symbol(sym);
-            }
+            .map(|local| {
+                let name = self
+                    .plan
+                    .local(*local)?
+                    .name()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("function parameter was spilled"))?;
+                Ok(ast::Typed::untyped(ast::Parameter::Regular(name)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut params = params;
+        if self.function.is_vararg {
+            params.push(ast::Typed::untyped(ast::Parameter::Vararg));
         }
 
-        let mut targets = Vec::with_capacity(symbols.len());
-        for symbol in symbols {
-            let storage = self
-                .symbol_storage(symbol)
-                .expect("assign-many symbols must exist in scope");
-            let slot = self
-                .declarations
-                .symbol_slot(&symbol)
-                .expect("assign-many symbols must exist in scope");
-            let slot_was_declared = self.declarations.contains_slot(slot);
-            if !slot_was_declared {
-                self.declare_slot(slot);
-            }
+        let mut stmts = self.scope_prefix(0)?;
+        self.lower_stmts(&self.function.prologue, 0, &mut stmts)?;
+        self.lower_region(&self.function.body, 0, &mut stmts)?;
 
-            targets.push(AssignManyTarget {
-                storage,
-                slot_was_declared,
+        Ok(EmittedFunction {
+            params,
+            body: ast::Block::with_stmts(stmts),
+        })
+    }
+
+    /// Emits the spill table required at one scope entry.
+    fn scope_prefix(&self, scope: usize) -> Result<Vec<ast::Stmt>> {
+        let scope = self.plan.scope(scope)?;
+        let mut stmts = Vec::new();
+        if !scope.prefix_names.is_empty() {
+            stmts.push(ast::Stmt::LocalDeclaration {
+                names: scope
+                    .prefix_names
+                    .iter()
+                    .cloned()
+                    .map(ast::Typed::untyped)
+                    .collect(),
+                values: Vec::new(),
             });
         }
-
-        targets
-    }
-
-    fn symbol_storage(&mut self, sym: SymbolId) -> Option<SymbolStorage> {
-        if let Some(storage) = self.current_context().plan.inherited_storage(sym) {
-            return Some(storage);
+        if let Some(table) = &scope.spill_table {
+            stmts.push(ast::Stmt::LocalDeclaration {
+                names: vec![ast::Typed::untyped(table.clone())],
+                values: vec![ast::Expr::Table { items: Vec::new() }],
+            });
         }
-
-        let idx = self.declarations.symbol_slot(&sym)?;
-        let spill_locals = self.options.spill_locals;
-        Some(
-            self.current_context_mut()
-                .plan
-                .storage_for(sym, idx, spill_locals, MAX_LOCAL_COUNT),
-        )
+        Ok(stmts)
     }
 
-    fn symbol_expr(&mut self, sym: SymbolId) -> ast::Expr {
-        match self.symbol_storage(sym) {
-            Some(storage) => storage.into_expr(),
-            None => {
-                let name = self.get_symbol_name(&sym);
-                let proto_idx = self.current_proto_idx();
-                self.record_anomaly(format!(
-                    "undeclared symbol read during structuring: proto={}, symbol={}, emitted as {}",
-                    proto_idx,
-                    sym.index(),
-                    name.as_str()
-                ));
-                ast::Expr::Named(name)
-            }
+    /// Returns the shared placeholder identifier for discard slots.
+    ///
+    /// Claimed once per function so user variables named `_` are never shadowed.
+    fn discard_name(&mut self) -> ast::Identifier {
+        if let Some(name) = &self.discard {
+            return name.clone();
         }
+        let name = self.plan.names.claim(ast::Identifier::new("_"));
+        self.discard = Some(name.clone());
+        name
     }
 
-    fn record_anomaly(&mut self, message: String) {
-        let anomalies = &mut self.contexts[self.current_ctx].anomalies;
-        if !anomalies.contains(&message) {
-            anomalies.push(message);
-        }
+    /// Allocates the next child scope in structural traversal order.
+    fn child_scope(&mut self) -> usize {
+        let scope = self.next_scope;
+        self.next_scope += 1;
+        scope
     }
 
-    fn visit_region(&mut self, region: &RegionNode) -> ast::Block {
-        let mut stmts = Vec::new();
-        self.visit_node(region, &mut stmts);
-        ast::Block::with_stmts(stmts)
+    /// Lowers one child region inside a fresh lexical scope.
+    fn lower_child_scope(&mut self, region: &nir::Region) -> Result<ast::Block> {
+        let scope = self.child_scope();
+        let mut stmts = self.scope_prefix(scope)?;
+        self.lower_region(region, scope, &mut stmts)?;
+        Ok(ast::Block::with_stmts(stmts))
     }
 
-    /// Visits a flat sequence of region nodes, giving each `If` node access to its
-    /// continuation so that only symbols genuinely needed after the branch are hoisted.
-    fn visit_sequence(&mut self, nodes: &[RegionNode], buf: &mut Vec<ast::Stmt>) {
-        for (i, node) in nodes.iter().enumerate() {
-            if let RegionNode::If {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } = node
-            {
-                let continuation = &nodes[i + 1..];
-                self.visit_if_node(
-                    condition,
-                    then_branch,
-                    else_branch.as_deref(),
-                    continuation,
-                    buf,
-                );
-            } else {
-                self.visit_node(node, buf);
-            }
-        }
-    }
-
-    /// Emits an `if`/`else` statement, hoisting symbols that are assigned in both
-    /// branches *and* actually read in `continuation` (the remaining nodes that follow
-    /// this `if` in the enclosing sequence).
-    fn visit_if_node(
+    /// Lowers one structured region into the current AST statement buffer.
+    fn lower_region(
         &mut self,
-        condition: &hil::Expr,
-        then_branch: &RegionNode,
-        else_branch: Option<&RegionNode>,
-        continuation: &[RegionNode],
-        buf: &mut Vec<ast::Stmt>,
-    ) {
-        let then_assigned = AssignCollector::collect_assigned_symbols(then_branch);
-
-        let else_assigned = else_branch
-            .map(AssignCollector::collect_assigned_symbols)
-            .unwrap_or_default();
-
-        // A symbol needs to be hoisted only when it is assigned in *both* branches
-        // (so it is live on all paths after the if) *and* is actually read somewhere
-        // in the continuation.  Symbols that are dead after the if stay local to their
-        // branch, which gives downstream HIL passes more room to fold them.
-        let continuation_reads = ReadCollector::in_region(continuation);
-
-        let mut hoisted: Vec<_> = then_assigned
-            .intersection(&else_assigned)
-            .copied()
-            .filter(|sym| !self.declarations.contains_symbol(sym))
-            .filter(|sym| continuation.is_empty() || continuation_reads.contains(sym))
-            .collect();
-        hoisted.sort_by_key(|sym| sym.index());
-
-        if !hoisted.is_empty() {
-            for sym in &hoisted {
-                let slot = self.declare_symbol(*sym);
-                self.declare_slot(slot);
+        region: &nir::Region,
+        scope: usize,
+        out: &mut Vec<ast::Stmt>,
+    ) -> Result<()> {
+        match region {
+            nir::Region::Block { stmts, .. } => self.lower_stmts(stmts, scope, out)?,
+            nir::Region::Sequence(nodes) => {
+                for node in nodes {
+                    self.lower_region(node, scope, out)?;
+                }
             }
-
-            let names: Vec<_> = hoisted
-                .iter()
-                .filter_map(|sym| match self.symbol_storage(*sym) {
-                    Some(SymbolStorage::Named(name)) => Some(self.typed_identifier(*sym, name)),
-                    Some(SymbolStorage::Spilled(_)) | None => None,
-                })
-                .collect();
-            if !names.is_empty() {
-                buf.push(ast::Stmt::LocalDeclaration {
-                    names,
-                    values: Vec::new(),
-                });
-            }
-        }
-
-        self.declarations.push_scope();
-        let then_body = self.visit_region(then_branch);
-        self.declarations.pop_scope();
-
-        let else_clause = else_branch.map(|e| {
-            self.declarations.push_scope();
-            let region = self.visit_region(e);
-            self.declarations.pop_scope();
-
-            // if the region is only one If statement we can fold into an elseif
-            if let [ast::Stmt::If(elseif)] = region.stmts.as_slice() {
-                return ast::ElseClause::If(Box::new(elseif.clone()));
-            }
-
-            ast::ElseClause::Else(region)
-        });
-
-        buf.push(ast::Stmt::If(ast::If {
-            condition: self.visit_expr(condition),
-            then_body,
-            else_clause,
-        }));
-    }
-
-    fn visit_node(&mut self, node: &RegionNode, buf: &mut Vec<ast::Stmt>) {
-        match node {
-            RegionNode::BasicBlock { stmts } => self.visit_block(stmts, buf),
-            RegionNode::Sequence { nodes } => self.visit_sequence(nodes, buf),
-            RegionNode::If {
+            nir::Region::If {
                 condition,
                 then_branch,
                 else_branch,
-                ..
             } => {
-                // No continuation is known when visiting a bare If node outside of a
-                // Sequence. Pass an empty slice so the hoist filter falls back to the
-                // conservative behaviour of hoisting anything assigned in both branches.
-                self.visit_if_node(condition, then_branch, else_branch.as_deref(), &[], buf);
+                let condition = self.lower_expr(condition)?;
+                let then_body = self.lower_child_scope(then_branch)?;
+                let else_clause = if let Some(else_branch) = else_branch {
+                    let mut body = self.lower_child_scope(else_branch)?;
+                    Some(match body.stmts.as_slice() {
+                        [ast::Stmt::If(_)] => {
+                            let Some(ast::Stmt::If(nested)) = body.stmts.pop() else {
+                                unreachable!()
+                            };
+                            ast::ElseClause::If(Box::new(nested))
+                        }
+                        _ => ast::ElseClause::Else(body),
+                    })
+                } else {
+                    None
+                };
+                out.push(ast::Stmt::If(ast::If {
+                    condition,
+                    then_body,
+                    else_clause,
+                }));
             }
-            RegionNode::While {
-                condition, body, ..
-            } => {
-                self.declarations.push_scope();
-
-                let body = self.visit_region(body);
-                buf.push(ast::Stmt::While {
-                    condition: self.visit_expr(condition),
-                    body,
-                });
-
-                self.declarations.pop_scope();
+            nir::Region::While { condition, body } => {
+                let condition = self.lower_expr(condition)?;
+                let body = self.lower_child_scope(body)?;
+                out.push(ast::Stmt::While { condition, body });
             }
-            RegionNode::RepeatUntil { condition, body } => {
-                self.declarations.push_scope();
-
-                let body = self.visit_region(body);
-                buf.push(ast::Stmt::RepeatUntil {
-                    condition: self.visit_expr(condition),
-                    body,
-                });
-
-                self.declarations.pop_scope();
+            nir::Region::RepeatUntil { condition, body } => {
+                let body = self.lower_child_scope(body)?;
+                let condition = self.lower_expr(condition)?;
+                out.push(ast::Stmt::RepeatUntil { condition, body });
             }
-            RegionNode::NumericFor {
-                body,
-                var,
+            nir::Region::NumericFor {
+                variable,
                 start,
                 end,
                 step,
-                ..
+                body,
             } => {
-                self.declarations.push_scope();
-
-                let slot = self.declare_symbol(*var);
-                self.bind_slot_to_symbol_name(slot, *var);
-                self.declare_slot(slot);
-                self.current_context_mut().plan.force_named_symbol(*var);
-                let var = match self.symbol_storage(*var).unwrap().into_expr() {
-                    ast::Expr::Named(name) => name,
-                    _ => unreachable!("numeric-for variables cannot be spilled"),
-                };
-                let start = self.visit_expr(start);
-                let end = self.visit_expr(end);
-                let step = Some(self.visit_expr(step));
-
-                let body = self.visit_region(body);
-                buf.push(ast::Stmt::NumericFor {
+                let var = self
+                    .plan
+                    .local(*variable)?
+                    .name()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("numeric-for variable was spilled"))?;
+                let start = self.lower_expr(start)?;
+                let end = self.lower_expr(end)?;
+                let step = Some(self.lower_expr(step)?);
+                let body = self.lower_child_scope(body)?;
+                out.push(ast::Stmt::NumericFor {
                     var,
                     start,
                     end,
                     step,
                     body,
                 });
-
-                self.declarations.pop_scope();
             }
-            RegionNode::GenericFor {
-                vars, exprs, body, ..
+            nir::Region::GenericFor {
+                variables,
+                values,
+                body,
             } => {
-                self.declarations.push_scope();
-
-                for &var in vars {
-                    let slot = self.declare_symbol(var);
-                    self.bind_slot_to_symbol_name(slot, var);
-                    self.declare_slot(slot);
-                    self.current_context_mut().plan.force_named_symbol(var);
-                }
-                let vars = vars
+                let vars = variables
                     .iter()
-                    .map(|s| match self.symbol_storage(*s).unwrap().into_expr() {
-                        ast::Expr::Named(name) => name,
-                        _ => unreachable!("generic-for variables cannot be spilled"),
+                    .map(|variable| {
+                        self.plan
+                            .local(*variable)?
+                            .name()
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("generic-for variable was spilled"))
                     })
-                    .collect();
-                let exprs = self.visit_value_pack(exprs);
-                let body = self.visit_region(body);
-                buf.push(ast::Stmt::GenericFor { vars, exprs, body });
-
-                self.declarations.pop_scope();
+                    .collect::<Result<_>>()?;
+                let exprs = values
+                    .iter()
+                    .map(|value| self.lower_expr(value))
+                    .collect::<Result<_>>()?;
+                let body = self.lower_child_scope(body)?;
+                out.push(ast::Stmt::GenericFor { vars, exprs, body });
             }
-            RegionNode::Continue => buf.push(ast::Stmt::Continue),
-            RegionNode::Break => buf.push(ast::Stmt::Break),
-            RegionNode::Return { values } => {
-                buf.push(ast::Stmt::Return {
-                    values: self.visit_value_pack(values),
+            nir::Region::Continue => out.push(ast::Stmt::Continue),
+            nir::Region::Break => out.push(ast::Stmt::Break),
+            nir::Region::Return(values) => out.push(ast::Stmt::Return {
+                values: self.lower_pack(values)?,
+            }),
+        }
+        Ok(())
+    }
+
+    /// Lowers a flat statement list.
+    fn lower_stmts(
+        &mut self,
+        stmts: &[nir::Stmt],
+        scope: usize,
+        out: &mut Vec<ast::Stmt>,
+    ) -> Result<()> {
+        for stmt in stmts {
+            self.lower_stmt(stmt, scope, out)?;
+        }
+        Ok(())
+    }
+
+    /// Emits one pack-producing effect whose results are unused.
+    fn eval_pack(&mut self, value: &nir::PackExpr, out: &mut Vec<ast::Stmt>) -> Result<()> {
+        match &value.kind {
+            nir::PackExprKind::Call { .. } | nir::PackExprKind::MethodCall { .. } => {
+                let mut values = self.lower_pack(value)?;
+                ensure!(values.len() == 1, "call pack must lower to one expression");
+                out.push(ast::Stmt::Expression {
+                    expr: values.pop().expect("the call produced one expression"),
                 });
             }
+            nir::PackExprKind::Values { .. } => {
+                let values = self.lower_pack(value)?;
+                if !values.is_empty() {
+                    out.push(ast::Stmt::Comment {
+                        text: "the following code evaluates an unused value pack".to_string(),
+                    });
+                    out.push(ast::Stmt::Expression {
+                        expr: ast::Expr::FunctionCall {
+                            func: Box::new(field(global("table"), "pack")),
+                            args: values,
+                        },
+                    });
+                }
+            }
+            nir::PackExprKind::Local(_) | nir::PackExprKind::VarArgs => {}
         }
+        Ok(())
     }
 
-    fn visit_block(&mut self, stmts: &[hil::Stmt], buf: &mut Vec<ast::Stmt>) {
-        for stmt in stmts {
-            self.maybe_predeclare_recursive_local(stmt, buf);
-            self.visit_stmt(stmt, buf);
-        }
-    }
-
-    fn maybe_predeclare_recursive_local(&mut self, stmt: &hil::Stmt, buf: &mut Vec<ast::Stmt>) {
-        let hil::Stmt::Assign {
-            left: hil::Expr::Symbol(sym),
-            value: hil::Expr::Closure { proto, captures },
-        } = stmt
-        else {
-            return;
-        };
-
-        if self.declarations.contains_symbol(sym)
-            || !captures
-                .iter()
-                .any(|capture| matches!(capture, hil::Capture::Copy(symbol) if symbol == sym))
-        {
-            return;
+    /// Binds one multivalue result into one list of places.
+    fn lower_bind_many(
+        &mut self,
+        targets: &[nir::Place],
+        values: &nir::PackExpr,
+        scope: usize,
+        out: &mut Vec<ast::Stmt>,
+    ) -> Result<()> {
+        /// One prepared binding inside a multibind.
+        enum Slot {
+            /// Declares one new name in this statement's scope.
+            Fresh(SmolStr),
+            /// Reuses existing source storage.
+            Existing(Storage),
         }
 
-        // If the closure has a debug_name, visit_stmt will emit a LocalFunction
-        // which natively handles recursion in Luau.
-        if self.functions[proto.0 as usize].debug_name.is_some() {
-            return;
+        let rhs = self.lower_pack(values)?;
+        let slots: Vec<_> = targets
+            .iter()
+            .map(|target| {
+                Ok(match target {
+                    // A discard slot always joins the fresh declaration group.
+                    nir::Place::Discard => Slot::Fresh(self.discard_name().0),
+                    nir::Place::Local(local) => {
+                        if self
+                            .plan
+                            .claim_declaration(BindingKey::Local(*local), scope)
+                            && let Some(name) = self.plan.local(*local)?.name().cloned()
+                        {
+                            Slot::Fresh(name.0)
+                        } else {
+                            Slot::Existing(self.plan.local(*local)?.clone())
+                        }
+                    }
+                    _ => unreachable!("only fold_packs builds multibindings, and it only targets locals and discards"),
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        if slots.iter().all(|slot| matches!(slot, Slot::Fresh(_))) {
+            let names = slots
+                .into_iter()
+                .map(|slot| match slot {
+                    Slot::Fresh(name) => ast::Typed::untyped(Identifier(name)),
+                    Slot::Existing(_) => unreachable!("all slots are fresh"),
+                })
+                .collect();
+            out.push(ast::Stmt::LocalDeclaration { names, values: rhs });
+            return Ok(());
         }
 
-        let slot = self.declare_symbol(*sym);
-        self.declare_slot(slot);
-        if let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym) {
-            buf.push(ast::Stmt::LocalDeclaration {
-                names: vec![self.typed_identifier(*sym, name)],
+        let fresh: Vec<_> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Fresh(name) => Some(ast::Typed::untyped(Identifier(name.clone()))),
+                Slot::Existing(_) => None,
+            })
+            .collect();
+        if !fresh.is_empty() {
+            out.push(ast::Stmt::LocalDeclaration {
+                names: fresh,
                 values: Vec::new(),
             });
         }
+        let lhs = slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Fresh(name) => ast::Expr::Named(Identifier(name.clone())),
+                Slot::Existing(storage) => storage.expr(),
+            })
+            .collect();
+        out.push(ast::Stmt::Assignment { lhs, rhs });
+        Ok(())
     }
 
-    /// Emits one assignment while preserving its SSA storage meaning.
-    fn visit_assign(&mut self, left: &hil::Expr, value: &hil::Expr, buf: &mut Vec<ast::Stmt>) {
-        let mut needs_declaration = false;
-        let mut named_closure = false;
-
-        let left_expr = match left {
-            hil::Expr::Symbol(sym) => {
-                if !self.declarations.contains_symbol(sym) {
-                    // If value is a named closure, reserve its debug_name
-                    // as the symbol name before declaring/symbol_expr.
-                    if let hil::Expr::Closure { proto, .. } = value {
-                        let debug_name = self.functions[proto.0 as usize].debug_name.clone();
-                        if let Some(name) = debug_name {
-                            self.current_context_mut()
-                                .plan
-                                .reserve_symbol_name_exact(*sym, name.into());
-                            named_closure = true;
-                        }
-                    }
-                    let slot = self.declare_symbol(*sym);
-                    needs_declaration = !self.declarations.contains_slot(slot);
-                    if needs_declaration {
-                        self.declare_slot(slot);
-                    }
+    /// Lowers one NIR statement.
+    fn lower_stmt(
+        &mut self,
+        stmt: &nir::Stmt,
+        scope: usize,
+        out: &mut Vec<ast::Stmt>,
+    ) -> Result<()> {
+        match stmt {
+            nir::Stmt::Bind { target, value, .. } => match target {
+                nir::Place::Local(local) => {
+                    let value = self.lower_expr_for_local(value, Some(*local))?;
+                    let declaration = self
+                        .plan
+                        .claim_declaration(BindingKey::Local(*local), scope);
+                    self.bind_storage(self.plan.local(*local)?, value, declaration, out);
                 }
-                self.symbol_expr(*sym)
-            }
-            _ => self.visit_expr(left),
-        };
-        let right = match value {
-            hil::Expr::Closure { proto, captures } => self.visit_closure(*proto, captures),
-            _ => self.visit_expr(value),
-        };
-        if needs_declaration {
-            let hil::Expr::Symbol(sym) = left else {
-                unreachable!("non-symbol lvalues are never declarations");
-            };
-
-            if named_closure
-                && let Some(SymbolStorage::Named(name)) = self.symbol_storage(*sym)
-                && let ast::Expr::AnonymousFunction { params, body } = right
-            {
-                buf.push(ast::Stmt::LocalFunction {
-                    name,
-                    params,
-                    body,
-                    returns: self.local_function_return_pack(self.current_proto_idx(), *sym),
-                });
-                return;
-            }
-
-            match self
-                .symbol_storage(*sym)
-                .expect("symbol was just declared in scope")
-            {
-                SymbolStorage::Named(name) => {
-                    buf.push(ast::Stmt::LocalDeclaration {
-                        names: vec![ast::Typed::untyped(name)],
-                        values: vec![right],
+                nir::Place::Cell(cell) => {
+                    let value = self.lower_expr(value)?;
+                    let declaration = self.plan.claim_declaration(BindingKey::Cell(*cell), scope);
+                    self.bind_storage(self.plan.cell(*cell)?, value, declaration, out);
+                }
+                nir::Place::Global(_) | nir::Place::Table { .. } => {
+                    let target = self.lower_place(target)?;
+                    let value = self.lower_expr(value)?;
+                    out.push(ast::Stmt::Assignment {
+                        lhs: vec![target],
+                        rhs: vec![value],
                     });
                 }
-                SymbolStorage::Spilled(_) => buf.push(ast::Stmt::Assignment {
-                    lhs: vec![left_expr],
-                    rhs: vec![right],
-                }),
+                nir::Place::Discard => {
+                    unreachable!("single binds never target a discard; only multibindings do")
+                }
+            },
+            nir::Stmt::BindMany { targets, values } => {
+                self.lower_bind_many(targets, values, scope, out)?;
             }
-        } else {
-            if let ast::Expr::Binary { lhs, op, rhs } = &right
-                && left.is_pure()
-                && lhs.as_ref() == &left_expr
-                && let Ok(compound_op) = CompoundBinOp::try_from(*op)
-            {
-                buf.push(ast::Stmt::CompoundAssignment {
-                    lhs: left_expr,
-                    op: compound_op,
-                    rhs: rhs.as_ref().clone(),
+            nir::Stmt::BindPack { local, value } => {
+                let packed = ast::Expr::FunctionCall {
+                    func: Box::new(field(global("table"), "pack")),
+                    args: self.lower_pack(value)?,
+                };
+                out.push(ast::Stmt::Comment {
+                    text: "the following code preserves a value pack that cannot be represented"
+                        .to_string(),
                 });
-                return;
+                let declaration = self.plan.claim_declaration(BindingKey::Pack(*local), scope);
+                self.bind_storage(self.plan.pack(*local)?, packed, declaration, out);
             }
+            nir::Stmt::Eval { value } => self.eval_pack(value, out)?,
+            nir::Stmt::OpenCell { cell, value, .. } => {
+                let value = self.lower_expr(value)?;
+                let declaration = self.plan.claim_declaration(BindingKey::Cell(*cell), scope);
+                self.bind_storage(self.plan.cell(*cell)?, value, declaration, out);
+            }
+            nir::Stmt::SetList {
+                table,
+                index,
+                values,
+                ..
+            } => self.lower_set_list(table, *index, values, out)?,
+        }
+        Ok(())
+    }
 
-            buf.push(ast::Stmt::Assignment {
-                lhs: vec![left_expr],
-                rhs: vec![right],
+    /// Emits a first binding as a declaration or assignment.
+    fn bind_storage(
+        &self,
+        storage: &Storage,
+        value: ast::Expr,
+        declaration: bool,
+        out: &mut Vec<ast::Stmt>,
+    ) {
+        if declaration && let Some(name) = storage.name() {
+            out.push(ast::Stmt::LocalDeclaration {
+                names: vec![ast::Typed::untyped(name.clone())],
+                values: vec![value],
+            });
+        } else {
+            out.push(ast::Stmt::Assignment {
+                lhs: vec![storage.expr()],
+                rhs: vec![value],
             });
         }
     }
 
-    fn visit_stmt(&mut self, stmt: &hil::Stmt, buf: &mut Vec<ast::Stmt>) {
-        match stmt {
-            hil::Stmt::Assign { left, value } => {
-                self.visit_assign(left, value, buf);
-            }
-            hil::Stmt::AssignMany { left, values } => {
-                let right = self.visit_value_pack(values);
-                if left
-                    .iter()
-                    .any(|lvalue| !matches!(lvalue, hil::Expr::Symbol(_)))
-                {
-                    let lhs = left.iter().map(|lvalue| self.visit_expr(lvalue)).collect();
-                    buf.push(ast::Stmt::Assignment { lhs, rhs: right });
-                    return;
-                }
-
-                let symbols: Vec<_> = left
-                    .iter()
-                    .map(|lvalue| {
-                        let hil::Expr::Symbol(sym) = lvalue else {
-                            unreachable!("guarded by symbol-only branch")
-                        };
-                        *sym
-                    })
-                    .collect();
-
-                let targets = self.prepare_assign_many_targets(symbols);
-
-                let all_declared = targets.iter().all(|target| target.slot_was_declared);
-                if all_declared {
-                    buf.push(ast::Stmt::Assignment {
-                        lhs: targets
-                            .into_iter()
-                            .map(|target| target.storage.into_expr())
-                            .collect(),
-                        rhs: right,
-                    });
-                    return;
-                }
-
-                let all_named = targets
-                    .iter()
-                    .all(|target| matches!(target.storage, SymbolStorage::Named(_)));
-                if all_named {
-                    let names = targets
-                        .into_iter()
-                        .map(|target| match target.storage {
-                            SymbolStorage::Named(name) => ast::Typed::untyped(name),
-                            SymbolStorage::Spilled(_) => unreachable!("guarded by all_named"),
-                        })
-                        .collect();
-                    buf.push(ast::Stmt::LocalDeclaration {
-                        names,
-                        values: right,
-                    });
-                    return;
-                }
-
-                let temps: Vec<_> = (0..targets.len())
-                    .map(|_| ast::Typed::untyped(self.fresh_temp_local()))
-                    .collect();
-                buf.push(ast::Stmt::LocalDeclaration {
-                    names: temps.clone(),
-                    values: right,
-                });
-
-                for (target, temp) in targets.into_iter().zip(temps) {
-                    let rhs = vec![ast::Expr::Named(temp.as_ref().clone())];
-                    match (target.storage, target.slot_was_declared) {
-                        (SymbolStorage::Named(name), false) => {
-                            buf.push(ast::Stmt::LocalDeclaration {
-                                names: vec![ast::Typed::untyped(name)],
-                                values: rhs,
-                            });
-                        }
-                        (storage, true) | (storage @ SymbolStorage::Spilled(_), false) => {
-                            buf.push(ast::Stmt::Assignment {
-                                lhs: vec![storage.into_expr()],
-                                rhs,
-                            });
-                        }
-                    }
-                }
-            }
-            hil::Stmt::SetList {
-                table,
-                index,
-                values,
-            } => {
-                let table_expr = self.visit_expr(&hil::Expr::Symbol(*table));
-                if values.is_open() {
-                    // Preserve the exact value count because a table length drops trailing nils.
-                    let packed_values = self.visit_value_pack(values);
-                    let temp_table = self.fresh_temp_local();
-                    let temp_count = self.fresh_temp_local();
-
-                    buf.extend(open_set_list_fallback(
-                        packed_values,
-                        temp_table,
-                        temp_count,
-                        *index,
-                        table_expr,
-                    ));
-                } else {
-                    let base = *index as usize;
-                    let length = values
-                        .fixed_len()
-                        .expect("the open SetList branch returned above");
-                    let lhs = (base..base + length)
-                        .map(|i| ast::Expr::Index {
-                            base: Box::new(table_expr.clone()),
-                            index: Box::new(ast::Expr::Literal(ast::Literal::Float(i as f64))),
-                        })
-                        .collect();
-                    let rhs = self.visit_value_pack(values);
-
-                    buf.push(ast::Stmt::Assignment { lhs, rhs });
-                }
-            }
-            hil::Stmt::Call(expr) => buf.push(ast::Stmt::Expression {
-                expr: self.visit_expr(expr),
-            }),
-            hil::Stmt::OpenCell { cell, value } => {
-                let symbol = self.functions[self.current_proto_idx()]
-                    .symbols
-                    .name_for_cell(*cell);
-                if matches!(value, hil::Expr::Closure { .. })
-                    && !self.declarations.contains_symbol(&symbol)
-                {
-                    let slot = self.declare_symbol(symbol);
-                    self.declare_slot(slot);
-                    if let Some(SymbolStorage::Named(name)) = self.symbol_storage(symbol) {
-                        buf.push(ast::Stmt::LocalDeclaration {
-                            names: vec![self.typed_identifier(symbol, name)],
-                            values: Vec::new(),
-                        });
-                    }
-                }
-                self.visit_assign(&hil::Expr::Symbol(symbol), value, buf);
-            }
-            hil::Stmt::StoreCell { cell, value } => {
-                let symbol = self.functions[self.current_proto_idx()]
-                    .symbols
-                    .name_for_cell(*cell);
-                self.visit_assign(&hil::Expr::Symbol(symbol), value, buf);
-            }
-            hil::Stmt::LoadCell { target, cell } => {
-                let symbol = self.functions[self.current_proto_idx()]
-                    .symbols
-                    .name_for_cell(*cell);
-                self.visit_assign(&hil::Expr::Symbol(*target), &hil::Expr::Symbol(symbol), buf);
-            }
-            hil::Stmt::Phi(phi) => unreachable!(
-                "source structuring must unfold phi target {} with operands {:?}",
-                phi.target.index(),
-                phi.operands
-            ),
+    /// Lowers a table list write while preserving open-pack length.
+    fn lower_set_list(
+        &mut self,
+        table: &nir::Expr,
+        index: u32,
+        values: &nir::PackExpr,
+        out: &mut Vec<ast::Stmt>,
+    ) -> Result<()> {
+        let table = self.lower_expr(table)?;
+        if let Some(length) = values.fixed_len() {
+            let lhs = (0..length)
+                .map(|offset| ast::Expr::Index {
+                    base: Box::new(table.clone()),
+                    index: Box::new(ast::Expr::Literal(ast::Literal::Float(
+                        f64::from(index) + offset as f64,
+                    ))),
+                })
+                .collect();
+            out.push(ast::Stmt::Assignment {
+                lhs,
+                rhs: self.lower_pack(values)?,
+            });
+            return Ok(());
         }
+
+        if let nir::PackExprKind::Local(local) = &values.kind {
+            out.push(ast::Stmt::Expression {
+                expr: move_packed_values(self.plan.pack(*local)?.expr(), table, index),
+            });
+            return Ok(());
+        }
+
+        let temp = self.plan.names.internal("pack");
+        let packed = ast::Expr::FunctionCall {
+            func: Box::new(field(global("table"), "pack")),
+            args: self.lower_pack(values)?,
+        };
+        out.push(ast::Stmt::Comment {
+            text: "the following code preserves an open table value list".to_string(),
+        });
+        out.push(ast::Stmt::Do {
+            body: ast::Block::with_stmts(vec![
+                ast::Stmt::LocalDeclaration {
+                    names: vec![ast::Typed::untyped(temp.clone())],
+                    values: vec![packed],
+                },
+                ast::Stmt::Expression {
+                    expr: move_packed_values(ast::Expr::Named(temp), table, index),
+                },
+            ]),
+        });
+        Ok(())
     }
 
-    fn visit_expr(&mut self, expr: &hil::Expr) -> ast::Expr {
-        match expr {
-            hil::Expr::Nil => ast::Expr::Literal(ast::Literal::Nil),
-            hil::Expr::Number(num) => match num {
-                hil::Number::Integer(i) => ast::Expr::Literal(ast::Literal::Integer(*i)),
-                hil::Number::Float(f) => ast::Expr::Literal(ast::Literal::Float(*f)),
-            },
-            hil::Expr::String(s) => ast::Expr::Literal(ast::Literal::String(s.clone())),
-            hil::Expr::Bool(b) => ast::Expr::Literal(ast::Literal::Bool(*b)),
-            hil::Expr::Symbol(sym) => self.symbol_expr(*sym),
-            hil::Expr::Closure { proto, captures } => self.visit_closure(*proto, captures),
-            hil::Expr::Binary { lhs, op, rhs } => ast::Expr::Binary {
-                lhs: Box::new(self.visit_expr(lhs)),
-                op: *op,
-                rhs: Box::new(self.visit_expr(rhs)),
-            },
-            hil::Expr::Unary { op, expr } => ast::Expr::Unary {
-                op: *op,
-                expr: Box::new(self.visit_expr(expr)),
-            },
-            hil::Expr::Global(name) => ast::Expr::Named(ast::Identifier::new(name.clone())),
-            hil::Expr::GetField { obj, field } => {
-                let base = Box::new(self.visit_expr(obj));
-
-                if is_valid_luau_identifier(field) {
-                    ast::Expr::Field {
-                        base,
-                        field: ast::Identifier::new(field.clone()),
-                    }
-                } else {
-                    ast::Expr::Index {
-                        base,
-                        index: Box::new(ast::Expr::Literal(ast::Literal::String(
-                            field.clone().into(),
-                        ))),
-                    }
-                }
+    /// Lowers one writable NIR place.
+    fn lower_place(&mut self, place: &nir::Place) -> Result<ast::Expr> {
+        Ok(match place {
+            nir::Place::Local(local) => self.plan.local(*local)?.expr(),
+            nir::Place::Cell(cell) => self.plan.cell(*cell)?.expr(),
+            nir::Place::Global(name) => global_name(name),
+            nir::Place::Discard => unreachable!("discard places are never read"),
+            nir::Place::Table { table, key } => {
+                table_access(self.lower_expr(table)?, key, self.lower_expr(key)?)
             }
-            hil::Expr::GetIndex { obj, index } => ast::Expr::Index {
-                base: Box::new(self.visit_expr(obj)),
-                index: Box::new(self.visit_expr(index)),
+        })
+    }
+
+    /// Lowers one expression without a recursive target binding.
+    fn lower_expr(&mut self, expr: &nir::Expr) -> Result<ast::Expr> {
+        self.lower_expr_for_local(expr, None)
+    }
+
+    /// Lowers one expression and exposes its target for recursive closures.
+    fn lower_expr_for_local(
+        &mut self,
+        expr: &nir::Expr,
+        target: Option<LocalId>,
+    ) -> Result<ast::Expr> {
+        Ok(match &expr.kind {
+            nir::ExprKind::Local(local) => self.plan.local(*local)?.expr(),
+            nir::ExprKind::Constant(value) => constant(value),
+            nir::ExprKind::Closure { proto, captures } => {
+                self.lower_closure(*proto, captures, target)?
+            }
+            nir::ExprKind::GetTable { table, key } => {
+                table_access(self.lower_expr(table)?, key, self.lower_expr(key)?)
+            }
+            nir::ExprKind::GetGlobal(name) => global_name(name),
+            nir::ExprKind::Binary { lhs, op, rhs } => ast::Expr::Binary {
+                lhs: Box::new(self.lower_expr(lhs)?),
+                op: *op,
+                rhs: Box::new(self.lower_expr(rhs)?),
             },
-            hil::Expr::Call { fun, args } => ast::Expr::FunctionCall {
-                func: Box::new(self.visit_expr(fun)),
-                args: self.visit_value_pack(args),
+            nir::ExprKind::Unary { op, value } => ast::Expr::Unary {
+                op: *op,
+                expr: Box::new(self.lower_expr(value)?),
             },
-            hil::Expr::MethodCall {
+            nir::ExprKind::Concat(values) => {
+                let mut values = values.iter().rev();
+                let Some(last) = values.next() else {
+                    bail!("NIR concat cannot be empty")
+                };
+                let mut combined = self.lower_expr(last)?;
+                for value in values {
+                    combined = ast::Expr::Binary {
+                        lhs: Box::new(self.lower_expr(value)?),
+                        op: BinOp::Concat,
+                        rhs: Box::new(combined),
+                    };
+                }
+                combined
+            }
+            nir::ExprKind::Select {
+                condition,
+                then_value,
+                else_value,
+            } => ast::Expr::IfElse {
+                condition: Box::new(self.lower_expr(condition)?),
+                then_expr: Box::new(self.lower_expr(then_value)?),
+                else_expr: Box::new(self.lower_expr(else_value)?),
+            },
+            nir::ExprKind::NewTable => ast::Expr::Table { items: Vec::new() },
+            nir::ExprKind::Project { pack, index } => self.lower_project(pack, *index)?,
+            nir::ExprKind::LoadCell(cell) => self.plan.cell(*cell)?.expr(),
+        })
+    }
+
+    /// Lowers one closure and maps positional captures to child upvalue cells.
+    fn lower_closure(
+        &mut self,
+        proto: ProtoId,
+        captures: &[nir::Capture],
+        recursive_target: Option<LocalId>,
+    ) -> Result<ast::Expr> {
+        let child_upvalues = &self.functions[proto.0 as usize].upvalues;
+        ensure!(
+            child_upvalues.len() == captures.len(),
+            "closure capture count does not match child upvalues"
+        );
+
+        let mut inherited = HashMap::new();
+        let mut copy_params = Vec::new();
+        let mut copy_args = Vec::new();
+        for (&cell, capture) in child_upvalues.iter().zip(captures) {
+            let storage = match capture {
+                nir::Capture::Share(parent_cell) => self.plan.cell(*parent_cell)?.clone(),
+                nir::Capture::Copy(local) if Some(*local) == recursive_target => {
+                    self.plan.local(*local)?.clone()
+                }
+                nir::Capture::Copy(local) => {
+                    let name = self.plan.names.internal("copy");
+                    copy_params.push(ast::Typed::untyped(ast::Parameter::Regular(name.clone())));
+                    copy_args.push(self.plan.local(*local)?.expr());
+                    Storage::Named(name)
+                }
+            };
+            inherited.insert(cell, storage);
+        }
+
+        let child = emit_function(
+            self.functions,
+            self.options,
+            &mut *self.namer,
+            proto,
+            inherited,
+        )?;
+        let closure = ast::Expr::AnonymousFunction {
+            params: child.params,
+            body: child.body,
+        };
+        if copy_params.is_empty() {
+            return Ok(closure);
+        }
+
+        Ok(ast::Expr::FunctionCall {
+            func: Box::new(ast::Expr::Parenthesized(Box::new(
+                ast::Expr::AnonymousFunction {
+                    params: copy_params,
+                    body: ast::Block::with_stmts(vec![ast::Stmt::Return {
+                        values: vec![closure],
+                    }]),
+                },
+            ))),
+            args: copy_args,
+        })
+    }
+
+    /// Lowers one scalar projection from a value pack.
+    fn lower_project(&mut self, pack: &nir::PackExpr, index: usize) -> Result<ast::Expr> {
+        if let nir::PackExprKind::Local(local) = &pack.kind {
+            return Ok(ast::Expr::Index {
+                base: Box::new(self.plan.pack(*local)?.expr()),
+                index: Box::new(ast::Expr::Literal(ast::Literal::Float((index + 1) as f64))),
+            });
+        }
+
+        let mut values = self.lower_pack(pack)?;
+        if index == 0 && values.len() == 1 {
+            return Ok(ast::Expr::Parenthesized(Box::new(values.pop().unwrap())));
+        }
+        let mut args = Vec::with_capacity(values.len() + 1);
+        args.push(ast::Expr::Literal(ast::Literal::Float((index + 1) as f64)));
+        args.extend(values);
+        Ok(ast::Expr::FunctionCall {
+            func: Box::new(global("select")),
+            args,
+        })
+    }
+
+    /// Lowers one NIR pack into a Luau expression list.
+    fn lower_pack(&mut self, pack: &nir::PackExpr) -> Result<Vec<ast::Expr>> {
+        Ok(match &pack.kind {
+            nir::PackExprKind::Local(local) => {
+                let packed = self.plan.pack(*local)?.expr();
+                vec![ast::Expr::FunctionCall {
+                    func: Box::new(field(global("table"), "unpack")),
+                    args: vec![
+                        packed.clone(),
+                        ast::Expr::Literal(ast::Literal::Float(1.0)),
+                        field(packed, "n"),
+                    ],
+                }]
+            }
+            nir::PackExprKind::Values { head, tail } => {
+                let mut values = head
+                    .iter()
+                    .map(|value| self.lower_expr(value))
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(tail) = tail {
+                    values.extend(self.lower_pack(tail)?);
+                }
+                values
+            }
+            nir::PackExprKind::Call { function, args } => vec![ast::Expr::FunctionCall {
+                func: Box::new(self.lower_expr(function)?),
+                args: self.lower_pack(args)?,
+            }],
+            nir::PackExprKind::MethodCall {
                 object,
                 method,
                 args,
-            } => ast::Expr::MethodCall {
-                object: Box::new(self.visit_expr(object)),
+            } => vec![ast::Expr::MethodCall {
+                object: Box::new(self.lower_expr(object)?),
                 method: ast::Identifier::new(method.clone()),
-                args: self.visit_value_pack(args),
-            },
-            hil::Expr::IfElse {
-                condition,
-                then_expr,
-                else_expr,
-            } => ast::Expr::IfElse {
-                condition: Box::new(self.visit_expr(condition)),
-                then_expr: Box::new(self.visit_expr(then_expr)),
-                else_expr: Box::new(self.visit_expr(else_expr)),
-            },
-            hil::Expr::Table { items } => ast::Expr::Table {
-                items: self.visit_table_items(items),
-            },
-            hil::Expr::VarArgs => ast::Expr::Vararg,
-        }
-    }
-
-    /// Emits a HIL value pack as a source expression list.
-    fn visit_value_pack(&mut self, values: &hil::ValuePack) -> Vec<ast::Expr> {
-        match values {
-            hil::ValuePack::Fixed(values) => {
-                let last = values.len().checked_sub(1);
-                values
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        let value_can_produce_multiple_values = value.can_produce_multiple_values();
-                        let value = self.visit_expr(value);
-                        if Some(index) == last && value_can_produce_multiple_values {
-                            ast::Expr::Parenthesized(Box::new(value))
-                        } else {
-                            value
-                        }
-                    })
-                    .collect()
-            }
-            hil::ValuePack::Open { head, tail } => {
-                let mut values = Vec::with_capacity(head.len() + 1);
-                values.extend(head.iter().map(|value| self.visit_expr(value)));
-                values.push(self.visit_expr(tail));
-                values
-            }
-        }
-    }
-
-    fn visit_table_items(&mut self, items: &[hil::TableItem]) -> Vec<ast::TableItem> {
-        let mut emitted = Vec::new();
-        for (index, item) in items.iter().enumerate() {
-            match item {
-                hil::TableItem::List(values) => {
-                    debug_assert!(
-                        !values.is_open() || index + 1 == items.len(),
-                        "an open table value pack must be the final table item"
-                    );
-                    emitted.extend(
-                        self.visit_value_pack(values)
-                            .into_iter()
-                            .map(|value| ast::TableItem::Implicit { value }),
-                    );
-                }
-                hil::TableItem::Index(key, value) => {
-                    let value = self.visit_expr(value);
-                    if let hil::Expr::String(s) = key
-                        && let Some(name) = s.as_utf8()
-                        && is_valid_luau_identifier(name)
-                    {
-                        emitted.push(ast::TableItem::Named {
-                            name: ast::Identifier::new(name),
-                            value,
-                        });
-                    } else {
-                        emitted.push(ast::TableItem::Indexed {
-                            index: self.visit_expr(key),
-                            value,
-                        });
-                    }
-                }
-            }
-        }
-        emitted
-    }
-
-    /// Emits one closure with the best inferred parameter annotations available.
-    fn visit_closure(&mut self, proto_idx: ProtoId, captures: &[hil::Capture]) -> ast::Expr {
-        let proto_idx = proto_idx.0 as usize;
-        let capture_symbols: Vec<_> = captures
-            .iter()
-            .map(|capture| match capture {
-                hil::Capture::Copy(symbol) => *symbol,
-                hil::Capture::Share(cell) => self.functions[self.current_proto_idx()]
-                    .symbols
-                    .name_for_cell(*cell),
-            })
-            .collect();
-        let parent_bindings: Vec<_> = capture_symbols
-            .iter()
-            .map(|symbol| {
-                self.symbol_storage(*symbol)
-                    .unwrap_or_else(|| SymbolStorage::Named(self.get_symbol_name(symbol)))
-            })
-            .collect();
-
-        let child_ctx = self.create_context(proto_idx);
-        let child_upvalues = self.functions[proto_idx].symbols.upvalues().to_vec();
-        for (i, binding) in parent_bindings.into_iter().enumerate() {
-            if let Some(&child_upval_sym) = child_upvalues.get(i) {
-                match binding {
-                    SymbolStorage::Named(name) => {
-                        self.contexts[child_ctx]
-                            .plan
-                            .inherit_named_upvalue(child_upval_sym, name);
-                    }
-                    SymbolStorage::Spilled(spill) => {
-                        self.contexts[child_ctx]
-                            .plan
-                            .inherit_spilled_upvalue(child_upval_sym, spill);
-                    }
-                }
-            }
-        }
-
-        let old_declarations = std::mem::take(&mut self.declarations);
-
-        let param_symbols = self.functions[proto_idx].symbols.params().to_vec();
-        let is_vararg = self.functions[proto_idx].is_vararg;
-        let mut params: Vec<_> = param_symbols
-            .into_iter()
-            .map(|sym| {
-                let name = self.get_symbol_name_for(child_ctx, sym);
-                self.typed_parameter_for(proto_idx, sym, ast::Parameter::Regular(name))
-            })
-            .collect();
-        if is_vararg {
-            params.push(ast::Typed::untyped(ast::Parameter::Vararg));
-        }
-
-        let body = self.visit_function(child_ctx);
-
-        self.declarations = old_declarations;
-
-        ast::Expr::AnonymousFunction { params, body }
-    }
-}
-
-/// Builds a source fallback for an open table-constructor value pack.
-fn open_set_list_fallback(
-    packed_values: Vec<ast::Expr>,
-    temp_table: ast::Identifier,
-    temp_count: ast::Identifier,
-    index: u32,
-    table: ast::Expr,
-) -> [ast::Stmt; 2] {
-    [
-        ast::Stmt::Comment {
-            text: "the following code is a fallback, not the original table constructor"
-                .to_string(),
-        },
-        ast::Stmt::Do {
-            body: ast::Block::with_stmts(vec![
-                ast::Stmt::LocalDeclaration {
-                    names: vec![ast::Typed::untyped(temp_table.clone())],
-                    values: vec![ast::Expr::FunctionCall {
-                        func: Box::new(ast::Expr::Field {
-                            base: Box::new(ast::Expr::Named(ast::Identifier::new("table"))),
-                            field: ast::Identifier::new("pack"),
-                        }),
-                        args: packed_values,
-                    }],
-                },
-                ast::Stmt::LocalDeclaration {
-                    names: vec![ast::Typed::untyped(temp_count.clone())],
-                    values: vec![ast::Expr::Field {
-                        base: Box::new(ast::Expr::Named(temp_table.clone())),
-                        field: ast::Identifier::new("n"),
-                    }],
-                },
-                ast::Stmt::Expression {
-                    expr: ast::Expr::FunctionCall {
-                        func: Box::new(ast::Expr::Field {
-                            base: Box::new(ast::Expr::Named(ast::Identifier::new("table"))),
-                            field: ast::Identifier::new("move"),
-                        }),
-                        args: vec![
-                            ast::Expr::Named(temp_table),
-                            ast::Expr::Literal(ast::Literal::Float(1.0)),
-                            ast::Expr::Named(temp_count),
-                            ast::Expr::Literal(ast::Literal::Float(index as f64)),
-                            table,
-                        ],
-                    },
-                },
-            ]),
-        },
-    ]
-}
-
-pub fn emit_ast(
-    functions: Vec<StructuredFunction>,
-    entry: usize,
-    options: DecompileOptions,
-    diagnostics: &Diagnostics,
-) -> ast::Block {
-    let mut st = Emitter {
-        functions,
-        entry,
-        options,
-        diagnostics,
-        declarations: DeclarationState::new(),
-        contexts: Vec::new(),
-        current_ctx: 0,
-    };
-
-    st.visit_entry()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{materialize_type, open_set_list_fallback};
-    use crate::ast;
-    use crate::hil::ty::store::TypeStore;
-
-    /// Open SetList fallback keeps the value count produced by table.pack.
-    #[test]
-    fn open_set_list_fallback_uses_packed_count() {
-        let statements = open_set_list_fallback(
-            vec![ast::Expr::FunctionCall {
-                func: Box::new(ast::Expr::Named(ast::Identifier::new("returns_stuff"))),
-                args: Vec::new(),
+                args: self.lower_pack(args)?,
             }],
-            ast::Identifier::new("__t"),
-            ast::Identifier::new("__n"),
-            1,
-            ast::Expr::Named(ast::Identifier::new("target")),
-        );
-        let output = crate::printer::print(&ast::Block::with_stmts(Vec::from(statements)), &[]);
-
-        assert_eq!(
-            output,
-            concat!(
-                "-- the following code is a fallback, not the original table constructor\n",
-                "do\n",
-                "    local __t = table.pack(returns_stuff())\n",
-                "    local __n = __t.n\n",
-                "    table.move(__t, 1, __n, 1, target)\n",
-                "end\n",
-            )
-        );
+            nir::PackExprKind::VarArgs => vec![ast::Expr::Vararg],
+        })
     }
+}
 
-    /// Materialization preserves nested shapes and zero-result function packs.
-    #[test]
-    fn materializes_nested_signature_with_empty_returns() {
-        let mut store = TypeStore::new();
-        let string = store.primitives().string;
-        let table = store.table_shape(vec![("name".into(), string)], None);
-        let params = store.pack(vec![table], None);
-        let returns = store.pack(Vec::new(), None);
-        let function = store.function_signature(params, returns);
+/// Converts one NIR constant into an AST literal.
+fn constant(value: &Constant) -> ast::Expr {
+    ast::Expr::Literal(match value {
+        Constant::Nil => ast::Literal::Nil,
+        Constant::Number(Number::Integer(value)) => ast::Literal::Integer(*value),
+        Constant::Number(Number::Float(value)) => ast::Literal::Float(*value),
+        Constant::String(value) => ast::Literal::String(value.clone()),
+        Constant::Bool(value) => ast::Literal::Bool(*value),
+    })
+}
 
-        let ast::Type::Function {
-            params, returns, ..
-        } = materialize_type(&store, function)
-        else {
-            panic!("expected function type")
-        };
-        assert!(returns.head.is_empty() && returns.tail.is_none());
-        assert!(
-            matches!(params.head.as_slice(), [ast::Type::Table { fields, .. }] if fields.contains_key("name"))
-        );
+/// Builds a global read, including names that cannot use identifier syntax.
+fn global_name(name: &SmolStr) -> ast::Expr {
+    if is_valid_luau_identifier(name) {
+        global(name.as_str())
+    } else {
+        ast::Expr::Index {
+            base: Box::new(global("_G")),
+            index: Box::new(ast::Expr::Literal(ast::Literal::String(
+                name.clone().into(),
+            ))),
+        }
     }
+}
 
-    /// Broad graph tables print as conservative unknown indexers.
-    #[test]
-    fn materializes_broad_table_as_unknown_indexer() {
-        let store = TypeStore::new();
-        let table = store.primitives().table;
-        assert!(matches!(
-            materialize_type(&store, table),
-            ast::Type::Table { fields, array: Some(array) }
-                if fields.is_empty()
-                    && matches!(array.as_ref(), (ast::Type::Unknown, ast::Type::Unknown))
-        ));
+/// Builds a plain global identifier expression.
+fn global(name: impl Into<SmolStr>) -> ast::Expr {
+    ast::Expr::Named(ast::Identifier::new(name))
+}
+
+/// Chooses field syntax when a constant string key permits it.
+fn table_access(base: ast::Expr, key: &nir::Expr, lowered_key: ast::Expr) -> ast::Expr {
+    if let nir::ExprKind::Constant(Constant::String(value)) = &key.kind
+        && let Some(field_name) = value.as_utf8()
+        && is_valid_luau_identifier(field_name)
+    {
+        field(base, field_name)
+    } else {
+        ast::Expr::Index {
+            base: Box::new(base),
+            index: Box::new(lowered_key),
+        }
+    }
+}
+
+/// Builds one AST field access.
+fn field(base: ast::Expr, name: impl Into<SmolStr>) -> ast::Expr {
+    ast::Expr::Field {
+        base: Box::new(base),
+        field: ast::Identifier::new(name),
+    }
+}
+
+/// Builds the table.move call used for one counted packed value list.
+fn move_packed_values(packed: ast::Expr, table: ast::Expr, index: u32) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        func: Box::new(field(global("table"), "move")),
+        args: vec![
+            packed.clone(),
+            ast::Expr::Literal(ast::Literal::Float(1.0)),
+            field(packed, "n"),
+            ast::Expr::Literal(ast::Literal::Float(f64::from(index))),
+            table,
+        ],
     }
 }

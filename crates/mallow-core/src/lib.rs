@@ -1,6 +1,7 @@
 mod ast;
 mod common;
 mod disasm;
+mod emitter;
 mod hil;
 mod il;
 mod ir;
@@ -28,9 +29,9 @@ use crate::logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EmitMode {
     /// Emit cleaned Luau source code.
+    #[default]
     Source,
     /// Emit flat intermediate representation without source structuring.
-    #[default]
     Ir,
     /// Emit the nested intermediate representation as debug text.
     Nir,
@@ -265,33 +266,45 @@ pub fn decompile_bytecode_with_diagnostics(
         options.max_pass_iterations > 0,
         "max pass iterations must be greater than zero"
     );
-    ensure!(
-        options.emit != EmitMode::Source,
-        "source emission is disabled while the IR pipeline is being rebuilt"
-    );
-
     let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    let entry = chunk.entry_proto;
     let functions = ir::lift(&chunk)?;
 
     use core::fmt::Write;
 
-    let mut out = String::new();
-    for (index, function) in functions.into_iter().enumerate() {
-        if index != 0 {
-            out.push_str("\n\n");
+    match options.emit {
+        EmitMode::Source => {
+            let mut functions = functions
+                .iter()
+                .map(|function| {
+                    let diagnostics = diagnostics.for_proto(function.proto.0);
+                    nir::materialize::lower(function, &diagnostics)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            nir::passes::run(&mut functions);
+            let block = emitter::emit_ast(functions, entry, options)?;
+            Ok(printer::print(&block, &[]))
         }
-        match options.emit {
-            EmitMode::Ir => write!(out, "{function}"),
-            EmitMode::Nir => {
-                let diagnostics = diagnostics.for_proto(function.proto.0);
-                let function = nir::materialize::lower(&function, &diagnostics)?;
-                write!(out, "{function:#?}")
+        EmitMode::Ir | EmitMode::Nir => {
+            let mut out = String::new();
+            for (index, function) in functions.into_iter().enumerate() {
+                if index != 0 {
+                    out.push_str("\n\n");
+                }
+                match options.emit {
+                    EmitMode::Ir => write!(out, "{function}"),
+                    EmitMode::Nir => {
+                        let diagnostics = diagnostics.for_proto(function.proto.0);
+                        let function = nir::materialize::lower(&function, &diagnostics)?;
+                        write!(out, "{function:#?}")
+                    }
+                    EmitMode::Source => unreachable!("handled above"),
+                }
+                .expect("writing should not fail here");
             }
-            EmitMode::Source => unreachable!("source mode was rejected above"),
+            Ok(out)
         }
-        .expect("writing should not fail here");
     }
-    Ok(out)
 }
 
 /// Generates a control-flow graph visualization from Luau bytecode.

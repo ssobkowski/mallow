@@ -1,158 +1,139 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use smol_str::{SmolStr, format_smolstr};
+use smol_str::{format_smolstr, SmolStr};
 
 use crate::ast::Identifier;
-use crate::hil::lifter::ssa::SymbolId;
+use crate::common::is_valid_luau_identifier;
+use crate::hil::ir::CellId;
+use crate::nir::{Expr, LocalId, PackLocalId};
 
-#[derive(Default)]
-pub struct NameAllocator {
-    used: HashSet<SmolStr>,
-    next_param: usize,
-    next_local: usize,
+/// The source role of one emitter binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalRole {
+    /// A formal function parameter.
+    Parameter,
+    /// A value produced by a NIR expression.
+    Value,
+    /// A mutable captured cell.
+    Cell,
+    /// A value pack that needs source storage.
+    Pack,
+    /// A numeric or generic loop variable.
+    LoopVariable,
 }
 
-impl NameAllocator {
-    pub fn reserve_exact(&mut self, preferred: SmolStr) -> Identifier {
+/// Returns the precedence used when several syntax roles share one identity.
+impl LocalRole {
+    #[inline]
+    pub const fn priority(&self) -> usize {
+        match self {
+            Self::Parameter => 4,
+            Self::LoopVariable => 3,
+            Self::Cell => 2,
+            Self::Pack => 1,
+            Self::Value => 0,
+        }
+    }
+}
+
+/// The NIR identity represented by one source binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalSource {
+    /// A source-representable NIR local.
+    Local(LocalId),
+    /// A mutable NIR cell.
+    Cell(CellId),
+    /// A materialized NIR pack.
+    Pack(PackLocalId),
+}
+
+/// Read-only information available while suggesting a local name.
+#[derive(Clone, Copy)]
+pub(crate) struct LocalNameCtx<'a> {
+    /// Identity represented by the source binding.
+    pub(crate) source: LocalSource,
+    /// Source role of the binding.
+    pub(crate) role: LocalRole,
+    /// Expression that defines the binding, when one exists.
+    pub(crate) value: Option<&'a Expr>,
+}
+
+/// Suggests readable names for source bindings.
+pub(crate) trait Namer {
+    /// Suggests one identifier. The allocator makes the result valid and unique.
+    fn name(&mut self, ctx: LocalNameCtx<'_>) -> Identifier;
+}
+
+/// Provides stable plain names when no smarter naming policy is installed.
+#[derive(Default)]
+pub(crate) struct PlainNamer;
+
+impl Namer for PlainNamer {
+    /// Uses the stable NIR identity as the plain name suffix.
+    fn name(&mut self, ctx: LocalNameCtx<'_>) -> Identifier {
+        let name = match (ctx.role, ctx.source) {
+            (LocalRole::Parameter, LocalSource::Local(local)) => {
+                format_smolstr!("p{}", local.index())
+            }
+            (LocalRole::Cell, LocalSource::Cell(cell)) => format_smolstr!("c{}", cell.index()),
+            (LocalRole::Pack, LocalSource::Pack(pack)) => format_smolstr!("q{}", pack.index()),
+            (_, LocalSource::Local(local)) => format_smolstr!("v{}", local.index()),
+            (_, LocalSource::Cell(cell)) => format_smolstr!("c{}", cell.index()),
+            (_, LocalSource::Pack(pack)) => format_smolstr!("q{}", pack.index()),
+        };
+        Identifier::new(name)
+    }
+}
+
+/// Owns the identifier namespace for one emitted function.
+pub(crate) struct Names {
+    used: HashSet<SmolStr>,
+    next_internal: usize,
+}
+
+impl Names {
+    /// Creates a namespace with names that generated locals must not shadow.
+    pub(crate) fn new(reserved: impl IntoIterator<Item = SmolStr>) -> Self {
+        Self {
+            used: reserved.into_iter().collect(),
+            next_internal: 0,
+        }
+    }
+
+    /// Claims a namer suggestion after validating and uniquifying it.
+    pub(crate) fn claim(&mut self, suggested: Identifier) -> Identifier {
+        let preferred = if is_valid_luau_identifier(suggested.as_str()) {
+            suggested.0
+        } else {
+            SmolStr::new_static("v")
+        };
+        self.claim_text(preferred)
+    }
+
+    /// Claims an internal name that cannot collide with source-visible names.
+    pub(crate) fn internal(&mut self, purpose: &str) -> Identifier {
+        loop {
+            let candidate = format_smolstr!("__mallow_{purpose}_{}", self.next_internal);
+            self.next_internal += 1;
+            if self.used.insert(candidate.clone()) {
+                return Identifier::new(candidate);
+            }
+        }
+    }
+
+    /// Claims one preferred text value.
+    fn claim_text(&mut self, preferred: SmolStr) -> Identifier {
         if self.used.insert(preferred.clone()) {
             return Identifier::new(preferred);
         }
 
-        let mut counter = 0usize;
-        loop {
-            let candidate = format_smolstr!("{preferred}__{counter}");
-            if self.used.insert(candidate.clone()) {
-                return Identifier::new(candidate);
-            }
-            counter += 1;
-        }
-    }
-
-    pub fn fresh_param(&mut self) -> Identifier {
-        loop {
-            let candidate = format_smolstr!("p{}", self.next_param);
-            self.next_param += 1;
+        for suffix in 1usize.. {
+            let candidate = format_smolstr!("{preferred}_{suffix}");
             if self.used.insert(candidate.clone()) {
                 return Identifier::new(candidate);
             }
         }
-    }
 
-    pub fn fresh_local(&mut self) -> Identifier {
-        loop {
-            let candidate = format_smolstr!("v{}", self.next_local);
-            self.next_local += 1;
-            if self.used.insert(candidate.clone()) {
-                return Identifier::new(candidate);
-            }
-        }
-    }
-}
-
-pub struct NamePlan {
-    /// Single allocator for every emitted identifier in this function.
-    allocator: NameAllocator,
-    /// Stable reservations for symbols that need a specific name, such as
-    /// params, debug-named closures, and inherited upvalues.
-    symbol_names: HashMap<SymbolId, Identifier>,
-    /// Names for planned source-local slots. Most ordinary symbol reads go
-    /// through this table rather than receiving one name per SSA symbol.
-    slot_names: HashMap<usize, Identifier>,
-    /// Reserved `_ms` table name when spill-local mode needs table storage.
-    spill_table: Option<Identifier>,
-}
-
-impl NamePlan {
-    pub fn new() -> Self {
-        Self {
-            allocator: NameAllocator::default(),
-            symbol_names: HashMap::new(),
-            slot_names: HashMap::new(),
-            spill_table: None,
-        }
-    }
-
-    pub fn reserve_symbol_name_exact(&mut self, sym: SymbolId, preferred: SmolStr) -> Identifier {
-        if let Some(name) = self.symbol_names.get(&sym) {
-            return name.clone();
-        }
-
-        let name = self.allocator.reserve_exact(preferred);
-        self.symbol_names.insert(sym, name.clone());
-        name
-    }
-
-    pub fn get_symbol_name(&mut self, sym: SymbolId, is_param: bool) -> Identifier {
-        if let Some(name) = self.symbol_names.get(&sym) {
-            return name.clone();
-        }
-
-        let name = if is_param {
-            self.allocator.fresh_param()
-        } else {
-            self.allocator.fresh_local()
-        };
-        self.symbol_names.insert(sym, name.clone());
-        name
-    }
-
-    pub fn bind_slot_to_symbol_name(&mut self, slot: usize, sym: SymbolId, is_param: bool) {
-        if self.slot_names.contains_key(&slot) {
-            return;
-        }
-
-        let name = self.get_symbol_name(sym, is_param);
-        self.slot_names.insert(slot, name);
-    }
-
-    pub fn get_slot_name(&mut self, slot: usize) -> Identifier {
-        if let Some(name) = self.slot_names.get(&slot) {
-            return name.clone();
-        }
-
-        let name = self.allocator.fresh_local();
-        self.slot_names.insert(slot, name.clone());
-        name
-    }
-
-    pub fn fresh_temp_local(&mut self) -> Identifier {
-        self.allocator.fresh_local()
-    }
-
-    pub fn reserve_exact_name(&mut self, name: &Identifier) {
-        self.allocator.reserve_exact(name.0.clone());
-    }
-
-    pub fn reserve_spill_table(&mut self) -> Identifier {
-        if let Some(name) = self.spill_table.clone() {
-            return name;
-        }
-
-        let name = self.allocator.reserve_exact("_ms".into());
-        self.spill_table = Some(name.clone());
-        name
-    }
-
-    pub fn spill_table(&self) -> Option<Identifier> {
-        self.spill_table.clone()
-    }
-
-    /// Returns the emitted name currently assigned to a symbol or its slot.
-    pub fn emitted_name_for(&self, sym: SymbolId, slot: usize) -> Option<Identifier> {
-        self.symbol_names
-            .get(&sym)
-            .or_else(|| self.slot_names.get(&slot))
-            .cloned()
-    }
-
-    /// Returns every symbol with a directly reserved emitted name.
-    pub fn symbol_names(&self) -> Vec<(SymbolId, Identifier)> {
-        let mut names: Vec<_> = self
-            .symbol_names
-            .iter()
-            .map(|(&sym, name)| (sym, name.clone()))
-            .collect();
-        names.sort_by_key(|(sym, _)| sym.index());
-        names
+        unreachable!("usize overflowed")
     }
 }

@@ -2,13 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use id_arena::Arena;
 
-use crate::hil::cflow::graph::{build_graph, AdjGraph, DominatorTree, GraphView};
+use crate::hil::cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
 use crate::hil::cflow::union_find::UnionFind;
 
-use super::inline::inline_control_values;
 use super::*;
 use crate::ir;
 use crate::ir::region::{Predicate, Shape};
@@ -37,8 +36,6 @@ pub(crate) fn materialize(function: &ir::Function, shape: Shape) -> Result<Funct
 struct SsaMeta {
     /// Canonical storage for every FIR value.
     storage: HashMap<ValueId, ValueId>,
-    /// Storages that receive writes after their first definition.
-    mutable: HashSet<ValueId>,
     /// A list of synthetic nil declarations grouped by dominating block.
     declarations: Vec<Vec<ValueId>>,
 }
@@ -125,12 +122,6 @@ impl SsaMeta {
             .iter()
             .map(|(value, _)| (value, groups.find(value)))
             .collect();
-        let mutable: HashSet<_> = phi_blocks
-            .iter()
-            .map(|(out, _)| out)
-            .chain(loop_values.iter())
-            .map(|value| storage[value])
-            .collect();
         let initialized: HashSet<_> = function
             .params
             .iter()
@@ -154,7 +145,6 @@ impl SsaMeta {
 
         Ok(Self {
             storage,
-            mutable,
             declarations,
         })
     }
@@ -163,12 +153,6 @@ impl SsaMeta {
     #[inline]
     fn storage(&self, value: ValueId) -> ValueId {
         self.storage[&value]
-    }
-
-    /// Returns whether one FIR value writes mutable storage.
-    #[inline]
-    fn is_mutable(&self, value: ValueId) -> bool {
-        self.mutable.contains(&self.storage(value))
     }
 }
 
@@ -315,9 +299,12 @@ impl<'a> Materializer<'a> {
             .collect::<Result<_>>()?;
         let body = self.region(shape)?;
         let function = Function {
+            id: self.function.proto,
             locals: self.locals,
             packs: self.packs,
             params,
+            is_vararg: self.function.is_vararg,
+            upvalues: self.function.upvalues.clone(),
             prologue,
             body,
         };
@@ -329,11 +316,12 @@ impl<'a> Materializer<'a> {
         Ok(function)
     }
 
-    /// Creates one synthetic nil declaration for a mutable storage.
+    /// Creates one synthetic nil declaration for mutable storage.
     #[inline]
     fn initialization(&self, storage: ValueId) -> Result<Stmt> {
-        Ok(Stmt::Let {
-            local: self.local(storage)?,
+        Ok(Stmt::Bind {
+            origin: None,
+            target: Place::Local(self.local(storage)?),
             value: Expr::nil(),
         })
     }
@@ -461,19 +449,14 @@ impl<'a> Materializer<'a> {
     fn instr(&self, origin: InstrOrigin, instr: &ir::Instr) -> Result<Stmt> {
         let produced_value = |out, kind| {
             let local = self.local(out)?;
-            let value = Expr::produced(origin, kind);
-            if self.ssa.is_mutable(out) {
-                Ok(Stmt::Assign {
-                    origin: None,
-                    target: Place::Local(local),
-                    value,
-                })
-            } else {
-                Ok(Stmt::Let { local, value })
-            }
+            Ok(Stmt::Bind {
+                origin: None,
+                target: Place::Local(local),
+                value: Expr::produced(origin, kind),
+            })
         };
         let produced_pack = |out, kind| {
-            Ok(Stmt::LetPack {
+            Ok(Stmt::BindPack {
                 local: self.pack(out)?,
                 value: PackExpr::produced(origin, kind),
             })
@@ -510,7 +493,7 @@ impl<'a> Materializer<'a> {
                     key: Box::new(self.value(*key)?),
                 },
             ),
-            ir::Instr::SetTable { table, key, value } => Ok(Stmt::Assign {
+            ir::Instr::SetTable { table, key, value } => Ok(Stmt::Bind {
                 origin: Some(origin),
                 target: Place::Table {
                     table: self.value(*table)?,
@@ -521,7 +504,7 @@ impl<'a> Materializer<'a> {
             ir::Instr::GetGlobal { out, name } => {
                 produced_value(*out, ExprKind::GetGlobal(name.clone()))
             }
-            ir::Instr::SetGlobal { name, value } => Ok(Stmt::Assign {
+            ir::Instr::SetGlobal { name, value } => Ok(Stmt::Bind {
                 origin: Some(origin),
                 target: Place::Global(name.clone()),
                 value: self.value(*value)?,
@@ -614,7 +597,7 @@ impl<'a> Materializer<'a> {
                 value: self.value(*value)?,
             }),
             ir::Instr::LoadCell { out, cell } => produced_value(*out, ExprKind::LoadCell(*cell)),
-            ir::Instr::StoreCell { cell, value } => Ok(Stmt::Assign {
+            ir::Instr::StoreCell { cell, value } => Ok(Stmt::Bind {
                 origin: Some(origin),
                 target: Place::Cell(*cell),
                 value: self.value(*value)?,

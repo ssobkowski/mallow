@@ -246,6 +246,7 @@ impl<'a, 'g> FunctionLifter<'a, 'g> {
         let function = Function {
             proto: self.proto.id,
             params,
+            is_vararg: self.proto.is_vararg,
             upvalues: self.upvalues,
             values,
             packs,
@@ -1673,7 +1674,7 @@ fn reachable_raw_blocks(proto: &Proto) -> Result<Vec<RawBlock>> {
 /// Lifts every proto in one disassembled chunk into flat IR.
 #[inline]
 pub(crate) fn lift(chunk: &Chunk) -> Result<Vec<Function>> {
-    chunk
+    let functions = chunk
         .protos
         .iter()
         .map(|proto| {
@@ -1683,5 +1684,6 @@ pub(crate) fn lift(chunk: &Chunk) -> Result<Vec<Function>> {
             let graph = AdjGraph::new(0, &successors, &predecessors);
             FunctionLifter::new(proto, chunk, &raw_blocks, &graph)?.lift()
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok(functions)
 }
