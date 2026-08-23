@@ -1168,7 +1168,7 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
             }
             il::Instr::Concat { dest, a, b } => {
                 ensure!(a < b, "concat must have at least two operands");
-                let operands = (a..b).rev().map(|reg| self.read_reg(reg)).collect();
+                let operands = (a..=b).map(|reg| self.read_reg(reg)).collect();
                 let out = self.value();
                 self.emitted.push(ir::Instr::Concat { out, operands });
                 self.write_reg(dest, out);

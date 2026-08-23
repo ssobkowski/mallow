@@ -267,8 +267,6 @@ fn collect_initialization_blocks(shape: &Shape, blocks: &mut HashSet<usize>) {
 struct Materializer<'f> {
     /// FIR function being converted.
     function: &'f ir::Function,
-    /// SSA metadata used by all value references.
-    ssa: &'f SsaMeta,
     /// NIR local arena.
     locals: Arena<Local>,
     /// NIR pack arena.
@@ -304,7 +302,6 @@ impl<'a> Materializer<'a> {
 
         Self {
             function,
-            ssa,
             locals,
             packs,
             values,
