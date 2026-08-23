@@ -28,7 +28,7 @@ pub(crate) fn materialize(function: &ir::Function, shape: Shape) -> Result<Funct
     }
 
     let ssa = SsaMeta::build(function)?;
-    let initializations = Initializations::build(&ssa, &shape, function.blocks.len());
+    let initializations = Initializations::build(function, &ssa, &shape);
     Materializer::new(function, &ssa, initializations).materialize(shape)
 }
 
@@ -154,6 +154,35 @@ impl SsaMeta {
     fn storage(&self, value: ValueId) -> ValueId {
         self.storage[&value]
     }
+
+    /// Returns whether one concrete instruction defines the storage before it is read.
+    fn is_defined_before_use_in_block(
+        &self,
+        function: &ir::Function,
+        block: usize,
+        storage: ValueId,
+    ) -> bool {
+        for instr in &function.blocks[block].instrs {
+            if matches!(instr, ir::Instr::Phi { .. }) {
+                continue;
+            }
+            if instr
+                .used_values()
+                .into_iter()
+                .any(|value| self.storage(value) == storage)
+            {
+                return false;
+            }
+            if instr
+                .defined_value()
+                .is_some_and(|value| self.storage(value) == storage)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 /// Synthetic storage declarations placed in one structured function.
@@ -165,16 +194,18 @@ struct Initializations {
 }
 
 impl Initializations {
-    /// Places each storage at its block or in the function prologue.
-    fn build(ssa: &SsaMeta, shape: &Shape, block_count: usize) -> Self {
+    /// Places storage without a concrete definition at its block or in the function prologue.
+    fn build(function: &ir::Function, ssa: &SsaMeta, shape: &Shape) -> Self {
         let mut initialization_blocks = HashSet::new();
         collect_initialization_blocks(shape, &mut initialization_blocks);
 
-        let mut by_block = vec![Vec::new(); block_count];
+        let mut by_block = vec![Vec::new(); function.blocks.len()];
         let mut prologue = Vec::new();
         for (block, storages) in ssa.declarations.iter().enumerate() {
             if initialization_blocks.contains(&block) {
-                by_block[block].extend(storages.iter().copied());
+                by_block[block].extend(storages.iter().copied().filter(|storage| {
+                    !ssa.is_defined_before_use_in_block(function, block, *storage)
+                }));
             } else {
                 prologue.extend(storages.iter().copied());
             }
@@ -194,14 +225,13 @@ fn common_strict_dominator(entry: usize, idoms: &DominatorTree, blocks: &[usize]
         return entry;
     };
 
-    // Graph entry is a dominator of all blocks.
-    let mut candidate = idoms.idom(*first).unwrap_or(entry);
+    let mut candidate = *first;
     for &block in rest {
         while !idoms.dominates(candidate, block) {
             candidate = idoms.idom(candidate).unwrap_or(entry);
         }
     }
-    candidate
+    idoms.idom(candidate).unwrap_or(entry)
 }
 
 /// Collects FIR blocks that can receive synthetic declarations.

@@ -750,7 +750,7 @@ impl fmt::Display for DisplayUnOp {
 
 impl Instr {
     /// Returns the value defined by this instruction, if it exists.
-    fn defined_value(&self) -> Option<ValueId> {
+    pub(crate) fn defined_value(&self) -> Option<ValueId> {
         match self {
             Self::Const { out, .. }
             | Self::Copy { out, .. }
@@ -789,7 +789,7 @@ impl Instr {
     }
 
     /// Returns immutable values read by this instruction.
-    fn used_values(&self) -> SmallVec<[ValueId; 3]> {
+    pub(crate) fn used_values(&self) -> SmallVec<[ValueId; 3]> {
         match self {
             Self::Const { .. }
             | Self::GetGlobal { .. }
