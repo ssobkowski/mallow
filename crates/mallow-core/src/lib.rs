@@ -267,22 +267,24 @@ pub fn decompile_bytecode_with_diagnostics(
         "max pass iterations must be greater than zero"
     );
     let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let entry = chunk.entry_proto;
     let functions = ir::lift(&chunk)?;
 
     use core::fmt::Write;
 
     match options.emit {
         EmitMode::Source => {
-            let mut functions = functions
+            let mut nested_functions: Vec<_> = functions
                 .iter()
                 .map(|function| {
                     let diagnostics = diagnostics.for_proto(function.proto.0);
                     nir::materialize::lower(function, &diagnostics)
                 })
-                .collect::<Result<Vec<_>>>()?;
-            nir::passes::run(&mut functions);
-            let block = emitter::emit_ast(functions, entry, options)?;
+                .collect::<Result<_>>()?;
+            nir::passes::run(&mut nested_functions);
+            for function in &mut nested_functions {
+                nir::materialize::destroy_ssa(function);
+            }
+            let block = emitter::emit_ast(nested_functions, chunk.entry_proto, options)?;
             Ok(printer::print(&block, &[]))
         }
         EmitMode::Ir | EmitMode::Nir => {
@@ -320,11 +322,11 @@ pub fn visualize_bytecode(
     let _enter = span.enter();
 
     let program = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let cfgs = program
+    let cfgs: Vec<_> = program
         .functions
         .into_iter()
         .map(|function| function.cfg)
-        .collect::<Vec<_>>();
+        .collect();
 
     dump_cfgs(
         &cfgs,

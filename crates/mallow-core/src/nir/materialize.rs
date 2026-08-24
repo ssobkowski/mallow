@@ -8,6 +8,7 @@ use id_arena::Arena;
 use crate::hil::cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
 use crate::hil::cflow::union_find::UnionFind;
 
+use super::visitor::VisitorMut;
 use super::*;
 use crate::ir;
 use crate::ir::region::{Predicate, Shape};
@@ -19,7 +20,7 @@ pub(crate) fn lower(function: &ir::Function, diagnostics: &Diagnostics) -> Resul
     materialize(function, shape)
 }
 
-/// Converts one verified control shape into materialized NIR.
+/// Converts one verified control shape into NIR with distinct FIR SSA symbols.
 pub(crate) fn materialize(function: &ir::Function, shape: Shape) -> Result<Function> {
     #[cfg(debug_assertions)]
     {
@@ -32,7 +33,29 @@ pub(crate) fn materialize(function: &ir::Function, shape: Shape) -> Result<Funct
     Materializer::new(function, &ssa, initializations).materialize(shape)
 }
 
-/// Describes SSA destruction for one FIR function.
+/// Unifies NIR symbols which point to the same underlying storage.
+pub(crate) fn destroy_ssa(function: &mut Function) {
+    let mut locals_by_source = HashMap::new();
+    let replacements: HashMap<_, _> = function
+        .locals
+        .iter()
+        .map(|(local, data)| {
+            let replacement = *locals_by_source.entry(data.source).or_insert(local);
+            (local, replacement)
+        })
+        .collect();
+
+    let mut rewriter = LocalRewriter {
+        replacements: &replacements,
+    };
+    for parameter in &mut function.params {
+        rewriter.visit_local(parameter);
+    }
+    rewriter.visit_stmts(&mut function.prologue);
+    rewriter.visit_region(&mut function.body);
+}
+
+/// Describes the underlying storage required by one FIR function.
 struct SsaMeta {
     /// Canonical storage for every FIR value.
     storage: HashMap<ValueId, ValueId>,
@@ -41,7 +64,7 @@ struct SsaMeta {
 }
 
 impl SsaMeta {
-    /// Unfolds Phi inputs and coalesces their values into mutable storage.
+    /// Groups Phi inputs which will use the same mutable storage.
     fn build(function: &ir::Function) -> Result<Self> {
         let (successors, predecessors) =
             build_graph(function.blocks.iter().map(|block| block.exit.targets()));
@@ -263,6 +286,18 @@ fn collect_initialization_blocks(shape: &Shape, blocks: &mut HashSet<usize>) {
     }
 }
 
+/// Rewrites SSA local references to their shared storage locals.
+struct LocalRewriter<'a> {
+    /// Shared storage local for every SSA local.
+    replacements: &'a HashMap<LocalId, LocalId>,
+}
+
+impl VisitorMut for LocalRewriter<'_> {
+    fn visit_local(&mut self, local: &mut LocalId) {
+        *local = self.replacements[local];
+    }
+}
+
 /// State used while converting FIR references into NIR identities.
 struct Materializer<'f> {
     /// FIR function being converted.
@@ -280,18 +315,17 @@ struct Materializer<'f> {
 }
 
 impl<'a> Materializer<'a> {
-    /// Creates stable NIR identities for every FIR storage and pack.
-    fn new(function: &'a ir::Function, ssa: &'a SsaMeta, initializations: Initializations) -> Self {
+    /// Creates one stable NIR identity for every FIR SSA value and pack.
+    fn new(function: &'a ir::Function, ssa: &SsaMeta, initializations: Initializations) -> Self {
         let mut locals = Arena::new();
-        let mut storage_locals = HashMap::new();
-        let mut values = HashMap::new();
-        for (source, _) in function.values.iter() {
-            let storage = ssa.storage(source);
-            let local = *storage_locals
-                .entry(storage)
-                .or_insert_with(|| locals.alloc(Local { source: storage }));
-            values.insert(source, local);
-        }
+        let values = function
+            .values
+            .iter()
+            .map(|(value, _)| {
+                let source = ssa.storage(value);
+                (value, locals.alloc(Local { source }))
+            })
+            .collect();
 
         let mut packs = Arena::new();
         let pack_values = function

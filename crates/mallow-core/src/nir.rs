@@ -1,6 +1,5 @@
 //! Nested intermediate representation used after control-flow recognition.
 
-mod inline;
 pub(crate) mod materialize;
 pub(crate) mod passes;
 mod verify;
@@ -15,13 +14,13 @@ use crate::il::ProtoId;
 use crate::ir::{Constant, PackId, ValueId};
 use crate::operator::{BinOp, UnOp};
 
-/// Stable identity for one source-representable local.
+/// Stable identity for one NIR scalar local.
 pub(crate) type LocalId = Id<Local>;
 
 /// Stable identity for one materialized value pack.
 pub(crate) type PackLocalId = Id<PackLocal>;
 
-/// One source-representable local with FIR provenance.
+/// One scalar local.
 #[derive(Debug, Clone)]
 pub(crate) struct Local {
     /// Canonical FIR value represented by this local.
@@ -567,22 +566,37 @@ mod tests {
         }
     }
 
-    /// Lowers a Phi into shared storage writes and removes the Phi owner.
+    /// Materializes Phi initialization before passes and unifies its storage after them.
     #[test]
-    fn materializes_phi_as_shared_storage() {
+    fn destroys_ssa_after_materialization() {
         let fir = phi_function();
         fir.verify().unwrap();
-        let function = materialize::lower(&fir, &Diagnostics::default()).unwrap();
+        let mut function = materialize::lower(&fir, &Diagnostics::default()).unwrap();
         function.verify(&fir).unwrap();
 
+        assert_eq!(function.locals.len(), fir.values.len());
         assert!(function.prologue.is_empty());
+
         let Region::Sequence(nodes) = &function.body else {
             panic!("root must be a sequence");
         };
         let Region::Block { stmts, .. } = &nodes[0] else {
             panic!("entry must remain a block");
         };
-        assert!(matches!(stmts.first(), Some(Stmt::Bind { .. })));
+        let Some(Stmt::Bind {
+            origin: None,
+            target: Place::Local(initialization),
+            value:
+                Expr {
+                    kind: ExprKind::Constant(crate::ir::Constant::Nil),
+                    ..
+                },
+        }) = stmts.first()
+        else {
+            panic!("entry must contain the Phi initialization before passes");
+        };
+        let initialization = *initialization;
+
         let Region::If {
             then_branch,
             else_branch: Some(else_branch),
@@ -591,17 +605,66 @@ mod tests {
         else {
             panic!("merge must be represented as an if");
         };
+        let branch_locals: Vec<_> = [then_branch.as_ref(), else_branch.as_ref()]
+            .into_iter()
+            .map(|branch| {
+                let Region::Block { stmts, .. } = branch else {
+                    panic!("branch must remain a block");
+                };
+                let [
+                    Stmt::Bind {
+                        target: Place::Local(local),
+                        ..
+                    },
+                ] = stmts.as_slice()
+                else {
+                    panic!("branch must contain one local binding");
+                };
+                *local
+            })
+            .collect();
+        assert!(branch_locals.iter().all(|local| *local != initialization));
+
+        passes::run(std::slice::from_mut(&mut function));
+        materialize::destroy_ssa(&mut function);
+        function.verify(&fir).unwrap();
+
+        let Region::Sequence(nodes) = &function.body else {
+            panic!("root must remain a sequence");
+        };
+        let Region::Block { stmts, .. } = &nodes[0] else {
+            panic!("entry must remain a block");
+        };
+        let Some(Stmt::Bind {
+            target: Place::Local(storage),
+            ..
+        }) = stmts.first()
+        else {
+            panic!("entry must retain the Phi initialization");
+        };
+        let storage = *storage;
+        let Region::If {
+            then_branch,
+            else_branch: Some(else_branch),
+            ..
+        } = &nodes[1]
+        else {
+            panic!("merge must remain an if");
+        };
         for branch in [then_branch.as_ref(), else_branch.as_ref()] {
             let Region::Block { stmts, .. } = branch else {
                 panic!("branch must remain a block");
             };
-            assert!(matches!(
-                stmts.as_slice(),
-                [Stmt::Bind {
-                    target: Place::Local(_),
+            let [
+                Stmt::Bind {
+                    target: Place::Local(local),
                     ..
-                }]
-            ));
+                },
+            ] = stmts.as_slice()
+            else {
+                panic!("branch must retain one local binding");
+            };
+            assert_eq!(*local, storage);
         }
     }
 }
