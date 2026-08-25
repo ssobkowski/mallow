@@ -199,8 +199,10 @@ impl PackExpr {
     pub fn fixed_len(&self) -> Option<usize> {
         match &self.kind {
             PackExprKind::Values { head, tail } => {
-                // let tail_len = tail.as_ref(|tail| tail.fixed_len()).unwrap_or(0);
-                let tail_len = tail.as_ref().and_then(|tail| tail.fixed_len()).unwrap_or(0);
+                let tail_len = match tail {
+                    Some(tail) => tail.fixed_len()?,
+                    None => 0,
+                };
                 Some(head.len() + tail_len)
             }
             PackExprKind::Local(_)
