@@ -15,7 +15,7 @@ use crate::common::is_valid_luau_identifier;
 use crate::hil::ir::{CellId, Number};
 use crate::il::ProtoId;
 use crate::ir::Constant;
-use crate::nir::{self, LocalId};
+use crate::nir;
 use crate::operator::BinOp;
 use crate::{DecompileOptions, ast};
 
@@ -407,7 +407,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         match stmt {
             nir::Stmt::Bind { target, value, .. } => match target {
                 nir::Place::Local(local) => {
-                    let value = self.lower_expr_for_local(value, Some(*local))?;
+                    let value = self.lower_expr(value)?;
                     let declaration = self
                         .plan
                         .claim_declaration(BindingKey::Local(*local), scope);
@@ -549,23 +549,12 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         })
     }
 
-    /// Lowers one expression without a recursive target binding.
+    /// Lowers one scalar expression.
     fn lower_expr(&mut self, expr: &nir::Expr) -> Result<ast::Expr> {
-        self.lower_expr_for_local(expr, None)
-    }
-
-    /// Lowers one expression and exposes its target for recursive closures.
-    fn lower_expr_for_local(
-        &mut self,
-        expr: &nir::Expr,
-        target: Option<LocalId>,
-    ) -> Result<ast::Expr> {
         Ok(match &expr.kind {
             nir::ExprKind::Local(local) => self.plan.local(*local)?.expr(),
             nir::ExprKind::Constant(value) => constant(value),
-            nir::ExprKind::Closure { proto, captures } => {
-                self.lower_closure(*proto, captures, target)?
-            }
+            nir::ExprKind::Closure { proto, captures } => self.lower_closure(*proto, captures)?,
             nir::ExprKind::GetTable { table, key } => {
                 table_access(self.lower_expr(table)?, key, self.lower_expr(key)?)
             }
@@ -610,12 +599,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
     }
 
     /// Lowers one closure and maps positional captures to child upvalue cells.
-    fn lower_closure(
-        &mut self,
-        proto: ProtoId,
-        captures: &[nir::Capture],
-        recursive_target: Option<LocalId>,
-    ) -> Result<ast::Expr> {
+    fn lower_closure(&mut self, proto: ProtoId, captures: &[nir::Capture]) -> Result<ast::Expr> {
         let child_upvalues = &self.functions[proto.0 as usize].upvalues;
         ensure!(
             child_upvalues.len() == captures.len(),
@@ -623,20 +607,10 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         );
 
         let mut inherited = HashMap::new();
-        let mut copy_params = Vec::new();
-        let mut copy_args = Vec::new();
         for (&cell, capture) in child_upvalues.iter().zip(captures) {
             let storage = match capture {
                 nir::Capture::Share(parent_cell) => self.plan.cell(*parent_cell)?.clone(),
-                nir::Capture::Copy(local) if Some(*local) == recursive_target => {
-                    self.plan.local(*local)?.clone()
-                }
-                nir::Capture::Copy(local) => {
-                    let name = self.plan.names.internal("copy");
-                    copy_params.push(ast::Typed::untyped(ast::Parameter::Regular(name.clone())));
-                    copy_args.push(self.plan.local(*local)?.expr());
-                    Storage::Named(name)
-                }
+                nir::Capture::Copy(local) => self.plan.local(*local)?.clone(),
             };
             inherited.insert(cell, storage);
         }
@@ -648,24 +622,9 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             proto,
             inherited,
         )?;
-        let closure = ast::Expr::AnonymousFunction {
+        Ok(ast::Expr::AnonymousFunction {
             params: child.params,
             body: child.body,
-        };
-        if copy_params.is_empty() {
-            return Ok(closure);
-        }
-
-        Ok(ast::Expr::FunctionCall {
-            func: Box::new(ast::Expr::Parenthesized(Box::new(
-                ast::Expr::AnonymousFunction {
-                    params: copy_params,
-                    body: ast::Block::with_stmts(vec![ast::Stmt::Return {
-                        values: vec![closure],
-                    }]),
-                },
-            ))),
-            args: copy_args,
         })
     }
 
