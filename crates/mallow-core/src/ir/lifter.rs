@@ -52,29 +52,48 @@ struct DeferredValue {
     index: usize,
 }
 
-/// Storage generation numbers for physical registers.
+/// Capture storage state for physical registers.
 #[derive(Debug, Clone)]
-struct CaptureGenerations([u16; 256]);
+struct CaptureState {
+    /// Current storage generation for each register.
+    generations: [u16; 256],
+    /// Open captured generation for each register.
+    open: [Option<u16>; 256],
+}
 
-impl Default for CaptureGenerations {
+impl Default for CaptureState {
     fn default() -> Self {
-        Self([0; 256])
+        Self {
+            generations: [0; 256],
+            open: [None; 256],
+        }
     }
 }
 
-impl CaptureGenerations {
+impl CaptureState {
     /// Returns the current generation of one register.
-    fn get(&self, reg: u8) -> u16 {
-        self.0[reg as usize]
+    fn generation(&self, reg: u8) -> u16 {
+        self.generations[reg as usize]
     }
 
-    /// Starts new generations for registers closed by `CLOSEUPVALS`.
+    /// Returns the open generation of one captured register.
+    fn open_generation(&self, reg: u8) -> Option<u16> {
+        self.open[reg as usize]
+    }
+
+    /// Opens the current generation of one captured register.
+    fn open(&mut self, reg: u8) {
+        self.open[reg as usize] = Some(self.generation(reg));
+    }
+
+    /// Closes captured registers and starts their next generations.
     fn close(&mut self, from_reg: u8) -> Result<()> {
-        for generation in &mut self.0[from_reg as usize..] {
+        for generation in &mut self.generations[from_reg as usize..] {
             *generation = generation
                 .checked_add(1)
                 .context("capture generation overflow")?;
         }
+        self.open[from_reg as usize..].fill(None);
         Ok(())
     }
 }
@@ -83,42 +102,41 @@ impl CaptureGenerations {
 struct FunctionCaptures {
     /// Cell for each captured register generation.
     register_cells: HashMap<(u8, u16), CellId>,
-    /// A list of captured registers
-    captured_registers: Vec<u8>,
-    /// Storage generations at each raw block entry.
-    block_generations: Vec<CaptureGenerations>,
+    /// Capture state at each raw block entry.
+    block_states: Vec<CaptureState>,
 }
 
 impl FunctionCaptures {
     /// Finds captured register generations and allocates their cells in bytecode order.
     fn analyze(proto: &Proto, raw_blocks: &[RawBlock], cells: &mut Arena<Cell>) -> Result<Self> {
-        let mut generations = CaptureGenerations::default();
-        let mut block_generations = vec![CaptureGenerations::default(); raw_blocks.len()];
+        let mut state = CaptureState::default();
+        let mut block_states = vec![CaptureState::default(); raw_blocks.len()];
 
         let mut seen = HashSet::new();
         let mut capture_order = Vec::new();
 
         for (block_index, block) in raw_blocks.iter().enumerate() {
-            block_generations[block_index] = generations.clone();
+            block_states[block_index] = state.clone();
 
             for decoded in &proto.instrs[block.instr_range.clone()] {
-                if let il::Instr::Capture {
-                    capture_type: CAPTURE_REF,
-                    reg,
-                } = decoded.instr
-                {
-                    let key = (reg, generations.get(reg));
-                    if seen.insert(key) {
-                        capture_order.push(key);
+                match decoded.instr {
+                    il::Instr::Capture {
+                        capture_type: CAPTURE_REF,
+                        reg,
+                    } => {
+                        let key = (reg, state.generation(reg));
+                        if seen.insert(key) {
+                            capture_order.push(key);
+                        }
+                        state.open(reg);
                     }
-                }
-
-                if let il::Instr::CloseUpvals { reg } = decoded.instr {
-                    generations.close(reg)?;
+                    il::Instr::CloseUpvals { reg } => state.close(reg)?,
+                    _ => {}
                 }
             }
         }
 
+        // Allocation does not make a cell active. CAPTURE_REF opens it while lifting.
         let register_cells: HashMap<_, _> = capture_order
             .into_iter()
             .map(|(reg, generation)| {
@@ -129,14 +147,9 @@ impl FunctionCaptures {
             })
             .collect();
 
-        let mut captured_registers: Vec<_> = register_cells.keys().map(|(reg, _)| *reg).collect();
-        captured_registers.sort_unstable();
-        captured_registers.dedup();
-
         Ok(Self {
             register_cells,
-            captured_registers,
-            block_generations,
+            block_states,
         })
     }
 
@@ -145,22 +158,6 @@ impl FunctionCaptures {
     #[must_use]
     fn cell(&self, reg: u8, generation: u16) -> Option<CellId> {
         self.register_cells.get(&(reg, generation)).copied()
-    }
-
-    /// Returns every physical register that is captured in any generation.
-    fn captured_registers(&self) -> impl Iterator<Item = u8> {
-        self.captured_registers.iter().copied()
-    }
-
-    /// Returns captured cells for one generation in register order.
-    fn cells_in<'a>(
-        &'a self,
-        generations: &'a CaptureGenerations,
-    ) -> impl Iterator<Item = (u8, CellId)> {
-        self.captured_registers
-            .iter()
-            .copied()
-            .filter_map(|reg| self.cell(reg, generations.get(reg)).map(|cell| (reg, cell)))
     }
 }
 
@@ -292,8 +289,8 @@ struct BlockLifter<'lift, 'source, 'graph> {
     pending: Option<PendingValues>,
     /// Register values projected only when they are read.
     deferred: [Option<DeferredValue>; 256],
-    /// Capture generations at the current instruction.
-    generations: CaptureGenerations,
+    /// Capture state at the current instruction.
+    capture_state: CaptureState,
 }
 
 impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
@@ -305,8 +302,8 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
         block: usize,
     ) -> Result<Self> {
         let instr_range = function.raw_blocks[block].instr_range.clone();
-        let generations = function.captures.block_generations[block].clone();
-        let mut lifter = Self {
+        let capture_state = function.captures.block_states[block].clone();
+        Ok(Self {
             function,
             ssa,
             packs,
@@ -316,34 +313,8 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
             emitted: Vec::new(),
             pending: None,
             deferred: [None; 256],
-            generations,
-        };
-
-        if block == lifter.function.graph.entry() {
-            let mut nil = None;
-            for reg in lifter.function.captures.captured_registers() {
-                if reg < lifter.function.proto.num_params {
-                    continue;
-                }
-
-                let value = *nil.get_or_insert_with(|| {
-                    let value = lifter.ssa.alloc();
-                    lifter.emitted.push(ir::Instr::Const {
-                        out: value,
-                        value: ir::Constant::Nil,
-                    });
-                    value
-                });
-                lifter.ssa.write_reg(block, reg, value);
-            }
-
-            for (reg, cell) in lifter.function.captures.cells_in(&lifter.generations) {
-                let value = lifter.ssa.read_reg(block, reg);
-                lifter.emitted.push(ir::Instr::OpenCell { cell, value });
-            }
-        }
-
-        Ok(lifter)
+            capture_state,
+        })
     }
 
     /// Lifts the block body and its exit.
@@ -429,7 +400,8 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
     /// Returns the active cell for a captured register.
     #[inline]
     fn open_cell(&self, reg: u8) -> Option<CellId> {
-        self.function.captures.cell(reg, self.generations.get(reg))
+        let generation = self.capture_state.open_generation(reg)?;
+        self.function.captures.cell(reg, generation)
     }
 
     /// Projects a deferred register into its current storage.
@@ -558,52 +530,39 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
         self.emitted.push(ir::Instr::SetTable { table, key, value });
     }
 
-    /// Returns the cell already allocated for one reference capture.
-    #[inline]
-    fn capture_cell(&self, reg: u8) -> Result<CellId> {
-        let generation = self.generations.get(reg);
-        self.open_cell(reg).with_context(|| {
-            format!("reference capture has no cell for R{reg} generation {generation}")
-        })
-    }
-
-    /// Closes captured cells and opens storage required by later generations.
-    #[inline]
-    fn close_cells(&mut self, from_reg: u8) -> Result<()> {
-        let mut next_generations = self.generations.clone();
-        next_generations.close(from_reg)?;
-
-        let next_registers: Vec<_> = self
-            .function
-            .captures
-            .cells_in(&next_generations)
-            .filter_map(|(reg, _)| (reg >= from_reg).then_some(reg))
-            .collect();
-        for reg in next_registers {
-            self.materialize_deferred(reg);
+    /// Opens one captured register and returns its cell.
+    fn open_capture_cell(&mut self, reg: u8) -> Result<CellId> {
+        if let Some(cell) = self.open_cell(reg) {
+            return Ok(cell);
         }
 
+        let value = self.read_reg(reg);
+        let generation = self.capture_state.generation(reg);
+        let cell = self
+            .function
+            .captures
+            .cell(reg, generation)
+            .with_context(|| {
+                format!("reference capture has no cell for R{reg} generation {generation}")
+            })?;
+        self.capture_state.open(reg);
+        self.emitted.push(ir::Instr::OpenCell { cell, value });
+        Ok(cell)
+    }
+
+    /// Closes captured cells and moves their values back into registers.
+    fn close_cells(&mut self, from_reg: u8) -> Result<()> {
         for reg in from_reg..self.function.proto.max_stack_size {
             let Some(cell) = self.open_cell(reg) else {
                 continue;
             };
+            self.materialize_deferred(reg);
             let value = self.value();
             self.emitted.push(ir::Instr::LoadCell { out: value, cell });
             self.ssa.write_reg(self.block, reg, value);
         }
 
-        self.generations = next_generations;
-        let cells = self
-            .function
-            .captures
-            .cells_in(&self.generations)
-            .filter(|(reg, _)| *reg >= from_reg);
-        for (reg, cell) in cells {
-            let value = self.ssa.read_reg(self.block, reg);
-            self.emitted.push(ir::Instr::OpenCell { cell, value });
-        }
-
-        Ok(())
+        self.capture_state.close(from_reg)
     }
 
     /// Marks an open pack as unavailable to later variadic consumers.
@@ -922,13 +881,18 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
             .num_upvals;
 
         let out = self.value();
-        let captures = self.consume_captures(capture_count, dest, out)?;
+        let (captures, recursive_cell) = self.consume_captures(capture_count, dest, out)?;
         self.emitted.push(ir::Instr::Closure {
             out,
             proto,
             captures,
         });
-        self.write_reg(dest, out);
+        if let Some(cell) = recursive_cell {
+            self.deferred[dest as usize] = None;
+            self.emitted.push(ir::Instr::OpenCell { cell, value: out });
+        } else {
+            self.write_reg(dest, out);
+        }
 
         Ok(())
     }
@@ -939,8 +903,9 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
         count: u8,
         closure_reg: u8,
         closure: ValueId,
-    ) -> Result<Vec<Capture>> {
+    ) -> Result<(Vec<Capture>, Option<CellId>)> {
         let mut captures = Vec::with_capacity(count as usize);
+        let mut recursive_cell = None;
         for capture_index in 0..count {
             let Some(il::Instr::Capture { capture_type, reg }) = self.next() else {
                 bail!("malformed bytecode: missing CAPTURE #{capture_index}");
@@ -949,7 +914,22 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
             let capture = match capture_type {
                 CAPTURE_VAL if reg == closure_reg => Capture::Copy(closure),
                 CAPTURE_VAL => Capture::Copy(self.read_reg(reg)),
-                CAPTURE_REF => Capture::Share(self.capture_cell(reg)?),
+                CAPTURE_REF if reg == closure_reg && self.open_cell(reg).is_none() => {
+                    let generation = self.capture_state.generation(reg);
+                    let cell = self
+                        .function
+                        .captures
+                        .cell(reg, generation)
+                        .with_context(|| {
+                            format!(
+                                "recursive capture has no cell for R{reg} generation {generation}"
+                            )
+                        })?;
+                    self.capture_state.open(reg);
+                    recursive_cell = Some(cell);
+                    Capture::Share(cell)
+                }
+                CAPTURE_REF => Capture::Share(self.open_capture_cell(reg)?),
                 CAPTURE_UPVAL => {
                     let cell = self
                         .function
@@ -963,7 +943,7 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
             };
             captures.push(capture);
         }
-        Ok(captures)
+        Ok((captures, recursive_cell))
     }
 
     /// Emits SETLIST with a fixed or open value pack.
