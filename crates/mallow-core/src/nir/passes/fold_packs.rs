@@ -1,15 +1,16 @@
-//! Folds pack bindings and their direct projections into multibindings.
+//! Folds pack bindings and their direct projections into scalar or multibindings.
 //!
-//! A `BindPack` whose only consumers are scalar projections that directly follow it
-//! becomes one `BindMany`, so the emitter can emit `local a, b, c = f()` mechanically.
-//! Projections need not cover every index; unused slots become [`Place::Discard`].
-//! Packs with any other consumer stay unfolded, and packs with no consumers at all
-//! become effect-only evaluation.
+//! A `BindPack` with one direct projection becomes one `Bind` containing the projected
+//! pack. Multiple direct projections become one `BindMany`, so the emitter can emit
+//! `local a, b, c = f()` mechanically. Subsequent projections don't need to cover
+//! every index from 0 to N, and unused slots become [`Place::Discard`].
 
 use std::collections::{HashMap, HashSet};
 
 use crate::nir::visitor::{Visitor, VisitorMut, walk_pack_expr, walk_stmt, walk_stmts_mut};
-use crate::nir::{ExprKind, Function, LocalId, PackExpr, PackExprKind, PackLocalId, Place, Stmt};
+use crate::nir::{
+    Expr, ExprKind, Function, LocalId, PackExpr, PackExprKind, PackLocalId, Place, Stmt,
+};
 
 /// Folds one function's pack bindings. Returns whether anything changed.
 pub(super) fn run(function: &mut Function) -> bool {
@@ -25,7 +26,8 @@ pub(super) fn run(function: &mut Function) -> bool {
 /// Returns one direct projection performed by this statement.
 ///
 /// A direct projection writes one scalar result into one local without any
-/// enclosing effect, so it can participate in one multibinding.
+/// enclosing effect, so it can participate in one binding.
+#[inline]
 fn direct_projection(stmt: &Stmt) -> Option<(Place, PackLocalId, usize)> {
     let Stmt::Bind {
         origin: None,
@@ -57,10 +59,8 @@ struct PackFacts {
 }
 
 impl PackFacts {
-    /// Returns whether this pack can be folded into one multibinding or dropped.
-    ///
-    /// Every consumer must be a direct projection with a distinct slot and a
-    /// distinct target local; otherwise one statement could not carry the fold.
+    /// Returns whether this pack can be folded into one binding or dropped.
+    #[inline]
     fn foldable(&self) -> bool {
         self.reads == 0
             && self.slots().len() == self.projections.len()
@@ -68,11 +68,15 @@ impl PackFacts {
     }
 
     /// Returns the distinct projected slots.
+    #[inline]
+    #[must_use]
     fn slots(&self) -> HashSet<usize> {
         self.projections.iter().map(|(index, _)| *index).collect()
     }
 
     /// Returns the distinct projected target locals.
+    #[inline]
+    #[must_use]
     fn locals(&self) -> HashSet<LocalId> {
         self.projections.iter().map(|(_, local)| *local).collect()
     }
@@ -123,7 +127,7 @@ impl Visitor for UseFacts {
     }
 }
 
-/// Rewrites pack bindings into multibindings and effect-only evaluation.
+/// Rewrites pack bindings into scalar bindings, multibindings, or evaluation.
 struct Folder {
     /// Use facts collected before rewriting.
     facts: UseFacts,
@@ -176,19 +180,34 @@ impl VisitorMut for Folder {
                 continue;
             }
 
-            let last_slot = consumed
-                .iter()
-                .map(|(slot, _)| *slot)
-                .max()
-                .expect("non-empty");
-            let mut targets = vec![Place::Discard; last_slot + 1];
-            for (slot, target) in consumed {
-                targets[slot] = target;
+            if consumed.len() == 1 {
+                let (slot, target) = consumed.into_iter().next().expect("one projection");
+                stmts[index] = Stmt::Bind {
+                    origin: None,
+                    target,
+                    value: Expr {
+                        origin: None,
+                        kind: ExprKind::Project {
+                            pack: Box::new(value.clone()),
+                            index: slot,
+                        },
+                    },
+                };
+            } else {
+                let last_slot = consumed
+                    .iter()
+                    .map(|(index, _)| index)
+                    .max()
+                    .expect("non-empty");
+                let mut targets = vec![Place::Discard; last_slot + 1];
+                for (index, target) in consumed {
+                    targets[index] = target;
+                }
+                stmts[index] = Stmt::BindMany {
+                    targets,
+                    values: Box::new(value.clone()),
+                };
             }
-            stmts[index] = Stmt::BindMany {
-                targets,
-                values: Box::new(value.clone()),
-            };
             stmts.drain(index + 1..=index + facts.projections.len());
             self.changed = true;
             index += 1;
@@ -203,13 +222,14 @@ mod tests {
     use id_arena::Arena;
 
     use super::*;
+    use crate::ir::{Constant, Pack, Value};
     use crate::nir::{Expr, Function, Local, PackLocal, Region};
 
     /// Allocates unique identities for test statements.
     #[derive(Default)]
     struct Ids {
-        values: Arena<crate::ir::Value>,
-        packs: Arena<crate::ir::Pack>,
+        values: Arena<Value>,
+        packs: Arena<Pack>,
         locals: Arena<Local>,
         pack_locals: Arena<PackLocal>,
     }
@@ -217,13 +237,13 @@ mod tests {
     impl Ids {
         /// Allocates one local identity.
         fn local(&mut self) -> LocalId {
-            let source = self.values.alloc(crate::ir::Value);
+            let source = self.values.alloc(Value);
             self.locals.alloc(Local { source })
         }
 
         /// Allocates one pack local identity.
         fn pack(&mut self) -> PackLocalId {
-            let source = self.packs.alloc(crate::ir::Pack);
+            let source = self.packs.alloc(Pack);
             self.pack_locals.alloc(PackLocal { source })
         }
     }
@@ -232,7 +252,7 @@ mod tests {
     fn nil_expr() -> Expr {
         Expr {
             origin: None,
-            kind: ExprKind::Constant(crate::ir::Constant::Nil),
+            kind: ExprKind::Constant(Constant::Nil),
         }
     }
 
@@ -308,6 +328,38 @@ mod tests {
             panic!("the pack should fold into one multibinding");
         };
         assert_eq!(targets, &[Place::Local(first), Place::Local(second)]);
+    }
+
+    /// Folds one projection into one scalar binding.
+    #[test]
+    fn folds_one_projection_into_scalar_binding() {
+        let mut ids = Ids::default();
+        let (pack, third) = (ids.pack(), ids.local());
+        let folded = fold(vec![
+            bind_pack(pack),
+            bind(Place::Local(third), project(pack, 2)),
+        ]);
+
+        let [
+            Stmt::Bind {
+                target: Place::Local(target),
+                value:
+                    Expr {
+                        kind:
+                            ExprKind::Project {
+                                pack: source,
+                                index: 2,
+                            },
+                        ..
+                    },
+                ..
+            },
+        ] = &folded[..]
+        else {
+            panic!("one projection should fold into one scalar binding");
+        };
+        assert_eq!(*target, third);
+        assert!(matches!(source.kind, PackExprKind::Values { .. }));
     }
 
     /// Fills unused projection slots with discard places.

@@ -59,6 +59,15 @@ struct EmittedFunction {
     body: ast::Block,
 }
 
+/// Describes how Luau syntax adjusts one emitted expression.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExprContext {
+    /// The surrounding syntax already keeps only one value.
+    Scalar,
+    /// The expression ends a list where calls and varargs can expand.
+    OpenTail,
+}
+
 /// Lowers one fully planned NIR function into AST nodes.
 struct FunctionEmitter<'f, 'n, N: Namer> {
     functions: &'f [nir::Function],
@@ -266,7 +275,15 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                     .collect::<Result<_>>()?;
                 let exprs = values
                     .iter()
-                    .map(|value| self.lower_expr(value))
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let context = if index + 1 == values.len() {
+                            ExprContext::OpenTail
+                        } else {
+                            ExprContext::Scalar
+                        };
+                        self.lower_expr_in(value, context)
+                    })
                     .collect::<Result<_>>()?;
                 let body = self.lower_child_scope(body)?;
                 out.push(ast::Stmt::GenericFor { vars, exprs, body });
@@ -549,8 +566,13 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         })
     }
 
-    /// Lowers one scalar expression.
+    /// Lowers one expression in a context which keeps only one value.
     fn lower_expr(&mut self, expr: &nir::Expr) -> Result<ast::Expr> {
+        self.lower_expr_in(expr, ExprContext::Scalar)
+    }
+
+    /// Lowers one scalar expression for its surrounding Luau syntax.
+    fn lower_expr_in(&mut self, expr: &nir::Expr, context: ExprContext) -> Result<ast::Expr> {
         Ok(match &expr.kind {
             nir::ExprKind::Local(local) => self.plan.local(*local)?.expr(),
             nir::ExprKind::Constant(value) => constant(value),
@@ -593,7 +615,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 else_expr: Box::new(self.lower_expr(else_value)?),
             },
             nir::ExprKind::NewTable => ast::Expr::Table { items: Vec::new() },
-            nir::ExprKind::Project { pack, index } => self.lower_project(pack, *index)?,
+            nir::ExprKind::Project { pack, index } => self.lower_project(pack, *index, context)?,
             nir::ExprKind::LoadCell(cell) => self.plan.cell(*cell)?.expr(),
         })
     }
@@ -629,7 +651,12 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
     }
 
     /// Lowers one scalar projection from a value pack.
-    fn lower_project(&mut self, pack: &nir::PackExpr, index: usize) -> Result<ast::Expr> {
+    fn lower_project(
+        &mut self,
+        pack: &nir::PackExpr,
+        index: usize,
+        context: ExprContext,
+    ) -> Result<ast::Expr> {
         if let nir::PackExprKind::Local(local) = &pack.kind {
             return Ok(ast::Expr::Index {
                 base: Box::new(self.plan.pack(*local)?.expr()),
@@ -639,7 +666,12 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
 
         let mut values = self.lower_pack(pack)?;
         if index == 0 && values.len() == 1 {
-            return Ok(ast::Expr::Parenthesized(Box::new(values.pop().unwrap())));
+            let value = values.pop().unwrap();
+            return if context == ExprContext::OpenTail {
+                Ok(ast::Expr::Parenthesized(Box::new(value)))
+            } else {
+                Ok(value)
+            };
         }
         let mut args = Vec::with_capacity(values.len() + 1);
         args.push(ast::Expr::Literal(ast::Literal::Float((index + 1) as f64)));
@@ -665,10 +697,15 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 }]
             }
             nir::PackExprKind::Values { head, tail } => {
-                let mut values = head
-                    .iter()
-                    .map(|value| self.lower_expr(value))
-                    .collect::<Result<Vec<_>>>()?;
+                let mut values = Vec::with_capacity(head.len());
+                for (index, value) in head.iter().enumerate() {
+                    let context = if tail.is_none() && index + 1 == head.len() {
+                        ExprContext::OpenTail
+                    } else {
+                        ExprContext::Scalar
+                    };
+                    values.push(self.lower_expr_in(value, context)?);
+                }
                 if let Some(tail) = tail {
                     values.extend(self.lower_pack(tail)?);
                 }
