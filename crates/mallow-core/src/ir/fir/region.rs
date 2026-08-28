@@ -2659,7 +2659,7 @@ mod tests {
 
     use super::*;
     use crate::il::ProtoId;
-    use crate::ir::{Pack, Value};
+    use crate::ir::fir::{Pack, Value};
     use crate::operator::BinOp;
 
     /// Builds one valid function around the supplied graph exits.

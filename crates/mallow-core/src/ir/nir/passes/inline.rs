@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use smallvec::SmallVec;
 
-use crate::ir::ValueId;
-use crate::nir::visitor::{VisitorMut, walk_expr_mut, walk_pack_expr_mut, walk_stmts_mut};
-use crate::nir::{
+use crate::ir::fir::ValueId;
+use crate::ir::nir::visitor::{VisitorMut, walk_expr_mut, walk_pack_expr_mut, walk_stmts_mut};
+use crate::ir::nir::{
     Capture, Expr, ExprKind, Function, LocalId, PackExpr, PackExprKind, PackLocalId, Place, Region,
     Stmt,
 };

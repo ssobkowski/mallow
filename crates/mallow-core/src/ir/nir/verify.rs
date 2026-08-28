@@ -5,11 +5,11 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Result, bail, ensure};
 
 use super::*;
-use crate::ir;
+use crate::ir::fir;
 
 impl Function {
     /// Verifies NIR identities and exact reachable FIR instruction ownership.
-    pub(crate) fn verify(&self, fir: &ir::Function) -> Result<()> {
+    pub(crate) fn verify(&self, fir: &fir::Function) -> Result<()> {
         ensure!(
             self.id == fir.proto,
             "NIR function prototype does not match FIR"
@@ -41,7 +41,7 @@ impl Function {
 
         for block in reachable_blocks(fir) {
             for (instr, value) in fir.blocks[block].instrs.iter().enumerate() {
-                if matches!(value, ir::Instr::Phi { .. }) {
+                if matches!(value, fir::Instr::Phi { .. }) {
                     continue;
                 }
                 let origin = InstrOrigin { block, instr };
@@ -62,7 +62,7 @@ struct Verifier<'a> {
     /// NIR function being checked.
     function: &'a Function,
     /// FIR function providing provenance.
-    fir: &'a ir::Function,
+    fir: &'a fir::Function,
     /// Number of NIR owners for each FIR instruction.
     origins: HashMap<InstrOrigin, usize>,
 }
@@ -82,7 +82,7 @@ impl Verifier<'_> {
             origin.instr
         );
         ensure!(
-            !matches!(instr, Some(ir::Instr::Phi { .. })),
+            !matches!(instr, Some(fir::Instr::Phi { .. })),
             "NIR cannot claim ownership of a Phi instruction bb{}:{}",
             origin.block,
             origin.instr
@@ -312,7 +312,7 @@ impl Verifier<'_> {
 }
 
 /// Returns all FIR blocks reachable from the function entry.
-fn reachable_blocks(function: &ir::Function) -> HashSet<usize> {
+fn reachable_blocks(function: &fir::Function) -> HashSet<usize> {
     let mut reachable = HashSet::new();
     let mut pending = vec![0];
     while let Some(block) = pending.pop() {
@@ -325,29 +325,29 @@ fn reachable_blocks(function: &ir::Function) -> HashSet<usize> {
 }
 
 /// Returns successor targets of one FIR block exit.
-fn exit_targets(exit: &ir::BlockExit) -> Vec<usize> {
+fn exit_targets(exit: &fir::BlockExit) -> Vec<usize> {
     match exit {
-        ir::BlockExit::Fallthrough(target) | ir::BlockExit::Jump(target) => vec![*target],
-        ir::BlockExit::Branch {
+        fir::BlockExit::Fallthrough(target) | fir::BlockExit::Jump(target) => vec![*target],
+        fir::BlockExit::Branch {
             then_block,
             else_block,
             ..
         }
-        | ir::BlockExit::NumericFor {
+        | fir::BlockExit::NumericFor {
             body_block: then_block,
             exit_block: else_block,
             ..
         }
-        | ir::BlockExit::NumericForLoop {
+        | fir::BlockExit::NumericForLoop {
             body_block: then_block,
             exit_block: else_block,
         }
-        | ir::BlockExit::GenericForLoop {
+        | fir::BlockExit::GenericForLoop {
             body_block: then_block,
             exit_block: else_block,
             ..
         } => vec![*then_block, *else_block],
-        ir::BlockExit::GenericFor { body_block, .. } => vec![*body_block],
-        ir::BlockExit::Return(_) => Vec::new(),
+        fir::BlockExit::GenericFor { body_block, .. } => vec![*body_block],
+        fir::BlockExit::Return(_) => Vec::new(),
     }
 }

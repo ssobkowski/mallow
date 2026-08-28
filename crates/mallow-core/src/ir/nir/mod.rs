@@ -11,7 +11,7 @@ use smol_str::SmolStr;
 
 use crate::hil::ir::CellId;
 use crate::il::ProtoId;
-use crate::ir::{Constant, PackId, ValueId};
+use crate::ir::fir::{Constant, PackId, ValueId};
 use crate::operator::{BinOp, UnOp};
 
 /// Stable identity for one NIR scalar local.
@@ -412,11 +412,11 @@ mod tests {
 
     use super::*;
     use crate::hil::ir::Cell;
-    use crate::ir::{self, Block, Pack, Value};
+    use crate::ir::fir::{self, Block, Constant, Pack, Value};
     use crate::logging::Diagnostics;
 
     /// Builds an acyclic branch whose condition has one concrete definition.
-    fn branch_function() -> ir::Function {
+    fn branch_function() -> fir::Function {
         let mut values = Arena::new();
         let lhs = values.alloc(Value);
         let rhs = values.alloc(Value);
@@ -425,7 +425,7 @@ mod tests {
         let then_pack = packs.alloc(Pack);
         let else_pack = packs.alloc(Pack);
 
-        ir::Function {
+        fir::Function {
             proto: ProtoId(0),
             params: vec![lhs, rhs],
             is_vararg: false,
@@ -436,13 +436,13 @@ mod tests {
             blocks: vec![
                 Block {
                     outputs: Vec::new(),
-                    instrs: vec![ir::Instr::Binary {
+                    instrs: vec![fir::Instr::Binary {
                         out: condition,
                         lhs,
                         op: BinOp::Lt,
                         rhs,
                     }],
-                    exit: ir::BlockExit::Branch {
+                    exit: fir::BlockExit::Branch {
                         condition,
                         then_block: 1,
                         else_block: 2,
@@ -450,21 +450,21 @@ mod tests {
                 },
                 Block {
                     outputs: Vec::new(),
-                    instrs: vec![ir::Instr::MakePack {
+                    instrs: vec![fir::Instr::MakePack {
                         out: then_pack,
                         head: Vec::new(),
                         tail: None,
                     }],
-                    exit: ir::BlockExit::Return(then_pack),
+                    exit: fir::BlockExit::Return(then_pack),
                 },
                 Block {
                     outputs: Vec::new(),
-                    instrs: vec![ir::Instr::MakePack {
+                    instrs: vec![fir::Instr::MakePack {
                         out: else_pack,
                         head: Vec::new(),
                         tail: None,
                     }],
-                    exit: ir::BlockExit::Return(else_pack),
+                    exit: fir::BlockExit::Return(else_pack),
                 },
             ],
         }
@@ -499,7 +499,7 @@ mod tests {
     }
 
     /// Builds a diamond with one value Phi at its merge block.
-    fn phi_function() -> ir::Function {
+    fn phi_function() -> fir::Function {
         let mut values = Arena::new();
         let lhs = values.alloc(Value);
         let rhs = values.alloc(Value);
@@ -510,7 +510,7 @@ mod tests {
         let mut packs = Arena::new();
         let result = packs.alloc(Pack);
 
-        ir::Function {
+        fir::Function {
             proto: ProtoId(0),
             params: vec![lhs, rhs],
             is_vararg: false,
@@ -521,13 +521,13 @@ mod tests {
             blocks: vec![
                 Block {
                     outputs: Vec::new(),
-                    instrs: vec![ir::Instr::Binary {
+                    instrs: vec![fir::Instr::Binary {
                         out: condition,
                         lhs,
                         op: BinOp::Lt,
                         rhs,
                     }],
-                    exit: ir::BlockExit::Branch {
+                    exit: fir::BlockExit::Branch {
                         condition,
                         then_block: 1,
                         else_block: 2,
@@ -535,34 +535,34 @@ mod tests {
                 },
                 Block {
                     outputs: Vec::new(),
-                    instrs: vec![ir::Instr::Copy {
+                    instrs: vec![fir::Instr::Copy {
                         out: then_value,
                         value: lhs,
                     }],
-                    exit: ir::BlockExit::Jump(3),
+                    exit: fir::BlockExit::Jump(3),
                 },
                 Block {
                     outputs: Vec::new(),
-                    instrs: vec![ir::Instr::Copy {
+                    instrs: vec![fir::Instr::Copy {
                         out: else_value,
                         value: rhs,
                     }],
-                    exit: ir::BlockExit::Jump(3),
+                    exit: fir::BlockExit::Jump(3),
                 },
                 Block {
                     outputs: Vec::new(),
                     instrs: vec![
-                        ir::Instr::Phi {
+                        fir::Instr::Phi {
                             out: merged,
                             inputs: vec![(1, then_value), (2, else_value)],
                         },
-                        ir::Instr::MakePack {
+                        fir::Instr::MakePack {
                             out: result,
                             head: vec![merged],
                             tail: None,
                         },
                     ],
-                    exit: ir::BlockExit::Return(result),
+                    exit: fir::BlockExit::Return(result),
                 },
             ],
         }
@@ -590,7 +590,7 @@ mod tests {
             target: Place::Local(initialization),
             value:
                 Expr {
-                    kind: ExprKind::Constant(crate::ir::Constant::Nil),
+                    kind: ExprKind::Constant(Constant::Nil),
                     ..
                 },
         }) = stmts.first()

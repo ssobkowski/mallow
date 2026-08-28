@@ -5,23 +5,22 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Result, bail, ensure};
 use id_arena::Arena;
 
-use crate::hil::cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
-use crate::hil::cflow::union_find::UnionFind;
-
 use super::visitor::VisitorMut;
 use super::*;
-use crate::ir;
-use crate::ir::region::{Predicate, Shape};
+use crate::hil::cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
+use crate::hil::cflow::union_find::UnionFind;
+use crate::ir::fir;
+use crate::ir::fir::region::{Predicate, Shape};
 use crate::logging::Diagnostics;
 
 /// Recognizes and materializes one FIR function as nested NIR.
-pub(crate) fn lower(function: &ir::Function, diagnostics: &Diagnostics) -> Result<Function> {
-    let shape = ir::region::structure(function, diagnostics)?;
+pub(crate) fn lower(function: &fir::Function, diagnostics: &Diagnostics) -> Result<Function> {
+    let shape = fir::region::structure(function, diagnostics)?;
     materialize(function, shape)
 }
 
 /// Converts one verified control shape into NIR with distinct FIR SSA symbols.
-pub(crate) fn materialize(function: &ir::Function, shape: Shape) -> Result<Function> {
+pub(crate) fn materialize(function: &fir::Function, shape: Shape) -> Result<Function> {
     #[cfg(debug_assertions)]
     {
         function.verify()?;
@@ -65,7 +64,7 @@ struct SsaMeta {
 
 impl SsaMeta {
     /// Groups Phi inputs which will use the same mutable storage.
-    fn build(function: &ir::Function) -> Result<Self> {
+    fn build(function: &fir::Function) -> Result<Self> {
         let (successors, predecessors) =
             build_graph(function.blocks.iter().map(|block| block.exit.targets()));
         let graph = AdjGraph::new(0, &successors, &predecessors);
@@ -78,7 +77,7 @@ impl SsaMeta {
         for block_index in graph.post_order() {
             let block = &function.blocks[block_index];
             for instr in &block.instrs {
-                let ir::Instr::Phi { out, inputs } = instr else {
+                let fir::Instr::Phi { out, inputs } = instr else {
                     continue;
                 };
 
@@ -86,12 +85,12 @@ impl SsaMeta {
                 for &(predecessor, input) in inputs {
                     // TODO: Is this necessary?
                     let is_loop_header_initializer = match &function.blocks[predecessor].exit {
-                        ir::BlockExit::NumericFor {
+                        fir::BlockExit::NumericFor {
                             body_block,
                             variable,
                             ..
                         } => *body_block == block_index && variable == out,
-                        ir::BlockExit::GenericFor {
+                        fir::BlockExit::GenericFor {
                             body_block,
                             variables,
                             ..
@@ -106,16 +105,16 @@ impl SsaMeta {
             }
 
             match &block.exit {
-                ir::BlockExit::NumericFor { variable, .. } => {
+                fir::BlockExit::NumericFor { variable, .. } => {
                     loop_values.push(*variable);
                 }
-                ir::BlockExit::GenericFor {
+                fir::BlockExit::GenericFor {
                     loop_block,
                     variables: init_variables,
                     ..
                 } => {
                     loop_values.extend(init_variables.iter().copied());
-                    let Some(ir::BlockExit::GenericForLoop {
+                    let Some(fir::BlockExit::GenericForLoop {
                         variables: body_variables,
                         ..
                     }) = function.blocks.get(*loop_block).map(|b| &b.exit)
@@ -133,7 +132,7 @@ impl SsaMeta {
                         groups.union(*entry, *body);
                     }
                 }
-                ir::BlockExit::GenericForLoop { variables, .. } => {
+                fir::BlockExit::GenericForLoop { variables, .. } => {
                     loop_values.extend(variables.iter().copied());
                 }
                 _ => {}
@@ -181,12 +180,12 @@ impl SsaMeta {
     /// Returns whether one concrete instruction defines the storage before it is read.
     fn is_defined_before_use_in_block(
         &self,
-        function: &ir::Function,
+        function: &fir::Function,
         block: usize,
         storage: ValueId,
     ) -> bool {
         for instr in &function.blocks[block].instrs {
-            if matches!(instr, ir::Instr::Phi { .. }) {
+            if matches!(instr, fir::Instr::Phi { .. }) {
                 continue;
             }
             if instr
@@ -218,7 +217,7 @@ struct Initializations {
 
 impl Initializations {
     /// Places storage without a concrete definition at its block or in the function prologue.
-    fn build(function: &ir::Function, ssa: &SsaMeta, shape: &Shape) -> Self {
+    fn build(function: &fir::Function, ssa: &SsaMeta, shape: &Shape) -> Self {
         let mut initialization_blocks = HashSet::new();
         collect_initialization_blocks(shape, &mut initialization_blocks);
 
@@ -301,7 +300,7 @@ impl VisitorMut for LocalRewriter<'_> {
 /// State used while converting FIR references into NIR identities.
 struct Materializer<'f> {
     /// FIR function being converted.
-    function: &'f ir::Function,
+    function: &'f fir::Function,
     /// NIR local arena.
     locals: Arena<Local>,
     /// NIR pack arena.
@@ -316,7 +315,7 @@ struct Materializer<'f> {
 
 impl<'a> Materializer<'a> {
     /// Creates one stable NIR identity for every FIR SSA value and pack.
-    fn new(function: &'a ir::Function, ssa: &SsaMeta, initializations: Initializations) -> Self {
+    fn new(function: &'a fir::Function, ssa: &SsaMeta, initializations: Initializations) -> Self {
         let mut locals = Arena::new();
         let values = function
             .values
@@ -498,7 +497,7 @@ impl<'a> Materializer<'a> {
             .map(|storage| self.initialization(*storage))
             .collect::<Result<_>>()?;
         for (instr, value) in block_ref.instrs.iter().enumerate() {
-            if matches!(value, ir::Instr::Phi { .. }) {
+            if matches!(value, fir::Instr::Phi { .. }) {
                 continue;
             }
             stmts.push(self.instr(InstrOrigin { block, instr }, value)?);
@@ -507,7 +506,7 @@ impl<'a> Materializer<'a> {
     }
 
     /// Materializes one FIR instruction without moving it across another instruction.
-    fn instr(&self, origin: InstrOrigin, instr: &ir::Instr) -> Result<Stmt> {
+    fn instr(&self, origin: InstrOrigin, instr: &fir::Instr) -> Result<Stmt> {
         let produced_value = |out, kind| {
             let local = self.local(out)?;
             Ok(Stmt::Bind {
@@ -524,13 +523,13 @@ impl<'a> Materializer<'a> {
         };
 
         match instr {
-            ir::Instr::Const { out, value } => {
+            fir::Instr::Const { out, value } => {
                 produced_value(*out, ExprKind::Constant(value.clone()))
             }
-            ir::Instr::Copy { out, value } => {
+            fir::Instr::Copy { out, value } => {
                 produced_value(*out, ExprKind::Local(self.local(*value)?))
             }
-            ir::Instr::Closure {
+            fir::Instr::Closure {
                 out,
                 proto,
                 captures,
@@ -541,20 +540,20 @@ impl<'a> Materializer<'a> {
                     captures: captures
                         .iter()
                         .map(|capture| match capture {
-                            ir::Capture::Copy(value) => self.local(*value).map(Capture::Copy),
-                            ir::Capture::Share(cell) => Ok(Capture::Share(*cell)),
+                            fir::Capture::Copy(value) => self.local(*value).map(Capture::Copy),
+                            fir::Capture::Share(cell) => Ok(Capture::Share(*cell)),
                         })
                         .collect::<Result<_>>()?,
                 },
             ),
-            ir::Instr::GetTable { out, table, key } => produced_value(
+            fir::Instr::GetTable { out, table, key } => produced_value(
                 *out,
                 ExprKind::GetTable {
                     table: Box::new(self.value(*table)?),
                     key: Box::new(self.value(*key)?),
                 },
             ),
-            ir::Instr::SetTable { table, key, value } => Ok(Stmt::Bind {
+            fir::Instr::SetTable { table, key, value } => Ok(Stmt::Bind {
                 origin: Some(origin),
                 target: Place::Table {
                     table: self.value(*table)?,
@@ -562,15 +561,15 @@ impl<'a> Materializer<'a> {
                 },
                 value: self.value(*value)?,
             }),
-            ir::Instr::GetGlobal { out, name } => {
+            fir::Instr::GetGlobal { out, name } => {
                 produced_value(*out, ExprKind::GetGlobal(name.clone()))
             }
-            ir::Instr::SetGlobal { name, value } => Ok(Stmt::Bind {
+            fir::Instr::SetGlobal { name, value } => Ok(Stmt::Bind {
                 origin: Some(origin),
                 target: Place::Global(name.clone()),
                 value: self.value(*value)?,
             }),
-            ir::Instr::Binary { out, lhs, op, rhs } => produced_value(
+            fir::Instr::Binary { out, lhs, op, rhs } => produced_value(
                 *out,
                 ExprKind::Binary {
                     lhs: Box::new(self.value(*lhs)?),
@@ -578,14 +577,14 @@ impl<'a> Materializer<'a> {
                     rhs: Box::new(self.value(*rhs)?),
                 },
             ),
-            ir::Instr::Unary { out, op, value } => produced_value(
+            fir::Instr::Unary { out, op, value } => produced_value(
                 *out,
                 ExprKind::Unary {
                     op: *op,
                     value: Box::new(self.value(*value)?),
                 },
             ),
-            ir::Instr::Concat { out, operands } => produced_value(
+            fir::Instr::Concat { out, operands } => produced_value(
                 *out,
                 ExprKind::Concat(
                     operands
@@ -594,7 +593,7 @@ impl<'a> Materializer<'a> {
                         .collect::<Result<_>>()?,
                 ),
             ),
-            ir::Instr::Select {
+            fir::Instr::Select {
                 out,
                 condition,
                 then_value,
@@ -607,8 +606,8 @@ impl<'a> Materializer<'a> {
                     else_value: Box::new(self.value(*else_value)?),
                 },
             ),
-            ir::Instr::NewTable { out } => produced_value(*out, ExprKind::NewTable),
-            ir::Instr::MakePack { out, head, tail } => produced_pack(
+            fir::Instr::NewTable { out } => produced_value(*out, ExprKind::NewTable),
+            fir::Instr::MakePack { out, head, tail } => produced_pack(
                 *out,
                 PackExprKind::Values {
                     head: head
@@ -620,14 +619,14 @@ impl<'a> Materializer<'a> {
                         .transpose()?,
                 },
             ),
-            ir::Instr::Project { out, pack, index } => produced_value(
+            fir::Instr::Project { out, pack, index } => produced_value(
                 *out,
                 ExprKind::Project {
                     pack: Box::new(self.pack_value(*pack)?),
                     index: *index,
                 },
             ),
-            ir::Instr::Call {
+            fir::Instr::Call {
                 out,
                 function,
                 args,
@@ -638,7 +637,7 @@ impl<'a> Materializer<'a> {
                     args: Box::new(self.pack_value(*args)?),
                 },
             ),
-            ir::Instr::MethodCall {
+            fir::Instr::MethodCall {
                 out,
                 object,
                 method,
@@ -651,19 +650,19 @@ impl<'a> Materializer<'a> {
                     args: Box::new(self.pack_value(*args)?),
                 },
             ),
-            ir::Instr::VarArgs { out } => produced_pack(*out, PackExprKind::VarArgs),
-            ir::Instr::OpenCell { cell, value } => Ok(Stmt::OpenCell {
+            fir::Instr::VarArgs { out } => produced_pack(*out, PackExprKind::VarArgs),
+            fir::Instr::OpenCell { cell, value } => Ok(Stmt::OpenCell {
                 origin,
                 cell: *cell,
                 value: self.value(*value)?,
             }),
-            ir::Instr::LoadCell { out, cell } => produced_value(*out, ExprKind::LoadCell(*cell)),
-            ir::Instr::StoreCell { cell, value } => Ok(Stmt::Bind {
+            fir::Instr::LoadCell { out, cell } => produced_value(*out, ExprKind::LoadCell(*cell)),
+            fir::Instr::StoreCell { cell, value } => Ok(Stmt::Bind {
                 origin: Some(origin),
                 target: Place::Cell(*cell),
                 value: self.value(*value)?,
             }),
-            ir::Instr::SetList {
+            fir::Instr::SetList {
                 table,
                 index,
                 values,
@@ -673,7 +672,7 @@ impl<'a> Materializer<'a> {
                 index: *index,
                 values: self.pack_value(*values)?,
             }),
-            ir::Instr::Phi { .. } => bail!(
+            fir::Instr::Phi { .. } => bail!(
                 "internal error: Phi bb{} instruction {} was not unfolded",
                 origin.block,
                 origin.instr

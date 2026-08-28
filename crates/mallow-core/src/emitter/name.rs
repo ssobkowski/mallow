@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 
-use smol_str::{format_smolstr, SmolStr};
+use smol_str::{SmolStr, format_smolstr};
 
 use crate::ast::Identifier;
 use crate::common::is_valid_luau_identifier;
 use crate::hil::ir::CellId;
-use crate::nir::{Expr, LocalId, PackLocalId};
+use crate::ir::nir::{Expr, LocalId, PackLocalId};
 
 /// The source role of one emitter binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

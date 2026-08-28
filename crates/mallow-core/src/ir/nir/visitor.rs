@@ -5,7 +5,7 @@
 
 use crate::common::ByteString;
 use crate::hil::ir::{CellId, Number};
-use crate::ir::Constant;
+use crate::ir::fir::Constant;
 use smol_str::SmolStr;
 
 use super::{Capture, Expr, ExprKind, Function, PackExpr, PackExprKind, Place, Region, Stmt};

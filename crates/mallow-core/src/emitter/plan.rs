@@ -7,8 +7,8 @@ use super::name::{LocalNameCtx, LocalRole, LocalSource, Namer, Names};
 use super::storage::Storage;
 use crate::ast::Identifier;
 use crate::hil::ir::CellId;
-use crate::nir::visitor::Visitor;
-use crate::nir::{self, LocalId, PackLocalId};
+use crate::ir::nir::visitor::Visitor;
+use crate::ir::nir::{self, LocalId, PackLocalId};
 
 /// Maximum number of active Luau locals accepted by the compiler.
 const SOURCE_LOCAL_LIMIT: usize = 200;
@@ -649,8 +649,8 @@ mod tests {
     use id_arena::Arena;
 
     use super::*;
-    use crate::ir::{Constant, Value};
-    use crate::nir::{Expr, ExprKind, Function, Local, Place, Region, Stmt};
+    use crate::ir::fir::{Constant, Value};
+    use crate::ir::nir::{Expr, ExprKind, Function, Local, Place, Region, Stmt};
 
     /// Builds one flat function with the requested local count.
     fn flat_function(count: usize) -> Function {

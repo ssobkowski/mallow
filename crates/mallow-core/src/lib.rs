@@ -6,7 +6,6 @@ mod hil;
 mod il;
 mod ir;
 mod logging;
-mod nir;
 mod operator;
 mod printer;
 mod scopes;
@@ -267,7 +266,7 @@ pub fn decompile_bytecode_with_diagnostics(
         "max pass iterations must be greater than zero"
     );
     let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let functions = ir::lift(&chunk)?;
+    let functions = ir::fir::lift(&chunk)?;
 
     use core::fmt::Write;
 
@@ -277,12 +276,12 @@ pub fn decompile_bytecode_with_diagnostics(
                 .iter()
                 .map(|function| {
                     let diagnostics = diagnostics.for_proto(function.proto.0);
-                    nir::materialize::lower(function, &diagnostics)
+                    ir::nir::materialize::lower(function, &diagnostics)
                 })
                 .collect::<Result<_>>()?;
-            nir::passes::run(&mut nested_functions);
+            ir::nir::passes::run(&mut nested_functions);
             for function in &mut nested_functions {
-                nir::materialize::destroy_ssa(function);
+                ir::nir::materialize::destroy_ssa(function);
             }
             let block = emitter::emit_ast(nested_functions, chunk.entry_proto, options)?;
             Ok(printer::print(&block, &[]))
@@ -297,7 +296,7 @@ pub fn decompile_bytecode_with_diagnostics(
                     EmitMode::Ir => write!(out, "{function}"),
                     EmitMode::Nir => {
                         let diagnostics = diagnostics.for_proto(function.proto.0);
-                        let function = nir::materialize::lower(&function, &diagnostics)?;
+                        let function = ir::nir::materialize::lower(&function, &diagnostics)?;
                         write!(out, "{function:#?}")
                     }
                     EmitMode::Source => unreachable!("handled above"),

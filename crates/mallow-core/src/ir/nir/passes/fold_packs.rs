@@ -7,8 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::nir::visitor::{Visitor, VisitorMut, walk_pack_expr, walk_stmt, walk_stmts_mut};
-use crate::nir::{
+use crate::ir::nir::visitor::{Visitor, VisitorMut, walk_pack_expr, walk_stmt, walk_stmts_mut};
+use crate::ir::nir::{
     Expr, ExprKind, Function, LocalId, PackExpr, PackExprKind, PackLocalId, Place, Stmt,
 };
 
@@ -222,8 +222,8 @@ mod tests {
     use id_arena::Arena;
 
     use super::*;
-    use crate::ir::{Constant, Pack, Value};
-    use crate::nir::{Expr, Function, Local, PackLocal, Region};
+    use crate::ir::fir::{Constant, Pack, Value};
+    use crate::ir::nir::{Expr, Function, Local, PackLocal, Region};
 
     /// Allocates unique identities for test statements.
     #[derive(Default)]

@@ -14,8 +14,8 @@ use crate::ast::Identifier;
 use crate::common::is_valid_luau_identifier;
 use crate::hil::ir::{CellId, Number};
 use crate::il::ProtoId;
-use crate::ir::Constant;
-use crate::nir;
+use crate::ir::fir::Constant;
+use crate::ir::nir;
 use crate::operator::BinOp;
 use crate::{DecompileOptions, ast};
 
