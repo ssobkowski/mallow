@@ -123,6 +123,26 @@ impl Expr {
     const fn nil() -> Self {
         Self::Constant(Constant::Nil)
     }
+
+    /// Creates a 'or' expression with the given operands.
+    #[inline]
+    pub fn or(left: Self, right: Self) -> Self {
+        Self::Binary {
+            op: BinOp::Or,
+            lhs: Box::new(left),
+            rhs: Box::new(right),
+        }
+    }
+
+    /// Creates an 'and' expression with the given operands.
+    #[inline]
+    pub fn and(left: Self, right: Self) -> Self {
+        Self::Binary {
+            op: BinOp::And,
+            lhs: Box::new(left),
+            rhs: Box::new(right),
+        }
+    }
 }
 
 /// One nested value-pack expression.
@@ -313,6 +333,16 @@ pub(crate) enum Region {
     Break,
     /// Returns one value pack.
     Return(PackExpr),
+}
+
+impl Region {
+    /// Returns whether the region is empty.
+    ///
+    /// A region is empty if it contains no statements or child regions.
+    pub const fn is_empty(&self) -> bool {
+        matches!(self, Region::Block { stmts, .. } if stmts.is_empty())
+            || matches!(self, Region::Sequence(nodes) if nodes.is_empty())
+    }
 }
 
 /// One nested function before AST naming and emission.

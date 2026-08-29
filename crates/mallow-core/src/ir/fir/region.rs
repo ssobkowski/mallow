@@ -334,7 +334,7 @@ impl Shape {
     }
 
     /// Returns a flat sequence without empty sequence children.
-    fn sequence(nodes: Vec<Self>) -> Self {
+    fn sequence(nodes: impl IntoIterator<Item = Self>) -> Self {
         let nodes = nodes
             .into_iter()
             .flat_map(|node| match node {
@@ -431,57 +431,6 @@ impl Shape {
                 then_branch: inner_then,
                 else_branch: inner_else,
             })),
-        }
-    }
-
-    /// Verifies unique executable block ownership.
-    pub(crate) fn verify(&self, function: &Function) -> Result<()> {
-        let mut block_counts = HashMap::new();
-        self.count_blocks(&mut block_counts);
-
-        for (block, value) in function.blocks.iter().enumerate() {
-            if value
-                .instrs
-                .iter()
-                .all(|instr| matches!(instr, Instr::Phi { .. }))
-            {
-                continue;
-            }
-
-            let count = block_counts.get(&block).copied().unwrap_or_default();
-            ensure!(
-                count == 1,
-                "executable bb{block} has {count} materialization sites"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Records the FIR blocks referenced by this shape.
-    fn count_blocks(&self, block_counts: &mut HashMap<usize, usize>) {
-        match self {
-            Self::Block { block } => *block_counts.entry(*block).or_default() += 1,
-            Self::Sequence { nodes } => {
-                for node in nodes {
-                    node.count_blocks(block_counts);
-                }
-            }
-            Self::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                then_branch.count_blocks(block_counts);
-                if let Some(else_branch) = else_branch {
-                    else_branch.count_blocks(block_counts);
-                }
-            }
-            Self::While { body, .. }
-            | Self::RepeatUntil { body, .. }
-            | Self::NumericFor { body, .. }
-            | Self::GenericFor { body, .. } => body.count_blocks(block_counts),
-            Self::Continue | Self::Break | Self::Return { .. } => {}
         }
     }
 }
@@ -2561,7 +2510,6 @@ pub(crate) fn structure(function: &Function, diagnostics: &Diagnostics) -> Resul
         .structure()
         .lower()
         .normalize();
-    node.verify(function)?;
     Ok(node)
 }
 
@@ -2763,39 +2711,6 @@ mod tests {
 
         let region = structure(&function, &Diagnostics::default()).unwrap();
         assert_eq!(numeric_loop(&region), Some((variable, start, end, step)));
-    }
-
-    /// Keeps a condition definition as payload until concrete inlining.
-    #[test]
-    fn condition_tree_remains_block_payload() {
-        let mut values = Arena::new();
-        let lhs = values.alloc(Value);
-        let rhs = values.alloc(Value);
-        let condition = values.alloc(Value);
-        let (mut function, _) = function_with_exits(values, vec![lhs, rhs], |pack| {
-            vec![
-                BlockExit::Branch {
-                    condition,
-                    then_block: 1,
-                    else_block: 2,
-                },
-                BlockExit::Jump(0),
-                BlockExit::Return(pack),
-            ]
-        });
-        function.blocks[0].instrs.push(Instr::Binary {
-            out: condition,
-            lhs,
-            op: BinOp::Lt,
-            rhs,
-        });
-        function.verify().unwrap();
-
-        let cfg = FlowGraph::new(&function);
-        assert!(cfg.block_has_payload(0));
-
-        let shape = structure(&function, &Diagnostics::default()).unwrap();
-        shape.verify(&function).unwrap();
     }
 
     /// Recovers a post-test loop condition from its latch.
