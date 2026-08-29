@@ -312,15 +312,15 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
 
     /// Emits one pack-producing effect whose results are unused.
     fn eval_pack(&mut self, value: &nir::PackExpr, out: &mut Vec<ast::Stmt>) -> Result<()> {
-        match &value.kind {
-            nir::PackExprKind::Call { .. } | nir::PackExprKind::MethodCall { .. } => {
+        match value {
+            nir::PackExpr::Call { .. } | nir::PackExpr::MethodCall { .. } => {
                 let mut values = self.lower_pack(value)?;
                 ensure!(values.len() == 1, "call pack must lower to one expression");
                 out.push(ast::Stmt::Expression {
                     expr: values.pop().expect("the call produced one expression"),
                 });
             }
-            nir::PackExprKind::Values { .. } => {
+            nir::PackExpr::Values { .. } => {
                 let values = self.lower_pack(value)?;
                 if !values.is_empty() {
                     out.push(ast::Stmt::Comment {
@@ -334,7 +334,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                     });
                 }
             }
-            nir::PackExprKind::Local(_) | nir::PackExprKind::VarArgs => {}
+            nir::PackExpr::Local(_) | nir::PackExpr::VarArgs => {}
         }
         Ok(())
     }
@@ -524,7 +524,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             return Ok(());
         }
 
-        if let nir::PackExprKind::Local(local) = &values.kind {
+        if let nir::PackExpr::Local(local) = values {
             out.push(ast::Stmt::Expression {
                 expr: move_packed_values(self.plan.pack(*local)?.expr(), table, index),
             });
@@ -573,24 +573,24 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
 
     /// Lowers one scalar expression for its surrounding Luau syntax.
     fn lower_expr_in(&mut self, expr: &nir::Expr, context: ExprContext) -> Result<ast::Expr> {
-        Ok(match &expr.kind {
-            nir::ExprKind::Local(local) => self.plan.local(*local)?.expr(),
-            nir::ExprKind::Constant(value) => constant(value),
-            nir::ExprKind::Closure { proto, captures } => self.lower_closure(*proto, captures)?,
-            nir::ExprKind::GetTable { table, key } => {
+        Ok(match expr {
+            nir::Expr::Local(local) => self.plan.local(*local)?.expr(),
+            nir::Expr::Constant(value) => constant(value),
+            nir::Expr::Closure { proto, captures } => self.lower_closure(*proto, captures)?,
+            nir::Expr::GetTable { table, key } => {
                 table_access(self.lower_expr(table)?, key, self.lower_expr(key)?)
             }
-            nir::ExprKind::GetGlobal(name) => global_name(name),
-            nir::ExprKind::Binary { lhs, op, rhs } => ast::Expr::Binary {
+            nir::Expr::GetGlobal(name) => global_name(name),
+            nir::Expr::Binary { lhs, op, rhs } => ast::Expr::Binary {
                 lhs: Box::new(self.lower_expr(lhs)?),
                 op: *op,
                 rhs: Box::new(self.lower_expr(rhs)?),
             },
-            nir::ExprKind::Unary { op, value } => ast::Expr::Unary {
+            nir::Expr::Unary { op, value } => ast::Expr::Unary {
                 op: *op,
                 expr: Box::new(self.lower_expr(value)?),
             },
-            nir::ExprKind::Concat(values) => {
+            nir::Expr::Concat(values) => {
                 let mut values = values.iter().rev();
                 let Some(last) = values.next() else {
                     bail!("NIR concat cannot be empty")
@@ -605,7 +605,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 }
                 combined
             }
-            nir::ExprKind::Select {
+            nir::Expr::Select {
                 condition,
                 then_value,
                 else_value,
@@ -614,9 +614,9 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 then_expr: Box::new(self.lower_expr(then_value)?),
                 else_expr: Box::new(self.lower_expr(else_value)?),
             },
-            nir::ExprKind::NewTable => ast::Expr::Table { items: Vec::new() },
-            nir::ExprKind::Project { pack, index } => self.lower_project(pack, *index, context)?,
-            nir::ExprKind::LoadCell(cell) => self.plan.cell(*cell)?.expr(),
+            nir::Expr::NewTable => ast::Expr::Table { items: Vec::new() },
+            nir::Expr::Project { pack, index } => self.lower_project(pack, *index, context)?,
+            nir::Expr::LoadCell(cell) => self.plan.cell(*cell)?.expr(),
         })
     }
 
@@ -657,7 +657,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         index: usize,
         context: ExprContext,
     ) -> Result<ast::Expr> {
-        if let nir::PackExprKind::Local(local) = &pack.kind {
+        if let nir::PackExpr::Local(local) = pack {
             return Ok(ast::Expr::Index {
                 base: Box::new(self.plan.pack(*local)?.expr()),
                 index: Box::new(ast::Expr::Literal(ast::Literal::Float((index + 1) as f64))),
@@ -684,8 +684,8 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
 
     /// Lowers one NIR pack into a Luau expression list.
     fn lower_pack(&mut self, pack: &nir::PackExpr) -> Result<Vec<ast::Expr>> {
-        Ok(match &pack.kind {
-            nir::PackExprKind::Local(local) => {
+        Ok(match pack {
+            nir::PackExpr::Local(local) => {
                 let packed = self.plan.pack(*local)?.expr();
                 vec![ast::Expr::FunctionCall {
                     func: Box::new(field(global("table"), "unpack")),
@@ -696,7 +696,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                     ],
                 }]
             }
-            nir::PackExprKind::Values { head, tail } => {
+            nir::PackExpr::Values { head, tail } => {
                 let mut values = Vec::with_capacity(head.len());
                 for (index, value) in head.iter().enumerate() {
                     let context = if tail.is_none() && index + 1 == head.len() {
@@ -711,11 +711,11 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 }
                 values
             }
-            nir::PackExprKind::Call { function, args } => vec![ast::Expr::FunctionCall {
+            nir::PackExpr::Call { function, args } => vec![ast::Expr::FunctionCall {
                 func: Box::new(self.lower_expr(function)?),
                 args: self.lower_pack(args)?,
             }],
-            nir::PackExprKind::MethodCall {
+            nir::PackExpr::MethodCall {
                 object,
                 method,
                 args,
@@ -724,7 +724,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 method: ast::Identifier::new(method.clone()),
                 args: self.lower_pack(args)?,
             }],
-            nir::PackExprKind::VarArgs => vec![ast::Expr::Vararg],
+            nir::PackExpr::VarArgs => vec![ast::Expr::Vararg],
         })
     }
 }
@@ -761,7 +761,7 @@ fn global(name: impl Into<SmolStr>) -> ast::Expr {
 
 /// Chooses field syntax when a constant string key permits it.
 fn table_access(base: ast::Expr, key: &nir::Expr, lowered_key: ast::Expr) -> ast::Expr {
-    if let nir::ExprKind::Constant(Constant::String(value)) = &key.kind
+    if let nir::Expr::Constant(Constant::String(value)) = key
         && let Some(field_name) = value.as_utf8()
         && is_valid_luau_identifier(field_name)
     {

@@ -8,9 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::nir::visitor::{Visitor, VisitorMut, walk_pack_expr, walk_stmt, walk_stmts_mut};
-use crate::ir::nir::{
-    Expr, ExprKind, Function, LocalId, PackExpr, PackExprKind, PackLocalId, Place, Stmt,
-};
+use crate::ir::nir::{Expr, Function, LocalId, PackExpr, PackLocalId, Place, Stmt};
 
 /// Folds one function's pack bindings. Returns whether anything changed.
 pub(super) fn run(function: &mut Function) -> bool {
@@ -29,24 +27,19 @@ pub(super) fn run(function: &mut Function) -> bool {
 /// enclosing effect, so it can participate in one binding.
 #[inline]
 fn direct_projection(stmt: &Stmt) -> Option<(Place, PackLocalId, usize)> {
-    let Stmt::Bind {
-        origin: None,
-        target,
-        value,
-    } = stmt
-    else {
+    let Stmt::Bind { target, value } = stmt else {
         return None;
     };
     if !matches!(target, Place::Local(_) | Place::Discard) {
         return None;
     }
-    let ExprKind::Project { pack, index } = &value.kind else {
+    let Expr::Project { pack, index } = value else {
         return None;
     };
-    let PackExprKind::Local(pack) = pack.kind else {
+    let PackExpr::Local(pack) = pack.as_ref() else {
         return None;
     };
-    Some((target.clone(), pack, *index))
+    Some((target.clone(), *pack, *index))
 }
 
 /// Use facts collected for every pack local.
@@ -119,8 +112,8 @@ impl Visitor for UseFacts {
     }
 
     fn visit_pack_expr(&mut self, pack: &PackExpr) {
-        if let PackExprKind::Local(local) = pack.kind {
-            self.entry(local).reads += 1;
+        if let PackExpr::Local(local) = pack {
+            self.entry(*local).reads += 1;
             return;
         }
         walk_pack_expr(self, pack);
@@ -183,14 +176,10 @@ impl VisitorMut for Folder {
             if consumed.len() == 1 {
                 let (slot, target) = consumed.into_iter().next().expect("one projection");
                 stmts[index] = Stmt::Bind {
-                    origin: None,
                     target,
-                    value: Expr {
-                        origin: None,
-                        kind: ExprKind::Project {
-                            pack: Box::new(value.clone()),
-                            index: slot,
-                        },
+                    value: Expr::Project {
+                        pack: Box::new(value.clone()),
+                        index: slot,
                     },
                 };
             } else {
@@ -250,45 +239,29 @@ mod tests {
 
     /// Builds one nil literal expression.
     fn nil_expr() -> Expr {
-        Expr {
-            origin: None,
-            kind: ExprKind::Constant(Constant::Nil),
-        }
+        Expr::Constant(Constant::Nil)
     }
 
     /// Builds one projection of one pack local at one index.
     fn project(pack: PackLocalId, index: usize) -> Expr {
-        Expr {
-            origin: None,
-            kind: ExprKind::Project {
-                pack: Box::new(PackExpr {
-                    origin: None,
-                    kind: PackExprKind::Local(pack),
-                }),
-                index,
-            },
+        Expr::Project {
+            pack: Box::new(PackExpr::Local(pack)),
+            index,
         }
     }
 
     /// Builds one bind of one place from one value.
     fn bind(target: Place, value: Expr) -> Stmt {
-        Stmt::Bind {
-            origin: None,
-            target,
-            value,
-        }
+        Stmt::Bind { target, value }
     }
 
     /// Builds one pack binding holding one empty value list.
     fn bind_pack(pack: PackLocalId) -> Stmt {
         Stmt::BindPack {
             local: pack,
-            value: PackExpr {
-                origin: None,
-                kind: PackExprKind::Values {
-                    head: Vec::new(),
-                    tail: None,
-                },
+            value: PackExpr::Values {
+                head: Vec::new(),
+                tail: None,
             },
         }
     }
@@ -344,22 +317,17 @@ mod tests {
             Stmt::Bind {
                 target: Place::Local(target),
                 value:
-                    Expr {
-                        kind:
-                            ExprKind::Project {
-                                pack: source,
-                                index: 2,
-                            },
-                        ..
+                    Expr::Project {
+                        pack: source,
+                        index: 2,
                     },
-                ..
             },
         ] = &folded[..]
         else {
             panic!("one projection should fold into one scalar binding");
         };
         assert_eq!(*target, third);
-        assert!(matches!(source.kind, PackExprKind::Values { .. }));
+        assert!(matches!(**source, PackExpr::Values { .. }));
     }
 
     /// Fills unused projection slots with discard places.
@@ -418,13 +386,10 @@ mod tests {
         // One nested projection inside a binary expression counts as a read.
         let read = bind(
             Place::Local(reader),
-            Expr {
-                origin: None,
-                kind: ExprKind::Binary {
-                    lhs: Box::new(project(pack, 0)),
-                    op: crate::operator::BinOp::Add,
-                    rhs: Box::new(nil_expr()),
-                },
+            Expr::Binary {
+                lhs: Box::new(project(pack, 0)),
+                op: crate::operator::BinOp::Add,
+                rhs: Box::new(nil_expr()),
             },
         );
         let statements = vec![

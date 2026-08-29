@@ -8,7 +8,7 @@ use crate::hil::ir::{CellId, Number};
 use crate::ir::fir::Constant;
 use smol_str::SmolStr;
 
-use super::{Capture, Expr, ExprKind, Function, PackExpr, PackExprKind, Place, Region, Stmt};
+use super::{Capture, Expr, Function, PackExpr, Place, Region, Stmt};
 use super::{LocalId, PackLocalId};
 
 /// Visits NIR without changing it.
@@ -268,30 +268,30 @@ pub fn walk_stmt<V: Visitor + ?Sized>(visitor: &mut V, stmt: &Stmt) {
 
 /// Walks one value expression in evaluation order.
 pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
-    match &expr.kind {
-        ExprKind::Local(local) => visitor.visit_local(*local),
-        ExprKind::Constant(constant) => visitor.visit_constant(constant),
-        ExprKind::Closure { captures, .. } => {
+    match expr {
+        Expr::Local(local) => visitor.visit_local(*local),
+        Expr::Constant(constant) => visitor.visit_constant(constant),
+        Expr::Closure { captures, .. } => {
             for (index, capture) in captures.iter().copied().enumerate() {
                 visitor.visit_capture(index, capture);
             }
         }
-        ExprKind::GetTable { table, key } => {
+        Expr::GetTable { table, key } => {
             visitor.visit_expr(table);
             visitor.visit_expr(key);
         }
-        ExprKind::GetGlobal(name) => visitor.visit_global(name),
-        ExprKind::Binary { lhs, rhs, .. } => {
+        Expr::GetGlobal(name) => visitor.visit_global(name),
+        Expr::Binary { lhs, rhs, .. } => {
             visitor.visit_expr(lhs);
             visitor.visit_expr(rhs);
         }
-        ExprKind::Unary { value, .. } => visitor.visit_expr(value),
-        ExprKind::Concat(values) => {
+        Expr::Unary { value, .. } => visitor.visit_expr(value),
+        Expr::Concat(values) => {
             for value in values {
                 visitor.visit_expr(value);
             }
         }
-        ExprKind::Select {
+        Expr::Select {
             condition,
             then_value,
             else_value,
@@ -300,9 +300,9 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
             visitor.visit_expr(then_value);
             visitor.visit_expr(else_value);
         }
-        ExprKind::NewTable => {}
-        ExprKind::Project { pack, .. } => visitor.visit_pack_expr(pack),
-        ExprKind::LoadCell(cell) => visitor.visit_cell(*cell),
+        Expr::NewTable => {}
+        Expr::Project { pack, .. } => visitor.visit_pack_expr(pack),
+        Expr::LoadCell(cell) => visitor.visit_cell(*cell),
     }
 }
 
@@ -322,9 +322,9 @@ pub fn walk_place<V: Visitor + ?Sized>(visitor: &mut V, place: &Place) {
 
 /// Walks one value-pack expression in evaluation order.
 pub fn walk_pack_expr<V: Visitor + ?Sized>(visitor: &mut V, pack: &PackExpr) {
-    match &pack.kind {
-        PackExprKind::Local(local) => visitor.visit_pack_local(*local),
-        PackExprKind::Values { head, tail } => {
+    match pack {
+        PackExpr::Local(local) => visitor.visit_pack_local(*local),
+        PackExpr::Values { head, tail } => {
             for value in head {
                 visitor.visit_expr(value);
             }
@@ -332,15 +332,15 @@ pub fn walk_pack_expr<V: Visitor + ?Sized>(visitor: &mut V, pack: &PackExpr) {
                 visitor.visit_pack_expr(tail);
             }
         }
-        PackExprKind::Call { function, args } => {
+        PackExpr::Call { function, args } => {
             visitor.visit_expr(function);
             visitor.visit_pack_expr(args);
         }
-        PackExprKind::MethodCall { object, args, .. } => {
+        PackExpr::MethodCall { object, args, .. } => {
             visitor.visit_expr(object);
             visitor.visit_pack_expr(args);
         }
-        PackExprKind::VarArgs => {}
+        PackExpr::VarArgs => {}
     }
 }
 
@@ -447,30 +447,30 @@ pub fn walk_stmt_mut<V: VisitorMut + ?Sized>(visitor: &mut V, stmt: &mut Stmt) {
 
 /// Walks one mutable value expression in evaluation order.
 pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut Expr) {
-    match &mut expr.kind {
-        ExprKind::Local(local) => visitor.visit_local(local),
-        ExprKind::Constant(constant) => visitor.visit_constant(constant),
-        ExprKind::Closure { captures, .. } => {
+    match expr {
+        Expr::Local(local) => visitor.visit_local(local),
+        Expr::Constant(constant) => visitor.visit_constant(constant),
+        Expr::Closure { captures, .. } => {
             for (index, capture) in captures.iter_mut().enumerate() {
                 visitor.visit_capture(index, capture);
             }
         }
-        ExprKind::GetTable { table, key } => {
+        Expr::GetTable { table, key } => {
             visitor.visit_expr(table);
             visitor.visit_expr(key);
         }
-        ExprKind::GetGlobal(name) => visitor.visit_global(name),
-        ExprKind::Binary { lhs, rhs, .. } => {
+        Expr::GetGlobal(name) => visitor.visit_global(name),
+        Expr::Binary { lhs, rhs, .. } => {
             visitor.visit_expr(lhs);
             visitor.visit_expr(rhs);
         }
-        ExprKind::Unary { value, .. } => visitor.visit_expr(value),
-        ExprKind::Concat(values) => {
+        Expr::Unary { value, .. } => visitor.visit_expr(value),
+        Expr::Concat(values) => {
             for value in values {
                 visitor.visit_expr(value);
             }
         }
-        ExprKind::Select {
+        Expr::Select {
             condition,
             then_value,
             else_value,
@@ -479,9 +479,9 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut Expr) {
             visitor.visit_expr(then_value);
             visitor.visit_expr(else_value);
         }
-        ExprKind::NewTable => {}
-        ExprKind::Project { pack, .. } => visitor.visit_pack_expr(pack),
-        ExprKind::LoadCell(cell) => visitor.visit_cell(cell),
+        Expr::NewTable => {}
+        Expr::Project { pack, .. } => visitor.visit_pack_expr(pack),
+        Expr::LoadCell(cell) => visitor.visit_cell(cell),
     }
 }
 
@@ -501,9 +501,9 @@ pub fn walk_place_mut<V: VisitorMut + ?Sized>(visitor: &mut V, place: &mut Place
 
 /// Walks one mutable value-pack expression in evaluation order.
 pub fn walk_pack_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, pack: &mut PackExpr) {
-    match &mut pack.kind {
-        PackExprKind::Local(local) => visitor.visit_pack_local(local),
-        PackExprKind::Values { head, tail } => {
+    match pack {
+        PackExpr::Local(local) => visitor.visit_pack_local(local),
+        PackExpr::Values { head, tail } => {
             for value in head {
                 visitor.visit_expr(value);
             }
@@ -511,14 +511,14 @@ pub fn walk_pack_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, pack: &mut Pa
                 visitor.visit_pack_expr(tail);
             }
         }
-        PackExprKind::Call { function, args } => {
+        PackExpr::Call { function, args } => {
             visitor.visit_expr(function);
             visitor.visit_pack_expr(args);
         }
-        PackExprKind::MethodCall { object, args, .. } => {
+        PackExpr::MethodCall { object, args, .. } => {
             visitor.visit_expr(object);
             visitor.visit_pack_expr(args);
         }
-        PackExprKind::VarArgs => {}
+        PackExpr::VarArgs => {}
     }
 }

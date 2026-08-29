@@ -2,7 +2,6 @@
 
 pub(crate) mod materialize;
 pub(crate) mod passes;
-mod verify;
 pub(crate) mod visitor;
 
 use id_arena::{Arena, Id};
@@ -34,15 +33,6 @@ pub(crate) struct PackLocal {
     pub(crate) source: PackId,
 }
 
-/// Location of one instruction in the FIR function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct InstrOrigin {
-    /// Block that contains the instruction.
-    pub(crate) block: usize,
-    /// Instruction index inside the block.
-    pub(crate) instr: usize,
-}
-
 /// A value or cell captured by a closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Capture {
@@ -54,56 +44,7 @@ pub(crate) enum Capture {
 
 /// One nested value expression.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Expr {
-    /// FIR instruction represented by this expression node.
-    pub(crate) origin: Option<InstrOrigin>,
-    /// Semantic expression operation.
-    pub(crate) kind: ExprKind,
-}
-
-impl Expr {
-    /// Creates a local reference with no instruction provenance.
-    #[inline]
-    #[must_use]
-    fn local(local: LocalId) -> Self {
-        Self {
-            origin: None,
-            kind: ExprKind::Local(local),
-        }
-    }
-
-    /// Creates a literal boolean with no instruction provenance.
-    #[inline]
-    #[must_use]
-    fn boolean(value: bool) -> Self {
-        Self {
-            origin: None,
-            kind: ExprKind::Constant(Constant::Bool(value)),
-        }
-    }
-
-    /// Creates a nil value with no instruction provenance.
-    fn nil() -> Self {
-        Self {
-            origin: None,
-            kind: ExprKind::Constant(Constant::Nil),
-        }
-    }
-
-    /// Creates one expression produced by a FIR instruction.
-    #[inline]
-    #[must_use]
-    fn produced(origin: InstrOrigin, kind: ExprKind) -> Self {
-        Self {
-            origin: Some(origin),
-            kind,
-        }
-    }
-}
-
-/// Semantic operation of one nested expression.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ExprKind {
+pub(crate) enum Expr {
     /// Reads one stable local.
     Local(LocalId),
     /// Evaluates one literal.
@@ -164,58 +105,29 @@ pub(crate) enum ExprKind {
     LoadCell(CellId),
 }
 
+impl Expr {
+    /// Creates a local reference.
+    #[inline]
+    const fn local(local: LocalId) -> Self {
+        Self::Local(local)
+    }
+
+    /// Creates a literal boolean.
+    #[inline]
+    const fn boolean(value: bool) -> Self {
+        Self::Constant(Constant::Bool(value))
+    }
+
+    /// Creates a nil value.
+    #[inline]
+    const fn nil() -> Self {
+        Self::Constant(Constant::Nil)
+    }
+}
+
 /// One nested value-pack expression.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PackExpr {
-    /// FIR instruction represented by this pack node.
-    pub(crate) origin: Option<InstrOrigin>,
-    /// Semantic pack operation.
-    pub(crate) kind: PackExprKind,
-}
-
-impl PackExpr {
-    /// Creates a pack-local reference with no instruction provenance.
-    #[inline]
-    #[must_use]
-    fn local(local: PackLocalId) -> Self {
-        Self {
-            origin: None,
-            kind: PackExprKind::Local(local),
-        }
-    }
-
-    /// Creates one pack produced by a FIR instruction.
-    #[inline]
-    #[must_use]
-    fn produced(origin: InstrOrigin, kind: PackExprKind) -> Self {
-        Self {
-            origin: Some(origin),
-            kind,
-        }
-    }
-
-    /// Returns the fixed number of values produced by a pack when statically known.
-    #[inline]
-    pub fn fixed_len(&self) -> Option<usize> {
-        match &self.kind {
-            PackExprKind::Values { head, tail } => {
-                let tail_len = match tail {
-                    Some(tail) => tail.fixed_len()?,
-                    None => 0,
-                };
-                Some(head.len() + tail_len)
-            }
-            PackExprKind::Local(_)
-            | PackExprKind::Call { .. }
-            | PackExprKind::MethodCall { .. }
-            | PackExprKind::VarArgs => None,
-        }
-    }
-}
-
-/// Semantic operation of one nested pack expression.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PackExprKind {
+pub(crate) enum PackExpr {
     /// Reads one stable pack local.
     Local(PackLocalId),
     /// Joins fixed head values with an optional pack tail.
@@ -245,6 +157,30 @@ pub(crate) enum PackExprKind {
     VarArgs,
 }
 
+impl PackExpr {
+    /// Creates a pack-local reference.
+    #[inline]
+    #[must_use]
+    fn local(local: PackLocalId) -> Self {
+        Self::Local(local)
+    }
+
+    /// Returns the fixed number of values produced by a pack when statically known.
+    #[inline]
+    pub fn fixed_len(&self) -> Option<usize> {
+        match self {
+            Self::Values { head, tail } => {
+                let tail_len = match tail {
+                    Some(tail) => tail.fixed_len()?,
+                    None => 0,
+                };
+                Some(head.len() + tail_len)
+            }
+            Self::Local(_) | Self::Call { .. } | Self::MethodCall { .. } | Self::VarArgs => None,
+        }
+    }
+}
+
 /// One writable NIR location.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Place {
@@ -270,8 +206,6 @@ pub(crate) enum Place {
 pub(crate) enum Stmt {
     /// Writes one value into one location.
     Bind {
-        /// FIR effect represented by this statement, when one exists.
-        origin: Option<InstrOrigin>,
         /// Destination place.
         target: Place,
         /// Value being written.
@@ -300,8 +234,6 @@ pub(crate) enum Stmt {
     },
     /// Opens one mutable captured cell.
     OpenCell {
-        /// FIR effect represented by this statement.
-        origin: InstrOrigin,
         /// Cell being opened.
         cell: CellId,
         /// Initial cell value.
@@ -309,8 +241,6 @@ pub(crate) enum Stmt {
     },
     /// Writes a sequence into a table array part.
     SetList {
-        /// FIR effect represented by this statement.
-        origin: InstrOrigin,
         /// Destination table.
         table: Expr,
         /// One-based array index.
@@ -473,11 +403,10 @@ mod tests {
     /// Materializes and concretely inlines an adjacent branch condition.
     #[test]
     #[ignore = "inlining is temporarily disabled"]
-    fn materializes_condition_without_virtual_ownership() {
+    fn materializes_condition_for_inlining() {
         let fir = branch_function();
         fir.verify().unwrap();
         let function = materialize::lower(&fir, &Diagnostics::default()).unwrap();
-        function.verify(&fir).unwrap();
 
         let Region::Sequence(nodes) = &function.body else {
             panic!("root must be a sequence");
@@ -489,10 +418,7 @@ mod tests {
         assert!(matches!(
             &nodes[1],
             Region::If {
-                condition: Expr {
-                    origin: Some(InstrOrigin { block: 0, instr: 0 }),
-                    kind: ExprKind::Binary { op: BinOp::Lt, .. },
-                },
+                condition: Expr::Binary { op: BinOp::Lt, .. },
                 ..
             }
         ));
@@ -574,7 +500,6 @@ mod tests {
         let fir = phi_function();
         fir.verify().unwrap();
         let mut function = materialize::lower(&fir, &Diagnostics::default()).unwrap();
-        function.verify(&fir).unwrap();
 
         assert_eq!(function.locals.len(), fir.values.len());
         assert!(function.prologue.is_empty());
@@ -586,13 +511,8 @@ mod tests {
             panic!("entry must remain a block");
         };
         let Some(Stmt::Bind {
-            origin: None,
             target: Place::Local(initialization),
-            value:
-                Expr {
-                    kind: ExprKind::Constant(Constant::Nil),
-                    ..
-                },
+            value: Expr::Constant(Constant::Nil),
         }) = stmts.first()
         else {
             panic!("entry must contain the Phi initialization before passes");
@@ -629,7 +549,6 @@ mod tests {
 
         passes::run(std::slice::from_mut(&mut function));
         materialize::destroy_ssa(&mut function);
-        function.verify(&fir).unwrap();
 
         let Region::Sequence(nodes) = &function.body else {
             panic!("root must remain a sequence");

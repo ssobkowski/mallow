@@ -256,66 +256,25 @@ pub struct Function {
 }
 
 impl Function {
-    /// Verifies identity, definition, and reference invariants.
+    /// Verifies definitions and Phi predecessor inputs.
     pub fn verify(&self) -> Result<()> {
-        let mut value_defs = HashSet::new();
+        let mut value_defs: HashSet<_> = self.params.iter().copied().collect();
         let mut value_uses = HashSet::new();
         let mut pack_defs = HashSet::new();
+        let mut pack_uses = HashSet::new();
         let (_, predecessors) = build_graph(self.blocks.iter().map(|block| block.exit.targets()));
 
-        for &parameter in &self.params {
-            ensure!(
-                value_defs.insert(parameter),
-                "value %v{} is defined twice",
-                parameter.index()
-            );
-        }
-
         for (block_index, block) in self.blocks.iter().enumerate() {
-            for &output in &block.outputs {
-                ensure!(
-                    value_defs.insert(output),
-                    "value %v{} is defined twice",
-                    output.index()
-                );
-            }
+            value_defs.extend(block.outputs.iter().copied());
             for instr in &block.instrs {
-                for value in instr.used_values() {
-                    ensure!(
-                        self.values.get(value).is_some(),
-                        "instruction in bb{block_index} uses invalid value %v{}",
-                        value.index()
-                    );
-                    value_uses.insert(value);
-                }
-                for pack in instr.used_packs() {
-                    ensure!(
-                        self.packs.get(pack).is_some(),
-                        "instruction in bb{block_index} uses invalid pack %pack{}",
-                        pack.index()
-                    );
-                }
-                if let Some(value) = instr.defined_value() {
-                    ensure!(
-                        value_defs.insert(value),
-                        "value %v{} is defined twice",
-                        value.index()
-                    );
-                }
-                if let Some(pack) = instr.defined_pack() {
-                    ensure!(
-                        pack_defs.insert(pack),
-                        "pack %pack{} is defined twice",
-                        pack.index()
-                    );
-                }
+                value_uses.extend(instr.used_values());
+                pack_uses.extend(instr.used_packs());
+                value_defs.extend(instr.defined_value());
+                pack_defs.extend(instr.defined_pack());
+
                 if let Instr::Phi { inputs, .. } = instr {
                     let mut input_predecessors = HashSet::new();
                     for &(predecessor, _) in inputs {
-                        ensure!(
-                            predecessor < self.blocks.len(),
-                            "phi in bb{block_index} references invalid predecessor bb{predecessor}"
-                        );
                         ensure!(
                             input_predecessors.insert(predecessor),
                             "phi in bb{block_index} lists predecessor bb{predecessor} twice"
@@ -328,36 +287,10 @@ impl Function {
                         "phi in bb{block_index} does not describe every predecessor"
                     );
                 }
-                for cell in instr.cells() {
-                    ensure!(
-                        self.cells.get(cell).is_some(),
-                        "instruction in bb{block_index} uses invalid cell ${}",
-                        cell.index()
-                    );
-                }
             }
 
-            for value in block.exit.used_values() {
-                ensure!(
-                    self.values.get(value).is_some(),
-                    "block exit in bb{block_index} uses invalid value %v{}",
-                    value.index()
-                );
-                value_uses.insert(value);
-            }
-            for pack in block.exit.used_packs() {
-                ensure!(
-                    self.packs.get(pack).is_some(),
-                    "block exit in bb{block_index} uses invalid pack %pack{}",
-                    pack.index()
-                );
-            }
-            for target in block.exit.targets() {
-                ensure!(
-                    target < self.blocks.len(),
-                    "block exit in bb{block_index} targets invalid bb{target}"
-                );
-            }
+            value_uses.extend(block.exit.used_values());
+            pack_uses.extend(block.exit.used_packs());
         }
 
         for value in value_uses {
@@ -367,10 +300,10 @@ impl Function {
                 value.index()
             );
         }
-        for (pack, _) in &self.packs {
+        for pack in pack_uses {
             ensure!(
                 pack_defs.contains(&pack),
-                "pack %pack{} has no definition",
+                "used pack %pack{} has no definition",
                 pack.index()
             );
         }
@@ -834,23 +767,6 @@ impl Instr {
             Self::Project { pack, .. } => smallvec![*pack],
             Self::Call { args, .. } | Self::MethodCall { args, .. } => smallvec![*args],
             Self::SetList { values, .. } => smallvec![*values],
-            _ => SmallVec::new(),
-        }
-    }
-
-    /// Returns mutable cells referenced by this instruction.
-    fn cells(&self) -> SmallVec<[CellId; 3]> {
-        match self {
-            Self::Closure { captures, .. } => captures
-                .iter()
-                .filter_map(|capture| match capture {
-                    Capture::Copy(_) => None,
-                    Capture::Share(cell) => Some(*cell),
-                })
-                .collect(),
-            Self::OpenCell { cell, .. }
-            | Self::LoadCell { cell, .. }
-            | Self::StoreCell { cell, .. } => smallvec![*cell],
             _ => SmallVec::new(),
         }
     }

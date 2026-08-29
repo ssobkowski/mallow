@@ -520,15 +520,15 @@ impl<'a> BindingCollector<'a> {
 
     /// Visits one scalar expression.
     fn expr(&mut self, expr: &'a nir::Expr, scope: usize) {
-        match &expr.kind {
-            nir::ExprKind::Local(local) => self.touch(
+        match expr {
+            nir::Expr::Local(local) => self.touch(
                 BindingKey::Local(*local),
                 scope,
                 false,
                 LocalRole::Value,
                 None,
             ),
-            nir::ExprKind::Closure { captures, .. } => {
+            nir::Expr::Closure { captures, .. } => {
                 for capture in captures {
                     match capture {
                         nir::Capture::Copy(local) => self.touch(
@@ -544,21 +544,21 @@ impl<'a> BindingCollector<'a> {
                     }
                 }
             }
-            nir::ExprKind::GetTable { table, key } => {
+            nir::Expr::GetTable { table, key } => {
                 self.expr(table, scope);
                 self.expr(key, scope);
             }
-            nir::ExprKind::Binary { lhs, rhs, .. } => {
+            nir::Expr::Binary { lhs, rhs, .. } => {
                 self.expr(lhs, scope);
                 self.expr(rhs, scope);
             }
-            nir::ExprKind::Unary { value, .. } => self.expr(value, scope),
-            nir::ExprKind::Concat(values) => {
+            nir::Expr::Unary { value, .. } => self.expr(value, scope),
+            nir::Expr::Concat(values) => {
                 for value in values {
                     self.expr(value, scope);
                 }
             }
-            nir::ExprKind::Select {
+            nir::Expr::Select {
                 condition,
                 then_value,
                 else_value,
@@ -567,25 +567,25 @@ impl<'a> BindingCollector<'a> {
                 self.expr(then_value, scope);
                 self.expr(else_value, scope);
             }
-            nir::ExprKind::Project { pack, .. } => self.pack_expr(pack, scope),
-            nir::ExprKind::LoadCell(cell) => {
+            nir::Expr::Project { pack, .. } => self.pack_expr(pack, scope),
+            nir::Expr::LoadCell(cell) => {
                 self.touch(BindingKey::Cell(*cell), scope, false, LocalRole::Cell, None)
             }
-            nir::ExprKind::Constant(_) | nir::ExprKind::GetGlobal(_) | nir::ExprKind::NewTable => {}
+            nir::Expr::Constant(_) | nir::Expr::GetGlobal(_) | nir::Expr::NewTable => {}
         }
     }
 
     /// Visits one pack expression.
     fn pack_expr(&mut self, pack: &'a nir::PackExpr, scope: usize) {
-        match &pack.kind {
-            nir::PackExprKind::Local(local) => self.touch(
+        match pack {
+            nir::PackExpr::Local(local) => self.touch(
                 BindingKey::Pack(*local),
                 scope,
                 false,
                 LocalRole::Pack,
                 None,
             ),
-            nir::PackExprKind::Values { head, tail } => {
+            nir::PackExpr::Values { head, tail } => {
                 for value in head {
                     self.expr(value, scope);
                 }
@@ -593,15 +593,15 @@ impl<'a> BindingCollector<'a> {
                     self.pack_expr(tail, scope);
                 }
             }
-            nir::PackExprKind::Call { function, args } => {
+            nir::PackExpr::Call { function, args } => {
                 self.expr(function, scope);
                 self.pack_expr(args, scope);
             }
-            nir::PackExprKind::MethodCall { object, args, .. } => {
+            nir::PackExpr::MethodCall { object, args, .. } => {
                 self.expr(object, scope);
                 self.pack_expr(args, scope);
             }
-            nir::PackExprKind::VarArgs => {}
+            nir::PackExpr::VarArgs => {}
         }
     }
 }
@@ -650,7 +650,7 @@ mod tests {
 
     use super::*;
     use crate::ir::fir::{Constant, Value};
-    use crate::ir::nir::{Expr, ExprKind, Function, Local, Place, Region, Stmt};
+    use crate::ir::nir::{Expr, Function, Local, Place, Region, Stmt};
 
     /// Builds one flat function with the requested local count.
     fn flat_function(count: usize) -> Function {
@@ -661,12 +661,8 @@ mod tests {
             let source = values.alloc(Value);
             let local = locals.alloc(Local { source });
             stmts.push(Stmt::Bind {
-                origin: None,
                 target: Place::Local(local),
-                value: Expr {
-                    origin: None,
-                    kind: ExprKind::Constant(Constant::Nil),
-                },
+                value: Expr::Constant(Constant::Nil),
             });
         }
         Function {

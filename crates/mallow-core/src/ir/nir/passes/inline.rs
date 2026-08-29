@@ -5,8 +5,7 @@ use smallvec::SmallVec;
 use crate::ir::fir::ValueId;
 use crate::ir::nir::visitor::{VisitorMut, walk_expr_mut, walk_pack_expr_mut, walk_stmts_mut};
 use crate::ir::nir::{
-    Capture, Expr, ExprKind, Function, LocalId, PackExpr, PackExprKind, PackLocalId, Place, Region,
-    Stmt,
+    Capture, Expr, Function, LocalId, PackExpr, PackLocalId, Place, Region, Stmt,
 };
 use crate::operator::BinOp;
 
@@ -288,9 +287,9 @@ impl<'nir> DefUse<'nir> {
             let [LocalUse::Expression(site)] = chain.uses.as_slice() else {
                 continue;
             };
-            let can_move = match value.kind {
-                ExprKind::Constant(_) => true,
-                ExprKind::Local(_) => site.is_adjacent_to(statement),
+            let can_move = match value {
+                Expr::Constant(_) => true,
+                Expr::Local(_) => site.is_adjacent_to(statement),
                 _ => site.preserves(statement),
             };
             if !can_move {
@@ -481,23 +480,23 @@ impl<'nir> DefUse<'nir> {
 
     /// Collects scalar and pack uses from one scalar expression.
     fn collect_expr(&mut self, expr: &'nir Expr, context: UseContext<'nir>) {
-        match &expr.kind {
-            ExprKind::Local(local) => {
+        match expr {
+            Expr::Local(local) => {
                 self.use_local(*local, LocalUse::Expression(context.local_site()));
             }
-            ExprKind::Constant(_) | ExprKind::GetGlobal(_) | ExprKind::NewTable => {}
-            ExprKind::Closure { captures, .. } => {
+            Expr::Constant(_) | Expr::GetGlobal(_) | Expr::NewTable => {}
+            Expr::Closure { captures, .. } => {
                 for capture in captures {
                     if let Capture::Copy(local) = capture {
                         self.use_local(*local, LocalUse::Capture);
                     }
                 }
             }
-            ExprKind::GetTable { table, key } => {
+            Expr::GetTable { table, key } => {
                 self.collect_expr(table, context);
                 self.collect_expr(key, context.after_expr(table));
             }
-            ExprKind::Binary { lhs, op, rhs } => {
+            Expr::Binary { lhs, op, rhs } => {
                 self.collect_expr(lhs, context);
                 let rhs_context = if matches!(op, BinOp::And | BinOp::Or) {
                     context.conditional()
@@ -506,15 +505,15 @@ impl<'nir> DefUse<'nir> {
                 };
                 self.collect_expr(rhs, rhs_context);
             }
-            ExprKind::Unary { value, .. } => self.collect_expr(value, context),
-            ExprKind::Concat(values) => {
+            Expr::Unary { value, .. } => self.collect_expr(value, context),
+            Expr::Concat(values) => {
                 let mut context = context;
                 for value in values {
                     self.collect_expr(value, context);
                     context = context.after_expr(value);
                 }
             }
-            ExprKind::Select {
+            Expr::Select {
                 condition,
                 then_value,
                 else_value,
@@ -524,16 +523,16 @@ impl<'nir> DefUse<'nir> {
                 self.collect_expr(then_value, branch_context);
                 self.collect_expr(else_value, branch_context);
             }
-            ExprKind::Project { pack, .. } => self.collect_pack_expr(pack, context),
-            ExprKind::LoadCell(_) => {}
+            Expr::Project { pack, .. } => self.collect_pack_expr(pack, context),
+            Expr::LoadCell(_) => {}
         }
     }
 
     /// Collects scalar and pack uses from one pack expression.
     fn collect_pack_expr(&mut self, pack: &'nir PackExpr, context: UseContext<'nir>) {
-        match &pack.kind {
-            PackExprKind::Local(local) => self.use_pack(*local, context.pack_site()),
-            PackExprKind::Values { head, tail } => {
+        match pack {
+            PackExpr::Local(local) => self.use_pack(*local, context.pack_site()),
+            PackExpr::Values { head, tail } => {
                 let mut context = context;
                 for value in head {
                     self.collect_expr(value, context);
@@ -543,15 +542,15 @@ impl<'nir> DefUse<'nir> {
                     self.collect_pack_expr(tail, context);
                 }
             }
-            PackExprKind::Call { function, args } => {
+            PackExpr::Call { function, args } => {
                 self.collect_expr(function, context);
                 self.collect_pack_expr(args, context.after_expr(function));
             }
-            PackExprKind::MethodCall { object, args, .. } => {
+            PackExpr::MethodCall { object, args, .. } => {
                 self.collect_expr(object, context);
                 self.collect_pack_expr(args, context.after_expr(object));
             }
-            PackExprKind::VarArgs => {}
+            PackExpr::VarArgs => {}
         }
     }
 }
@@ -569,7 +568,7 @@ fn place_is_stable_prefix(place: &Place) -> bool {
 /// Returns whether an expression is safe to evaluate before a moved value.
 #[inline]
 const fn expr_is_stable_prefix(expr: &Expr) -> bool {
-    matches!(expr.kind, ExprKind::Local(_) | ExprKind::Constant(_))
+    matches!(expr, Expr::Local(_) | Expr::Constant(_))
 }
 
 /// Applies scalar and pack replacements selected by one analysis.
@@ -597,11 +596,11 @@ impl VisitorMut for Inliner {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
-        while let ExprKind::Local(local) = expr.kind
-            && let Some(replacement) = self.replacements.locals.get(&local)
-        {
-            expr.origin = replacement.origin;
-            expr.kind = replacement.kind.clone();
+        while let Expr::Local(local) = expr {
+            let Some(replacement) = self.replacements.locals.get(local) else {
+                break;
+            };
+            *expr = replacement.clone();
             self.changed = true;
         }
 
@@ -609,11 +608,11 @@ impl VisitorMut for Inliner {
     }
 
     fn visit_pack_expr(&mut self, pack: &mut PackExpr) {
-        while let PackExprKind::Local(local) = pack.kind
-            && let Some(replacement) = self.replacements.packs.get(&local)
-        {
-            pack.origin = replacement.origin;
-            pack.kind = replacement.kind.clone();
+        while let PackExpr::Local(local) = pack {
+            let Some(replacement) = self.replacements.packs.get(local) else {
+                break;
+            };
+            *pack = replacement.clone();
             self.changed = true;
         }
 

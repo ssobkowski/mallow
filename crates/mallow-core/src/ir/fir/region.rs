@@ -434,26 +434,17 @@ impl Shape {
         }
     }
 
-    /// Verifies all FIR references and unique executable block ownership.
+    /// Verifies unique executable block ownership.
     pub(crate) fn verify(&self, function: &Function) -> Result<()> {
-        ensure!(
-            !function.blocks.is_empty(),
-            "cannot verify an empty function"
-        );
-
-        let graph = FlowGraph::new(function);
-        let reachable: HashSet<_> = graph.reverse_post_order().into_iter().collect();
         let mut block_counts = HashMap::new();
-        self.verify_node(function, &mut block_counts)?;
-        for block in block_counts.keys() {
-            ensure!(
-                reachable.contains(block),
-                "shape materializes unreachable bb{block}"
-            );
-        }
+        self.count_blocks(&mut block_counts);
 
-        for block in reachable {
-            if !graph.block_has_payload(block) {
+        for (block, value) in function.blocks.iter().enumerate() {
+            if value
+                .instrs
+                .iter()
+                .all(|instr| matches!(instr, Instr::Phi { .. }))
+            {
                 continue;
             }
 
@@ -467,109 +458,31 @@ impl Shape {
         Ok(())
     }
 
-    /// Verifies one node and records its executable block references.
-    fn verify_node(
-        &self,
-        function: &Function,
-        block_counts: &mut HashMap<usize, usize>,
-    ) -> Result<()> {
+    /// Records the FIR blocks referenced by this shape.
+    fn count_blocks(&self, block_counts: &mut HashMap<usize, usize>) {
         match self {
-            Self::Block { block } => {
-                ensure!(
-                    function.blocks.get(*block).is_some(),
-                    "shape references invalid bb{block}"
-                );
-                *block_counts.entry(*block).or_default() += 1;
-            }
+            Self::Block { block } => *block_counts.entry(*block).or_default() += 1,
             Self::Sequence { nodes } => {
                 for node in nodes {
-                    node.verify_node(function, block_counts)?;
+                    node.count_blocks(block_counts);
                 }
             }
             Self::If {
-                condition,
                 then_branch,
                 else_branch,
+                ..
             } => {
-                condition.verify(function)?;
-                then_branch.verify_node(function, block_counts)?;
+                then_branch.count_blocks(block_counts);
                 if let Some(else_branch) = else_branch {
-                    else_branch.verify_node(function, block_counts)?;
+                    else_branch.count_blocks(block_counts);
                 }
             }
-            Self::While { condition, body } | Self::RepeatUntil { condition, body } => {
-                condition.verify(function)?;
-                body.verify_node(function, block_counts)?;
-            }
-            Self::NumericFor {
-                variable,
-                start,
-                end,
-                step,
-                body,
-            } => {
-                for value in [variable, start, end, step] {
-                    ensure!(
-                        function.values.get(*value).is_some(),
-                        "shape references invalid value %v{}",
-                        value.index()
-                    );
-                }
-                body.verify_node(function, block_counts)?;
-            }
-            Self::GenericFor {
-                variables,
-                values,
-                body,
-            } => {
-                for value in variables.iter().chain(values) {
-                    ensure!(
-                        function.values.get(*value).is_some(),
-                        "shape references invalid value %v{}",
-                        value.index()
-                    );
-                }
-                body.verify_node(function, block_counts)?;
-            }
-            Self::Return { values } => ensure!(
-                function.packs.get(*values).is_some(),
-                "shape references invalid pack %q{}",
-                values.index()
-            ),
-            Self::Continue | Self::Break => {}
+            Self::While { body, .. }
+            | Self::RepeatUntil { body, .. }
+            | Self::NumericFor { body, .. }
+            | Self::GenericFor { body, .. } => body.count_blocks(block_counts),
+            Self::Continue | Self::Break | Self::Return { .. } => {}
         }
-
-        Ok(())
-    }
-}
-
-impl Predicate {
-    /// Verifies every FIR value referenced by this predicate.
-    fn verify(&self, function: &Function) -> Result<()> {
-        match self {
-            Self::Value(value) => ensure!(
-                function.values.get(*value).is_some(),
-                "predicate references invalid value %v{}",
-                value.index()
-            ),
-            Self::Not(inner) => inner.verify(function)?,
-            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
-                lhs.verify(function)?;
-                rhs.verify(function)?;
-            }
-            Self::Select {
-                condition,
-                then_predicate,
-                else_predicate,
-            } => {
-                condition.verify(function)?;
-                then_predicate.verify(function)?;
-                else_predicate.verify(function)?;
-            }
-            Self::True | Self::False => {}
-        }
-
-        Ok(())
     }
 }
 

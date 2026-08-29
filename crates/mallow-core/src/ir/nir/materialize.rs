@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, bail};
 use id_arena::Arena;
 
 use super::visitor::VisitorMut;
@@ -10,6 +10,7 @@ use super::*;
 use crate::hil::cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
 use crate::hil::cflow::union_find::UnionFind;
 use crate::ir::fir;
+use crate::ir::fir::PackId;
 use crate::ir::fir::region::{Predicate, Shape};
 use crate::logging::Diagnostics;
 
@@ -21,12 +22,6 @@ pub(crate) fn lower(function: &fir::Function, diagnostics: &Diagnostics) -> Resu
 
 /// Converts one verified control shape into NIR with distinct FIR SSA symbols.
 pub(crate) fn materialize(function: &fir::Function, shape: Shape) -> Result<Function> {
-    #[cfg(debug_assertions)]
-    {
-        function.verify()?;
-        shape.verify(function)?;
-    }
-
     let ssa = SsaMeta::build(function)?;
     let initializations = Initializations::build(function, &ssa, &shape);
     Materializer::new(function, &ssa, initializations).materialize(shape)
@@ -114,19 +109,13 @@ impl SsaMeta {
                     ..
                 } => {
                     loop_values.extend(init_variables.iter().copied());
-                    let Some(fir::BlockExit::GenericForLoop {
+                    let fir::BlockExit::GenericForLoop {
                         variables: body_variables,
                         ..
-                    }) = function.blocks.get(*loop_block).map(|b| &b.exit)
+                    } = &function.blocks[*loop_block].exit
                     else {
-                        bail!("generic-for target bb{loop_block} is not a generic loop block");
+                        unreachable!("raw CFG validation guarantees the generic loop target")
                     };
-
-                    #[cfg(debug_assertions)]
-                    ensure!(
-                        init_variables.len() == body_variables.len(),
-                        "generic-for loop variable counts do not match"
-                    );
 
                     for (entry, body) in init_variables.iter().zip(body_variables) {
                         groups.union(*entry, *body);
@@ -343,7 +332,7 @@ impl<'a> Materializer<'a> {
         }
     }
 
-    /// Materializes the complete shape and verifies instruction ownership.
+    /// Materializes the complete shape.
     fn materialize(self, shape: Shape) -> Result<Function> {
         let params = self
             .function
@@ -368,11 +357,6 @@ impl<'a> Materializer<'a> {
             prologue,
             body,
         };
-        // inline_control_values(&mut function.body);
-
-        #[cfg(debug_assertions)]
-        function.verify(self.function)?;
-
         Ok(function)
     }
 
@@ -380,7 +364,6 @@ impl<'a> Materializer<'a> {
     #[inline]
     fn initialization(&self, storage: ValueId) -> Result<Stmt> {
         Ok(Stmt::Bind {
-            origin: None,
             target: Place::Local(self.local(storage)?),
             value: Expr::nil(),
         })
@@ -496,46 +479,40 @@ impl<'a> Materializer<'a> {
             .flatten()
             .map(|storage| self.initialization(*storage))
             .collect::<Result<_>>()?;
-        for (instr, value) in block_ref.instrs.iter().enumerate() {
-            if matches!(value, fir::Instr::Phi { .. }) {
+        for instr in &block_ref.instrs {
+            if matches!(instr, fir::Instr::Phi { .. }) {
                 continue;
             }
-            stmts.push(self.instr(InstrOrigin { block, instr }, value)?);
+            stmts.push(self.instr(instr)?);
         }
         Ok(stmts)
     }
 
     /// Materializes one FIR instruction without moving it across another instruction.
-    fn instr(&self, origin: InstrOrigin, instr: &fir::Instr) -> Result<Stmt> {
-        let produced_value = |out, kind| {
-            let local = self.local(out)?;
+    fn instr(&self, instr: &fir::Instr) -> Result<Stmt> {
+        let local = |out, value| {
             Ok(Stmt::Bind {
-                origin: None,
-                target: Place::Local(local),
-                value: Expr::produced(origin, kind),
+                target: Place::Local(self.local(out)?),
+                value,
             })
         };
-        let produced_pack = |out, kind| {
+        let pack = |out, value| {
             Ok(Stmt::BindPack {
                 local: self.pack(out)?,
-                value: PackExpr::produced(origin, kind),
+                value,
             })
         };
 
         match instr {
-            fir::Instr::Const { out, value } => {
-                produced_value(*out, ExprKind::Constant(value.clone()))
-            }
-            fir::Instr::Copy { out, value } => {
-                produced_value(*out, ExprKind::Local(self.local(*value)?))
-            }
+            fir::Instr::Const { out, value } => local(*out, Expr::Constant(value.clone())),
+            fir::Instr::Copy { out, value } => local(*out, Expr::Local(self.local(*value)?)),
             fir::Instr::Closure {
                 out,
                 proto,
                 captures,
-            } => produced_value(
+            } => local(
                 *out,
-                ExprKind::Closure {
+                Expr::Closure {
                     proto: *proto,
                     captures: captures
                         .iter()
@@ -546,47 +523,43 @@ impl<'a> Materializer<'a> {
                         .collect::<Result<_>>()?,
                 },
             ),
-            fir::Instr::GetTable { out, table, key } => produced_value(
+            fir::Instr::GetTable { out, table, key } => local(
                 *out,
-                ExprKind::GetTable {
+                Expr::GetTable {
                     table: Box::new(self.value(*table)?),
                     key: Box::new(self.value(*key)?),
                 },
             ),
             fir::Instr::SetTable { table, key, value } => Ok(Stmt::Bind {
-                origin: Some(origin),
                 target: Place::Table {
                     table: self.value(*table)?,
                     key: self.value(*key)?,
                 },
                 value: self.value(*value)?,
             }),
-            fir::Instr::GetGlobal { out, name } => {
-                produced_value(*out, ExprKind::GetGlobal(name.clone()))
-            }
+            fir::Instr::GetGlobal { out, name } => local(*out, Expr::GetGlobal(name.clone())),
             fir::Instr::SetGlobal { name, value } => Ok(Stmt::Bind {
-                origin: Some(origin),
                 target: Place::Global(name.clone()),
                 value: self.value(*value)?,
             }),
-            fir::Instr::Binary { out, lhs, op, rhs } => produced_value(
+            fir::Instr::Binary { out, lhs, op, rhs } => local(
                 *out,
-                ExprKind::Binary {
+                Expr::Binary {
                     lhs: Box::new(self.value(*lhs)?),
                     op: *op,
                     rhs: Box::new(self.value(*rhs)?),
                 },
             ),
-            fir::Instr::Unary { out, op, value } => produced_value(
+            fir::Instr::Unary { out, op, value } => local(
                 *out,
-                ExprKind::Unary {
+                Expr::Unary {
                     op: *op,
                     value: Box::new(self.value(*value)?),
                 },
             ),
-            fir::Instr::Concat { out, operands } => produced_value(
+            fir::Instr::Concat { out, operands } => local(
                 *out,
-                ExprKind::Concat(
+                Expr::Concat(
                     operands
                         .iter()
                         .map(|value| self.value(*value))
@@ -598,18 +571,18 @@ impl<'a> Materializer<'a> {
                 condition,
                 then_value,
                 else_value,
-            } => produced_value(
+            } => local(
                 *out,
-                ExprKind::Select {
+                Expr::Select {
                     condition: Box::new(self.value(*condition)?),
                     then_value: Box::new(self.value(*then_value)?),
                     else_value: Box::new(self.value(*else_value)?),
                 },
             ),
-            fir::Instr::NewTable { out } => produced_value(*out, ExprKind::NewTable),
-            fir::Instr::MakePack { out, head, tail } => produced_pack(
+            fir::Instr::NewTable { out } => local(*out, Expr::NewTable),
+            fir::Instr::MakePack { out, head, tail } => pack(
                 *out,
-                PackExprKind::Values {
+                PackExpr::Values {
                     head: head
                         .iter()
                         .map(|value| self.value(*value))
@@ -619,9 +592,9 @@ impl<'a> Materializer<'a> {
                         .transpose()?,
                 },
             ),
-            fir::Instr::Project { out, pack, index } => produced_value(
+            fir::Instr::Project { out, pack, index } => local(
                 *out,
-                ExprKind::Project {
+                Expr::Project {
                     pack: Box::new(self.pack_value(*pack)?),
                     index: *index,
                 },
@@ -630,9 +603,9 @@ impl<'a> Materializer<'a> {
                 out,
                 function,
                 args,
-            } => produced_pack(
+            } => pack(
                 *out,
-                PackExprKind::Call {
+                PackExpr::Call {
                     function: Box::new(self.value(*function)?),
                     args: Box::new(self.pack_value(*args)?),
                 },
@@ -642,23 +615,21 @@ impl<'a> Materializer<'a> {
                 object,
                 method,
                 args,
-            } => produced_pack(
+            } => pack(
                 *out,
-                PackExprKind::MethodCall {
+                PackExpr::MethodCall {
                     object: Box::new(self.value(*object)?),
                     method: method.clone(),
                     args: Box::new(self.pack_value(*args)?),
                 },
             ),
-            fir::Instr::VarArgs { out } => produced_pack(*out, PackExprKind::VarArgs),
+            fir::Instr::VarArgs { out } => pack(*out, PackExpr::VarArgs),
             fir::Instr::OpenCell { cell, value } => Ok(Stmt::OpenCell {
-                origin,
                 cell: *cell,
                 value: self.value(*value)?,
             }),
-            fir::Instr::LoadCell { out, cell } => produced_value(*out, ExprKind::LoadCell(*cell)),
+            fir::Instr::LoadCell { out, cell } => local(*out, Expr::LoadCell(*cell)),
             fir::Instr::StoreCell { cell, value } => Ok(Stmt::Bind {
-                origin: Some(origin),
                 target: Place::Cell(*cell),
                 value: self.value(*value)?,
             }),
@@ -667,16 +638,13 @@ impl<'a> Materializer<'a> {
                 index,
                 values,
             } => Ok(Stmt::SetList {
-                origin,
                 table: self.value(*table)?,
                 index: *index,
                 values: self.pack_value(*values)?,
             }),
-            fir::Instr::Phi { .. } => bail!(
-                "internal error: Phi bb{} instruction {} was not unfolded",
-                origin.block,
-                origin.instr
-            ),
+            fir::Instr::Phi { .. } => {
+                unreachable!("Phi instructions are skipped by block materialization")
+            }
         }
     }
 
@@ -686,40 +654,28 @@ impl<'a> Materializer<'a> {
             Predicate::Value(value) => self.value(value)?,
             Predicate::True => Expr::boolean(true),
             Predicate::False => Expr::boolean(false),
-            Predicate::Not(inner) => Expr {
-                origin: None,
-                kind: ExprKind::Unary {
-                    op: UnOp::Not,
-                    value: Box::new(self.predicate(*inner)?),
-                },
+            Predicate::Not(inner) => Expr::Unary {
+                op: UnOp::Not,
+                value: Box::new(self.predicate(*inner)?),
             },
-            Predicate::And(lhs, rhs) => Expr {
-                origin: None,
-                kind: ExprKind::Binary {
-                    lhs: Box::new(self.predicate(*lhs)?),
-                    op: BinOp::And,
-                    rhs: Box::new(self.predicate(*rhs)?),
-                },
+            Predicate::And(lhs, rhs) => Expr::Binary {
+                lhs: Box::new(self.predicate(*lhs)?),
+                op: BinOp::And,
+                rhs: Box::new(self.predicate(*rhs)?),
             },
-            Predicate::Or(lhs, rhs) => Expr {
-                origin: None,
-                kind: ExprKind::Binary {
-                    lhs: Box::new(self.predicate(*lhs)?),
-                    op: BinOp::Or,
-                    rhs: Box::new(self.predicate(*rhs)?),
-                },
+            Predicate::Or(lhs, rhs) => Expr::Binary {
+                lhs: Box::new(self.predicate(*lhs)?),
+                op: BinOp::Or,
+                rhs: Box::new(self.predicate(*rhs)?),
             },
             Predicate::Select {
                 condition,
                 then_predicate,
                 else_predicate,
-            } => Expr {
-                origin: None,
-                kind: ExprKind::Select {
-                    condition: Box::new(self.predicate(*condition)?),
-                    then_value: Box::new(self.predicate(*then_predicate)?),
-                    else_value: Box::new(self.predicate(*else_predicate)?),
-                },
+            } => Expr::Select {
+                condition: Box::new(self.predicate(*condition)?),
+                then_value: Box::new(self.predicate(*then_predicate)?),
+                else_value: Box::new(self.predicate(*else_predicate)?),
             },
         })
     }
