@@ -58,6 +58,8 @@ struct SsaMeta {
     storage: HashMap<ValueId, ValueId>,
     /// A list of synthetic nil declarations grouped by dominating block.
     declarations: Vec<Vec<ValueId>>,
+    /// Immediate dominators for every reachable FIR block.
+    idoms: DominatorTree,
 }
 
 impl SsaMeta {
@@ -160,6 +162,7 @@ impl SsaMeta {
         Ok(Self {
             storage,
             declarations,
+            idoms,
         })
     }
 
@@ -169,13 +172,21 @@ impl SsaMeta {
         self.storage[&value]
     }
 
-    /// Returns whether one concrete instruction defines the storage before it is read.
-    fn is_defined_before_use_in_block(
+    /// Returns whether concrete code defines the storage before its declaration point.
+    fn is_defined_before_use(
         &self,
         function: &fir::Function,
         block: usize,
         storage: ValueId,
     ) -> bool {
+        let mut dominator = self.idoms.idom(block);
+        while let Some(block) = dominator {
+            if self.block_defines_storage(function, block, storage) {
+                return true;
+            }
+            dominator = self.idoms.idom(block);
+        }
+
         for instr in &function.blocks[block].instrs {
             if matches!(instr, fir::Instr::Phi { .. }) {
                 continue;
@@ -197,6 +208,21 @@ impl SsaMeta {
 
         false
     }
+
+    /// Returns whether one block contains a concrete definition of the storage.
+    fn block_defines_storage(
+        &self,
+        function: &fir::Function,
+        block: usize,
+        storage: ValueId,
+    ) -> bool {
+        function.blocks[block].instrs.iter().any(|instr| {
+            !matches!(instr, fir::Instr::Phi { .. })
+                && instr
+                    .defined_value()
+                    .is_some_and(|value| self.storage(value) == storage)
+        })
+    }
 }
 
 /// Synthetic storage declarations placed in one structured function.
@@ -217,9 +243,12 @@ impl Initializations {
         let mut prologue = Vec::new();
         for (block, storages) in ssa.declarations.iter().enumerate() {
             if initialization_blocks.contains(&block) {
-                by_block[block].extend(storages.iter().copied().filter(|storage| {
-                    !ssa.is_defined_before_use_in_block(function, block, *storage)
-                }));
+                by_block[block].extend(
+                    storages
+                        .iter()
+                        .copied()
+                        .filter(|storage| !ssa.is_defined_before_use(function, block, *storage)),
+                );
             } else {
                 prologue.extend(storages.iter().copied());
             }
