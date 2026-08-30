@@ -84,6 +84,7 @@ impl<'a, G: GraphView> Ssa<'a, G> {
         blocks: &mut [Block],
     ) -> (Arena<Value>, HashMap<ValueId, ValueId>) {
         self.seal_blocks();
+        self.remove_remaining_trivial_phis();
         let mut phis: Vec<_> = std::mem::take(&mut self.phi_to_inputs)
             .into_iter()
             .collect();
@@ -167,7 +168,10 @@ impl<'a, G: GraphView> Ssa<'a, G> {
     /// Records the inputs and reverse uses of one Phi.
     fn record_inputs(&mut self, phi: ValueId, inputs: Vec<(usize, ValueId)>) {
         for (_, value) in &inputs {
-            self.phi_uses.entry(*value).or_default().insert(phi);
+            self.phi_uses
+                .entry(self.resolve(*value))
+                .or_default()
+                .insert(phi);
         }
         self.phi_to_inputs.insert(phi, inputs);
     }
@@ -196,13 +200,30 @@ impl<'a, G: GraphView> Ssa<'a, G> {
         self.aliases.insert(phi, replacement);
 
         if let Some(uses) = self.phi_uses.remove(&phi) {
-            for use_value in uses {
-                if !self.aliases.contains_key(&use_value) {
-                    self.remove_trivial_phi(use_value);
-                }
+            let active_uses: Vec<_> = uses
+                .into_iter()
+                .filter(|use_value| !self.aliases.contains_key(use_value))
+                .collect();
+            self.phi_uses
+                .entry(replacement)
+                .or_default()
+                .extend(active_uses.iter().copied());
+            for use_value in active_uses {
+                self.remove_trivial_phi(use_value);
             }
         }
         replacement
+    }
+
+    /// Revisits every surviving Phi after incomplete Phi values are sealed.
+    fn remove_remaining_trivial_phis(&mut self) {
+        let mut phis: Vec<_> = self.phi_to_inputs.keys().copied().collect();
+        phis.sort_unstable();
+        for phi in phis {
+            if !self.aliases.contains_key(&phi) {
+                self.remove_trivial_phi(phi);
+            }
+        }
     }
 
     /// Completes Phi values created before all predecessors were filled.
