@@ -353,6 +353,8 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             Fresh(SmolStr),
             /// Reuses existing source storage.
             Existing(Storage),
+            /// Writes one non-storage place.
+            Place(ast::Expr),
         }
 
         let rhs = self.lower_pack(values)?;
@@ -373,7 +375,18 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                             Slot::Existing(self.plan.local(*local)?.clone())
                         }
                     }
-                    _ => unreachable!("only fold_packs builds multibindings, and it only targets locals and discards"),
+                    nir::Place::Cell(cell) => {
+                        if self.plan.claim_declaration(BindingKey::Cell(*cell), scope)
+                            && let Some(name) = self.plan.cell(*cell)?.name().cloned()
+                        {
+                            Slot::Fresh(name.0)
+                        } else {
+                            Slot::Existing(self.plan.cell(*cell)?.clone())
+                        }
+                    }
+                    nir::Place::Global(_) | nir::Place::Table { .. } => {
+                        Slot::Place(self.lower_place(target)?)
+                    }
                 })
             })
             .collect::<Result<_>>()?;
@@ -383,7 +396,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 .into_iter()
                 .map(|slot| match slot {
                     Slot::Fresh(name) => ast::Typed::untyped(Identifier(name)),
-                    Slot::Existing(_) => unreachable!("all slots are fresh"),
+                    Slot::Existing(_) | Slot::Place(_) => unreachable!("all slots are fresh"),
                 })
                 .collect();
             out.push(ast::Stmt::LocalDeclaration { names, values: rhs });
@@ -394,7 +407,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             .iter()
             .filter_map(|slot| match slot {
                 Slot::Fresh(name) => Some(ast::Typed::untyped(Identifier(name.clone()))),
-                Slot::Existing(_) => None,
+                Slot::Existing(_) | Slot::Place(_) => None,
             })
             .collect();
         if !fresh.is_empty() {
@@ -404,10 +417,11 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             });
         }
         let lhs = slots
-            .iter()
+            .into_iter()
             .map(|slot| match slot {
-                Slot::Fresh(name) => ast::Expr::Named(Identifier(name.clone())),
+                Slot::Fresh(name) => ast::Expr::Named(Identifier(name)),
                 Slot::Existing(storage) => storage.expr(),
+                Slot::Place(place) => place,
             })
             .collect();
         out.push(ast::Stmt::Assignment { lhs, rhs });
