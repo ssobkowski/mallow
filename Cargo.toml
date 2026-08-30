@@ -22,6 +22,7 @@ mallow-test-macros = { path = "crates/mallow-test-macros" }
 anyhow = "1.0.102"
 clap = { version = "4.5.60", features = ["derive"] }
 directories = "6.0.0"
+either = "1.18.0"
 fs2 = "0.4.3"
 id-arena = "2.3.0"
 libtest-mimic = "0.8.2"

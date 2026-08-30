@@ -567,11 +567,22 @@ impl<'a> BindingCollector<'a> {
                 self.expr(then_value, scope);
                 self.expr(else_value, scope);
             }
+            nir::Expr::Table { items } => {
+                for item in items {
+                    match item {
+                        nir::TableItem::List(pack) => self.pack_expr(pack, scope),
+                        nir::TableItem::Index(key, value) => {
+                            self.expr(key, scope);
+                            self.expr(value, scope);
+                        }
+                    }
+                }
+            }
             nir::Expr::Project { pack, .. } => self.pack_expr(pack, scope),
             nir::Expr::LoadCell(cell) => {
                 self.touch(BindingKey::Cell(*cell), scope, false, LocalRole::Cell, None)
             }
-            nir::Expr::Constant(_) | nir::Expr::GetGlobal(_) | nir::Expr::NewTable => {}
+            nir::Expr::Constant(_) | nir::Expr::GetGlobal(_) => {}
         }
     }
 

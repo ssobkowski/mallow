@@ -2,6 +2,7 @@
 
 mod fold_packs;
 mod fold_shapes;
+mod fold_tables;
 mod inline;
 
 use super::Function;
@@ -16,6 +17,7 @@ pub(crate) fn run(functions: &mut [Function]) -> bool {
         for function in functions.iter_mut() {
             round_changed |= fold_packs::run(function);
             round_changed |= inline::run(function);
+            round_changed |= fold_tables::run(function);
             round_changed |= fold_shapes::run(function);
         }
         if !round_changed {

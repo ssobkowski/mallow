@@ -11,6 +11,7 @@ use smol_str::SmolStr;
 use crate::hil::ir::CellId;
 use crate::il::ProtoId;
 use crate::ir::fir::{Constant, PackId, ValueId};
+use crate::ir::nir::visitor::{Visitor, walk_expr, walk_pack_expr};
 use crate::operator::{BinOp, UnOp};
 
 /// Stable identity for one NIR scalar local.
@@ -92,8 +93,8 @@ pub(crate) enum Expr {
         /// Value used when the condition fails.
         else_value: Box<Expr>,
     },
-    /// Creates a new table.
-    NewTable,
+    /// Creates a new table with the given items.
+    Table { items: Vec<TableItem> },
     /// Reads one value from a pack.
     Project {
         /// Pack being projected.
@@ -143,6 +144,58 @@ impl Expr {
             rhs: Box::new(right),
         }
     }
+
+    /// Returns whether the expression contains a given [`LocalId`].
+    pub fn contains_local(&self, id: LocalId) -> bool {
+        struct Contains {
+            target: LocalId,
+            found: bool,
+        }
+
+        impl Visitor for Contains {
+            fn visit_capture(&mut self, _: usize, _: Capture) {
+                // Captures do not count as contained locals.
+            }
+
+            fn visit_expr(&mut self, expr: &Expr) {
+                if self.found {
+                    return;
+                }
+
+                walk_expr(self, expr);
+            }
+
+            fn visit_pack_expr(&mut self, pack: &PackExpr) {
+                if self.found {
+                    return;
+                }
+
+                walk_pack_expr(self, pack);
+            }
+
+            fn visit_local(&mut self, id: LocalId) {
+                if id == self.target {
+                    self.found = true;
+                }
+            }
+        }
+
+        let mut contains = Contains {
+            target: id,
+            found: false,
+        };
+        contains.visit_expr(self);
+        contains.found
+    }
+}
+
+/// An entry in the table constructor.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TableItem {
+    /// Array-part values produced by an expression list.
+    List(PackExpr),
+    /// A generic expression-keyed dictionary value, e.g., `[key] = value`
+    Index(Expr, Expr),
 }
 
 /// One nested value-pack expression.
@@ -183,6 +236,62 @@ impl PackExpr {
     #[must_use]
     fn local(local: PackLocalId) -> Self {
         Self::Local(local)
+    }
+
+    /// Returns whether this pack expression has a multi-value tail.
+    #[inline]
+    pub const fn is_open(&self) -> bool {
+        matches!(self, Self::Values { tail, .. } if tail.is_some())
+    }
+
+    /// Returns the statically stored values in this pack expression.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &Expr> {
+        std::iter::successors(Some(self), |pack| match pack {
+            Self::Values { tail, .. } => tail.as_deref(),
+            _ => None,
+        })
+        .flat_map(|pack| -> &[Expr] {
+            match pack {
+                Self::Values { head, .. } => head,
+                _ => &[],
+            }
+        })
+    }
+
+    /// Returns the statically stored values in this pack expression, consuming it.
+    #[inline]
+    pub fn into_iter(self) -> impl Iterator<Item = Expr> {
+        let (head, mut tail) = match self {
+            Self::Values { head, tail } => (head, tail),
+            Self::Local(_) | Self::Call { .. } | Self::MethodCall { .. } | Self::VarArgs => {
+                (Vec::new(), None)
+            }
+        };
+        let mut head = head.into_iter();
+
+        std::iter::from_fn(move || {
+            loop {
+                if let Some(expr) = head.next() {
+                    return Some(expr);
+                }
+
+                let next = tail.take()?;
+                match *next {
+                    Self::Values {
+                        head: next_head,
+                        tail: next_tail,
+                    } => {
+                        head = next_head.into_iter();
+                        tail = next_tail;
+                    }
+                    Self::Local(_)
+                    | Self::Call { .. }
+                    | Self::MethodCall { .. }
+                    | Self::VarArgs => return None,
+                }
+            }
+        })
     }
 
     /// Returns the fixed number of values produced by a pack when statically known.

@@ -579,7 +579,7 @@ impl<'a> Materializer<'a> {
                     else_value: Box::new(self.value(*else_value)?),
                 },
             ),
-            fir::Instr::NewTable { out } => local(*out, Expr::NewTable),
+            fir::Instr::NewTable { out } => local(*out, Expr::Table { items: Vec::new() }),
             fir::Instr::MakePack { out, head, tail } => pack(
                 *out,
                 PackExpr::Values {

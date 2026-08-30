@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use anyhow::{Result, ensure};
+use either::Either;
 
 use crate::hil::cflow::graph::{DominatorTree, GraphView, Reversed, SeseGraphView, build_graph};
 use crate::logging::{Diagnostics, LogLevel, LogTarget};
@@ -284,12 +285,7 @@ impl Shape {
     /// Performs one bottom-up shape normalization sweep.
     fn normalize_once(self) -> Self {
         match self {
-            Self::Sequence { nodes } => Self::sequence(
-                nodes
-                    .into_iter()
-                    .map(Self::normalize_once)
-                    .collect::<Vec<_>>(),
-            ),
+            Self::Sequence { nodes } => Self::sequence(nodes.into_iter().map(Self::normalize_once)),
             Self::If {
                 condition,
                 then_branch,
@@ -338,8 +334,8 @@ impl Shape {
         let nodes = nodes
             .into_iter()
             .flat_map(|node| match node {
-                Self::Sequence { nodes } => nodes,
-                other => vec![other],
+                Self::Sequence { nodes } => Either::Left(nodes.into_iter()),
+                other => Either::Right(std::iter::once(other)),
             })
             .collect();
         Self::Sequence { nodes }

@@ -614,7 +614,13 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 then_expr: Box::new(self.lower_expr(then_value)?),
                 else_expr: Box::new(self.lower_expr(else_value)?),
             },
-            nir::Expr::NewTable => ast::Expr::Table { items: Vec::new() },
+            nir::Expr::Table { items } => {
+                let mut lowered = Vec::new();
+                for item in items {
+                    lowered.extend(self.lower_table_item(item)?);
+                }
+                ast::Expr::Table { items: lowered }
+            }
             nir::Expr::Project { pack, index } => self.lower_project(pack, *index, context)?,
             nir::Expr::LoadCell(cell) => self.plan.cell(*cell)?.expr(),
         })
@@ -725,6 +731,38 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 args: self.lower_pack(args)?,
             }],
             nir::PackExpr::VarArgs => vec![ast::Expr::Vararg],
+        })
+    }
+
+    /// Lowers one table item into a vector of AST table items.
+    fn lower_table_item(&mut self, item: &nir::TableItem) -> Result<Vec<ast::TableItem>> {
+        Ok(match item {
+            nir::TableItem::List(pack) => self
+                .lower_pack(pack)?
+                .into_iter()
+                .map(|value| ast::TableItem::Implicit { value })
+                .collect(),
+            nir::TableItem::Index(key, value) => {
+                let value = self.lower_expr(value)?;
+                // TODO: `is_valid_luau_identifier` needs to support ByteString (or have a separate method for it.)
+                // if let nir::Expr::Constant(fir::Constant::String(s)) = key
+                //     && is_valid_luau_identifier(s)
+                // {
+                //     TableItem::Named {
+                //         name: Identifier::new(s.clone()),
+                //         value,
+                //     }
+                // } else {
+                //     TableItem::Indexed {
+                //         index: self.visit_expr(key),
+                //         value,
+                //     }
+                // }
+                vec![ast::TableItem::Indexed {
+                    index: self.lower_expr(key)?,
+                    value,
+                }]
+            }
         })
     }
 }

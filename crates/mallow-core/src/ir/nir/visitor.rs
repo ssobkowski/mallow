@@ -6,6 +6,7 @@
 use crate::common::ByteString;
 use crate::hil::ir::{CellId, Number};
 use crate::ir::fir::Constant;
+use crate::ir::nir::TableItem;
 use smol_str::SmolStr;
 
 use super::{Capture, Expr, Function, PackExpr, Place, Region, Stmt};
@@ -63,6 +64,17 @@ pub trait Visitor {
             Constant::Number(number) => self.visit_number(*number),
             Constant::String(string) => self.visit_string(string),
             Constant::Bool(value) => self.visit_bool(*value),
+        }
+    }
+
+    /// Visits one table item.
+    fn visit_table_item(&mut self, item: &TableItem) {
+        match item {
+            TableItem::List(pack) => self.visit_pack_expr(pack),
+            TableItem::Index(key, value) => {
+                self.visit_expr(key);
+                self.visit_expr(value);
+            }
         }
     }
 
@@ -140,6 +152,17 @@ pub trait VisitorMut {
             Constant::Number(number) => self.visit_number(number),
             Constant::String(string) => self.visit_string(string),
             Constant::Bool(value) => self.visit_bool(value),
+        }
+    }
+
+    /// Visits one mutable table item.
+    fn visit_table_item(&mut self, item: &mut TableItem) {
+        match item {
+            TableItem::List(pack) => self.visit_pack_expr(pack),
+            TableItem::Index(key, value) => {
+                self.visit_expr(key);
+                self.visit_expr(value);
+            }
         }
     }
 
@@ -300,7 +323,11 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
             visitor.visit_expr(then_value);
             visitor.visit_expr(else_value);
         }
-        Expr::NewTable => {}
+        Expr::Table { items } => {
+            for item in items {
+                visitor.visit_table_item(item);
+            }
+        }
         Expr::Project { pack, .. } => visitor.visit_pack_expr(pack),
         Expr::LoadCell(cell) => visitor.visit_cell(*cell),
     }
@@ -479,7 +506,11 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut Expr) {
             visitor.visit_expr(then_value);
             visitor.visit_expr(else_value);
         }
-        Expr::NewTable => {}
+        Expr::Table { items } => {
+            for item in items {
+                visitor.visit_table_item(item);
+            }
+        }
         Expr::Project { pack, .. } => visitor.visit_pack_expr(pack),
         Expr::LoadCell(cell) => visitor.visit_cell(cell),
     }

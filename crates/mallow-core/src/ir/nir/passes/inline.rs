@@ -7,7 +7,7 @@ use crate::ir::nir::visitor::{
     VisitorMut, walk_expr_mut, walk_pack_expr_mut, walk_region_mut, walk_stmts_mut,
 };
 use crate::ir::nir::{
-    Capture, Expr, Function, LocalId, PackExpr, PackLocalId, Place, Region, Stmt,
+    Capture, Expr, Function, LocalId, PackExpr, PackLocalId, Place, Region, Stmt, TableItem,
 };
 use crate::operator::BinOp;
 
@@ -486,7 +486,7 @@ impl<'nir> DefUse<'nir> {
             Expr::Local(local) => {
                 self.use_local(*local, LocalUse::Expression(context.local_site()));
             }
-            Expr::Constant(_) | Expr::GetGlobal(_) | Expr::NewTable => {}
+            Expr::Constant(_) | Expr::GetGlobal(_) => {}
             Expr::Closure { captures, .. } => {
                 for capture in captures {
                     if let Capture::Copy(local) = capture {
@@ -524,6 +524,17 @@ impl<'nir> DefUse<'nir> {
                 let branch_context = context.conditional();
                 self.collect_expr(then_value, branch_context);
                 self.collect_expr(else_value, branch_context);
+            }
+            Expr::Table { items } => {
+                for item in items {
+                    match item {
+                        TableItem::List(pack) => self.collect_pack_expr(pack, context),
+                        TableItem::Index(key, value) => {
+                            self.collect_expr(key, context);
+                            self.collect_expr(value, context);
+                        }
+                    }
+                }
             }
             Expr::Project { pack, .. } => self.collect_pack_expr(pack, context),
             Expr::LoadCell(_) => {}
