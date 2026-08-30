@@ -3,8 +3,6 @@
 //!
 //! Such instructions can be folded only if they appear after an assignment to a table expr.
 
-use either::Either;
-
 use crate::hil::ir::Number;
 use crate::ir::fir::Constant;
 use crate::ir::nir::visitor::VisitorMut;
@@ -49,11 +47,12 @@ impl VisitorMut for Folder {
             while j < stmts.len() {
                 match &stmts[j] {
                     Stmt::Bind {
-                        target: Place::Table { table, .. },
+                        target: Place::Table { table, key },
                         value,
                     } if is_target_table(table)
                         && !is_target_table(value)
-                        && !value.contains_local(target_table) =>
+                        && !value.contains_local(target_table)
+                        && !key.contains_local(target_table) =>
                     {
                         j += 1;
                     }
@@ -86,26 +85,27 @@ impl VisitorMut for Folder {
             if j > i + 1 {
                 self.changed = true;
 
-                // Re-calculate running array size for constructing TableItem::List vs Index
-                let mut current_array_len = match &stmts[i] {
+                let mut items = match &mut stmts[i] {
                     Stmt::Bind {
                         value: Expr::Table { items },
                         ..
-                    } => items.iter().try_fold(0usize, |count, item| match item {
-                        TableItem::List(values) => Some(count + values.fixed_len()?),
-                        TableItem::Index(_, _) => Some(count),
-                    }),
-                    _ => unreachable!(),
+                    } => std::mem::take(items),
+                    _ => unreachable!("this statement is a table bind"),
                 };
 
-                let folded_items: Vec<_> = stmts
-                    .drain(i + 1..j)
-                    .flat_map(|stmt| match stmt {
+                // Re-calculate running array size for constructing TableItem::List vs Index
+                let mut current_array_len =
+                    items.iter().try_fold(0usize, |count, item| match item {
+                        TableItem::List(values) => Some(count + values.fixed_len()?),
+                        TableItem::Index(_, _) => Some(count),
+                    });
+
+                for stmt in stmts.drain(i + 1..j) {
+                    match stmt {
                         Stmt::Bind {
                             target: Place::Table { key, .. },
                             value,
-                        } => Either::Left(std::iter::once(TableItem::Index(key, value))),
-
+                        } => items.push(TableItem::Index(key, value)),
                         Stmt::SetList {
                             index: base,
                             values,
@@ -118,29 +118,29 @@ impl VisitorMut for Folder {
                                 current_array_len = values
                                     .fixed_len()
                                     .and_then(|len| current_array_len.map(|c| c + len));
-                                Either::Left(std::iter::once(TableItem::List(values)))
+                                items.push(TableItem::List(values));
                             } else {
-                                Either::Right(values.into_iter().enumerate().map(
-                                    move |(k, val)| {
-                                        let idx_expr = Expr::Constant(Constant::Number(
-                                            Number::Float(base as f64 + k as f64),
-                                        ));
-                                        TableItem::Index(idx_expr, val.clone())
-                                    },
-                                ))
+                                items.extend(values.into_iter().enumerate().map(|(k, val)| {
+                                    let idx_expr = Expr::Constant(Constant::Number(Number::Float(
+                                        base as f64 + k as f64,
+                                    )));
+                                    TableItem::Index(idx_expr, val.clone())
+                                }));
                             }
                         }
-                        _ => unreachable!(),
-                    })
-                    .collect();
+                        _ => unreachable!("other statements cannot appear here"),
+                    }
+                }
 
-                if let Stmt::Bind {
-                    value: Expr::Table { items },
+                let Stmt::Bind {
+                    value: Expr::Table { items: table_items },
                     ..
                 } = &mut stmts[i]
-                {
-                    items.extend(folded_items);
-                }
+                else {
+                    unreachable!("this statement is a table bind");
+                };
+
+                *table_items = items;
             }
 
             i += 1;

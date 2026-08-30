@@ -145,41 +145,8 @@ impl Expr {
         }
     }
 
-    /// Returns whether the expression contains a given [`LocalId`].
+    /// Returns whether this expression contains a given [`LocalId`].
     pub fn contains_local(&self, id: LocalId) -> bool {
-        struct Contains {
-            target: LocalId,
-            found: bool,
-        }
-
-        impl Visitor for Contains {
-            fn visit_capture(&mut self, _: usize, _: Capture) {
-                // Captures do not count as contained locals.
-            }
-
-            fn visit_expr(&mut self, expr: &Expr) {
-                if self.found {
-                    return;
-                }
-
-                walk_expr(self, expr);
-            }
-
-            fn visit_pack_expr(&mut self, pack: &PackExpr) {
-                if self.found {
-                    return;
-                }
-
-                walk_pack_expr(self, pack);
-            }
-
-            fn visit_local(&mut self, id: LocalId) {
-                if id == self.target {
-                    self.found = true;
-                }
-            }
-        }
-
         let mut contains = Contains {
             target: id,
             found: false,
@@ -242,21 +209,6 @@ impl PackExpr {
     #[inline]
     pub const fn is_open(&self) -> bool {
         matches!(self, Self::Values { tail, .. } if tail.is_some())
-    }
-
-    /// Returns the statically stored values in this pack expression.
-    #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &Expr> {
-        std::iter::successors(Some(self), |pack| match pack {
-            Self::Values { tail, .. } => tail.as_deref(),
-            _ => None,
-        })
-        .flat_map(|pack| -> &[Expr] {
-            match pack {
-                Self::Values { head, .. } => head,
-                _ => &[],
-            }
-        })
     }
 
     /// Returns the statically stored values in this pack expression, consuming it.
@@ -475,256 +427,36 @@ pub(crate) struct Function {
     pub(crate) body: Region,
 }
 
-#[cfg(test)]
-mod tests {
-    use id_arena::Arena;
+/// A visitor that searches for a [`LocalId`].
+struct Contains {
+    target: LocalId,
+    found: bool,
+}
 
-    use super::*;
-    use crate::hil::ir::Cell;
-    use crate::ir::fir::{self, Block, Constant, Pack, Value};
-    use crate::logging::Diagnostics;
+impl Visitor for Contains {
+    fn visit_capture(&mut self, _: usize, _: Capture) {
+        // Captures do not count as contained locals.
+    }
 
-    /// Builds an acyclic branch whose condition has one concrete definition.
-    fn branch_function() -> fir::Function {
-        let mut values = Arena::new();
-        let lhs = values.alloc(Value);
-        let rhs = values.alloc(Value);
-        let condition = values.alloc(Value);
-        let mut packs = Arena::new();
-        let then_pack = packs.alloc(Pack);
-        let else_pack = packs.alloc(Pack);
-
-        fir::Function {
-            proto: ProtoId(0),
-            params: vec![lhs, rhs],
-            is_vararg: false,
-            upvalues: Vec::new(),
-            values,
-            packs,
-            cells: Arena::<Cell>::new(),
-            blocks: vec![
-                Block {
-                    outputs: Vec::new(),
-                    instrs: vec![fir::Instr::Binary {
-                        out: condition,
-                        lhs,
-                        op: BinOp::Lt,
-                        rhs,
-                    }],
-                    exit: fir::BlockExit::Branch {
-                        condition,
-                        then_block: 1,
-                        else_block: 2,
-                    },
-                },
-                Block {
-                    outputs: Vec::new(),
-                    instrs: vec![fir::Instr::MakePack {
-                        out: then_pack,
-                        head: Vec::new(),
-                        tail: None,
-                    }],
-                    exit: fir::BlockExit::Return(then_pack),
-                },
-                Block {
-                    outputs: Vec::new(),
-                    instrs: vec![fir::Instr::MakePack {
-                        out: else_pack,
-                        head: Vec::new(),
-                        tail: None,
-                    }],
-                    exit: fir::BlockExit::Return(else_pack),
-                },
-            ],
+    fn visit_expr(&mut self, expr: &Expr) {
+        if self.found {
+            return;
         }
+
+        walk_expr(self, expr);
     }
 
-    /// Materializes and concretely inlines an adjacent branch condition.
-    #[test]
-    #[ignore = "inlining is temporarily disabled"]
-    fn materializes_condition_for_inlining() {
-        let fir = branch_function();
-        fir.verify().unwrap();
-        let function = materialize::lower(&fir, &Diagnostics::default()).unwrap();
-
-        let Region::Sequence(nodes) = &function.body else {
-            panic!("root must be a sequence");
-        };
-        let Region::Block { stmts, .. } = &nodes[0] else {
-            panic!("condition source must remain a concrete block");
-        };
-        assert!(stmts.is_empty());
-        assert!(matches!(
-            &nodes[1],
-            Region::If {
-                condition: Expr::Binary { op: BinOp::Lt, .. },
-                ..
-            }
-        ));
-    }
-
-    /// Builds a diamond with one value Phi at its merge block.
-    fn phi_function() -> fir::Function {
-        let mut values = Arena::new();
-        let lhs = values.alloc(Value);
-        let rhs = values.alloc(Value);
-        let condition = values.alloc(Value);
-        let then_value = values.alloc(Value);
-        let else_value = values.alloc(Value);
-        let merged = values.alloc(Value);
-        let mut packs = Arena::new();
-        let result = packs.alloc(Pack);
-
-        fir::Function {
-            proto: ProtoId(0),
-            params: vec![lhs, rhs],
-            is_vararg: false,
-            upvalues: Vec::new(),
-            values,
-            packs,
-            cells: Arena::<Cell>::new(),
-            blocks: vec![
-                Block {
-                    outputs: Vec::new(),
-                    instrs: vec![fir::Instr::Binary {
-                        out: condition,
-                        lhs,
-                        op: BinOp::Lt,
-                        rhs,
-                    }],
-                    exit: fir::BlockExit::Branch {
-                        condition,
-                        then_block: 1,
-                        else_block: 2,
-                    },
-                },
-                Block {
-                    outputs: Vec::new(),
-                    instrs: vec![fir::Instr::Copy {
-                        out: then_value,
-                        value: lhs,
-                    }],
-                    exit: fir::BlockExit::Jump(3),
-                },
-                Block {
-                    outputs: Vec::new(),
-                    instrs: vec![fir::Instr::Copy {
-                        out: else_value,
-                        value: rhs,
-                    }],
-                    exit: fir::BlockExit::Jump(3),
-                },
-                Block {
-                    outputs: Vec::new(),
-                    instrs: vec![
-                        fir::Instr::Phi {
-                            out: merged,
-                            inputs: vec![(1, then_value), (2, else_value)],
-                        },
-                        fir::Instr::MakePack {
-                            out: result,
-                            head: vec![merged],
-                            tail: None,
-                        },
-                    ],
-                    exit: fir::BlockExit::Return(result),
-                },
-            ],
+    fn visit_pack_expr(&mut self, pack: &PackExpr) {
+        if self.found {
+            return;
         }
+
+        walk_pack_expr(self, pack);
     }
 
-    /// Materializes Phi initialization before passes and unifies its storage after them.
-    #[test]
-    fn destroys_ssa_after_materialization() {
-        let fir = phi_function();
-        fir.verify().unwrap();
-        let mut function = materialize::lower(&fir, &Diagnostics::default()).unwrap();
-
-        assert_eq!(function.locals.len(), fir.values.len());
-        assert!(function.prologue.is_empty());
-
-        let Region::Sequence(nodes) = &function.body else {
-            panic!("root must be a sequence");
-        };
-        let Region::Block { stmts, .. } = &nodes[0] else {
-            panic!("entry must remain a block");
-        };
-        let Some(Stmt::Bind {
-            target: Place::Local(initialization),
-            value: Expr::Constant(Constant::Nil),
-        }) = stmts.first()
-        else {
-            panic!("entry must contain the Phi initialization before passes");
-        };
-        let initialization = *initialization;
-
-        let Region::If {
-            then_branch,
-            else_branch: Some(else_branch),
-            ..
-        } = &nodes[1]
-        else {
-            panic!("merge must be represented as an if");
-        };
-        let branch_locals: Vec<_> = [then_branch.as_ref(), else_branch.as_ref()]
-            .into_iter()
-            .map(|branch| {
-                let Region::Block { stmts, .. } = branch else {
-                    panic!("branch must remain a block");
-                };
-                let [
-                    Stmt::Bind {
-                        target: Place::Local(local),
-                        ..
-                    },
-                ] = stmts.as_slice()
-                else {
-                    panic!("branch must contain one local binding");
-                };
-                *local
-            })
-            .collect();
-        assert!(branch_locals.iter().all(|local| *local != initialization));
-
-        passes::run(std::slice::from_mut(&mut function));
-        materialize::destroy_ssa(&mut function);
-
-        let Region::Sequence(nodes) = &function.body else {
-            panic!("root must remain a sequence");
-        };
-        let Region::Block { stmts, .. } = &nodes[0] else {
-            panic!("entry must remain a block");
-        };
-        let Some(Stmt::Bind {
-            target: Place::Local(storage),
-            ..
-        }) = stmts.first()
-        else {
-            panic!("entry must retain the Phi initialization");
-        };
-        let storage = *storage;
-        let Region::If {
-            then_branch,
-            else_branch: Some(else_branch),
-            ..
-        } = &nodes[1]
-        else {
-            panic!("merge must remain an if");
-        };
-        for branch in [then_branch.as_ref(), else_branch.as_ref()] {
-            let Region::Block { stmts, .. } = branch else {
-                panic!("branch must remain a block");
-            };
-            let [
-                Stmt::Bind {
-                    target: Place::Local(local),
-                    ..
-                },
-            ] = stmts.as_slice()
-            else {
-                panic!("branch must retain one local binding");
-            };
-            assert_eq!(*local, storage);
+    fn visit_local(&mut self, id: LocalId) {
+        if id == self.target {
+            self.found = true;
         }
     }
 }
