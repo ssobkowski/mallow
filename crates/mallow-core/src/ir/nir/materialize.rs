@@ -59,7 +59,7 @@ struct SsaMeta {
     /// A list of synthetic nil declarations grouped by dominating block.
     declarations: Vec<Vec<ValueId>>,
     /// Immediate dominators for every reachable FIR block.
-    idoms: DominatorTree,
+    idoms: DominatorTree<usize>,
 }
 
 impl SsaMeta {
@@ -155,7 +155,7 @@ impl SsaMeta {
             if initialized.contains(&storage_id) {
                 continue;
             }
-            let declaration = common_strict_dominator(graph.entry(), &idoms, &blocks);
+            let declaration = idoms.common_strict_dominator(graph.entry(), &blocks);
             declarations[declaration].push(storage_id);
         }
 
@@ -256,25 +256,6 @@ impl Initializations {
 
         Self { by_block, prologue }
     }
-}
-
-/// Returns a common strict dominator for several Phi blocks.
-#[inline]
-fn common_strict_dominator(entry: usize, idoms: &DominatorTree, blocks: &[usize]) -> usize {
-    // Apparently, this could have been written better. I (probably) agree, but this implementation
-    // does not cause any meaningful issues for now.
-
-    let Some((first, rest)) = blocks.split_first() else {
-        return entry;
-    };
-
-    let mut candidate = *first;
-    for &block in rest {
-        while !idoms.dominates(candidate, block) {
-            candidate = idoms.idom(candidate).unwrap_or(entry);
-        }
-    }
-    idoms.idom(candidate).unwrap_or(entry)
 }
 
 /// Collects FIR blocks that can receive synthetic declarations.

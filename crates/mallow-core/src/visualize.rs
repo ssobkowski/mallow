@@ -56,7 +56,7 @@ fn node_size(label: &NodeLabel) -> (f64, f64) {
     (w, h)
 }
 
-fn dom_depths(idoms: &DominatorTree, entry: usize, node_count: usize) -> Vec<usize> {
+fn dom_depths(idoms: &DominatorTree<usize>, entry: usize, node_count: usize) -> Vec<usize> {
     let mut depth = vec![usize::MAX; node_count];
     depth[entry] = 0;
 
@@ -245,7 +245,7 @@ fn add_edge(
     edges: &mut Vec<Edge>,
     edge_counter: &mut usize,
     graph: &AdjGraph<'_>,
-    idoms: &DominatorTree,
+    idoms: &DominatorTree<usize>,
     src: usize,
     dst: usize,
     color: &'static str,

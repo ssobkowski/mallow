@@ -6,7 +6,7 @@ use super::{Block, Instr, Value, ValueId};
 use crate::ir::graph::GraphView;
 
 /// Builds immutable value versions for physical registers.
-pub(super) struct Ssa<'a, G: GraphView> {
+pub(super) struct Ssa<'a, G: GraphView<Node = usize>> {
     /// Register versions stored as contiguous block rows.
     registers: Vec<Option<ValueId>>,
     /// Number of register slots in each block row.
@@ -29,7 +29,7 @@ pub(super) struct Ssa<'a, G: GraphView> {
     incomplete_phis: HashMap<usize, Vec<(u8, ValueId)>>,
 }
 
-impl<'a, G: GraphView> Ssa<'a, G> {
+impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
     /// Creates empty SSA state sized to the function's declared registers.
     pub(super) fn new(graph: &'a G, register_count: u8) -> Self {
         let block_count = graph.len();
@@ -124,7 +124,7 @@ impl<'a, G: GraphView> Ssa<'a, G> {
 
     /// Recursively reads one register and creates a Phi when needed.
     fn read_reg_recursive(&mut self, block: usize, reg: u8) -> ValueId {
-        let predecessors = self.graph.predecessors(block);
+        let predecessors: Vec<_> = self.graph.predecessors(block).collect();
         if predecessors.is_empty() {
             return self.alloc();
         }
@@ -152,16 +152,16 @@ impl<'a, G: GraphView> Ssa<'a, G> {
         let phi = self.alloc();
         self.write_reg(block, reg, phi);
         self.phi_to_block.insert(phi, block);
-        let inputs = self.read_inputs(predecessors, reg);
+        let inputs = self.read_inputs(block, reg);
         self.record_inputs(phi, inputs);
         self.remove_trivial_phi(phi)
     }
 
     /// Reads one register from every predecessor.
-    fn read_inputs(&mut self, predecessors: &[usize], reg: u8) -> Vec<(usize, ValueId)> {
-        predecessors
-            .iter()
-            .map(|&predecessor| (predecessor, self.read_reg(predecessor, reg)))
+    fn read_inputs(&mut self, block: usize, reg: u8) -> Vec<(usize, ValueId)> {
+        self.graph
+            .predecessors(block)
+            .map(|predecessor| (predecessor, self.read_reg(predecessor, reg)))
             .collect()
     }
 
@@ -230,7 +230,7 @@ impl<'a, G: GraphView> Ssa<'a, G> {
     fn seal_blocks(&mut self) {
         for (block, phis) in std::mem::take(&mut self.incomplete_phis) {
             for (reg, phi) in phis {
-                let inputs = self.read_inputs(self.graph.predecessors(block), reg);
+                let inputs = self.read_inputs(block, reg);
                 self.record_inputs(phi, inputs);
                 self.remove_trivial_phi(phi);
             }

@@ -197,6 +197,7 @@ impl<'a> FlowGraph<'a> {
 
 impl GraphView for FlowGraph<'_> {
     type Item = Block;
+    type Node = usize;
 
     fn get(&self, node: usize) -> Option<&Self::Item> {
         self.function.blocks.get(node)
@@ -206,19 +207,19 @@ impl GraphView for FlowGraph<'_> {
         0
     }
 
-    fn successors(&self, node: usize) -> &[usize] {
-        &self.successors[node]
+    fn successors(&self, node: usize) -> impl Iterator<Item = usize> {
+        self.successors[node].iter().copied()
     }
 
-    fn predecessors(&self, node: usize) -> &[usize] {
-        &self.predecessors[node]
+    fn predecessors(&self, node: usize) -> impl Iterator<Item = usize> {
+        self.predecessors[node].iter().copied()
     }
 
     fn contains_node(&self, node: usize) -> bool {
         node < self.function.blocks.len()
     }
 
-    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+    fn nodes(&self) -> impl Iterator<Item = usize> {
         0..self.function.blocks.len()
     }
 
@@ -710,23 +711,23 @@ impl LoopForest {
     /// parent body includes all child bodies, exits are computed from those
     /// final bodies, and same-header multi-latch loops are represented by a
     /// single [`LoopInfo`] whose `latches` set records all backedge sources.
-    fn build(cfg: &FlowGraph<'_>, idoms: &DominatorTree) -> Self {
+    fn build(cfg: &FlowGraph<'_>, idoms: &DominatorTree<usize>) -> Self {
         let mut loops = HashMap::new();
         let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::new();
         let reachable: HashSet<_> = cfg.reverse_post_order().into_iter().collect();
 
-        for latch in cfg.iter() {
+        for latch in cfg.nodes() {
             if !reachable.contains(&latch) {
                 continue;
             }
 
-            for &header in cfg.successors(latch) {
+            for header in cfg.successors(latch) {
                 if reachable.contains(&header) && idoms.dominates(header, latch) {
                     let id = LoopId { header, latch };
                     let body = natural_loop_body(cfg, header, latch, &reachable);
                     let exits = body
                         .iter()
-                        .flat_map(|&block| cfg.successors(block).iter().copied())
+                        .flat_map(|&block| cfg.successors(block))
                         .filter(|target| !body.contains(target))
                         .collect();
 
@@ -843,7 +844,7 @@ impl LoopForest {
             info.exits = info
                 .body
                 .iter()
-                .flat_map(|&block| cfg.successors(block).iter().copied())
+                .flat_map(|&block| cfg.successors(block))
                 .filter(|target| !info.body.contains(target))
                 .collect();
         }
@@ -1018,6 +1019,7 @@ struct RegionGraph {
 
 impl GraphView for RegionGraph {
     type Item = RecognizedShape;
+    type Node = usize;
 
     fn get(&self, node: usize) -> Option<&Self::Item> {
         self.nodes.get(&node)
@@ -1027,19 +1029,19 @@ impl GraphView for RegionGraph {
         self.entry
     }
 
-    fn successors(&self, node: usize) -> &[usize] {
-        self.successors.get(&node).map_or(&[], |v| v.as_slice())
+    fn successors(&self, node: usize) -> impl Iterator<Item = usize> {
+        self.successors.get(&node).into_iter().flatten().copied()
     }
 
-    fn predecessors(&self, node: usize) -> &[usize] {
-        self.predecessors.get(&node).map_or(&[], |v| v.as_slice())
+    fn predecessors(&self, node: usize) -> impl Iterator<Item = usize> {
+        self.predecessors.get(&node).into_iter().flatten().copied()
     }
 
     fn contains_node(&self, node: usize) -> bool {
         self.nodes.contains_key(&node)
     }
 
-    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+    fn nodes(&self) -> impl Iterator<Item = usize> {
         self.nodes.keys().copied()
     }
 
@@ -1057,14 +1059,17 @@ impl SeseGraphView for RegionGraph {
 impl RegionGraph {
     /// Creates a region graph from one flat control-flow graph.
     fn from_cfg(cfg: &FlowGraph<'_>) -> Self {
-        let mut nodes: HashMap<_, _> = cfg.iter().map(|i| (i, RecognizedShape::Block(i))).collect();
-        let mut successors: HashMap<_, _> = cfg
-            .iter()
-            .map(|i| (i, cfg.successors(i).to_vec()))
+        let mut nodes: HashMap<_, _> = cfg
+            .nodes()
+            .map(|i| (i, RecognizedShape::Block(i)))
             .collect();
-        let mut predecessors: HashMap<_, _> = cfg
-            .iter()
-            .map(|i| (i, cfg.predecessors(i).to_vec()))
+        let mut successors: HashMap<_, Vec<_>> = cfg
+            .nodes()
+            .map(|i| (i, cfg.successors(i).collect()))
+            .collect();
+        let mut predecessors: HashMap<_, Vec<_>> = cfg
+            .nodes()
+            .map(|i| (i, cfg.predecessors(i).collect()))
             .collect();
 
         let terminal_nodes: Vec<_> = nodes
@@ -1100,7 +1105,7 @@ struct Structurer<'cfg, 'd> {
     /// SESE graph with one synthetic exit.
     graph: RegionGraph,
     /// Immediate post-dominators computed through the reversed SESE graph.
-    ipdoms: DominatorTree,
+    ipdoms: DominatorTree<usize>,
     /// Natural loops and their lexical containment.
     loops: LoopForest,
     /// Diagnostic destination for recognition traces and warnings.
@@ -1208,7 +1213,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             }
 
             if let Some(loop_shape) = self.recognize_loop(current, scope, blocked_loop) {
-                let next = single_target(&loop_shape.exits);
+                let next = single_target(&loop_shape.exits).copied();
                 trace.line(
                     2,
                     format_args!("recognized loop {:?}, next = {:?}", loop_shape.id, next),
@@ -1278,8 +1283,6 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             let next = self
                 .graph
                 .successors(current)
-                .iter()
-                .copied()
                 .find(|succ| scope.nodes.contains(succ) || scope.exits.contains(succ));
 
             let Some(next) = next else {
@@ -1491,7 +1494,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         let mut body = loop_info.body.clone();
         let mut stack: Vec<_> = body
             .iter()
-            .flat_map(|&block| self.graph.successors(block).iter().copied())
+            .flat_map(|&block| self.graph.successors(block))
             .filter(|target| !body.contains(target) && !exits.contains(target))
             .collect();
 
@@ -1503,8 +1506,6 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             stack.extend(
                 self.graph
                     .successors(node)
-                    .iter()
-                    .copied()
                     .filter(|target| !body.contains(target) && !exits.contains(target)),
             );
         }
@@ -1529,8 +1530,6 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             LoopKind::RepeatUntil { latch, .. } => self
                 .graph
                 .successors(*latch)
-                .iter()
-                .copied()
                 .filter(|target| *target != loop_info.header)
                 .collect(),
             LoopKind::While { exits, .. } => exits.clone(),
@@ -1744,8 +1743,6 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             queue.extend(
                 self.graph
                     .successors(node)
-                    .iter()
-                    .copied()
                     .map(|successor| (successor, distance + 1)),
             );
         }
@@ -1936,28 +1933,23 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             } = &self.cfg.block(latch).exit
             && *body_block == loop_info.header
         {
-            let prep_block = self
-                .cfg
-                .predecessors(loop_info.header)
-                .iter()
-                .copied()
-                .find(|&pred| {
-                    matches!(
-                        &self.cfg.block(pred).exit,
-                        BlockExit::NumericFor {
-                            body_block: prep_body,
-                            exit_block: prep_exit,
-                            ..
-                        } if prep_body == body_block
-                            && (prep_exit == exit_block
-                                // Luau can duplicate a return-only bytecode block after one
-                                // branch on O1 and O2. FORNPREP skips to the shared return
-                                // while FORNLOOP falls through to the duplicate return block.
-                                //
-                                // Dedicated test case: controlflow37.luau
-                                || self.cfg.blocks_return_same_values(*prep_exit, *exit_block))
-                    )
-                });
+            let prep_block = self.cfg.predecessors(loop_info.header).find(|&pred| {
+                matches!(
+                    &self.cfg.block(pred).exit,
+                    BlockExit::NumericFor {
+                        body_block: prep_body,
+                        exit_block: prep_exit,
+                        ..
+                    } if prep_body == body_block
+                       && (prep_exit == exit_block
+                           // Luau can duplicate a return-only bytecode block after one
+                           // branch on O1 and O2. FORNPREP skips to the shared return
+                           // while FORNLOOP falls through to the duplicate return block.
+                           //
+                           // Dedicated test case: controlflow37.luau
+                           || self.cfg.blocks_return_same_values(*prep_exit, *exit_block))
+                )
+            });
 
             if let Some(prep_block) = prep_block
                 && let BlockExit::NumericFor {
@@ -1990,21 +1982,16 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             } = &self.cfg.block(latch).exit
             && *body_block == loop_info.header
         {
-            let prep_block = self
-                .cfg
-                .predecessors(loop_info.header)
-                .iter()
-                .copied()
-                .find(|&pred| {
-                    matches!(
-                        &self.cfg.block(pred).exit,
-                        BlockExit::GenericFor {
-                            body_block: prep_body,
-                            loop_block,
-                            ..
-                        } if prep_body == body_block && *loop_block == latch
-                    )
-                });
+            let prep_block = self.cfg.predecessors(loop_info.header).find(|&pred| {
+                matches!(
+                    &self.cfg.block(pred).exit,
+                    BlockExit::GenericFor {
+                        body_block: prep_body,
+                        loop_block,
+                        ..
+                    } if prep_body == body_block && *loop_block == latch
+                )
+            });
 
             if let Some(prep_block) = prep_block
                 && let BlockExit::GenericFor {
@@ -2210,8 +2197,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             && self
                 .graph
                 .successors(loop_info.header)
-                .iter()
-                .any(|target| !loop_info.body.contains(target))
+                .any(|target| !loop_info.body.contains(&target))
         {
             return false;
         }
@@ -2225,25 +2211,25 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
 
     /// Returns the common loop follow target, if one exists.
     fn common_loop_follow(&self, loop_info: &LoopInfo) -> Option<usize> {
+        // 1. Header's immediate post-dominator outside the loop
         if let Some(follow) = self.ipdoms.idom(loop_info.header)
             && !loop_info.body.contains(&follow)
         {
             return Some(follow);
         }
 
-        // This tree uses the reversed graph, so dominance here means
-        // that the candidate post-dominates every loop exit.
-        //
-        // TODO: This is O(N^2). Probably not the best way to do it.
-        if let Some(follow) = loop_info.exits.iter().copied().find(|candidate| {
-            loop_info
-                .exits
-                .iter()
-                .all(|exit| self.ipdoms.dominates(*candidate, *exit))
-        }) {
-            return Some(follow);
+        // 2. O(N): Find the Lowest Common Post-Dominator among all exit blocks.
+        // If that LCD is one of the exit blocks itself, it post-dominates all exits.
+        if let Some(lcd) = self
+            .ipdoms
+            .lowest_common_dominator(loop_info.exits.iter().copied())
+        {
+            if loop_info.exits.contains(&lcd) {
+                return Some(lcd);
+            }
         }
 
+        // 3. Fallback: Check if all exits share a single, identical external target.
         let mut follow = None;
         for &exit in &loop_info.exits {
             let target = single_target(self.graph.successors(exit))?;
@@ -2377,8 +2363,6 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             stack.extend(
                 self.graph
                     .successors(node)
-                    .iter()
-                    .copied()
                     .filter(|succ| !exits.contains(succ)),
             );
         }
@@ -2484,7 +2468,7 @@ fn natural_loop_body(
         }
 
         if body.insert(node) && node != header {
-            for &pred in cfg.predecessors(node) {
+            for pred in cfg.predecessors(node) {
                 if reachable.contains(&pred) {
                     stack.push(pred);
                 }
@@ -2496,8 +2480,8 @@ fn natural_loop_body(
 }
 
 /// Returns `Some(target)` if `targets` contains exactly one target, otherwise `None`.
-fn single_target<'a, I: IntoIterator<Item = &'a usize>>(targets: I) -> Option<usize> {
-    let mut targets = targets.into_iter().copied();
+fn single_target<T, I: IntoIterator<Item = T>>(targets: I) -> Option<T> {
+    let mut targets = targets.into_iter();
     let target = targets.next()?;
     targets.next().is_none().then_some(target)
 }
