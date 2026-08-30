@@ -145,6 +145,15 @@ impl Expr {
         }
     }
 
+    /// Creates a 'not' expression with the given operand.
+    #[inline]
+    pub fn not(operand: Self) -> Self {
+        Self::Unary {
+            op: UnOp::Not,
+            value: Box::new(operand),
+        }
+    }
+
     /// Returns whether this expression contains a given [`LocalId`].
     pub fn contains_local(&self, id: LocalId) -> bool {
         let mut contains = Contains {
