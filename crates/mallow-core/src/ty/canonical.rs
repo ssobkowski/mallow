@@ -52,7 +52,7 @@ pub enum Metamethod {
 
 impl Metamethod {
     /// Returns the field name used by Luau to store this metamethod.
-    pub const fn field(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Index => "__index",
             Self::NewIndex => "__newindex",
@@ -73,6 +73,12 @@ impl Metamethod {
             Self::Len => "__len",
             Self::Iter => "__iter",
         }
+    }
+}
+
+impl std::fmt::Display for Metamethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 

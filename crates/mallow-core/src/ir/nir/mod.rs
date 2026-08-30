@@ -10,9 +10,8 @@ use id_arena::{Arena, Id};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
-use crate::hil::ir::CellId;
 use crate::il::ProtoId;
-use crate::ir::fir::{Constant, PackId, ValueId};
+use crate::ir::fir::{CellId, Constant, PackId, ValueId};
 use crate::ir::nir::visitor::{Visitor, walk_expr, walk_pack_expr};
 use crate::operator::{BinOp, UnOp};
 

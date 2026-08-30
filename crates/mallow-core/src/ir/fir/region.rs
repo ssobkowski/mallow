@@ -4,7 +4,7 @@ use std::fmt;
 use anyhow::{Result, ensure};
 use either::Either;
 
-use crate::hil::cflow::graph::{DominatorTree, GraphView, Reversed, SeseGraphView, build_graph};
+use crate::ir::graph::{DominatorTree, GraphView, Reversed, SeseGraphView, build_graph};
 use crate::logging::{Diagnostics, LogLevel, LogTarget};
 
 use super::{Block, BlockExit, Function, Instr, PackId, ValueId};

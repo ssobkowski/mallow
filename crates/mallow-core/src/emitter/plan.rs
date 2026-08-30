@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 use super::name::{LocalNameCtx, LocalRole, LocalSource, Namer, Names};
 use super::storage::Storage;
 use crate::ast::Identifier;
-use crate::hil::ir::CellId;
+use crate::ir::fir::CellId;
 use crate::ir::nir::visitor::Visitor;
 use crate::ir::nir::{self, LocalId, PackLocalId};
 
@@ -731,8 +731,7 @@ mod tests {
     use id_arena::Arena;
 
     use super::*;
-    use crate::hil::ir::{Cell, CellOrigin};
-    use crate::ir::fir::{Constant, Value};
+    use crate::ir::fir::{Cell, CellOrigin, Constant, Value};
     use crate::ir::nir::{Capture, Expr, Function, Local, Place, Region, Stmt};
 
     /// Builds one flat function with the requested local count.

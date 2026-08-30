@@ -3,8 +3,7 @@
 //!
 //! Such instructions can be folded only if they appear after an assignment to a table expr.
 
-use crate::hil::ir::Number;
-use crate::ir::fir::Constant;
+use crate::ir::fir::{Constant, Number};
 use crate::ir::nir::visitor::VisitorMut;
 use crate::ir::nir::{Expr, Function, Place, Stmt, TableItem};
 

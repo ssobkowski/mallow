@@ -5,18 +5,21 @@ use anyhow::{Context, Result, bail, ensure};
 use id_arena::Arena;
 use smol_str::{SmolStr, ToSmolStr};
 
+use super::cflow::{Cond, CondRhs, RawBlock, RawBlockExit, build_raw_from_proto};
 use super::ssa::Ssa;
 use super::{self as ir, Block, BlockExit, Capture, Function, Pack, PackId, ValueId};
 use crate::common::ByteString;
 use crate::disasm::Chunk;
-use crate::hil::cflow::cfg::{Cond, CondRhs, RawBlock, RawBlockExit, build_raw_from_proto};
-use crate::hil::cflow::graph::{AdjGraph, GraphView, build_graph};
-use crate::hil::ir::{Cell, CellId, CellOrigin, Number};
-use crate::hil::lifter::common::{CAPTURE_REF, CAPTURE_UPVAL, CAPTURE_VAL};
 use crate::il::{
     self, ChildProtoId, ConstId, Count, ImportPath, Proto, ProtoId, reg_add, reg_range,
 };
+use crate::ir::fir::{Cell, CellId, CellOrigin, Number};
+use crate::ir::graph::{AdjGraph, GraphView, build_graph};
 use crate::operator::{BinOp, UnOp};
+
+pub const CAPTURE_VAL: u8 = 0;
+pub const CAPTURE_REF: u8 = 1;
+pub const CAPTURE_UPVAL: u8 = 2;
 
 /// A deferred value pack waiting for a variadic consumer.
 #[derive(Debug, Clone, Copy)]

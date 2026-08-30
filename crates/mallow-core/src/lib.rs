@@ -2,26 +2,24 @@ mod ast;
 mod common;
 mod disasm;
 mod emitter;
-mod hil;
 mod il;
 mod ir;
 mod logging;
 mod operator;
 mod printer;
 mod scopes;
-mod types_view;
+
+#[cfg(feature = "visualize")]
+mod visualize;
 
 use anyhow::{Result, ensure};
 pub use logging::{
     DIAGNOSTIC_EVENT_TARGET, DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
 };
-pub use types_view::{TypeFactory, TypePackView, TypeView, TypesView};
 
 use crate::disasm::Chunk;
-use crate::hil::lifted::LiftedFunction;
-#[cfg(feature = "visualize")]
-use crate::il::ProtoId;
-use crate::il::{BytecodeType, ProtoTypeInfo, TypeTag};
+use crate::il::{BytecodeType, ProtoId, TypeTag};
+use crate::ir::fir;
 use crate::logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget};
 
 /// Output form produced by bytecode decompilation.
@@ -87,12 +85,6 @@ pub fn disassemble_bytecode_with_diagnostics(
     info.line(1, format_args!("Type Version: {}", chunk.types_version));
     info.line(1, format_args!("Proto count: {}", chunk.protos.len()));
     info.line(1, format_args!("Entry: {}", chunk.entry_proto));
-    dump_type_info(&chunk, &info);
-
-    Ok(chunk)
-}
-
-fn dump_type_info(chunk: &Chunk, info: &logging::DiagnosticSink<'_>) {
     info.line(1, format_args!("Type info:"));
 
     match &chunk.userdata_type_mappings {
@@ -116,54 +108,48 @@ fn dump_type_info(chunk: &Chunk, info: &logging::DiagnosticSink<'_>) {
         }
 
         info.line(2, format_args!("proto {}:", proto.id));
-        dump_proto_type_info(type_info, chunk, info);
-    }
-}
-
-fn dump_proto_type_info(
-    type_info: &ProtoTypeInfo,
-    chunk: &Chunk,
-    info: &logging::DiagnosticSink<'_>,
-) {
-    if let Some(function) = &type_info.function {
-        let params = function
-            .params
-            .iter()
-            .enumerate()
-            .map(|(i, tag)| format!("R{i}: {}", format_type_tag(*tag, chunk)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        info.line(
-            3,
-            format_args!("function params({}): {}", function.num_params, params),
-        );
-    }
-
-    if !type_info.upvalues.is_empty() {
-        info.line(3, format_args!("upvalues:"));
-        for (index, tag) in type_info.upvalues.iter().enumerate() {
+        if let Some(function) = &type_info.function {
+            let params = function
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, tag)| format!("R{i}: {}", format_type_tag(*tag, &chunk)))
+                .collect::<Vec<_>>()
+                .join(", ");
             info.line(
-                4,
-                format_args!("U{index}: {}", format_type_tag(*tag, chunk)),
+                3,
+                format_args!("function params({}): {}", function.num_params, params),
             );
+        }
+
+        if !type_info.upvalues.is_empty() {
+            info.line(3, format_args!("upvalues:"));
+            for (index, tag) in type_info.upvalues.iter().enumerate() {
+                info.line(
+                    4,
+                    format_args!("U{index}: {}", format_type_tag(*tag, &chunk)),
+                );
+            }
+        }
+
+        if !type_info.locals.is_empty() {
+            info.line(3, format_args!("locals/temporaries:"));
+            for local in &type_info.locals {
+                info.line(
+                    4,
+                    format_args!(
+                        "R{}: {} from {} to {}",
+                        local.register,
+                        format_type_tag(local.ty, &chunk),
+                        local.start_pc,
+                        local.end_pc
+                    ),
+                );
+            }
         }
     }
 
-    if !type_info.locals.is_empty() {
-        info.line(3, format_args!("locals/temporaries:"));
-        for local in &type_info.locals {
-            info.line(
-                4,
-                format_args!(
-                    "R{}: {} from {} to {}",
-                    local.register,
-                    format_type_tag(local.ty, chunk),
-                    local.start_pc,
-                    local.end_pc
-                ),
-            );
-        }
-    }
+    Ok(chunk)
 }
 
 fn format_type_tag(tag: TypeTag, chunk: &Chunk) -> String {
@@ -188,39 +174,28 @@ fn format_type_tag(tag: TypeTag, chunk: &Chunk) -> String {
     base
 }
 
-/// Lifted functions shared by public bytecode pipelines.
-struct LiftedProgram {
-    /// Entry proto selected by the bytecode chunk.
-    #[cfg(feature = "visualize")]
-    entry_proto: ProtoId,
-    /// Functions indexed by their proto IDs.
-    functions: Vec<LiftedFunction>,
+/// Lifts Luau bytecode into the FIR.
+///
+/// Returns a tuple of the entry proto, and a vector of lifted functions.
+pub fn lift_bytecode(bytecode: &[u8]) -> Result<(ProtoId, Vec<fir::Function>)> {
+    lift_bytecode_with_diagnostics(bytecode, &Diagnostics::default())
 }
 
-/// Disassembles and lifts bytecode without structuring its control flow.
-fn lift_bytecode_with_diagnostics(
+/// Lifts Luau bytecode into the FIR using an existing diagnostics context.
+///
+/// Returns a tuple of the entry proto, and a vector of lifted functions.
+pub fn lift_bytecode_with_diagnostics(
     bytecode: &[u8],
     diagnostics: &Diagnostics,
-) -> Result<LiftedProgram> {
-    let disassembled = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let diagnostics = diagnostics.with_entry_proto(disassembled.entry_proto.0);
-    let functions = {
-        let span = tracing::info_span!("lift_protos", proto_count = disassembled.protos.len());
-        let _enter = span.enter();
-
-        disassembled
-            .protos
-            .iter()
-            .map(|proto| LiftedFunction::from_proto(proto, &disassembled, &diagnostics))
-            .collect::<Result<_, _>>()?
-    };
-
-    Ok(LiftedProgram {
-        #[cfg(feature = "visualize")]
-        entry_proto: disassembled.entry_proto,
-        functions,
-    })
+) -> Result<(ProtoId, Vec<fir::Function>)> {
+    let span = tracing::info_span!("lift_bytecode", byte_len = bytecode.len());
+    let _enter = span.enter();
+    let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    let functions = ir::fir::lift(&chunk)?;
+    Ok((chunk.entry_proto, functions))
 }
+
+pub struct TypesView;
 
 /// Infers named-local types from Luau bytecode.
 pub fn infer_bytecode_types(bytecode: &[u8]) -> Result<TypesView> {
@@ -229,14 +204,15 @@ pub fn infer_bytecode_types(bytecode: &[u8]) -> Result<TypesView> {
 
 /// Infers named-local types using an existing diagnostics context.
 pub fn infer_bytecode_types_with_diagnostics(
-    bytecode: &[u8],
-    diagnostics: &Diagnostics,
+    _bytecode: &[u8],
+    _diagnostics: &Diagnostics,
 ) -> Result<TypesView> {
-    let span = tracing::info_span!("infer_bytecode_types", byte_len = bytecode.len());
-    let _enter = span.enter();
-    let mut program = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    hil::ty::inference::run(&mut program.functions);
-    Ok(TypesView::from_inferred(&program.functions))
+    // let span = tracing::info_span!("infer_bytecode_types", byte_len = bytecode.len());
+    // let _enter = span.enter();
+    // let (_, functions) = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    // ty::inference::run(&mut functions);
+    // Ok(TypesView::from_inferred(&functions))
+    todo!("in works")
 }
 
 /// Emits Luau bytecode as cleaned source or intermediate representation text.
@@ -315,22 +291,10 @@ pub fn visualize_bytecode(
     output: impl AsRef<std::path::Path>,
     diagnostics: &Diagnostics,
 ) -> Result<()> {
-    use crate::hil::cflow::visualize::dump_cfgs;
-
     let span = tracing::info_span!("visualize_bytecode", byte_len = bytecode.len());
     let _enter = span.enter();
 
-    let program = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let cfgs: Vec<_> = program
-        .functions
-        .into_iter()
-        .map(|function| function.cfg)
-        .collect();
-
-    dump_cfgs(
-        &cfgs,
-        program.entry_proto.0 as usize,
-        output.as_ref().to_path_buf(),
-    );
+    let (entry, functions) = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    visualize::dump_cfgs(&functions, entry.0 as usize, output.as_ref().to_path_buf());
     Ok(())
 }

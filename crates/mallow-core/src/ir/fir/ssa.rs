@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use id_arena::Arena;
 
 use super::{Block, Instr, Value, ValueId};
-use crate::hil::cflow::graph::GraphView;
+use crate::ir::graph::GraphView;
 
 /// Builds immutable value versions for physical registers.
 pub(super) struct Ssa<'a, G: GraphView> {

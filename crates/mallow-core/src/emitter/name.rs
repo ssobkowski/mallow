@@ -4,7 +4,7 @@ use smol_str::{SmolStr, format_smolstr};
 
 use crate::ast::Identifier;
 use crate::common::is_valid_luau_identifier;
-use crate::hil::ir::CellId;
+use crate::ir::fir::CellId;
 use crate::ir::nir::{Expr, LocalId, PackLocalId};
 
 /// The source role of one emitter binding.

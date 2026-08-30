@@ -1,10 +1,9 @@
-use std::fmt::Display;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use crate::hil::cflow::cfg::{Block, BlockExit, ControlFlowGraph};
-use crate::hil::cflow::graph::{DominatorTree, GraphView};
+use crate::ir::fir::{Block, BlockExit, Function};
+use crate::ir::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
 
 const CHAR_W: f64 = 7.2;
 const LINE_H: f64 = 16.0;
@@ -17,69 +16,38 @@ const LAYER_H_HINT: f64 = 200.0;
 
 struct NodeLabel {
     header: String,
-    /// (text, bold)
     lines: Vec<(String, bool)>,
 }
 
-fn join_display(items: impl IntoIterator<Item = impl Display>, sep: &str) -> String {
-    items
-        .into_iter()
-        .map(|v| v.to_string())
-        .collect::<Vec<_>>()
-        .join(sep)
-}
-
-fn build_label(idx: usize, block: &Block, is_entry: bool) -> NodeLabel {
+fn build_label(idx: usize, function: &Function, block: &Block, is_entry: bool) -> NodeLabel {
     let mut header = format!("Block {idx}");
     if is_entry {
         header.push_str(" (Entry)");
     }
-    if matches!(block.exit(), BlockExit::Return(_)) {
+    if matches!(&block.exit, BlockExit::Return(_)) {
         header.push_str(" (Exit)");
     }
 
     let mut lines: Vec<_> = block
-        .stmts()
+        .instrs
         .iter()
-        .map(|s| (format!("{}", s), false))
+        .map(|instr| (function.display_instr(instr).to_string(), false))
         .collect();
 
-    match block.exit() {
-        BlockExit::CondJump { cond, .. } => lines.push((format!("if ({})", cond), true)),
-        BlockExit::FornPrep {
-            var,
-            start,
-            end,
-            step,
-            ..
-        } => lines.push((
-            format!("for v{} = {}, {}, {}", var.index(), start, end, step),
-            true,
-        )),
-        BlockExit::FornLoop { .. } => lines.push(("forn_loop".into(), true)),
-        BlockExit::ForgPrep { exprs, .. } => lines.push((
-            format!("for {}, {}, {}", exprs[0], exprs[1], exprs[2]),
-            true,
-        )),
-        BlockExit::ForgLoop { vars, .. } => lines.push((
-            format!(
-                "forg_loop {}",
-                join_display(vars.iter().map(|s| format!("v{}", s.index())), ", ")
-            ),
-            true,
-        )),
-        BlockExit::Return(vals) => lines.push((format!("return {}", vals), false)),
-        _ => {}
+    if !matches!(&block.exit, BlockExit::Jump(_) | BlockExit::Fallthrough(_)) {
+        let is_return = matches!(&block.exit, BlockExit::Return(_));
+        lines.push((block.exit.display().to_string(), !is_return));
     }
 
     NodeLabel { header, lines }
 }
 
+/// Computes the dimensions of one node label.
 fn node_size(label: &NodeLabel) -> (f64, f64) {
     let max_chars = label
         .lines
         .iter()
-        .map(|(l, _)| l.len())
+        .map(|(line, _)| line.len())
         .chain(std::iter::once(label.header.len()))
         .max()
         .unwrap_or(0);
@@ -89,31 +57,29 @@ fn node_size(label: &NodeLabel) -> (f64, f64) {
 }
 
 fn dom_depths(idoms: &DominatorTree, entry: usize, node_count: usize) -> Vec<usize> {
-    let n = node_count;
-    let mut depth = vec![usize::MAX; n];
+    let mut depth = vec![usize::MAX; node_count];
     depth[entry] = 0;
 
     let mut changed = true;
     while changed {
         changed = false;
-        for i in 0..n {
-            if depth[i] != usize::MAX {
+        for node in 0..node_count {
+            if depth[node] != usize::MAX {
                 continue;
             }
-            if let Some(idom) = idoms.idom(i)
-                && idom < n
+            if let Some(idom) = idoms.idom(node)
+                && idom < node_count
                 && depth[idom] != usize::MAX
             {
-                depth[i] = depth[idom] + 1;
+                depth[node] = depth[idom] + 1;
                 changed = true;
             }
         }
     }
 
-    // Unreachable nodes (depth still MAX) get 0 - they're filtered out anyway.
     depth
         .iter()
-        .map(|&d| if d == usize::MAX { 0 } else { d })
+        .map(|&depth| if depth == usize::MAX { 0 } else { depth })
         .collect()
 }
 
@@ -121,10 +87,8 @@ struct Edge {
     id: String,
     src: usize,
     dst: usize,
-    /// CSS color string
     color: &'static str,
     is_back: bool,
-    /// Port order on the source's south face (0 = leftmost).
     src_port_order: usize,
 }
 
@@ -135,118 +99,177 @@ struct GraphPayload {
     edge_color_json: Value,
 }
 
-impl ControlFlowGraph {
-    fn graph_payload(&self, tag: &str) -> GraphPayload {
-        let n = self.len();
+fn graph_payload(function: &Function, tag: &str) -> GraphPayload {
+    let (successors, predecessors) =
+        build_graph(function.blocks.iter().map(|block| block.exit.targets()));
+    let graph = AdjGraph::new(0, &successors, &predecessors);
+    let node_count = function.blocks.len();
+    let idoms = (node_count > 0).then(|| graph.build_idoms());
+    let depths = idoms.as_ref().map_or_else(Vec::new, |idoms| {
+        dom_depths(idoms, graph.entry(), node_count)
+    });
 
-        let idoms = self.build_idoms();
-        let depths = dom_depths(&idoms, self.entry(), n);
-        let labels: Vec<Option<NodeLabel>> = self
-            .blocks()
-            .enumerate()
-            .map(|(i, b)| {
-                self.is_reachable(i)
-                    .then(|| build_label(i, b, i == self.entry()))
-            })
-            .collect();
+    let labels: Vec<Option<NodeLabel>> = function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            graph
+                .is_reachable(index)
+                .then(|| build_label(index, function, block, index == graph.entry()))
+        })
+        .collect();
 
-        let mut edge_counter = 0usize;
-        let mut edges: Vec<Edge> = Vec::new();
+    let mut edge_counter = 0usize;
+    let mut edges = Vec::new();
 
-        for (src, block) in self.blocks().enumerate() {
-            if !self.is_reachable(src) {
+    if let Some(idoms) = idoms.as_ref() {
+        for (src, block) in function.blocks.iter().enumerate() {
+            if !graph.is_reachable(src) {
                 continue;
             }
 
-            let mut push =
-                |edges: &mut Vec<Edge>, dst: usize, color: &'static str, port_order: usize| {
-                    if !self.is_reachable(dst) {
-                        return;
-                    }
-
-                    edge_counter += 1;
-                    let is_back = idoms.dominates(src, dst);
-                    edges.push(Edge {
-                        id: format!("e{edge_counter}"),
-                        src,
-                        dst,
-                        color,
-                        is_back,
-                        src_port_order: port_order,
-                    });
-                };
-
-            match block.exit() {
-                BlockExit::Jump(t) | BlockExit::Fallthrough(t) => {
-                    push(&mut edges, *t, "#2196F3", 0)
-                }
-                BlockExit::CondJump {
+            match &block.exit {
+                BlockExit::Jump(target) | BlockExit::Fallthrough(target) => add_edge(
+                    &mut edges,
+                    &mut edge_counter,
+                    &graph,
+                    idoms,
+                    src,
+                    *target,
+                    "#2196F3",
+                    0,
+                ),
+                BlockExit::Branch {
                     then_block,
                     else_block,
                     ..
                 } => {
-                    // then (green) → order 0 (left), else (red) → order 1 (right)
-                    push(&mut edges, *then_block, "#4CAF50", 0);
-                    push(&mut edges, *else_block, "#f44336", 1);
+                    // Then is green and left. Else is red and right.
+                    add_edge(
+                        &mut edges,
+                        &mut edge_counter,
+                        &graph,
+                        idoms,
+                        src,
+                        *then_block,
+                        "#4CAF50",
+                        0,
+                    );
+                    add_edge(
+                        &mut edges,
+                        &mut edge_counter,
+                        &graph,
+                        idoms,
+                        src,
+                        *else_block,
+                        "#f44336",
+                        1,
+                    );
                 }
-                BlockExit::FornPrep {
+                BlockExit::NumericFor {
                     body_block,
                     exit_block,
                     ..
                 }
-                | BlockExit::FornLoop {
+                | BlockExit::NumericForLoop {
                     body_block,
                     exit_block,
-                    ..
                 }
-                | BlockExit::ForgLoop {
+                | BlockExit::GenericForLoop {
                     body_block,
                     exit_block,
                     ..
                 } => {
-                    push(&mut edges, *body_block, "#4CAF50", 0);
-                    push(&mut edges, *exit_block, "#f44336", 1);
+                    add_edge(
+                        &mut edges,
+                        &mut edge_counter,
+                        &graph,
+                        idoms,
+                        src,
+                        *body_block,
+                        "#4CAF50",
+                        0,
+                    );
+                    add_edge(
+                        &mut edges,
+                        &mut edge_counter,
+                        &graph,
+                        idoms,
+                        src,
+                        *exit_block,
+                        "#f44336",
+                        1,
+                    );
                 }
-                BlockExit::ForgPrep {
-                    body_block,
-                    exit_block,
-                    ..
-                } => {
-                    push(&mut edges, *body_block, "#4CAF50", 0);
-                    push(&mut edges, *exit_block, "#f44336", 1);
+                BlockExit::GenericFor { body_block, .. } => {
+                    add_edge(
+                        &mut edges,
+                        &mut edge_counter,
+                        &graph,
+                        idoms,
+                        src,
+                        *body_block,
+                        "#4CAF50",
+                        0,
+                    );
                 }
                 BlockExit::Return(_) => {}
             }
         }
+    }
 
-        let mut out_edges = vec![vec![]; n];
-        let mut in_edges = vec![vec![]; n];
-        for e in &edges {
-            out_edges[e.src].push(e);
-            in_edges[e.dst].push(e);
-        }
-        for oe in &mut out_edges {
-            oe.sort_by_key(|e| e.src_port_order);
-        }
+    let mut out_edges = vec![vec![]; node_count];
+    let mut in_edges = vec![vec![]; node_count];
+    for edge in &edges {
+        out_edges[edge.src].push(edge);
+        in_edges[edge.dst].push(edge);
+    }
+    for outgoing in &mut out_edges {
+        outgoing.sort_by_key(|edge| edge.src_port_order);
+    }
 
-        let elk_json = build_elk_json(&labels, &edges, &out_edges, &in_edges, &depths, n);
-        let label_json = build_label_json(&labels, n);
-        let edge_color_json = build_edge_color_json(&edges);
+    let elk_json = build_elk_json(&labels, &edges, &out_edges, &in_edges, &depths, node_count);
+    let label_json = build_label_json(&labels, node_count);
+    let edge_color_json = build_edge_color_json(&edges);
 
-        GraphPayload {
-            tag: tag.to_owned(),
-            elk_json,
-            label_json,
-            edge_color_json,
-        }
+    GraphPayload {
+        tag: tag.to_owned(),
+        elk_json,
+        label_json,
+        edge_color_json,
     }
 }
 
-pub fn dump_cfgs(cfgs: &[ControlFlowGraph], selected_index: usize, output: PathBuf) {
-    let payloads: Vec<_> = cfgs
+fn add_edge(
+    edges: &mut Vec<Edge>,
+    edge_counter: &mut usize,
+    graph: &AdjGraph<'_>,
+    idoms: &DominatorTree,
+    src: usize,
+    dst: usize,
+    color: &'static str,
+    src_port_order: usize,
+) {
+    if !graph.is_reachable(dst) {
+        return;
+    }
+
+    *edge_counter += 1;
+    edges.push(Edge {
+        id: format!("e{edge_counter}"),
+        src,
+        dst,
+        color,
+        is_back: idoms.dominates(dst, src),
+        src_port_order,
+    });
+}
+
+pub fn dump_cfgs(functions: &[Function], selected_index: usize, output: PathBuf) {
+    let payloads: Vec<_> = functions
         .iter()
-        .enumerate()
-        .map(|(i, cfg)| cfg.graph_payload(&format!("Proto {i}")))
+        .map(|function| graph_payload(function, &format!("Proto {}", function.proto.0)))
         .collect();
 
     let selected_index = selected_index.min(payloads.len().saturating_sub(1));
@@ -384,7 +407,7 @@ fn build_graphs_json(graphs: &[GraphPayload]) -> Value {
 }
 
 fn build_html(graphs_json: &Value, selected_index: usize, title: &str) -> String {
-    include_str!("../../../assets/cfg.html")
+    include_str!("../assets/cfg.html")
         .replace("__GRAPHS_JSON__", &graphs_json.to_string())
         .replace("__SELECTED_INDEX__", &selected_index.to_string())
         .replace("__BASE_TITLE__", &serde_json::to_string(title).unwrap())

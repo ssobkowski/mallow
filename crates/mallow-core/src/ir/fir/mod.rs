@@ -1,7 +1,9 @@
 //! Flat intermediate representation used before source structuring.
 
-mod lifter;
 pub(crate) mod region;
+
+mod cflow;
+mod lifter;
 mod ssa;
 
 use std::collections::HashSet;
@@ -13,9 +15,8 @@ use smallvec::{SmallVec, smallvec};
 use smol_str::SmolStr;
 
 use crate::common::ByteString;
-use crate::hil::cflow::graph::build_graph;
-use crate::hil::ir::{Cell, CellId, CellOrigin, Number};
 use crate::il::ProtoId;
+use crate::ir::graph::build_graph;
 use crate::operator::{BinOp, UnOp};
 
 pub(crate) use lifter::lift;
@@ -61,6 +62,43 @@ impl fmt::Display for Constant {
             Self::Bool(b) => write!(f, "{}", b),
         }
     }
+}
+
+/// A numeric literal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Number {
+    /// A 64-bit Luau integer literal.
+    Integer(i64),
+    /// A floating-point literal.
+    Float(f64),
+}
+
+impl std::fmt::Display for Number {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Number::Integer(n) => write!(f, "{}i", n),
+            Number::Float(n) => write!(f, "{}", n),
+        }
+    }
+}
+
+/// Stable identity for one mutable HIL storage cell.
+pub type CellId = Id<Cell>;
+
+/// One mutable storage cell used by closure upvalues.
+#[derive(Debug, Clone)]
+pub struct Cell {
+    /// Bytecode storage that introduced this cell.
+    pub origin: CellOrigin,
+}
+
+/// The bytecode storage represented by one cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CellOrigin {
+    /// One declared upvalue slot in the current function.
+    Upvalue(u8),
+    /// One generation of an open captured register.
+    CapturedRegister { reg: u8, generation: u16 },
 }
 
 /// A value or cell captured by one closure.
@@ -308,6 +346,12 @@ impl Function {
             );
         }
         Ok(())
+    }
+
+    /// Returns a formatter for one instruction in this function.
+    #[cfg(feature = "visualize")]
+    pub(crate) fn display_instr<'a>(&'a self, instr: &'a Instr) -> impl fmt::Display + 'a {
+        DisplayInstr(self, instr)
     }
 }
 
@@ -823,6 +867,12 @@ impl BlockExit {
             Self::GenericFor { body_block, .. } => smallvec![*body_block],
             Self::Return(_) => SmallVec::new(),
         }
+    }
+
+    /// Returns a formatter for this block exit.
+    #[cfg(feature = "visualize")]
+    pub(crate) fn display(&self) -> impl fmt::Display + '_ {
+        DisplayBlockExit(self)
     }
 }
 

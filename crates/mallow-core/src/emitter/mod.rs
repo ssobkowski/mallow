@@ -12,9 +12,8 @@ use storage::Storage;
 
 use crate::ast::Identifier;
 use crate::common::is_valid_luau_identifier;
-use crate::hil::ir::{CellId, Number};
 use crate::il::ProtoId;
-use crate::ir::fir::Constant;
+use crate::ir::fir::{CellId, Constant, Number};
 use crate::ir::nir;
 use crate::operator::{BinOp, CompoundBinOp};
 use crate::{DecompileOptions, ast};

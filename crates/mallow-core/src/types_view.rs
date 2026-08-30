@@ -5,9 +5,9 @@ use std::fmt;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
-use crate::hil::lifted::LiftedFunction;
-use crate::hil::ty::canonical::{Type, TypeId, TypeLiteral, TypePackId, TypePackTail};
-use crate::hil::ty::store::TypeStore;
+use crate::ir::fir::Function;
+use crate::ty::canonical::{Type, TypeId, TypeLiteral, TypePackId, TypePackTail};
+use crate::ty::store::TypeStore;
 
 /// Inferred types indexed by named locals from debug information.
 pub struct TypesView {
@@ -35,7 +35,7 @@ struct LocalType {
 
 impl TypesView {
     /// Builds a source-level view from functions after inference has completed.
-    pub(crate) fn from_inferred(functions: &[LiftedFunction]) -> Self {
+    pub(crate) fn from_inferred(functions: &[Function]) -> Self {
         let mut store = TypeStore::new();
         let mut locals = Vec::new();
 

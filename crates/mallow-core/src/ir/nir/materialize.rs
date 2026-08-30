@@ -7,11 +7,11 @@ use id_arena::Arena;
 
 use super::visitor::VisitorMut;
 use super::*;
-use crate::hil::cflow::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
-use crate::hil::cflow::union_find::UnionFind;
 use crate::ir::fir;
 use crate::ir::fir::PackId;
 use crate::ir::fir::region::{Predicate, Shape};
+use crate::ir::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
+use crate::ir::union_find::UnionFind;
 use crate::logging::Diagnostics;
 
 /// Recognizes and materializes one FIR function as nested NIR.

@@ -1,6 +1,6 @@
 //! Type-specific ownership and canonical graph operations.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher as _};
 
 use id_arena::{Arena, Id};
@@ -25,9 +25,7 @@ fn fingerprint<T: Hash>(value: &T) -> u64 {
 /// unequal values.
 #[derive(Debug)]
 pub struct HashConsArena<T: Hash + Eq> {
-    /// Owned values. Allocation is private to [`Self::intern`].
     arena: Arena<T>,
-    /// Fingerprint buckets containing candidate IDs.
     buckets: HashMap<u64, Vec<Id<T>>>,
 }
 
@@ -66,14 +64,13 @@ impl<T: Hash + Eq> HashConsArena<T> {
     }
 
     /// Returns the value addressed by `id`, or `None` for a foreign ID.
-    #[must_use]
+    #[inline]
     pub fn get(&self, id: Id<T>) -> Option<&T> {
         self.arena.get(id)
     }
 
     /// Returns the number of owned values.
     #[cfg(test)]
-    #[must_use]
     pub fn len(&self) -> usize {
         self.arena.len()
     }
@@ -121,13 +118,13 @@ impl TypeStore {
     }
 
     /// Borrows primitive IDs without copying the complete primitive set.
-    #[must_use]
+    #[inline]
     pub const fn primitives(&self) -> &PrimitiveIds {
         &self.primitives
     }
 
     /// Returns the node for `id`, panicking if it came from another store.
-    #[must_use]
+    #[inline]
     pub fn get(&self, id: TypeId) -> &Type {
         self.types
             .get(id)
@@ -135,7 +132,7 @@ impl TypeStore {
     }
 
     /// Returns the pack for `id`, panicking if it came from another store.
-    #[must_use]
+    #[inline]
     pub fn get_pack(&self, id: TypePackId) -> &TypePack {
         self.packs
             .get(id)
@@ -143,17 +140,21 @@ impl TypeStore {
     }
 
     /// Interns a node after its child IDs have been validated by a constructor.
+    #[inline]
+    #[must_use]
     fn intern_node(&mut self, node: Type) -> TypeId {
         self.types.intern(node)
     }
 
     /// Creates a named host type.
+    #[inline]
     #[must_use]
     pub fn named(&mut self, name: impl Into<SmolStr>) -> TypeId {
         self.intern_node(Type::Named(name.into()))
     }
 
     /// Creates one literal node and reuses the canonical boolean primitives.
+    #[inline]
     #[must_use]
     pub fn literal(&mut self, literal: TypeLiteral) -> TypeId {
         match literal {
@@ -164,6 +165,7 @@ impl TypeStore {
     }
 
     /// Creates a type pack after validating every referenced type ID.
+    #[inline]
     #[must_use]
     pub fn pack(&mut self, head: Vec<TypeId>, tail: Option<TypePackTail>) -> TypePackId {
         for id in &head {
@@ -177,6 +179,7 @@ impl TypeStore {
     }
 
     /// Creates a structural table shape with ordered, unique field names.
+    #[inline]
     #[must_use]
     pub fn table_shape(
         &mut self,
@@ -201,6 +204,7 @@ impl TypeStore {
     }
 
     /// Creates a function signature from canonical argument and return packs.
+    #[inline]
     #[must_use]
     pub fn function_signature(&mut self, params: TypePackId, returns: TypePackId) -> TypeId {
         self.assert_pack(params);
@@ -225,6 +229,7 @@ impl TypeStore {
     }
 
     /// Recursively imports one node with per-operation memoization.
+    #[must_use]
     fn import_node(
         &mut self,
         source: &TypeStore,
@@ -305,6 +310,7 @@ impl TypeStore {
     }
 
     /// Recursively imports one type pack with per-operation memoization.
+    #[must_use]
     fn import_pack(
         &mut self,
         source: &TypeStore,
@@ -335,13 +341,12 @@ impl TypeStore {
 
     /// Creates a metatabled type with ordered, unique method entries.
     #[must_use]
-    pub fn with_metatable(&mut self, base: TypeId, mut methods: Vec<MetamethodType>) -> TypeId {
+    pub fn with_metatable(&mut self, base: TypeId, methods: Vec<MetamethodType>) -> TypeId {
         self.assert_type(base);
         for entry in &methods {
             self.assert_type(entry.ty);
         }
-        methods.sort_by_key(|entry| entry.method as u8);
-        assert!(
+        debug_assert!(
             methods
                 .windows(2)
                 .all(|pair| pair[0].method != pair[1].method),
@@ -351,12 +356,14 @@ impl TypeStore {
     }
 
     /// Builds a structural union of two members.
+    #[inline]
     #[must_use]
     pub fn union(&mut self, lhs: TypeId, rhs: TypeId) -> TypeId {
         self.union_all([lhs, rhs])
     }
 
     /// Builds a structural union by flattening only nested unions and removing exact duplicates.
+    #[inline]
     #[must_use]
     pub fn union_all<I>(&mut self, members: I) -> TypeId
     where
@@ -366,12 +373,14 @@ impl TypeStore {
     }
 
     /// Builds a structural intersection of two members.
+    #[inline]
     #[must_use]
     pub fn intersection(&mut self, lhs: TypeId, rhs: TypeId) -> TypeId {
         self.intersection_all([lhs, rhs])
     }
 
     /// Builds a structural intersection by flattening only nested intersections and removing exact duplicates.
+    #[inline]
     #[must_use]
     pub fn intersection_all<I>(&mut self, members: I) -> TypeId
     where
@@ -473,6 +482,7 @@ impl TypeStore {
     }
 
     /// Computes a left fold of [`Self::join`].
+    #[inline]
     #[must_use]
     pub fn join_all<I>(&mut self, members: I) -> TypeId
     where
@@ -539,6 +549,7 @@ impl TypeStore {
     }
 
     /// Returns whether `evidence` contains any value accepted by `expected`.
+    #[inline]
     pub fn overlaps(&mut self, evidence: TypeId, expected: TypeId) -> bool {
         self.meet(evidence, expected) != self.primitives.never
     }
@@ -566,6 +577,7 @@ impl TypeStore {
     }
 
     /// Returns whether `lhs` and `rhs` have no common runtime values.
+    #[inline]
     fn are_disjoint(&self, lhs: TypeId, rhs: TypeId) -> bool {
         match (self.get(lhs), self.get(rhs)) {
             (Type::Literal(TypeLiteral::String(lhs)), Type::Literal(TypeLiteral::String(rhs))) => {
@@ -582,6 +594,7 @@ impl TypeStore {
     }
 
     /// Flattens matching structural nodes and removes exact duplicate IDs.
+    #[must_use]
     fn structural_combine<I>(&mut self, members: I, method: CombineMethod) -> TypeId
     where
         I: IntoIterator<Item = TypeId>,
@@ -756,150 +769,6 @@ impl TypeStore {
             _ => id,
         }
     }
-
-    /// Returns whether a type is precise enough to emit as an upper bound.
-    #[must_use]
-    pub fn is_emittable_upper_bound(&self, id: TypeId) -> bool {
-        match self.get(id) {
-            Type::Never | Type::Unknown | Type::Any | Type::Table | Type::Function => false,
-            Type::Union(parts) | Type::Intersection(parts) => parts
-                .iter()
-                .all(|part| self.is_emittable_upper_bound(*part)),
-            _ => true,
-        }
-    }
-
-    /// Returns whether a graph node contains an unresolved `unknown` child.
-    #[must_use]
-    pub fn contains_unknown(&self, id: TypeId) -> bool {
-        let mut visited = HashSet::new();
-        self.contains_unknown_inner(id, &mut visited)
-    }
-
-    /// Traverses one node for [`Self::contains_unknown`].
-    fn contains_unknown_inner(&self, id: TypeId, visited: &mut HashSet<TypeId>) -> bool {
-        if !visited.insert(id) {
-            return false;
-        }
-        match self.get(id) {
-            Type::Unknown => true,
-            Type::TableShape { fields, indexer } => {
-                fields
-                    .iter()
-                    .any(|(_, ty)| self.contains_unknown_inner(*ty, visited))
-                    || indexer.is_some_and(|(key, value)| {
-                        self.contains_unknown_inner(key, visited)
-                            || self.contains_unknown_inner(value, visited)
-                    })
-            }
-            Type::FunctionSignature { params, returns } => {
-                self.pack_contains_unknown(*params, visited)
-                    || self.pack_contains_unknown(*returns, visited)
-            }
-            Type::Union(parts) | Type::Intersection(parts) => parts
-                .iter()
-                .any(|ty| self.contains_unknown_inner(*ty, visited)),
-            Type::WithMetatable { base, methods } => {
-                self.contains_unknown_inner(*base, visited)
-                    || methods
-                        .iter()
-                        .any(|method| self.contains_unknown_inner(method.ty, visited))
-            }
-            _ => false,
-        }
-    }
-
-    /// Returns whether a pack contains an unresolved `unknown` child.
-    #[must_use]
-    fn pack_contains_unknown(&self, id: TypePackId, visited: &mut HashSet<TypeId>) -> bool {
-        let pack = self.get_pack(id);
-        pack.head
-            .iter()
-            .any(|ty| self.contains_unknown_inner(*ty, visited))
-            || pack.tail.as_ref().is_some_and(|tail| match tail {
-                TypePackTail::Homogeneous(ty) => self.contains_unknown_inner(*ty, visited),
-            })
-    }
-
-    /// Returns whether a node or any child carries metatable behavior.
-    #[must_use]
-    pub fn contains_metatable(&self, id: TypeId) -> bool {
-        match self.get(id) {
-            Type::WithMetatable { .. } => true,
-            Type::TableShape { fields, indexer } => {
-                fields.iter().any(|(_, ty)| self.contains_metatable(*ty))
-                    || indexer.is_some_and(|(key, value)| {
-                        self.contains_metatable(key) || self.contains_metatable(value)
-                    })
-            }
-            Type::FunctionSignature { params, returns } => {
-                self.pack_contains_metatable(*params) || self.pack_contains_metatable(*returns)
-            }
-            Type::Union(parts) | Type::Intersection(parts) => {
-                parts.iter().any(|ty| self.contains_metatable(*ty))
-            }
-            _ => false,
-        }
-    }
-
-    /// Returns whether a type is useful enough to emit as a source annotation.
-    #[must_use]
-    pub fn is_meaningful(&self, id: TypeId) -> bool {
-        match self.get(id) {
-            Type::Unknown | Type::Any | Type::Table | Type::Function => false,
-            Type::TableShape { fields, indexer }
-                if fields.is_empty()
-                    && indexer.is_some_and(|(key, value)| {
-                        key == self.primitives.unknown && value == self.primitives.unknown
-                    }) =>
-            {
-                false
-            }
-            Type::FunctionSignature { params, returns }
-                if self.is_unknown_variadic_pack(*params)
-                    && self.is_unknown_variadic_pack(*returns) =>
-            {
-                false
-            }
-            Type::Union(parts) => parts.iter().any(|ty| self.is_meaningful(*ty)),
-            _ => true,
-        }
-    }
-
-    /// Returns whether one graph type can be emitted as a useful source annotation.
-    #[must_use]
-    pub fn is_emittable_annotation(&self, id: TypeId) -> bool {
-        self.is_meaningful(id) && !self.contains_unknown(id)
-    }
-
-    /// Returns whether every element of a return pack can be emitted faithfully.
-    ///
-    /// An empty pack is meaningful because `: ()` distinguishes a function that
-    /// returns no values from one whose return behavior was left unannotated.
-    #[must_use]
-    pub fn is_emittable_return_pack(&self, id: TypePackId) -> bool {
-        let pack = self.get_pack(id);
-        pack.head.iter().all(|ty| self.is_emittable_annotation(*ty))
-            && pack.tail.as_ref().is_none_or(|tail| match tail {
-                TypePackTail::Homogeneous(ty) => self.is_emittable_annotation(*ty),
-            })
-    }
-
-    /// Returns whether a pack is exactly one unknown variadic tail.
-    fn is_unknown_variadic_pack(&self, id: TypePackId) -> bool {
-        let pack = self.get_pack(id);
-        pack.head.is_empty()
-            && pack.tail == Some(TypePackTail::Homogeneous(self.primitives.unknown))
-    }
-
-    /// Returns whether any type in a pack has metatable behavior.
-    fn pack_contains_metatable(&self, id: TypePackId) -> bool {
-        let pack = self.get_pack(id);
-        pack.head.iter().any(|ty| self.contains_metatable(*ty))
-            || pack.tail.as_ref().is_some_and(|tail| match tail {
-                TypePackTail::Homogeneous(ty) => self.contains_metatable(*ty),
-            })
-    }
 }
 
 /// How to combine types.
@@ -914,7 +783,7 @@ mod tests {
     use std::hash::{Hash, Hasher};
 
     use super::{HashConsArena, MetamethodType, RuntimeKind, Type, TypeLiteral, TypeStore};
-    use crate::hil::ty::canonical::{Metamethod, TypePackTail};
+    use crate::ty::canonical::{Metamethod, TypePackTail};
 
     /// A test value whose every fingerprint collides.
     #[derive(Debug, Clone, PartialEq, Eq)]

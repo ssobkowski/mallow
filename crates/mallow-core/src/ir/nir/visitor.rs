@@ -4,8 +4,7 @@
 )]
 
 use crate::common::ByteString;
-use crate::hil::ir::{CellId, Number};
-use crate::ir::fir::Constant;
+use crate::ir::fir::{CellId, Constant, Number};
 use crate::ir::nir::TableItem;
 use smol_str::SmolStr;
 
