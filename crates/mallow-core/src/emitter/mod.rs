@@ -16,7 +16,7 @@ use crate::hil::ir::{CellId, Number};
 use crate::il::ProtoId;
 use crate::ir::fir::Constant;
 use crate::ir::nir;
-use crate::operator::BinOp;
+use crate::operator::{BinOp, CompoundBinOp};
 use crate::{DecompileOptions, ast};
 
 /// Emits a materialized NIR program with the default naming policy.
@@ -25,7 +25,7 @@ pub(crate) fn emit_ast(
     entry: ProtoId,
     options: DecompileOptions,
 ) -> Result<ast::Block> {
-    emit_ast_with_namer(functions, entry, options, PlainNamer)
+    emit_ast_with_namer(functions, entry, options, PlainNamer::default())
 }
 
 /// Emits a materialized NIR program with a caller-provided naming policy.
@@ -438,16 +438,32 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         match stmt {
             nir::Stmt::Bind { target, value, .. } => match target {
                 nir::Place::Local(local) => {
-                    let value = self.lower_expr(value)?;
                     let declaration = self
                         .plan
                         .claim_declaration(BindingKey::Local(*local), scope);
-                    self.bind_storage(self.plan.local(*local)?, value, declaration, out);
+                    if !declaration && let Some((op, rhs)) = compound_binding(target, value) {
+                        out.push(ast::Stmt::CompoundAssignment {
+                            lhs: self.plan.local(*local)?.expr(),
+                            op,
+                            rhs: self.lower_expr(rhs)?,
+                        });
+                    } else {
+                        let value = self.lower_expr(value)?;
+                        self.bind_storage(self.plan.local(*local)?, value, declaration, out);
+                    }
                 }
                 nir::Place::Cell(cell) => {
-                    let value = self.lower_expr(value)?;
                     let declaration = self.plan.claim_declaration(BindingKey::Cell(*cell), scope);
-                    self.bind_storage(self.plan.cell(*cell)?, value, declaration, out);
+                    if !declaration && let Some((op, rhs)) = compound_binding(target, value) {
+                        out.push(ast::Stmt::CompoundAssignment {
+                            lhs: self.plan.cell(*cell)?.expr(),
+                            op,
+                            rhs: self.lower_expr(rhs)?,
+                        });
+                    } else {
+                        let value = self.lower_expr(value)?;
+                        self.bind_storage(self.plan.cell(*cell)?, value, declaration, out);
+                    }
                 }
                 nir::Place::Global(_) | nir::Place::Table { .. } => {
                     let target = self.lower_place(target)?;
@@ -478,9 +494,14 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             }
             nir::Stmt::Eval { value } => self.eval_pack(value, out)?,
             nir::Stmt::OpenCell { cell, value, .. } => {
-                let value = self.lower_expr(value)?;
-                let declaration = self.plan.claim_declaration(BindingKey::Cell(*cell), scope);
-                self.bind_storage(self.plan.cell(*cell)?, value, declaration, out);
+                let backing_local =
+                    self.function.cell_locals.get(cell).ok_or_else(|| {
+                        anyhow::anyhow!("opened cell has no backing source local")
+                    })?;
+                ensure!(
+                    matches!(value, nir::Expr::Local(local) if local == backing_local),
+                    "opened cell does not reference its backing source local"
+                );
             }
             nir::Stmt::SetList {
                 table,
@@ -779,6 +800,26 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             }
         })
     }
+}
+
+/// Returns the compound form of one local or cell binding when it exists.
+fn compound_binding<'a>(
+    target: &nir::Place,
+    value: &'a nir::Expr,
+) -> Option<(CompoundBinOp, &'a nir::Expr)> {
+    let nir::Expr::Binary { lhs, op, rhs } = value else {
+        return None;
+    };
+    let reads_target = match (target, lhs.as_ref()) {
+        (nir::Place::Local(target), nir::Expr::Local(source)) => target == source,
+        (nir::Place::Cell(target), nir::Expr::LoadCell(source)) => target == source,
+        _ => false,
+    };
+    if !reads_target {
+        return None;
+    }
+    let op = CompoundBinOp::try_from(*op).ok()?;
+    Some((op, rhs.as_ref()))
 }
 
 /// Converts one NIR constant into an AST literal.

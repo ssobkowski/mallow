@@ -45,6 +45,9 @@ pub(crate) fn destroy_ssa(function: &mut Function) {
     for parameter in &mut function.params {
         rewriter.visit_local(parameter);
     }
+    for local in function.cell_locals.values_mut() {
+        rewriter.visit_local(local);
+    }
     rewriter.visit_stmts(&mut function.prologue);
     rewriter.visit_region(&mut function.body);
 }
@@ -346,6 +349,7 @@ impl<'a> Materializer<'a> {
             .iter()
             .map(|storage| self.initialization(*storage))
             .collect::<Result<_>>()?;
+        let cell_locals = self.cell_locals()?;
         let body = self.region(shape)?;
         let function = Function {
             id: self.function.proto,
@@ -354,10 +358,33 @@ impl<'a> Materializer<'a> {
             params,
             is_vararg: self.function.is_vararg,
             upvalues: self.function.upvalues.clone(),
+            cell_locals,
             prologue,
             body,
         };
         Ok(function)
+    }
+
+    /// Finds the source local which backs every locally opened cell.
+    fn cell_locals(&self) -> Result<HashMap<CellId, LocalId>> {
+        let mut cell_locals = HashMap::new();
+        for instr in self
+            .function
+            .blocks
+            .iter()
+            .flat_map(|block| block.instrs.iter())
+        {
+            let fir::Instr::OpenCell { cell, value } = instr else {
+                continue;
+            };
+            let local = self.local(*value)?;
+            if let Some(previous) = cell_locals.insert(*cell, local)
+                && self.locals[previous].source != self.locals[local].source
+            {
+                bail!("cell was opened from unrelated source locals");
+            }
+        }
+        Ok(cell_locals)
     }
 
     /// Creates one synthetic nil declaration for mutable storage.

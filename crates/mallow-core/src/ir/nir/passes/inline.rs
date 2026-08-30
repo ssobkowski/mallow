@@ -278,7 +278,12 @@ impl<'nir> DefUse<'nir> {
         let mut replacements = Replacements::default();
 
         for (local, data) in function.locals.iter() {
-            if self.storage_symbol_counts[&data.source] != 1 {
+            if function
+                .cell_locals
+                .values()
+                .any(|backing_local| *backing_local == local)
+                || self.storage_symbol_counts[&data.source] != 1
+            {
                 continue;
             }
 

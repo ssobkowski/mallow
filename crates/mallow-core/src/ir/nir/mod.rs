@@ -4,6 +4,8 @@ pub(crate) mod materialize;
 pub(crate) mod passes;
 pub(crate) mod visitor;
 
+use std::collections::HashMap;
+
 use id_arena::{Arena, Id};
 use smallvec::SmallVec;
 use smol_str::SmolStr;
@@ -430,6 +432,8 @@ pub(crate) struct Function {
     pub(crate) is_vararg: bool,
     /// Upvalue cells in closure capture order.
     pub(crate) upvalues: Vec<CellId>,
+    /// Source locals which provide storage for locally opened cells.
+    pub(crate) cell_locals: HashMap<CellId, LocalId>,
     /// Statements that declare storage before control flow starts.
     pub(crate) prologue: Vec<Stmt>,
     /// Nested function body.

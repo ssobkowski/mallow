@@ -64,12 +64,36 @@ pub(crate) trait Namer {
     fn name(&mut self, ctx: LocalNameCtx<'_>) -> Identifier;
 }
 
-/// Provides stable plain names when no smarter naming policy is installed.
+/// Provides plain sequential names when no smarter naming policy is installed.
 #[derive(Default)]
-pub(crate) struct PlainNamer;
+pub(crate) struct PlainNamer {
+    next_parameter: usize,
+    next_value: usize,
+}
 
 impl Namer for PlainNamer {
-    /// Uses the stable NIR identity as the plain name suffix.
+    /// Uses separate sequential names for parameters and other values.
+    fn name(&mut self, ctx: LocalNameCtx<'_>) -> Identifier {
+        let name = if ctx.role == LocalRole::Parameter {
+            let index = self.next_parameter;
+            self.next_parameter += 1;
+            format_smolstr!("p{index}")
+        } else {
+            let index = self.next_value;
+            self.next_value += 1;
+            format_smolstr!("v{index}")
+        };
+        Identifier::new(name)
+    }
+}
+
+/// Provides names whose suffixes preserve NIR arena identities.
+#[derive(Default)]
+#[allow(dead_code, reason = "not implemented yet")]
+pub(crate) struct ArenaNamer;
+
+impl Namer for ArenaNamer {
+    /// Uses the NIR identity and role to build one detailed name.
     fn name(&mut self, ctx: LocalNameCtx<'_>) -> Identifier {
         let name = match (ctx.role, ctx.source) {
             (LocalRole::Parameter, LocalSource::Local(local)) => {

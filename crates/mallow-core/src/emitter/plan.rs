@@ -182,6 +182,14 @@ impl FunctionPlan {
             });
         }
 
+        for (&cell, &local) in &function.cell_locals {
+            let storage = locals
+                .get(&local)
+                .ok_or_else(|| anyhow::anyhow!("missing backing local for cell {}", cell.index()))?
+                .clone();
+            cells.insert(cell, storage);
+        }
+
         Ok(Self {
             locals,
             cells,
@@ -253,11 +261,17 @@ fn insert_storage(
     }
 }
 
-/// First source access observed for one binding.
+/// Source access observed for a binding.
 #[derive(Clone, Copy)]
-struct FirstAccess {
+struct Access {
     scope: usize,
-    is_write: bool,
+    kind: AccessKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessKind {
+    Read,
+    Write,
 }
 
 /// Source facts accumulated for one binding identity.
@@ -265,7 +279,7 @@ struct BindingData<'a> {
     role: LocalRole,
     value: Option<&'a nir::Expr>,
     scope: usize,
-    first: FirstAccess,
+    first: Access,
     order: usize,
 }
 
@@ -274,6 +288,7 @@ struct BindingCollector<'a> {
     scopes: Vec<ScopeFacts<'a>>,
     bindings: HashMap<BindingKey, BindingData<'a>>,
     inherited_cells: &'a HashMap<CellId, Storage>,
+    cell_locals: &'a HashMap<CellId, LocalId>,
     next_order: usize,
 }
 
@@ -290,13 +305,16 @@ impl<'a> BindingCollector<'a> {
             }],
             bindings: HashMap::new(),
             inherited_cells,
+            cell_locals: &function.cell_locals,
             next_order: 0,
         };
         for &parameter in &function.params {
             collector.touch(
                 BindingKey::Local(parameter),
-                0,
-                true,
+                Access {
+                    scope: 0,
+                    kind: AccessKind::Read,
+                },
                 LocalRole::Parameter,
                 None,
             );
@@ -308,7 +326,7 @@ impl<'a> BindingCollector<'a> {
             let declaration = if matches!(data.role, LocalRole::Parameter | LocalRole::LoopVariable)
             {
                 Declaration::Syntax
-            } else if data.first.scope == data.scope && data.first.is_write {
+            } else if data.first.scope == data.scope && data.first.kind == AccessKind::Write {
                 Declaration::Inline(data.scope)
             } else {
                 Declaration::Prefix
@@ -328,18 +346,21 @@ impl<'a> BindingCollector<'a> {
     fn touch(
         &mut self,
         key: BindingKey,
-        scope: usize,
-        is_write: bool,
+        access: Access,
         role: LocalRole,
         value: Option<&'a nir::Expr>,
     ) {
-        if matches!(key, BindingKey::Cell(cell) if self.inherited_cells.contains_key(&cell)) {
-            return;
-        }
+        let key = match key {
+            BindingKey::Cell(cell) if self.inherited_cells.contains_key(&cell) => return,
+            BindingKey::Cell(cell) if self.cell_locals.contains_key(&cell) => {
+                BindingKey::Local(self.cell_locals[&cell])
+            }
+            key => key,
+        };
         let order = self.next_order;
         self.next_order += 1;
         if let Some(data) = self.bindings.get_mut(&key) {
-            data.scope = common_scope(&self.scopes, data.scope, scope);
+            data.scope = common_scope(&self.scopes, data.scope, access.scope);
             if role.priority() > data.role.priority() {
                 data.role = role;
             }
@@ -353,8 +374,8 @@ impl<'a> BindingCollector<'a> {
             BindingData {
                 role,
                 value,
-                scope,
-                first: FirstAccess { scope, is_write },
+                scope: access.scope,
+                first: access,
                 order,
             },
         );
@@ -415,8 +436,10 @@ impl<'a> BindingCollector<'a> {
                 let body_scope = self.push_scope(scope);
                 self.touch(
                     BindingKey::Local(*variable),
-                    body_scope,
-                    true,
+                    Access {
+                        scope: body_scope,
+                        kind: AccessKind::Write,
+                    },
                     LocalRole::LoopVariable,
                     None,
                 );
@@ -434,8 +457,10 @@ impl<'a> BindingCollector<'a> {
                 for &variable in variables {
                     self.touch(
                         BindingKey::Local(variable),
-                        body_scope,
-                        true,
+                        Access {
+                            scope: body_scope,
+                            kind: AccessKind::Write,
+                        },
                         LocalRole::LoopVariable,
                         None,
                     );
@@ -457,15 +482,19 @@ impl<'a> BindingCollector<'a> {
                     match target {
                         nir::Place::Local(local) => self.touch(
                             BindingKey::Local(*local),
-                            scope,
-                            true,
+                            Access {
+                                scope,
+                                kind: AccessKind::Write,
+                            },
                             LocalRole::Value,
                             Some(value),
                         ),
                         nir::Place::Cell(cell) => self.touch(
                             BindingKey::Cell(*cell),
-                            scope,
-                            true,
+                            Access {
+                                scope,
+                                kind: AccessKind::Write,
+                            },
                             LocalRole::Cell,
                             Some(value),
                         ),
@@ -476,28 +505,52 @@ impl<'a> BindingCollector<'a> {
                 nir::Stmt::BindMany { targets, values } => {
                     self.pack_expr(values, scope);
                     for target in targets {
-                        if let nir::Place::Local(local) = target {
-                            self.touch(
+                        match target {
+                            nir::Place::Local(local) => self.touch(
                                 BindingKey::Local(*local),
-                                scope,
-                                true,
+                                Access {
+                                    scope,
+                                    kind: AccessKind::Write,
+                                },
                                 LocalRole::Value,
                                 None,
-                            );
+                            ),
+                            nir::Place::Cell(cell) => self.touch(
+                                BindingKey::Cell(*cell),
+                                Access {
+                                    scope,
+                                    kind: AccessKind::Write,
+                                },
+                                LocalRole::Cell,
+                                None,
+                            ),
+                            nir::Place::Global(_)
+                            | nir::Place::Table { .. }
+                            | nir::Place::Discard => {}
                         }
                     }
                 }
                 nir::Stmt::BindPack { local, value } => {
                     self.pack_expr(value, scope);
-                    self.touch(BindingKey::Pack(*local), scope, true, LocalRole::Pack, None);
+                    self.touch(
+                        BindingKey::Pack(*local),
+                        Access {
+                            scope,
+                            kind: AccessKind::Write,
+                        },
+                        LocalRole::Pack,
+                        None,
+                    );
                 }
                 nir::Stmt::Eval { value } => self.pack_expr(value, scope),
                 nir::Stmt::OpenCell { cell, value, .. } => {
                     self.expr(value, scope);
                     self.touch(
                         BindingKey::Cell(*cell),
-                        scope,
-                        true,
+                        Access {
+                            scope,
+                            kind: AccessKind::Write,
+                        },
                         LocalRole::Cell,
                         Some(value),
                     );
@@ -523,8 +576,10 @@ impl<'a> BindingCollector<'a> {
         match expr {
             nir::Expr::Local(local) => self.touch(
                 BindingKey::Local(*local),
-                scope,
-                false,
+                Access {
+                    scope,
+                    kind: AccessKind::Read,
+                },
                 LocalRole::Value,
                 None,
             ),
@@ -533,14 +588,22 @@ impl<'a> BindingCollector<'a> {
                     match capture {
                         nir::Capture::Copy(local) => self.touch(
                             BindingKey::Local(*local),
-                            scope,
-                            false,
+                            Access {
+                                scope,
+                                kind: AccessKind::Read,
+                            },
                             LocalRole::Value,
                             None,
                         ),
-                        nir::Capture::Share(cell) => {
-                            self.touch(BindingKey::Cell(*cell), scope, false, LocalRole::Cell, None)
-                        }
+                        nir::Capture::Share(cell) => self.touch(
+                            BindingKey::Cell(*cell),
+                            Access {
+                                scope,
+                                kind: AccessKind::Read,
+                            },
+                            LocalRole::Cell,
+                            None,
+                        ),
                     }
                 }
             }
@@ -579,9 +642,15 @@ impl<'a> BindingCollector<'a> {
                 }
             }
             nir::Expr::Project { pack, .. } => self.pack_expr(pack, scope),
-            nir::Expr::LoadCell(cell) => {
-                self.touch(BindingKey::Cell(*cell), scope, false, LocalRole::Cell, None)
-            }
+            nir::Expr::LoadCell(cell) => self.touch(
+                BindingKey::Cell(*cell),
+                Access {
+                    scope,
+                    kind: AccessKind::Read,
+                },
+                LocalRole::Cell,
+                None,
+            ),
             nir::Expr::Constant(_) | nir::Expr::GetGlobal(_) => {}
         }
     }
@@ -591,8 +660,10 @@ impl<'a> BindingCollector<'a> {
         match pack {
             nir::PackExpr::Local(local) => self.touch(
                 BindingKey::Pack(*local),
-                scope,
-                false,
+                Access {
+                    scope,
+                    kind: AccessKind::Read,
+                },
                 LocalRole::Pack,
                 None,
             ),
@@ -660,8 +731,9 @@ mod tests {
     use id_arena::Arena;
 
     use super::*;
+    use crate::hil::ir::{Cell, CellOrigin};
     use crate::ir::fir::{Constant, Value};
-    use crate::ir::nir::{Expr, Function, Local, Place, Region, Stmt};
+    use crate::ir::nir::{Capture, Expr, Function, Local, Place, Region, Stmt};
 
     /// Builds one flat function with the requested local count.
     fn flat_function(count: usize) -> Function {
@@ -683,6 +755,7 @@ mod tests {
             params: Vec::new(),
             is_vararg: false,
             upvalues: Vec::new(),
+            cell_locals: HashMap::new(),
             prologue: Vec::new(),
             body: Region::Block { origin: 0, stmts },
         }
@@ -692,7 +765,7 @@ mod tests {
     #[test]
     fn spills_excess_bindings_in_their_scope() {
         let function = flat_function(201);
-        let mut namer = crate::emitter::name::PlainNamer;
+        let mut namer = crate::emitter::name::PlainNamer::default();
         let plan = FunctionPlan::build(&function, &HashMap::new(), true, &mut namer).unwrap();
 
         assert!(plan.scope(0).unwrap().spill_table.is_some());
@@ -702,5 +775,57 @@ mod tests {
             .filter(|(local, _)| plan.local(*local).unwrap().name().is_some())
             .count();
         assert_eq!(named, 199);
+    }
+
+    /// A recursive cell uses and prefixes the storage of its backing local.
+    #[test]
+    fn aliases_and_prefixes_local_cell_storage() {
+        let mut values = Arena::<Value>::new();
+        let mut locals = Arena::<Local>::new();
+        let source = values.alloc(Value);
+        let local = locals.alloc(Local { source });
+        let mut cells = Arena::<Cell>::new();
+        let cell = cells.alloc(Cell {
+            origin: CellOrigin::CapturedRegister {
+                reg: 0,
+                generation: 0,
+            },
+        });
+        let function = Function {
+            id: crate::il::ProtoId(0),
+            locals,
+            packs: Arena::new(),
+            params: Vec::new(),
+            is_vararg: false,
+            upvalues: Vec::new(),
+            cell_locals: HashMap::from([(cell, local)]),
+            prologue: Vec::new(),
+            body: Region::Block {
+                origin: 0,
+                stmts: vec![
+                    Stmt::Bind {
+                        target: Place::Local(local),
+                        value: Expr::Closure {
+                            proto: crate::il::ProtoId(0),
+                            captures: vec![Capture::Share(cell)],
+                        },
+                    },
+                    Stmt::OpenCell {
+                        cell,
+                        value: Expr::Local(local),
+                    },
+                ],
+            },
+        };
+        let mut namer = crate::emitter::name::PlainNamer::default();
+
+        let mut plan = FunctionPlan::build(&function, &HashMap::new(), false, &mut namer).unwrap();
+
+        assert_eq!(
+            plan.local(local).unwrap().expr(),
+            plan.cell(cell).unwrap().expr()
+        );
+        assert_eq!(plan.scope(0).unwrap().prefix_names.len(), 1);
+        assert!(!plan.claim_declaration(BindingKey::Cell(cell), 0));
     }
 }
