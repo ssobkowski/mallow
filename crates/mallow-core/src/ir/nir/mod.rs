@@ -165,6 +165,35 @@ impl Expr {
         contains.visit_expr(self);
         contains.found
     }
+
+    /// Returns the semantic negation of this expression.
+    ///
+    /// Ordered comparisons are wrapped in `not` instead of being converted to
+    /// the opposite comparison because values such as NaN make those forms
+    /// observably different.
+    #[inline]
+    pub fn invert(self) -> Expr {
+        match self {
+            Expr::Constant(Constant::Bool(b)) => Expr::Constant(Constant::Bool(!b)),
+            Expr::Binary {
+                lhs,
+                op: op @ (BinOp::Eq | BinOp::Ne),
+                rhs,
+            } => {
+                let inverted = op.invert().expect("equality operators are invertible");
+                Expr::Binary {
+                    lhs: Box::new(*lhs),
+                    op: inverted,
+                    rhs: Box::new(*rhs),
+                }
+            }
+            Expr::Unary {
+                op: UnOp::Not,
+                value,
+            } => *value,
+            other => Expr::not(other),
+        }
+    }
 }
 
 /// An entry in the table constructor.

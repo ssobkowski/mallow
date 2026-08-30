@@ -4,6 +4,7 @@ mod fold_packs;
 mod fold_shapes;
 mod fold_tables;
 mod inline;
+mod normalize;
 
 use super::Function;
 
@@ -15,6 +16,7 @@ pub(crate) fn run(functions: &mut [Function]) -> bool {
     loop {
         let mut round_changed = false;
         for function in functions.iter_mut() {
+            round_changed |= normalize::run(function);
             round_changed |= fold_packs::run(function);
             round_changed |= inline::run(function);
             round_changed |= fold_tables::run(function);
