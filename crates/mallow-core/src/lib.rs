@@ -7,7 +7,6 @@ mod ir;
 mod logging;
 mod operator;
 mod printer;
-mod scopes;
 
 #[cfg(feature = "visualize")]
 mod visualize;
