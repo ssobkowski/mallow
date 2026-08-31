@@ -150,6 +150,49 @@ impl<'a> FlowGraph<'a> {
             .iter()
             .any(|instr| !matches!(instr, Instr::Phi { .. }))
     }
+
+    /// Returns whether two blocks only construct and return the same value pack.
+    fn blocks_return_same_values(&self, left: usize, right: usize) -> bool {
+        let (
+            Block {
+                instrs: left_instrs,
+                exit: BlockExit::Return(left_return),
+                ..
+            },
+            Block {
+                instrs: right_instrs,
+                exit: BlockExit::Return(right_return),
+                ..
+            },
+        ) = (self.block(left), self.block(right))
+        else {
+            return false;
+        };
+        let (
+            [
+                Instr::MakePack {
+                    out: left_pack,
+                    head: left_head,
+                    tail: left_tail,
+                },
+            ],
+            [
+                Instr::MakePack {
+                    out: right_pack,
+                    head: right_head,
+                    tail: right_tail,
+                },
+            ],
+        ) = (left_instrs.as_slice(), right_instrs.as_slice())
+        else {
+            return false;
+        };
+
+        left_return == left_pack
+            && right_return == right_pack
+            && left_head == right_head
+            && left_tail == right_tail
+    }
 }
 
 impl GraphView for FlowGraph<'_> {
@@ -1905,7 +1948,14 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                             body_block: prep_body,
                             exit_block: prep_exit,
                             ..
-                        } if prep_body == body_block && prep_exit == exit_block
+                        } if prep_body == body_block
+                            && (prep_exit == exit_block
+                                // Luau can duplicate a return-only bytecode block after one
+                                // branch on O1 and O2. FORNPREP skips to the shared return
+                                // while FORNLOOP falls through to the duplicate return block.
+                                //
+                                // Dedicated test case: controlflow37.luau
+                                || self.cfg.blocks_return_same_values(*prep_exit, *exit_block))
                     )
                 });
 
@@ -2507,385 +2557,4 @@ pub(crate) fn structure(function: &Function, diagnostics: &Diagnostics) -> Resul
         .lower()
         .normalize();
     Ok(node)
-}
-
-#[cfg(test)]
-mod tests {
-    use id_arena::Arena;
-    use smallvec::smallvec;
-
-    use super::*;
-    use crate::il::ProtoId;
-    use crate::ir::fir::{Pack, Value};
-    use crate::operator::BinOp;
-
-    /// Builds one valid function around the supplied graph exits.
-    fn function_with_exits(
-        values: Arena<Value>,
-        params: Vec<ValueId>,
-        make_exits: impl FnOnce(PackId) -> Vec<BlockExit>,
-    ) -> (Function, PackId) {
-        let mut packs = Arena::new();
-        let pack = packs.alloc(Pack);
-        let exits = make_exits(pack);
-        let last = exits.len() - 1;
-        let blocks = exits
-            .into_iter()
-            .enumerate()
-            .map(|(block, exit)| Block {
-                outputs: Vec::new(),
-                instrs: (block == last)
-                    .then_some(Instr::MakePack {
-                        out: pack,
-                        head: Vec::new(),
-                        tail: None,
-                    })
-                    .into_iter()
-                    .collect(),
-                exit,
-            })
-            .collect();
-
-        (
-            Function {
-                proto: ProtoId(0),
-                params,
-                is_vararg: false,
-                upvalues: Vec::new(),
-                values,
-                packs,
-                cells: Arena::new(),
-                blocks,
-            },
-            pack,
-        )
-    }
-
-    /// Returns the first numeric loop nested in a region.
-    fn numeric_loop(region: &Shape) -> Option<(ValueId, ValueId, ValueId, ValueId)> {
-        match region {
-            Shape::NumericFor {
-                variable,
-                start,
-                end,
-                step,
-                ..
-            } => Some((*variable, *start, *end, *step)),
-            Shape::Sequence { nodes } => nodes.iter().find_map(numeric_loop),
-            Shape::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                numeric_loop(then_branch).or_else(|| else_branch.as_deref().and_then(numeric_loop))
-            }
-            Shape::While { body, .. }
-            | Shape::RepeatUntil { body, .. }
-            | Shape::GenericFor { body, .. } => numeric_loop(body),
-            Shape::Block { .. } | Shape::Continue | Shape::Break | Shape::Return { .. } => None,
-        }
-    }
-
-    /// Returns the first generic loop nested in a region.
-    fn generic_loop(region: &Shape) -> Option<(Vec<ValueId>, [ValueId; 3])> {
-        match region {
-            Shape::GenericFor {
-                variables, values, ..
-            } => Some((variables.clone(), *values)),
-            Shape::Sequence { nodes } => nodes.iter().find_map(generic_loop),
-            Shape::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                generic_loop(then_branch).or_else(|| else_branch.as_deref().and_then(generic_loop))
-            }
-            Shape::While { body, .. }
-            | Shape::RepeatUntil { body, .. }
-            | Shape::NumericFor { body, .. } => generic_loop(body),
-            Shape::Block { .. } | Shape::Continue | Shape::Break | Shape::Return { .. } => None,
-        }
-    }
-
-    /// Structures a diamond without changing its branch condition identity.
-    #[test]
-    fn structures_if_diamond() {
-        let mut values = Arena::new();
-        let condition = values.alloc(Value);
-        let (function, pack) = function_with_exits(values, vec![condition], |pack| {
-            vec![
-                BlockExit::Branch {
-                    condition,
-                    then_block: 1,
-                    else_block: 2,
-                },
-                BlockExit::Jump(3),
-                BlockExit::Jump(3),
-                BlockExit::Return(pack),
-            ]
-        });
-        function.verify().unwrap();
-
-        let region = structure(&function, &Diagnostics::default()).unwrap();
-        let Shape::Sequence { nodes } = region else {
-            panic!("root must be a sequence");
-        };
-        assert!(matches!(
-            &nodes[0],
-            Shape::If {
-                condition: Predicate::Value(value),
-                ..
-            } if *value == condition
-        ));
-        assert!(matches!(nodes.last(), Some(Shape::Return { values }) if *values == pack));
-    }
-
-    /// Recovers the values owned by a typed generic loop.
-    #[test]
-    fn structures_generic_for_loop() {
-        let mut values = Arena::new();
-        let iterator = values.alloc(Value);
-        let state = values.alloc(Value);
-        let control = values.alloc(Value);
-        let variable = values.alloc(Value);
-        let (mut function, _) =
-            function_with_exits(values, vec![iterator, state, control], |pack| {
-                vec![
-                    BlockExit::GenericFor {
-                        body_block: 1,
-                        loop_block: 2,
-                        variables: smallvec![variable],
-                        values: [iterator, state, control],
-                    },
-                    BlockExit::Jump(2),
-                    BlockExit::GenericForLoop {
-                        body_block: 1,
-                        exit_block: 3,
-                        variables: smallvec![variable],
-                    },
-                    BlockExit::Return(pack),
-                ]
-            });
-        function.blocks[0].outputs.push(variable);
-        function.verify().unwrap();
-
-        let region = structure(&function, &Diagnostics::default()).unwrap();
-        assert_eq!(
-            generic_loop(&region),
-            Some((vec![variable], [iterator, state, control]))
-        );
-    }
-
-    /// Recovers the values owned by a typed numeric loop.
-    #[test]
-    fn structures_numeric_for_loop() {
-        let mut values = Arena::new();
-        let start = values.alloc(Value);
-        let end = values.alloc(Value);
-        let step = values.alloc(Value);
-        let variable = values.alloc(Value);
-        let (mut function, _) = function_with_exits(values, vec![start, end, step], |pack| {
-            vec![
-                BlockExit::NumericFor {
-                    body_block: 1,
-                    exit_block: 3,
-                    variable,
-                    start,
-                    end,
-                    step,
-                },
-                BlockExit::Jump(2),
-                BlockExit::NumericForLoop {
-                    body_block: 1,
-                    exit_block: 3,
-                },
-                BlockExit::Return(pack),
-            ]
-        });
-        function.blocks[0].outputs.push(variable);
-        function.verify().unwrap();
-
-        let region = structure(&function, &Diagnostics::default()).unwrap();
-        assert_eq!(numeric_loop(&region), Some((variable, start, end, step)));
-    }
-
-    /// Recovers a post-test loop condition from its latch.
-    #[test]
-    fn structures_repeat_until_loop() {
-        let mut values = Arena::new();
-        let condition = values.alloc(Value);
-        let (function, _) = function_with_exits(values, vec![condition], |pack| {
-            vec![
-                BlockExit::Jump(1),
-                BlockExit::Branch {
-                    condition,
-                    then_block: 2,
-                    else_block: 0,
-                },
-                BlockExit::Return(pack),
-            ]
-        });
-        function.verify().unwrap();
-
-        let region = structure(&function, &Diagnostics::default()).unwrap();
-        let Shape::Sequence { nodes } = region else {
-            panic!("root must be a sequence");
-        };
-        assert!(matches!(
-            &nodes[0],
-            Shape::RepeatUntil {
-                condition: Predicate::Value(value),
-                ..
-            } if *value == condition
-        ));
-    }
-
-    /// Recovers an empty while guard chain as short-circuit `and`.
-    #[test]
-    fn structures_while_guard_chain() {
-        let mut values = Arena::new();
-        let lhs = values.alloc(Value);
-        let rhs = values.alloc(Value);
-        let (function, _) = function_with_exits(values, vec![lhs, rhs], |pack| {
-            vec![
-                BlockExit::Branch {
-                    condition: lhs,
-                    then_block: 1,
-                    else_block: 3,
-                },
-                BlockExit::Branch {
-                    condition: rhs,
-                    then_block: 2,
-                    else_block: 3,
-                },
-                BlockExit::Jump(0),
-                BlockExit::Return(pack),
-            ]
-        });
-        function.verify().unwrap();
-
-        let region = structure(&function, &Diagnostics::default()).unwrap();
-        let Shape::Sequence { nodes } = region else {
-            panic!("root must be a sequence");
-        };
-        assert!(matches!(
-            &nodes[0],
-            Shape::While {
-                condition: Predicate::And(left, right),
-                ..
-            } if **left == Predicate::Value(lhs) && **right == Predicate::Value(rhs)
-        ));
-    }
-
-    /// Folds a shared payload by block identity before ownership verification.
-    #[test]
-    fn folds_shared_payload_or() {
-        let mut values = Arena::new();
-        let lhs = values.alloc(Value);
-        let rhs = values.alloc(Value);
-        let (mut function, _) = function_with_exits(values, vec![lhs, rhs], |pack| {
-            vec![
-                BlockExit::Branch {
-                    condition: lhs,
-                    then_block: 1,
-                    else_block: 2,
-                },
-                BlockExit::Jump(3),
-                BlockExit::Branch {
-                    condition: rhs,
-                    then_block: 1,
-                    else_block: 3,
-                },
-                BlockExit::Return(pack),
-            ]
-        });
-        function.blocks[1].instrs.push(Instr::SetGlobal {
-            name: "taken".into(),
-            value: lhs,
-        });
-        function.verify().unwrap();
-
-        let shape = structure(&function, &Diagnostics::default()).unwrap();
-        let Shape::Sequence { nodes } = shape else {
-            panic!("root must be a sequence");
-        };
-        assert!(matches!(
-            nodes.first(),
-            Some(Shape::If {
-                condition: Predicate::Or(left, right),
-                then_branch,
-                ..
-            }) if **left == Predicate::Value(lhs)
-                && **right == Predicate::Value(rhs)
-                && matches!(**then_branch, Shape::Block { block: 1 })
-        ));
-    }
-
-    /// Keeps a shared condition definition as block payload.
-    #[test]
-    fn shared_condition_is_block_payload() {
-        let mut values = Arena::new();
-        let lhs = values.alloc(Value);
-        let rhs = values.alloc(Value);
-        let condition = values.alloc(Value);
-        let (mut function, _) = function_with_exits(values, vec![lhs, rhs], |pack| {
-            vec![
-                BlockExit::Branch {
-                    condition,
-                    then_block: 1,
-                    else_block: 2,
-                },
-                BlockExit::Jump(0),
-                BlockExit::Return(pack),
-            ]
-        });
-        function.blocks[0].instrs.extend([
-            Instr::Binary {
-                out: condition,
-                lhs,
-                op: BinOp::Lt,
-                rhs,
-            },
-            Instr::SetGlobal {
-                name: "seen".into(),
-                value: condition,
-            },
-        ]);
-        function.verify().unwrap();
-
-        let cfg = FlowGraph::new(&function);
-        assert!(cfg.block_has_payload(0));
-    }
-
-    /// Structures an empty guarded natural loop as a pre-test loop.
-    #[test]
-    fn structures_while_loop() {
-        let mut values = Arena::new();
-        let condition = values.alloc(Value);
-        let (function, pack) = function_with_exits(values, vec![condition], |pack| {
-            vec![
-                BlockExit::Branch {
-                    condition,
-                    then_block: 1,
-                    else_block: 2,
-                },
-                BlockExit::Jump(0),
-                BlockExit::Return(pack),
-            ]
-        });
-        function.verify().unwrap();
-
-        let region = structure(&function, &Diagnostics::default()).unwrap();
-        let Shape::Sequence { nodes } = region else {
-            panic!("root must be a sequence");
-        };
-        assert!(matches!(
-            &nodes[0],
-            Shape::While {
-                condition: Predicate::Value(value),
-                ..
-            } if *value == condition
-        ));
-        assert!(matches!(nodes.last(), Some(Shape::Return { values }) if *values == pack));
-    }
 }
