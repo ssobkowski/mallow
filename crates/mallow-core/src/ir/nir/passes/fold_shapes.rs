@@ -376,9 +376,8 @@ impl VisitorMut for Folder {
 
 #[cfg(test)]
 mod tests {
-    use crate::operator::UnOp;
-
     use super::*;
+    use crate::operator::UnOp;
 
     /// Creates an empty flat block for shape tests.
     fn block(origin: usize) -> Region {

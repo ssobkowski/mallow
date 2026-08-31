@@ -11,6 +11,7 @@ use std::fmt;
 
 use anyhow::{Result, ensure};
 use id_arena::{Arena, Id};
+pub(crate) use lifter::lift;
 use smallvec::{SmallVec, smallvec};
 use smol_str::SmolStr;
 
@@ -18,8 +19,6 @@ use crate::common::ByteString;
 use crate::il::ProtoId;
 use crate::ir::graph::build_graph;
 use crate::operator::{BinOp, UnOp};
-
-pub(crate) use lifter::lift;
 
 /// Stable identity for one immutable IR value.
 pub type ValueId = Id<Value>;

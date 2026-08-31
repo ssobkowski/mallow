@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
-use crate::il::{DecodedInstr, Instr, Proto, reg_add, reg_range};
-use crate::operator::BinOp;
 use anyhow::{Result, anyhow, ensure};
 use smallvec::SmallVec;
+
+use crate::il::{DecodedInstr, Instr, Proto, reg_add, reg_range};
+use crate::operator::BinOp;
 
 /// Returns the list of instruction indices which are block entries.
 fn find_block_entries(instrs: &[DecodedInstr]) -> Result<Vec<usize>> {

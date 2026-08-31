@@ -3,13 +3,12 @@
     reason = "visitor infrastructure may be used by future NIR passes"
 )]
 
+use smol_str::SmolStr;
+
+use super::{Capture, Expr, Function, LocalId, PackExpr, PackLocalId, Place, Region, Stmt};
 use crate::common::ByteString;
 use crate::ir::fir::{CellId, Constant, Number};
 use crate::ir::nir::TableItem;
-use smol_str::SmolStr;
-
-use super::{Capture, Expr, Function, PackExpr, Place, Region, Stmt};
-use super::{LocalId, PackLocalId};
 
 /// Visits NIR without changing it.
 pub trait Visitor {
