@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::ops::Range;
 
 use anyhow::{Result, anyhow, ensure};
 use smallvec::SmallVec;
@@ -74,8 +73,8 @@ fn find_block_entries(instrs: &[DecodedInstr]) -> Result<Vec<usize>> {
 
 /// Represents an unlifted block
 #[derive(Debug)]
-pub struct RawBlock {
-    pub(crate) instr_range: Range<usize>,
+pub struct RawBlock<'p> {
+    pub(crate) instrs: &'p [DecodedInstr],
     pub(crate) exit_writes: SmallVec<[u8; 4]>,
     pub(crate) exit: RawBlockExit,
 }
@@ -178,7 +177,7 @@ pub enum Cond {
 }
 
 /// Builds the bytecode-level blocks shared by flat and structured lifting.
-pub fn build_raw_from_proto(proto: &Proto) -> Result<Vec<RawBlock>> {
+pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
     let entries = find_block_entries(&proto.instrs)?;
     let mut raw_blocks = Vec::with_capacity(entries.len());
 
@@ -447,7 +446,7 @@ pub fn build_raw_from_proto(proto: &Proto) -> Result<Vec<RawBlock>> {
         };
 
         raw_blocks.push(RawBlock {
-            instr_range: start..body_end,
+            instrs: &proto.instrs[start..body_end],
             exit_writes,
             exit,
         });

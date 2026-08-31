@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ops::Range;
 
 use anyhow::{Context, Result, bail, ensure};
 use id_arena::Arena;
@@ -11,7 +10,8 @@ use super::{self as ir, Block, BlockExit, Capture, Function, Pack, PackId, Value
 use crate::common::ByteString;
 use crate::disasm::Chunk;
 use crate::il::{
-    self, ChildProtoId, ConstId, Count, ImportPath, Proto, ProtoId, reg_add, reg_range,
+    self, ChildProtoId, ConstId, Count, DecodedInstr, ImportPath, Proto, ProtoId, reg_add,
+    reg_range,
 };
 use crate::ir::fir::{Cell, CellId, CellOrigin, Number};
 use crate::ir::graph::{AdjGraph, GraphView, build_graph};
@@ -111,7 +111,7 @@ struct FunctionCaptures {
 
 impl FunctionCaptures {
     /// Finds captured register generations and allocates their cells in bytecode order.
-    fn analyze(proto: &Proto, raw_blocks: &[RawBlock], cells: &mut Arena<Cell>) -> Result<Self> {
+    fn analyze(raw_blocks: &[RawBlock], cells: &mut Arena<Cell>) -> Result<Self> {
         let mut state = CaptureState::default();
         let mut block_states = vec![CaptureState::default(); raw_blocks.len()];
 
@@ -121,7 +121,7 @@ impl FunctionCaptures {
         for (block_index, block) in raw_blocks.iter().enumerate() {
             block_states[block_index] = state.clone();
 
-            for decoded in &proto.instrs[block.instr_range.clone()] {
+            for decoded in block.instrs {
                 match decoded.instr {
                     il::Instr::Capture {
                         capture_type: CAPTURE_REF,
@@ -165,13 +165,13 @@ impl FunctionCaptures {
 }
 
 /// Mutable state for lifting one function directly into flat IR.
-struct FunctionLifter<'a, 'g> {
+struct FunctionLifter<'c, 'g> {
     /// Proto currently being lifted.
-    proto: &'a Proto,
+    proto: &'c Proto,
     /// Chunk that owns constants and child protos.
-    chunk: &'a Chunk,
+    chunk: &'c Chunk,
     /// Raw bytecode blocks in instruction order.
-    raw_blocks: &'a [RawBlock],
+    raw_blocks: &'c [RawBlock<'c>],
     /// Graph used to construct register SSA.
     graph: &'g AdjGraph<'g>,
     /// Mutable cells owned by the function.
@@ -198,7 +198,7 @@ impl<'a, 'g> FunctionLifter<'a, 'g> {
                 })
             })
             .collect();
-        let captures = FunctionCaptures::analyze(proto, raw_blocks, &mut cells)?;
+        let captures = FunctionCaptures::analyze(raw_blocks, &mut cells)?;
 
         Ok(Self {
             proto,
@@ -281,8 +281,6 @@ struct BlockLifter<'lift, 'source, 'graph> {
 
     /// Block currently being lifted.
     block: usize,
-    /// Range of instructions in the block.
-    instr_range: Range<usize>,
     /// Current instruction cursor relative to [`instr_range`].
     cursor: usize,
 
@@ -304,14 +302,12 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
         packs: &'lift mut Arena<Pack>,
         block: usize,
     ) -> Result<Self> {
-        let instr_range = function.raw_blocks[block].instr_range.clone();
         let capture_state = function.captures.block_states[block].clone();
         Ok(Self {
             function,
             ssa,
             packs,
             block,
-            instr_range,
             cursor: 0,
             emitted: Vec::new(),
             pending: None,
@@ -341,43 +337,55 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
         })
     }
 
+    /// Returns the instructions for the current block.
+    #[inline]
+    const fn instrs(&self) -> &[DecodedInstr] {
+        &self.function.raw_blocks[self.block].instrs
+    }
+
+    /// Returns the instruction at a given position.
+    #[inline]
+    fn instr_at(&self, pos: usize) -> Option<DecodedInstr> {
+        self.instrs().get(pos).copied()
+    }
+
     /// Returns the next bytecode instruction and advances the cursor.
+    #[inline]
     fn next(&mut self) -> Option<il::Instr> {
-        let idx = self.instr_range.start + self.cursor;
-        if idx >= self.instr_range.end {
-            return None;
-        }
-        let instr = self.function.proto.instrs.get(idx)?.instr;
+        let instr = self.instr_at(self.cursor)?.instr;
         self.cursor += 1;
         Some(instr)
     }
 
-    /// Returns the current bytecode instruction index.
+    /// Returns the next bytecode instruction without advancing the cursor.
     #[inline]
-    fn current_ip(&self) -> usize {
-        self.instr_range.start + self.cursor.saturating_sub(1)
+    fn peek(&self) -> Option<il::Instr> {
+        Some(self.instr_at(self.cursor)?.instr)
     }
 
     /// Returns the current bytecode program counter.
     #[inline]
-    fn current_pc(&self) -> u32 {
-        self.function.proto.instrs[self.current_ip()].word_pc
+    fn current_pc(&self) -> Option<u32> {
+        Some(self.instr_at(self.cursor.saturating_sub(1))?.word_pc)
     }
 
     /// Allocates one immutable value identity.
     #[inline]
+    #[must_use]
     fn value(&mut self) -> ValueId {
         self.ssa.alloc()
     }
 
     /// Allocates one value pack identity.
     #[inline]
+    #[must_use]
     fn pack(&mut self) -> PackId {
         self.packs.alloc(Pack)
     }
 
     /// Emits one fixed value pack.
     #[inline]
+    #[must_use]
     fn fixed_pack(&mut self, head: Vec<ValueId>) -> PackId {
         let out = self.pack();
         self.emitted.push(ir::Instr::MakePack {
@@ -390,6 +398,7 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
 
     /// Emits one pack with a fixed prefix and open tail.
     #[inline]
+    #[must_use]
     fn open_pack(&mut self, head: Vec<ValueId>, tail: PackId) -> PackId {
         let out = self.pack();
         self.emitted.push(ir::Instr::MakePack {
@@ -495,6 +504,7 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
 
     /// Emits one literal constant.
     #[inline]
+    #[must_use]
     fn constant(&mut self, value: ir::Constant) -> ValueId {
         let out = self.value();
         self.emitted.push(ir::Instr::Const { out, value });
@@ -503,6 +513,7 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
 
     /// Emits a global read.
     #[inline]
+    #[must_use]
     fn global(&mut self, name: SmolStr) -> ValueId {
         let out = self.value();
         self.emitted.push(ir::Instr::GetGlobal { out, name });
@@ -511,6 +522,7 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
 
     /// Emits a binary operation.
     #[inline]
+    #[must_use]
     fn binary(&mut self, lhs: ValueId, op: BinOp, rhs: ValueId) -> ValueId {
         let out = self.value();
         self.emitted.push(ir::Instr::Binary { out, lhs, op, rhs });
@@ -519,6 +531,7 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
 
     /// Emits a string-keyed table read without changing the key bytes.
     #[inline]
+    #[must_use]
     fn string_access(&mut self, table: ValueId, key: ByteString) -> ValueId {
         let key = self.constant(ir::Constant::String(key));
         let out = self.value();
@@ -590,23 +603,15 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
                 count,
                 ..
             } if Count::from(count).is_variadic() => base >= values,
-            il::Instr::NameCall { .. } | il::Instr::NameCallUData { .. } => {
-                match self
-                    .function
-                    .proto
-                    .instrs
-                    .get(self.instr_range.start + self.cursor)
-                    .map(|decoded| decoded.instr)
-                {
-                    Some(il::Instr::Call {
-                        func, arg_count, ..
-                    }) if Count::from(arg_count).is_variadic() && base >= reg_add(func, 2) => true,
-                    _ => bail!(
-                        "malformed bytecode: NAMECALL at {} is not followed by CALL",
-                        self.current_pc()
-                    ),
-                }
-            }
+            il::Instr::NameCall { .. } | il::Instr::NameCallUData { .. } => match self.peek() {
+                Some(il::Instr::Call {
+                    func, arg_count, ..
+                }) if Count::from(arg_count).is_variadic() && base >= reg_add(func, 2) => true,
+                _ => bail!(
+                    "malformed bytecode: NAMECALL at {:?} is not followed by CALL",
+                    self.current_pc().expect("")
+                ),
+            },
             _ => false,
         };
 
@@ -826,7 +831,10 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
             ret_count,
         }) = self.next()
         else {
-            bail!("malformed bytecode: NAMECALL at {namecall_pc} is not followed by CALL");
+            bail!(
+                "malformed bytecode: NAMECALL at {:?} is not followed by CALL",
+                namecall_pc
+            );
         };
 
         ensure!(
@@ -1258,7 +1266,7 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
 
 /// Returns the binary operator encoded by an arithmetic instruction.
 #[inline]
-fn binop_for_instr(instr: il::Instr) -> BinOp {
+const fn binop_for_instr(instr: il::Instr) -> BinOp {
     match instr {
         il::Instr::Add { .. } | il::Instr::AddK { .. } => BinOp::Add,
         il::Instr::Sub { .. } | il::Instr::SubK { .. } | il::Instr::SubRK { .. } => BinOp::Sub,
@@ -1269,18 +1277,18 @@ fn binop_for_instr(instr: il::Instr) -> BinOp {
         il::Instr::Pow { .. } | il::Instr::PowK { .. } => BinOp::Pow,
         il::Instr::And { .. } | il::Instr::AndK { .. } => BinOp::And,
         il::Instr::Or { .. } | il::Instr::OrK { .. } => BinOp::Or,
-        _ => unreachable!("instruction is not a binary operator"),
+        _ => panic!("instruction is not a binary operator"),
     }
 }
 
 /// Returns the unary operator encoded by an instruction.
 #[inline]
-fn unop_for_instr(instr: il::Instr) -> UnOp {
+const fn unop_for_instr(instr: il::Instr) -> UnOp {
     match instr {
         il::Instr::Not { .. } => UnOp::Not,
         il::Instr::Minus { .. } => UnOp::Minus,
         il::Instr::Length { .. } => UnOp::Length,
-        _ => unreachable!("instruction is not a unary operator"),
+        _ => panic!("instruction is not a unary operator"),
     }
 }
 
@@ -1563,7 +1571,7 @@ fn threaded_target(blocks: &[RawBlock], target: usize) -> usize {
 
     while visited.insert(current) {
         let block = &blocks[current];
-        if !block.instr_range.is_empty() || !block.exit_writes.is_empty() {
+        if !block.instrs.is_empty() || !block.exit_writes.is_empty() {
             return current;
         }
 
@@ -1662,7 +1670,7 @@ fn remap_raw_exit(exit: &mut RawBlockExit, old_to_new: &[Option<usize>]) {
 }
 
 /// Removes unreachable raw blocks while retaining bytecode order.
-fn reachable_raw_blocks(proto: &Proto) -> Result<Vec<RawBlock>> {
+fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
     let mut raw_blocks = build_raw_from_proto(proto)?;
     ensure!(!raw_blocks.is_empty(), "function contains no basic blocks");
 
