@@ -74,11 +74,7 @@ fn find_block_entries(instrs: &[DecodedInstr]) -> Result<Vec<usize>> {
 /// Represents an unlifted block
 #[derive(Debug)]
 pub struct RawBlock {
-    /// The range of instructions indices that belong to this block, excluding the potential exit instruction.
     pub(crate) instr_range: Range<usize>,
-    /// Program counter for the instruction lowered as this block's exit.
-    pub(crate) exit_pc: Option<u32>,
-    /// Registers written by an unlifted terminator instruction.
     pub(crate) exit_writes: SmallVec<[u8; 4]>,
     pub(crate) exit: RawBlockExit,
 }
@@ -99,7 +95,6 @@ pub enum RawBlockExit {
         exit_block: usize,
     },
     FornLoop {
-        base: u8,
         body_block: usize,
         exit_block: usize,
     },
@@ -216,7 +211,6 @@ pub fn build_raw_from_proto(proto: &Proto) -> Result<Vec<RawBlock>> {
         };
 
         let exit_instr_idx = end.saturating_sub(1);
-        let exit_pc = exit_instr.map(|_| proto.instrs[exit_instr_idx].word_pc);
         let exit = match exit_instr {
             Some(Instr::Return { base, count }) => RawBlockExit::Return { base, count },
             Some(Instr::Jump { offset }) | Some(Instr::JumpBack { offset }) => {
@@ -394,10 +388,9 @@ pub fn build_raw_from_proto(proto: &Proto) -> Result<Vec<RawBlock>> {
                     exit_block: pc_to_block_idx(&entries, target),
                 }
             }
-            Some(Instr::FornLoop { base, offset }) => {
+            Some(Instr::FornLoop { offset, .. }) => {
                 let target = rel_target_from_instr(exit_instr_idx, offset.into(), &proto.instrs)?;
                 RawBlockExit::FornLoop {
-                    base,
                     body_block: pc_to_block_idx(&entries, target),
                     exit_block: block_idx + 1,
                 }
@@ -454,7 +447,6 @@ pub fn build_raw_from_proto(proto: &Proto) -> Result<Vec<RawBlock>> {
 
         raw_blocks.push(RawBlock {
             instr_range: start..body_end,
-            exit_pc,
             exit_writes,
             exit,
         });

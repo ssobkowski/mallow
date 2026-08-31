@@ -300,7 +300,7 @@ impl GraphView for AdjGraph<'_> {
     }
 }
 
-/// Builds forward/backward adjacency lists based on the given block exits.
+/// Builds forward and backward adjacency lists with one edge per block pair.
 pub fn build_graph<I, T>(exits_iter: I) -> (Vec<Vec<usize>>, Vec<Vec<usize>>)
 where
     I: IntoIterator<Item = T>,
@@ -311,7 +311,13 @@ where
     let len = iter.len();
 
     let successors: Vec<Vec<_>> = iter
-        .map(|targets| targets.into_iter().filter(|&t| t < len).collect())
+        .map(|targets| {
+            let mut seen = HashSet::new();
+            targets
+                .into_iter()
+                .filter(|&target| target < len && seen.insert(target))
+                .collect()
+        })
         .collect();
 
     let mut predecessors = vec![Vec::new(); len];
@@ -329,7 +335,7 @@ where
 mod tests {
     use std::collections::HashMap;
 
-    use super::{AdjGraph, GraphView, Reversed, SeseGraphView};
+    use super::{AdjGraph, GraphView, Reversed, SeseGraphView, build_graph};
 
     struct SparseGraph {
         entry: usize,
@@ -396,6 +402,15 @@ mod tests {
         fn exit(&self) -> usize {
             self.exit
         }
+    }
+
+    /// Keeps each predecessor and successor once when branch outcomes converge.
+    #[test]
+    fn dense_graph_deduplicates_edges() {
+        let (successors, predecessors) = build_graph([vec![1, 1], vec![2, 2], Vec::new()]);
+
+        assert_eq!(successors, vec![vec![1], vec![2], vec![]]);
+        assert_eq!(predecessors, vec![vec![], vec![0], vec![1]]);
     }
 
     #[test]

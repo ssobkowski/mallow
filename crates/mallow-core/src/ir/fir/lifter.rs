@@ -1431,23 +1431,6 @@ fn apply_exit_writes(
     }
 }
 
-/// Lowers one raw branch condition into an immutable value.
-fn lower_condition(cond: &Cond, lifter: &mut BlockLifter<'_, '_, '_>) -> Result<ValueId> {
-    Ok(match cond {
-        Cond::Unary(reg) => lifter.read_reg(*reg),
-        Cond::Binary { lhs, op, rhs } => {
-            let lhs = lifter.read_reg(*lhs);
-            let rhs = match rhs {
-                CondRhs::Reg(reg) => lifter.read_reg(*reg),
-                CondRhs::Const(index) => lifter.emit_constant(ConstId(*index))?,
-                CondRhs::Nil => lifter.constant(ir::Constant::Nil),
-                CondRhs::Bool(value) => lifter.constant(ir::Constant::Bool(*value)),
-            };
-            lifter.binary(lhs, *op, rhs)
-        }
-    })
-}
-
 /// Resolves one value through the trivial-Phi alias map.
 fn resolve_alias(mut value: ValueId, aliases: &HashMap<ValueId, ValueId>) -> ValueId {
     while let Some(&alias) = aliases.get(&value) {
@@ -1570,6 +1553,73 @@ fn resolve_exit(exit: &mut BlockExit, aliases: &HashMap<ValueId, ValueId>) {
     }
 }
 
+/// Returns the first target after a chain of empty unconditional blocks.
+///
+/// A cyclic chain is left unchanged so threading cannot choose an arbitrary
+/// block from the cycle.
+fn threaded_target(blocks: &[RawBlock], target: usize) -> usize {
+    let mut current = target;
+    let mut visited = HashSet::new();
+
+    while visited.insert(current) {
+        let block = &blocks[current];
+        if !block.instr_range.is_empty() || !block.exit_writes.is_empty() {
+            return current;
+        }
+
+        current = match block.exit {
+            RawBlockExit::Jump(next) | RawBlockExit::Fallthrough(next) if next != current => next,
+            _ => return current,
+        };
+    }
+
+    target
+}
+
+/// Rewrites actual CFG successors through precomputed empty-block targets.
+fn thread_raw_exit(exit: &mut RawBlockExit, targets: &[usize]) {
+    let thread = |target: &mut usize| *target = targets[*target];
+
+    match exit {
+        RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => thread(target),
+        RawBlockExit::CondJump {
+            then_block,
+            else_block,
+            ..
+        }
+        | RawBlockExit::FornPrep {
+            body_block: then_block,
+            exit_block: else_block,
+            ..
+        }
+        | RawBlockExit::FornLoop {
+            body_block: then_block,
+            exit_block: else_block,
+        }
+        | RawBlockExit::ForgLoop {
+            body_block: then_block,
+            exit_block: else_block,
+            ..
+        } => {
+            thread(then_block);
+            thread(else_block);
+        }
+        RawBlockExit::ForgPrep { body_block, .. } => thread(body_block),
+        RawBlockExit::Return { .. } => {}
+    }
+}
+
+/// Threads every raw CFG edge through empty unconditional blocks.
+fn thread_raw_jumps(blocks: &mut [RawBlock]) {
+    let targets: Vec<_> = (0..blocks.len())
+        .map(|target| threaded_target(blocks, target))
+        .collect();
+
+    for block in blocks {
+        thread_raw_exit(&mut block.exit, &targets);
+    }
+}
+
 /// Rewrites raw block targets after unreachable blocks are removed.
 #[inline]
 fn remap_raw_exit(exit: &mut RawBlockExit, old_to_new: &[Option<usize>]) {
@@ -1613,7 +1663,7 @@ fn remap_raw_exit(exit: &mut RawBlockExit, old_to_new: &[Option<usize>]) {
 
 /// Removes unreachable raw blocks while retaining bytecode order.
 fn reachable_raw_blocks(proto: &Proto) -> Result<Vec<RawBlock>> {
-    let raw_blocks = build_raw_from_proto(proto)?;
+    let mut raw_blocks = build_raw_from_proto(proto)?;
     ensure!(!raw_blocks.is_empty(), "function contains no basic blocks");
 
     for (block, raw) in raw_blocks.iter().enumerate() {
@@ -1624,6 +1674,8 @@ fn reachable_raw_blocks(proto: &Proto) -> Result<Vec<RawBlock>> {
             );
         }
     }
+
+    thread_raw_jumps(&mut raw_blocks);
 
     let mut reachable = HashSet::new();
     let mut pending = VecDeque::from([0]);
