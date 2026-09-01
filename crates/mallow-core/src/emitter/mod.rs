@@ -4,7 +4,7 @@ mod storage;
 
 use std::collections::HashMap;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use name::{Namer, PlainNamer};
 use plan::{BindingKey, FunctionPlan};
 use smol_str::SmolStr;
@@ -778,24 +778,21 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 .collect(),
             nir::TableItem::Index(key, value) => {
                 let value = self.lower_expr(value)?;
-                // TODO: `is_valid_luau_identifier` needs to support ByteString (or have a separate method for it.)
-                // if let nir::Expr::Constant(fir::Constant::String(s)) = key
-                //     && is_valid_luau_identifier(s)
-                // {
-                //     TableItem::Named {
-                //         name: Identifier::new(s.clone()),
-                //         value,
-                //     }
-                // } else {
-                //     TableItem::Indexed {
-                //         index: self.visit_expr(key),
-                //         value,
-                //     }
-                // }
-                vec![ast::TableItem::Indexed {
-                    index: self.lower_expr(key)?,
-                    value,
-                }]
+                if let nir::Expr::Constant(Constant::String(s)) = key
+                    && is_valid_luau_identifier(s)
+                {
+                    vec![ast::TableItem::Named {
+                        name: Identifier::new(
+                            s.as_utf8().context("this string is a valid identifier")?,
+                        ),
+                        value,
+                    }]
+                } else {
+                    vec![ast::TableItem::Indexed {
+                        index: self.lower_expr(key)?,
+                        value,
+                    }]
+                }
             }
         })
     }

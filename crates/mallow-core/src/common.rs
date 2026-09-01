@@ -8,23 +8,17 @@ use smol_str::SmolStr;
 pub struct ByteString(Rc<[u8]>);
 
 impl ByteString {
-    /// Returns the exact string bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
     /// Returns the string as UTF-8 when every byte is valid.
     #[must_use]
     pub fn as_utf8(&self) -> Option<&str> {
-        std::str::from_utf8(self.as_bytes()).ok()
+        std::str::from_utf8(self.as_ref()).ok()
     }
 }
 
 impl fmt::Display for ByteString {
     /// Formats bytes with the same escapes used by quoted Luau literals.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&escape_bytes(self.as_bytes()))
+        formatter.write_str(&escape_bytes(self.as_ref()))
     }
 }
 
@@ -70,6 +64,12 @@ impl From<SmolStr> for ByteString {
     }
 }
 
+impl AsRef<[u8]> for ByteString {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// Escapes bytes for use inside a quoted Luau string literal.
 pub fn escape_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -92,32 +92,49 @@ pub fn escape_bytes(bytes: &[u8]) -> String {
 }
 
 /// Returns whether if the given string is a valid Lua identifier.
-pub fn is_valid_luau_identifier(s: &str) -> bool {
-    if s.is_empty() {
+pub fn is_valid_luau_identifier<S: AsRef<[u8]>>(s: S) -> bool {
+    let bytes = s.as_ref();
+
+    let Some((&first, rest)) = bytes.split_first() else {
+        return false;
+    };
+
+    // 1. Must start with an ASCII letter or underscore
+    if !first.is_ascii_alphabetic() && first != b'_' {
         return false;
     }
 
-    let mut chars = s.chars();
-    let first = chars.next().unwrap();
-
-    // 1. Must start with a letter or underscore
-    if !first.is_ascii_alphabetic() && first != '_' {
+    // 2. Remaining characters must be ASCII alphanumeric or underscore
+    if !rest.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_') {
         return false;
-    }
-
-    // 2. Remaining characters must be alphanumeric or underscore
-    for c in chars {
-        if !c.is_ascii_alphanumeric() && c != '_' {
-            return false;
-        }
     }
 
     // 3. Must not be a strict reserved keyword
-    const KEYWORDS: [&str; 21] = [
-        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
-        "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+    const KEYWORDS: [&[u8]; 21] = [
+        b"and",
+        b"break",
+        b"do",
+        b"else",
+        b"elseif",
+        b"end",
+        b"false",
+        b"for",
+        b"function",
+        b"if",
+        b"in",
+        b"local",
+        b"nil",
+        b"not",
+        b"or",
+        b"repeat",
+        b"return",
+        b"then",
+        b"true",
+        b"until",
+        b"while",
     ];
-    !KEYWORDS.contains(&s)
+
+    !KEYWORDS.contains(&bytes)
 }
 
 #[cfg(test)]

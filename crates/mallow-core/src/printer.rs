@@ -597,7 +597,7 @@ impl AstPrinter {
             Literal::String(value) => match choose_string_style(value) {
                 StringStyle::Quoted => {
                     self.write("\"");
-                    self.write(&escape_bytes(value.as_bytes()));
+                    self.write(&escape_bytes(value.as_ref()));
                     self.write("\"");
                 }
                 StringStyle::Long { level } => {
@@ -740,7 +740,7 @@ fn escaped_len(bytes: &[u8]) -> usize {
 fn long_string_text(value: &ByteString) -> Option<&str> {
     let text = value.as_utf8()?;
     let safe_controls = value
-        .as_bytes()
+        .as_ref()
         .iter()
         .all(|byte| matches!(byte, b'\n' | b'\t' | 0x20..=0x7E) || *byte >= 0x80);
     safe_controls.then_some(text)
@@ -773,11 +773,11 @@ fn choose_string_style(value: &ByteString) -> StringStyle {
 
     let level = long_string_level(text);
     let newline_count = value
-        .as_bytes()
+        .as_ref()
         .iter()
         .filter(|byte| **byte == b'\n')
         .count();
-    let quoted_cost = 2 + escaped_len(value.as_bytes()) + newline_count * QUOTED_NEWLINE_STYLE_COST;
+    let quoted_cost = 2 + escaped_len(value.as_ref()) + newline_count * QUOTED_NEWLINE_STYLE_COST;
     let long_cost = long_string_len(text, level) + LONG_STRING_STYLE_COST;
 
     if long_cost < quoted_cost {
