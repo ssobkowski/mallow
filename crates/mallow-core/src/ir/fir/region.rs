@@ -5,7 +5,8 @@ use anyhow::{Result, ensure};
 use either::Either;
 
 use super::{Block, BlockExit, Function, Instr, PackId, ValueId};
-use crate::ir::graph::{DominatorTree, GraphView, Reversed, SeseGraphView, build_graph};
+use crate::ir::fir::ControlFlowGraph;
+use crate::ir::graph::{DominatorTree, GraphView, Reversed, SeseGraphView};
 use crate::logging::{Diagnostics, LogLevel, LogTarget};
 
 /// A source condition recovered from control-flow decisions.
@@ -112,119 +113,48 @@ impl fmt::Display for Predicate {
     }
 }
 
-/// Graph facts derived from one flat IR function.
-struct FlowGraph<'a> {
-    /// Function whose blocks are being structured.
-    function: &'a Function,
-    /// Successor blocks for every block.
-    successors: Vec<Vec<usize>>,
-    /// Predecessor blocks for every block.
-    predecessors: Vec<Vec<usize>>,
-}
-
-impl<'a> FlowGraph<'a> {
-    /// Builds graph facts without changing the flat function.
-    fn new(function: &'a Function) -> Self {
-        let (successors, predecessors) =
-            build_graph(function.blocks.iter().map(|block| block.exit.targets()));
-        Self {
-            function,
-            successors,
-            predecessors,
-        }
-    }
-
-    /// Returns one block and fails loudly for an invalid graph node.
-    fn block(&self, block: usize) -> &Block {
-        &self.function.blocks[block]
-    }
-
-    /// Returns whether a block has instructions that must be materialized.
-    ///
-    /// Phi instructions describe incoming edges. Every other instruction is
-    /// payload until the Shape-to-Region inliner concretely removes it.
-    fn block_has_payload(&self, block: usize) -> bool {
-        self.block(block)
-            .instrs
-            .iter()
-            .any(|instr| !matches!(instr, Instr::Phi { .. }))
-    }
-
-    /// Returns whether two blocks only construct and return the same value pack.
-    fn blocks_return_same_values(&self, left: usize, right: usize) -> bool {
-        let (
-            Block {
-                instrs: left_instrs,
-                exit: BlockExit::Return(left_return),
-                ..
+/// Returns whether two blocks only construct and return the same value pack.
+#[inline]
+fn blocks_return_same_values(left: &Block, right: &Block) -> bool {
+    let (
+        Block {
+            instrs: left_instrs,
+            exit: BlockExit::Return(left_return),
+            ..
+        },
+        Block {
+            instrs: right_instrs,
+            exit: BlockExit::Return(right_return),
+            ..
+        },
+    ) = (left, right)
+    else {
+        return false;
+    };
+    let (
+        [
+            Instr::MakePack {
+                out: left_pack,
+                head: left_head,
+                tail: left_tail,
             },
-            Block {
-                instrs: right_instrs,
-                exit: BlockExit::Return(right_return),
-                ..
+        ],
+        [
+            Instr::MakePack {
+                out: right_pack,
+                head: right_head,
+                tail: right_tail,
             },
-        ) = (self.block(left), self.block(right))
-        else {
-            return false;
-        };
-        let (
-            [
-                Instr::MakePack {
-                    out: left_pack,
-                    head: left_head,
-                    tail: left_tail,
-                },
-            ],
-            [
-                Instr::MakePack {
-                    out: right_pack,
-                    head: right_head,
-                    tail: right_tail,
-                },
-            ],
-        ) = (left_instrs.as_slice(), right_instrs.as_slice())
-        else {
-            return false;
-        };
+        ],
+    ) = (left_instrs.as_slice(), right_instrs.as_slice())
+    else {
+        return false;
+    };
 
-        left_return == left_pack
-            && right_return == right_pack
-            && left_head == right_head
-            && left_tail == right_tail
-    }
-}
-
-impl GraphView for FlowGraph<'_> {
-    type Item = Block;
-    type Node = usize;
-
-    fn get(&self, node: usize) -> Option<&Self::Item> {
-        self.function.blocks.get(node)
-    }
-
-    fn entry(&self) -> usize {
-        0
-    }
-
-    fn successors(&self, node: usize) -> impl Iterator<Item = usize> {
-        self.successors[node].iter().copied()
-    }
-
-    fn predecessors(&self, node: usize) -> impl Iterator<Item = usize> {
-        self.predecessors[node].iter().copied()
-    }
-
-    fn contains_node(&self, node: usize) -> bool {
-        node < self.function.blocks.len()
-    }
-
-    fn nodes(&self) -> impl Iterator<Item = usize> {
-        0..self.function.blocks.len()
-    }
-
-    fn len(&self) -> usize {
-        self.function.blocks.len()
-    }
+    left_return == left_pack
+        && right_return == right_pack
+        && left_head == right_head
+        && left_tail == right_tail
 }
 
 /// The lexical control-flow shape recognized from CFG facts.
@@ -710,23 +640,23 @@ impl LoopForest {
     /// parent body includes all child bodies, exits are computed from those
     /// final bodies, and same-header multi-latch loops are represented by a
     /// single [`LoopInfo`] whose `latches` set records all backedge sources.
-    fn build(cfg: &FlowGraph<'_>, idoms: &DominatorTree<usize>) -> Self {
+    fn build(graph: &RegionGraph, idoms: &DominatorTree<usize>) -> Self {
         let mut loops = HashMap::new();
         let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::new();
-        let reachable: HashSet<_> = cfg.reverse_post_order().into_iter().collect();
+        let reachable: HashSet<_> = graph.reverse_post_order().into_iter().collect();
 
-        for latch in cfg.nodes() {
+        for latch in graph.nodes() {
             if !reachable.contains(&latch) {
                 continue;
             }
 
-            for header in cfg.successors(latch) {
+            for header in graph.successors(latch) {
                 if reachable.contains(&header) && idoms.dominates(header, latch) {
                     let id = LoopId { header, latch };
-                    let body = natural_loop_body(cfg, header, latch, &reachable);
+                    let body = natural_loop_body(graph, header, latch, &reachable);
                     let exits = body
                         .iter()
-                        .flat_map(|&block| cfg.successors(block))
+                        .flat_map(|&block| graph.successors(block))
                         .filter(|target| !body.contains(target))
                         .collect();
 
@@ -762,10 +692,10 @@ impl LoopForest {
         //    entire lexical loop nest.
         // 4. Recompute exits again, because body propagation can turn an edge
         //    to a child block from an exit into an internal edge.
-        Self::recompute_exits(cfg, &mut loops);
+        Self::recompute_exits(&graph, &mut loops);
         Self::rebuild_tree(&mut loops);
         Self::propagate_child_bodies(&mut loops);
-        Self::recompute_exits(cfg, &mut loops);
+        Self::recompute_exits(&graph, &mut loops);
 
         // The canonical source pattern is a pre-test loop with an explicit `continue`
         // before the normal loop tail:
@@ -824,10 +754,10 @@ impl LoopForest {
         // Aggregation mutates the representative's body and latches and removes
         // sibling entries, leaving exits and containment stale. The second
         // sequence restores the same invariants as the first.
-        Self::recompute_exits(cfg, &mut loops);
+        Self::recompute_exits(&graph, &mut loops);
         Self::rebuild_tree(&mut loops);
         Self::propagate_child_bodies(&mut loops);
-        Self::recompute_exits(cfg, &mut loops);
+        Self::recompute_exits(&graph, &mut loops);
         let by_header = Self::rebuild_by_header(&loops);
 
         Self { loops, by_header }
@@ -838,12 +768,12 @@ impl LoopForest {
     /// This must be run after any operation that changes `LoopInfo::body`,
     /// because exits are consumed both by containment recovery and by loop-kind
     /// classification.
-    fn recompute_exits(cfg: &FlowGraph<'_>, loops: &mut HashMap<LoopId, LoopInfo>) {
+    fn recompute_exits(graph: &RegionGraph, loops: &mut HashMap<LoopId, LoopInfo>) {
         for info in loops.values_mut() {
             info.exits = info
                 .body
                 .iter()
-                .flat_map(|&block| cfg.successors(block))
+                .flat_map(|&block| graph.successors(block))
                 .filter(|target| !info.body.contains(target))
                 .collect();
         }
@@ -1004,44 +934,103 @@ impl LoopForest {
 /// A SESE region graph. Built on top of the control flow graph with its exit
 /// nodes tied to a single virtual exit.
 struct RegionGraph {
-    /// Entry block inherited from the flat graph.
     entry: usize,
-    /// Synthetic exit reached from every terminal block.
     exit: usize,
-    /// RecognizedShape associated with each real or synthetic block.
-    nodes: HashMap<usize, RecognizedShape>,
-    /// Successor blocks including edges to the synthetic exit.
-    successors: HashMap<usize, Vec<usize>>,
-    /// Predecessor blocks including terminal blocks at the synthetic exit.
-    predecessors: HashMap<usize, Vec<usize>>,
+
+    nodes: Box<[RecognizedShape]>,
+    blocks: Box<[Block]>,
+
+    out_offsets: Box<[usize]>,
+    out_edges: Box<[usize]>,
+
+    in_offsets: Box<[usize]>,
+    in_edges: Box<[usize]>,
+}
+
+impl From<ControlFlowGraph<Block>> for RegionGraph {
+    fn from(cfg: ControlFlowGraph<Block>) -> Self {
+        // We rebuild the CSR to include a virtual exit node at the end.
+        let blocks = cfg.nodes;
+        let mut nodes: Vec<_> = (0..blocks.len())
+            .map(|b| RecognizedShape::Block(b))
+            .collect();
+        let mut in_offsets = cfg.in_offsets.into_vec();
+        let mut in_edges = cfg.in_edges.into_vec();
+
+        let exit_idx = nodes.len();
+        nodes.push(RecognizedShape::VirtualExit);
+
+        let leaves: Vec<_> = (0..exit_idx)
+            .filter(|&u| cfg.out_offsets[u] == cfg.out_offsets[u + 1])
+            .collect();
+
+        let mut out_offsets = Vec::with_capacity(exit_idx + 2);
+        let mut out_edges = Vec::with_capacity(cfg.out_edges.len() + leaves.len());
+        out_offsets.push(0);
+
+        for u in 0..exit_idx {
+            let start = cfg.out_offsets[u];
+            let end = cfg.out_offsets[u + 1];
+
+            if start == end {
+                // Out-degree 0: add edge u -> exit_idx
+                out_edges.push(exit_idx);
+            } else {
+                // Keep original outgoing edges
+                out_edges.extend_from_slice(&cfg.out_edges[start..end]);
+            }
+            out_offsets.push(out_edges.len());
+        }
+
+        // Virtual exit has out-degree 0
+        out_offsets.push(out_edges.len());
+
+        in_edges.extend(leaves);
+        in_offsets.push(in_edges.len());
+
+        RegionGraph {
+            entry: 0, // remains unchanged from the cfg
+            exit: exit_idx,
+            nodes: nodes.into_boxed_slice(),
+            blocks,
+            out_offsets: out_offsets.into_boxed_slice(),
+            out_edges: out_edges.into_boxed_slice(),
+            in_offsets: in_offsets.into_boxed_slice(),
+            in_edges: in_edges.into_boxed_slice(),
+        }
+    }
 }
 
 impl GraphView for RegionGraph {
     type Item = RecognizedShape;
     type Node = usize;
 
-    fn get(&self, node: usize) -> Option<&Self::Item> {
-        self.nodes.get(&node)
-    }
-
-    fn entry(&self) -> usize {
+    fn entry(&self) -> Self::Node {
         self.entry
     }
 
-    fn successors(&self, node: usize) -> impl Iterator<Item = usize> {
-        self.successors.get(&node).into_iter().flatten().copied()
+    fn get(&self, node: Self::Node) -> Option<&Self::Item> {
+        self.nodes.get(node)
     }
 
-    fn predecessors(&self, node: usize) -> impl Iterator<Item = usize> {
-        self.predecessors.get(&node).into_iter().flatten().copied()
+    fn successors(&self, node: Self::Node) -> impl Iterator<Item = Self::Node> {
+        let start = self.out_offsets[node];
+        let end = self.out_offsets[node + 1];
+        self.out_edges[start..end].iter().copied()
     }
 
-    fn contains_node(&self, node: usize) -> bool {
-        self.nodes.contains_key(&node)
+    fn predecessors(&self, node: Self::Node) -> impl Iterator<Item = Self::Node> {
+        let start = self.in_offsets[node];
+        let end = self.in_offsets[node + 1];
+        self.in_edges[start..end].iter().copied()
     }
 
-    fn nodes(&self) -> impl Iterator<Item = usize> {
-        self.nodes.keys().copied()
+    fn nodes(&self) -> impl Iterator<Item = Self::Node> {
+        0..self.nodes.len()
+    }
+
+    fn items(&self) -> impl Iterator<Item = &Self::Item> {
+        self.nodes.iter()
     }
 
     fn len(&self) -> usize {
@@ -1055,52 +1044,8 @@ impl SeseGraphView for RegionGraph {
     }
 }
 
-impl RegionGraph {
-    /// Creates a region graph from one flat control-flow graph.
-    fn from_cfg(cfg: &FlowGraph<'_>) -> Self {
-        let mut nodes: HashMap<_, _> = cfg
-            .nodes()
-            .map(|i| (i, RecognizedShape::Block(i)))
-            .collect();
-        let mut successors: HashMap<_, Vec<_>> = cfg
-            .nodes()
-            .map(|i| (i, cfg.successors(i).collect()))
-            .collect();
-        let mut predecessors: HashMap<_, Vec<_>> = cfg
-            .nodes()
-            .map(|i| (i, cfg.predecessors(i).collect()))
-            .collect();
-
-        let terminal_nodes: Vec<_> = nodes
-            .keys()
-            .copied()
-            .filter(|&id| successors.get(&id).is_none_or(|s| s.is_empty()))
-            .collect();
-
-        let virtual_exit = usize::MAX;
-        nodes.insert(virtual_exit, RecognizedShape::VirtualExit);
-
-        for node in terminal_nodes {
-            successors.entry(node).or_default().push(virtual_exit);
-            predecessors.entry(virtual_exit).or_default().push(node);
-        }
-
-        successors.insert(virtual_exit, Vec::new());
-
-        Self {
-            entry: cfg.entry(),
-            exit: virtual_exit,
-            nodes,
-            successors,
-            predecessors,
-        }
-    }
-}
-
 /// State shared by recursive region recognition.
-struct Structurer<'cfg, 'd> {
-    /// Flat graph that owns executable block facts.
-    cfg: &'cfg FlowGraph<'cfg>,
+struct Structurer<'d> {
     /// SESE graph with one synthetic exit.
     graph: RegionGraph,
     /// Immediate post-dominators computed through the reversed SESE graph.
@@ -1111,17 +1056,16 @@ struct Structurer<'cfg, 'd> {
     diagnostics: &'d Diagnostics,
 }
 
-impl<'cfg, 'd> Structurer<'cfg, 'd> {
+impl<'d> Structurer<'d> {
     /// Builds all graph analyses required by region recognition.
-    fn new(cfg: &'cfg FlowGraph<'cfg>, diagnostics: &'d Diagnostics) -> Self {
-        let graph = RegionGraph::from_cfg(cfg);
+    fn new(cfg: &ControlFlowGraph<Block>, diagnostics: &'d Diagnostics) -> Self {
+        let graph = RegionGraph::from(cfg.clone());
         let ipdoms = Reversed::new(&graph).build_idoms();
 
         let idoms = graph.build_idoms();
-        let loops = LoopForest::build(cfg, &idoms);
+        let loops = LoopForest::build(&graph, &idoms);
 
         Self {
-            cfg,
             graph,
             ipdoms,
             loops,
@@ -1197,9 +1141,10 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         let mut visited = HashSet::new();
         let mut current = scope.entry;
 
-        visited.insert(usize::MAX); // virtual exit
+        visited.insert(self.graph.exit()); // virtual exit
 
-        while scope.nodes.contains(&current)
+        while current != self.graph.exit()
+            && scope.nodes.contains(&current)
             && !scope.exits.contains(&current)
             && visited.insert(current)
         {
@@ -1258,7 +1203,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                         merge
                     ),
                 );
-                if self.cfg.block_has_payload(current) {
+                if !self.graph.blocks[current].instrs.is_empty() {
                     nodes.push(RecognizedShape::Block(current));
                 }
 
@@ -1618,7 +1563,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                 .filter(|latch| *latch != loop_info.header)
                 .collect(),
             LoopKind::NumericFor { .. } | LoopKind::GenericFor { .. }
-                if self.cfg.block_has_payload(loop_info.latch) =>
+                if !self.graph.blocks[loop_info.latch].instrs.is_empty() =>
             {
                 [loop_info.latch].into_iter().collect()
             }
@@ -1638,9 +1583,9 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
     ) -> Option<ConditionalShape> {
         let BlockExit::Branch {
             condition,
-            then_block,
-            else_block,
-        } = &self.cfg.block(head).exit
+            then_edge,
+            else_edge,
+        } = &self.graph.blocks[head].exit
         else {
             return None;
         };
@@ -1648,10 +1593,16 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         Some(ConditionalShape {
             head,
             condition: Predicate::Value(*condition),
-            then_entry: *then_block,
-            else_entry: *else_block,
+            then_entry: then_edge.target,
+            else_entry: else_edge.target,
             merge: self.find_merge_point(head, scope).or_else(|| {
-                self.scoped_branch_merge(*then_block, *else_block, scope, loop_ctx, suppress_exit)
+                self.scoped_branch_merge(
+                    then_edge.target,
+                    else_edge.target,
+                    scope,
+                    loop_ctx,
+                    suppress_exit,
+                )
             }),
         })
     }
@@ -1927,26 +1878,26 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
 
         if let Some(latch) = single_latch
             && let BlockExit::NumericForLoop {
-                body_block,
-                exit_block,
-            } = &self.cfg.block(latch).exit
-            && *body_block == loop_info.header
+                body_edge,
+                exit_edge,
+            } = &self.graph.blocks[latch].exit
+            && body_edge.target == loop_info.header
         {
-            let prep_block = self.cfg.predecessors(loop_info.header).find(|&pred| {
+            let prep_block = self.graph.predecessors(loop_info.header).find(|&pred| {
                 matches!(
-                    &self.cfg.block(pred).exit,
+                    &self.graph.blocks[pred].exit,
                     BlockExit::NumericFor {
-                        body_block: prep_body,
-                        exit_block: prep_exit,
+                        body_edge: prep_body,
+                        exit_edge: prep_exit,
                         ..
-                    } if prep_body == body_block
-                       && (prep_exit == exit_block
+                    } if prep_body.target == body_edge.target
+                       && (prep_exit.target == exit_edge.target
                            // Luau can duplicate a return-only bytecode block after one
                            // branch on O1 and O2. FORNPREP skips to the shared return
                            // while FORNLOOP falls through to the duplicate return block.
                            //
                            // Dedicated test case: controlflow37.luau
-                           || self.cfg.blocks_return_same_values(*prep_exit, *exit_block))
+                           || blocks_return_same_values(&self.graph.blocks[prep_exit.target], &self.graph.blocks[exit_edge.target]))
                 )
             });
 
@@ -1956,15 +1907,15 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                     start,
                     end,
                     step,
-                    body_block,
-                    exit_block,
-                } = &self.cfg.block(prep_block).exit
+                    body_edge,
+                    exit_edge,
+                } = &self.graph.blocks[prep_block].exit
             {
                 trace.line(1, format_args!("kind = NumericFor"));
 
                 return LoopKind::NumericFor {
-                    body: *body_block,
-                    exit: *exit_block,
+                    body: body_edge.target,
+                    exit: exit_edge.target,
                     variable: *variable,
                     start: *start,
                     end: *end,
@@ -1975,35 +1926,35 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
 
         if let Some(latch) = single_latch
             && let BlockExit::GenericForLoop {
-                body_block,
-                exit_block,
+                body_edge,
+                exit_edge,
                 ..
-            } = &self.cfg.block(latch).exit
-            && *body_block == loop_info.header
+            } = &self.graph.blocks[latch].exit
+            && body_edge.target == loop_info.header
         {
-            let prep_block = self.cfg.predecessors(loop_info.header).find(|&pred| {
+            let prep_block = self.graph.predecessors(loop_info.header).find(|&pred| {
                 matches!(
-                    &self.cfg.block(pred).exit,
+                    &self.graph.blocks[pred].exit,
                     BlockExit::GenericFor {
-                        body_block: prep_body,
+                        body_edge: prep_body,
                         loop_block,
                         ..
-                    } if prep_body == body_block && *loop_block == latch
+                    } if prep_body.target == body_edge.target && *loop_block == latch
                 )
             });
 
             if let Some(prep_block) = prep_block
                 && let BlockExit::GenericFor {
                     variables, values, ..
-                } = &self.cfg.block(prep_block).exit
+                } = &self.graph.blocks[prep_block].exit
             {
                 trace.line(1, format_args!("kind = GenericFor"));
 
                 return LoopKind::GenericFor {
                     variables: variables.to_vec(),
                     values: *values,
-                    body: *body_block,
-                    exit: *exit_block,
+                    body: body_edge.target,
+                    exit: exit_edge.target,
                 };
             }
         }
@@ -2013,21 +1964,21 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         if let Some(latch) = single_latch
             && let BlockExit::Branch {
                 condition,
-                then_block,
-                else_block,
-            } = &self.cfg.block(latch).exit
-            && (*then_block == loop_info.header) ^ (*else_block == loop_info.header)
+                then_edge,
+                else_edge,
+            } = &self.graph.blocks[latch].exit
+            && (then_edge.target == loop_info.header) ^ (else_edge.target == loop_info.header)
         {
-            let condition = if *then_block == loop_info.header {
+            let condition = if then_edge.target == loop_info.header {
                 Predicate::Value(*condition).invert()
             } else {
                 Predicate::Value(*condition)
             };
 
-            let loop_exit = if *then_block == loop_info.header {
-                *else_block
+            let loop_exit = if then_edge.target == loop_info.header {
+                else_edge.target
             } else {
-                *then_block
+                then_edge.target
             };
 
             if self.can_represent_as_repeat_until(loop_info, loop_exit) {
@@ -2087,7 +2038,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         node: usize,
         visiting: &mut HashSet<usize>,
     ) -> Option<GuardBranch> {
-        if !loop_info.body.contains(&node) || self.cfg.block_has_payload(node) {
+        if !loop_info.body.contains(&node) || !self.graph.blocks[node].instrs.is_empty() {
             return None;
         }
         if !visiting.insert(node) {
@@ -2096,16 +2047,16 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
 
         let BlockExit::Branch {
             condition,
-            then_block,
-            else_block,
-        } = &self.cfg.block(node).exit
+            then_edge,
+            else_edge,
+        } = &self.graph.blocks[node].exit
         else {
             visiting.remove(&node);
             return None;
         };
 
-        let then_branch = self.recognize_while_guard_branch(loop_info, *then_block, visiting);
-        let else_branch = self.recognize_while_guard_branch(loop_info, *else_block, visiting);
+        let then_branch = self.recognize_while_guard_branch(loop_info, then_edge.target, visiting);
+        let else_branch = self.recognize_while_guard_branch(loop_info, else_edge.target, visiting);
 
         visiting.remove(&node);
 
@@ -2151,8 +2102,8 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         }
 
         if !loop_info.latches.contains(&target)
-            && !self.cfg.block_has_payload(target)
-            && matches!(&self.cfg.block(target).exit, BlockExit::Branch { .. })
+            && self.graph.blocks[target].instrs.is_empty()
+            && matches!(&self.graph.blocks[target].exit, BlockExit::Branch { .. })
             && self.conditional_has_loop_exit(loop_info, target)
             && let Some(guard) = self.recognize_while_guard_node(loop_info, target, visiting)
         {
@@ -2170,15 +2121,15 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
     /// Returns whether the Block `node` has a conditional jump that exits the loop body.
     fn conditional_has_loop_exit(&self, loop_info: &LoopInfo, node: usize) -> bool {
         let BlockExit::Branch {
-            then_block,
-            else_block,
+            then_edge,
+            else_edge,
             ..
-        } = &self.cfg.block(node).exit
+        } = &self.graph.blocks[node].exit
         else {
             return false;
         };
 
-        !loop_info.body.contains(then_block) || !loop_info.body.contains(else_block)
+        !loop_info.body.contains(&then_edge.target) || !loop_info.body.contains(&else_edge.target)
     }
 
     /// Returns whether the loop can be represented as a `repeat until` loop.
@@ -2205,7 +2156,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
             return true;
         }
 
-        !self.cfg.block_has_payload(loop_exit)
+        self.graph.blocks[loop_exit].instrs.is_empty()
     }
 
     /// Returns the common loop follow target, if one exists.
@@ -2271,28 +2222,30 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
         let trace = self.diagnostics.at(LogLevel::Trace, LogTarget::Region);
         let block_shape = RecognizedShape::Block(block);
 
-        match &self.cfg.block(block).exit {
-            BlockExit::Jump(target) | BlockExit::Fallthrough(target)
-                if scope.merge_points.contains(target) =>
+        match &self.graph.blocks[block].exit {
+            BlockExit::Jump(edge) | BlockExit::Fallthrough(edge)
+                if scope.merge_points.contains(&edge.target) =>
             {
                 trace.line(
                     2,
-                    format_args!("block {} exits to implicit target {}", block, target),
+                    format_args!("block {} exits to implicit target {}", block, edge.target),
                 );
                 block_shape
             }
-            BlockExit::Jump(target) | BlockExit::Fallthrough(target)
+            BlockExit::Jump(edge) | BlockExit::Fallthrough(edge)
                 if loop_ctx.is_some_and(|ctx| {
-                    ctx.continue_targets.contains(target)
-                        && !ctx.payload_continue_targets.contains(target)
+                    ctx.continue_targets.contains(&edge.target)
+                        && !ctx.payload_continue_targets.contains(&edge.target)
                 }) =>
             {
-                if suppress_exit == Some(*target) && self.ipdoms.idom(block) == Some(*target) {
+                if suppress_exit == Some(edge.target)
+                    && self.ipdoms.idom(block) == Some(edge.target)
+                {
                     trace.line(
                         2,
                         format_args!(
                             "block {} reaches suppressed loop terminal {}",
-                            block, target
+                            block, edge.target
                         ),
                     );
                     return block_shape;
@@ -2305,7 +2258,7 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
                         2,
                         format_args!(
                             "block {} exits through implicit loop tail to {}",
-                            block, target
+                            block, edge.target
                         ),
                     );
                     return block_shape;
@@ -2313,16 +2266,16 @@ impl<'cfg, 'd> Structurer<'cfg, 'd> {
 
                 trace.line(
                     2,
-                    format_args!("block {} exits to continue target {}", block, target),
+                    format_args!("block {} exits to continue target {}", block, edge.target),
                 );
                 RecognizedShape::sequence([block_shape, RecognizedShape::Continue])
             }
-            BlockExit::Jump(target) | BlockExit::Fallthrough(target)
-                if loop_ctx.is_some_and(|ctx| ctx.exits.contains(target)) =>
+            BlockExit::Jump(edge) | BlockExit::Fallthrough(edge)
+                if loop_ctx.is_some_and(|ctx| ctx.exits.contains(&edge.target)) =>
             {
                 trace.line(
                     2,
-                    format_args!("block {} exits to break target {}", block, target),
+                    format_args!("block {} exits to break target {}", block, edge.target),
                 );
                 RecognizedShape::sequence([block_shape, RecognizedShape::Break])
             }
@@ -2390,26 +2343,26 @@ impl RecognizedShape {
         matches!(self, RecognizedShape::Sequence(nodes) if nodes.is_empty())
     }
 
-    /// Lowers one recognized shape into flat-IR structured control flow.
-    fn lower(self) -> Shape {
+    /// Lifts one recognized shape into flat-IR structured control flow.
+    fn lift(self) -> Shape {
         match self {
             RecognizedShape::Block(block) => Shape::Block { block },
             RecognizedShape::Sequence(nodes) => Shape::Sequence {
-                nodes: nodes.into_iter().map(RecognizedShape::lower).collect(),
+                nodes: nodes.into_iter().map(RecognizedShape::lift).collect(),
             },
             RecognizedShape::If(shape) => Shape::If {
                 condition: shape.condition,
-                then_branch: Box::new(shape.then_branch.lower()),
-                else_branch: shape.else_branch.map(|branch| Box::new(branch.lower())),
+                then_branch: Box::new(shape.then_branch.lift()),
+                else_branch: shape.else_branch.map(|branch| Box::new(branch.lift())),
             },
             RecognizedShape::Loop(shape) => match shape.kind {
                 LoopKind::While { condition, .. } => Shape::While {
                     condition,
-                    body: Box::new(shape.body.lower()),
+                    body: Box::new(shape.body.lift()),
                 },
                 LoopKind::RepeatUntil { condition, .. } => Shape::RepeatUntil {
                     condition,
-                    body: Box::new(shape.body.lower()),
+                    body: Box::new(shape.body.lift()),
                 },
                 LoopKind::NumericFor {
                     variable,
@@ -2422,25 +2375,25 @@ impl RecognizedShape {
                     start,
                     end,
                     step,
-                    body: Box::new(shape.body.lower()),
+                    body: Box::new(shape.body.lift()),
                 },
                 LoopKind::GenericFor {
                     variables, values, ..
                 } => Shape::GenericFor {
                     variables,
                     values,
-                    body: Box::new(shape.body.lower()),
+                    body: Box::new(shape.body.lift()),
                 },
                 LoopKind::Infinite { .. } => Shape::While {
                     condition: Predicate::True,
-                    body: Box::new(shape.body.lower()),
+                    body: Box::new(shape.body.lift()),
                 },
             },
             RecognizedShape::Break => Shape::Break,
             RecognizedShape::Continue => Shape::Continue,
             RecognizedShape::Return(values) => Shape::Return { values },
             RecognizedShape::VirtualExit => {
-                unreachable!("virtual exit must not survive shape lowering")
+                unreachable!("virtual exit must not survive shape lifting")
             }
         }
     }
@@ -2452,7 +2405,7 @@ impl RecognizedShape {
 /// **Note**: Natural loop body does not account for lexical ownership or loop-kind
 ///           specific boundaries.
 fn natural_loop_body(
-    cfg: &FlowGraph<'_>,
+    cfg: &RegionGraph,
     header: usize,
     latch: usize,
     reachable: &HashSet<usize>,
@@ -2529,15 +2482,11 @@ fn conditional_branch_exits(
 
 /// Structures one flat IR function without changing its blocks or instructions.
 pub(crate) fn structure(function: &Function, diagnostics: &Diagnostics) -> Result<Shape> {
-    ensure!(
-        !function.blocks.is_empty(),
-        "cannot structure an empty function"
-    );
+    ensure!(function.cfg.len() > 0, "cannot structure an empty function");
 
-    let cfg = FlowGraph::new(function);
-    let node = Structurer::new(&cfg, diagnostics)
+    let node = Structurer::new(&function.cfg, diagnostics)
         .structure()
-        .lower()
+        .lift()
         .normalize();
     Ok(node)
 }

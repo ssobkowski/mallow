@@ -2,17 +2,37 @@ use std::collections::{BTreeSet, HashMap};
 
 use id_arena::Arena;
 
-use super::{Block, Instr, Value, ValueId};
+use super::{Block, Value, ValueId};
+use crate::ir::fir::{ControlFlowGraph, Edge};
 use crate::ir::graph::GraphView;
 
+enum Input {
+    /// This value comes from the entry block (e.g. from a function param).
+    Entry(ValueId),
+    /// This value comes from a predecessor block.
+    Predecessor(usize, ValueId),
+}
+
+impl Input {
+    #[inline]
+    fn value(&self) -> ValueId {
+        match self {
+            Input::Entry(value) => *value,
+            Input::Predecessor(_, value) => *value,
+        }
+    }
+}
+
 /// Builds immutable value versions for physical registers.
-pub(super) struct Ssa<'a, G: GraphView<Node = usize>> {
+pub struct Ssa<'g, G> {
     /// Register versions stored as contiguous block rows.
-    registers: Vec<Option<ValueId>>,
+    registers: Box<[Option<ValueId>]>,
+    /// Registers allocated at the entry.
+    entry_registers: Box<[Option<ValueId>]>,
     /// Number of register slots in each block row.
     register_count: usize,
     /// Control-flow graph that owns the block indices.
-    graph: &'a G,
+    graph: &'g G,
     /// Values allocated while constructing SSA.
     values: Arena<Value>,
     /// Trivial Phi values mapped to their surviving values.
@@ -22,16 +42,16 @@ pub(super) struct Ssa<'a, G: GraphView<Node = usize>> {
     /// Block containing each Phi value.
     phi_to_block: HashMap<ValueId, usize>,
     /// Predecessor inputs read by each Phi value.
-    phi_to_inputs: HashMap<ValueId, Vec<(usize, ValueId)>>,
+    phi_to_inputs: HashMap<ValueId, Vec<Input>>,
     /// Whether each block has received all local writes.
-    filled_blocks: Vec<bool>,
+    filled_blocks: Box<[bool]>,
     /// Phi values waiting for predecessor blocks to be filled.
     incomplete_phis: HashMap<usize, Vec<(u8, ValueId)>>,
 }
 
-impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
+impl<'g, G: GraphView<Node = usize>> Ssa<'g, G> {
     /// Creates empty SSA state sized to the function's declared registers.
-    pub(super) fn new(graph: &'a G, register_count: u8) -> Self {
+    pub fn new(graph: &'g G, register_count: u8) -> Self {
         let block_count = graph.len();
         let register_count = register_count as usize;
         let register_slots = block_count
@@ -39,7 +59,8 @@ impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
             .expect("SSA register state size overflow");
 
         Self {
-            registers: vec![None; register_slots],
+            registers: vec![None; register_slots].into_boxed_slice(),
+            entry_registers: vec![None; register_count].into_boxed_slice(),
             register_count,
             graph,
             values: Arena::new(),
@@ -47,24 +68,35 @@ impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
             phi_uses: HashMap::new(),
             phi_to_block: HashMap::new(),
             phi_to_inputs: HashMap::new(),
-            filled_blocks: vec![false; block_count],
+            filled_blocks: vec![false; block_count].into_boxed_slice(),
             incomplete_phis: HashMap::new(),
         }
     }
 
-    /// Allocates one immutable value identity.
-    pub(super) fn alloc(&mut self) -> ValueId {
+    /// Allocates an immutable value identity.
+    #[inline]
+    #[must_use]
+    pub fn alloc(&mut self) -> ValueId {
         self.values.alloc(Value)
     }
 
+    /// Stores a register value at the entry block, without creating
+    /// a "SSA Identity" for it yet.
+    #[inline]
+    pub fn write_entry(&mut self, reg: u8, value: ValueId) {
+        self.entry_registers[reg as usize] = Some(value);
+    }
+
     /// Writes one register version in one block.
-    pub(super) fn write_reg(&mut self, block: usize, reg: u8, value: ValueId) {
+    #[inline]
+    pub fn write_reg(&mut self, block: usize, reg: u8, value: ValueId) {
         let index = self.register_index(block, reg);
         self.registers[index] = Some(value);
     }
 
     /// Reads one register version in one block.
-    pub(super) fn read_reg(&mut self, block: usize, reg: u8) -> ValueId {
+    #[must_use]
+    pub fn read_reg(&mut self, block: usize, reg: u8) -> ValueId {
         let index = self.register_index(block, reg);
         if let Some(value) = self.registers[index] {
             value
@@ -74,15 +106,24 @@ impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
     }
 
     /// Marks one block complete for sealed SSA construction.
-    pub(super) fn mark_filled(&mut self, block: usize) {
+    #[inline]
+    pub fn mark_filled(&mut self, block: usize) {
         self.filled_blocks[block] = true;
     }
 
-    /// Completes SSA, inserts surviving Phi instructions, and returns its values.
-    pub(super) fn finish(
+    /// Completes SSA, updating the block edges.
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple of:
+    /// - The values allocated during SSA construction.
+    /// - The Phi value aliases.
+    /// - The function's entry edge.
+    #[must_use]
+    pub fn finish(
         mut self,
-        blocks: &mut [Block],
-    ) -> (Arena<Value>, HashMap<ValueId, ValueId>) {
+        cfg: &mut ControlFlowGraph<Block>,
+    ) -> (Arena<Value>, HashMap<ValueId, ValueId>, Edge) {
         self.seal_blocks();
         self.remove_remaining_trivial_phis();
         let mut phis: Vec<_> = std::mem::take(&mut self.phi_to_inputs)
@@ -90,22 +131,38 @@ impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
             .collect();
         phis.sort_by_key(|(value, _)| (self.phi_to_block[value], *value));
 
-        for (out, inputs) in phis.into_iter().rev() {
+        let mut entry = Edge {
+            target: cfg.entry(),
+            params: Vec::new(),
+        };
+        for (out, inputs) in phis.into_iter() {
             let block = self.phi_to_block[&out];
-            let inputs = inputs
-                .into_iter()
-                .map(|(predecessor, value)| (predecessor, self.resolve(value)))
-                .collect();
-            blocks[block].instrs.insert(0, Instr::Phi { out, inputs });
+            cfg[block].params.push(out);
+
+            for input in inputs {
+                match input {
+                    Input::Predecessor(predecessor, input) => {
+                        for edge in cfg[predecessor].exit.edges_mut() {
+                            if edge.target == block {
+                                edge.params.push(self.resolve(input));
+                            }
+                        }
+                    }
+                    Input::Entry(input) => {
+                        entry.params.push(self.resolve(input));
+                    }
+                }
+            }
         }
 
-        (self.values, self.aliases)
+        (self.values, self.aliases, entry)
     }
 
     /// Returns the flat state index for one register in one block.
+    #[inline]
     fn register_index(&self, block: usize, reg: u8) -> usize {
         assert!(block < self.graph.len(), "SSA block index out of range");
-        let reg = usize::from(reg);
+        let reg = reg as usize;
         assert!(
             reg < self.register_count,
             "register R{reg} exceeds max stack size {}",
@@ -115,6 +172,7 @@ impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
     }
 
     /// Resolves one value through trivial Phi aliases.
+    #[inline]
     fn resolve(&self, mut value: ValueId) -> ValueId {
         while let Some(&alias) = self.aliases.get(&value) {
             value = alias;
@@ -123,9 +181,14 @@ impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
     }
 
     /// Recursively reads one register and creates a Phi when needed.
+    #[must_use]
     fn read_reg_recursive(&mut self, block: usize, reg: u8) -> ValueId {
         let predecessors: Vec<_> = self.graph.predecessors(block).collect();
         if predecessors.is_empty() {
+            // No predecessors = MIGHT be the entry block.
+            if let Some(value) = self.entry_registers[reg as usize] {
+                return value;
+            }
             return self.alloc();
         }
 
@@ -158,18 +221,28 @@ impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
     }
 
     /// Reads one register from every predecessor.
-    fn read_inputs(&mut self, block: usize, reg: u8) -> Vec<(usize, ValueId)> {
-        self.graph
-            .predecessors(block)
-            .map(|predecessor| (predecessor, self.read_reg(predecessor, reg)))
-            .collect()
+    fn read_inputs(&mut self, block: usize, reg: u8) -> Vec<Input> {
+        let mut inputs = Vec::new();
+
+        if block == self.graph.entry()
+            && let Some(value) = self.entry_registers[reg as usize]
+        {
+            inputs.push(Input::Entry(value));
+        }
+        inputs.extend(
+            self.graph.predecessors(block).map(|predecessor| {
+                Input::Predecessor(predecessor, self.read_reg(predecessor, reg))
+            }),
+        );
+
+        inputs
     }
 
     /// Records the inputs and reverse uses of one Phi.
-    fn record_inputs(&mut self, phi: ValueId, inputs: Vec<(usize, ValueId)>) {
-        for (_, value) in &inputs {
+    fn record_inputs(&mut self, phi: ValueId, inputs: Vec<Input>) {
+        for input in &inputs {
             self.phi_uses
-                .entry(self.resolve(*value))
+                .entry(self.resolve(input.value()))
                 .or_default()
                 .insert(phi);
         }
@@ -183,8 +256,8 @@ impl<'a, G: GraphView<Node = usize>> Ssa<'a, G> {
         };
 
         let mut same = None;
-        for (_, input) in inputs {
-            let input = self.resolve(*input);
+        for input in inputs {
+            let input = self.resolve(input.value());
             if input == phi || Some(input) == same {
                 continue;
             }

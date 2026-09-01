@@ -17,7 +17,7 @@ use smol_str::SmolStr;
 
 use crate::common::ByteString;
 use crate::il::ProtoId;
-use crate::ir::graph::build_graph;
+use crate::ir::graph::{GraphView, GraphViewMut};
 use crate::operator::{BinOp, UnOp};
 
 /// Stable identity for one immutable IR value.
@@ -204,65 +204,106 @@ pub enum Instr {
         index: u32,
         values: PackId,
     },
-    /// Selects a value based on which predecessor code path was taken (for control flow merges).
-    Phi {
-        out: ValueId,
-        /// Each pair: (predecessor block index, value from that path).
-        inputs: Vec<(usize, ValueId)>,
-    },
 }
 
-/// An exit from a block.
-#[derive(Debug, Clone)]
-pub enum BlockExit {
-    /// Continues into the next bytecode block.
-    Fallthrough(usize),
-    /// Transfers control to one block.
-    Jump(usize),
-    /// Transfers control based on one value.
-    Branch {
-        condition: ValueId,
-        then_block: usize,
-        else_block: usize,
-    },
-    /// Starts a numeric loop.
-    NumericFor {
-        body_block: usize,
-        exit_block: usize,
-        variable: ValueId,
-        start: ValueId,
-        end: ValueId,
-        step: ValueId,
-    },
-    /// Continues a numeric loop.
-    NumericForLoop {
-        body_block: usize,
-        exit_block: usize,
-    },
-    /// Starts a generic loop.
-    GenericFor {
-        /// First block in the loop body.
-        body_block: usize,
-        /// Block containing the generic loop operation.
-        loop_block: usize,
-        /// Values produced for the source loop variables.
-        variables: SmallVec<[ValueId; 3]>,
-        /// Iterator, state, and initial control values.
-        values: [ValueId; 3],
-    },
-    /// Continues a generic loop.
-    GenericForLoop {
-        body_block: usize,
-        exit_block: usize,
-        variables: SmallVec<[ValueId; 3]>,
-    },
-    /// Returns a value pack.
-    Return(PackId),
+impl Instr {
+    /// Returns the value defined by this instruction, if it exists.
+    #[inline]
+    pub(crate) fn defined_value(&self) -> Option<ValueId> {
+        match self {
+            Self::Const { out, .. }
+            | Self::Copy { out, .. }
+            | Self::GetGlobal { out, .. }
+            | Self::Closure { out, .. }
+            | Self::GetTable { out, .. }
+            | Self::Binary { out, .. }
+            | Self::Unary { out, .. }
+            | Self::Concat { out, .. }
+            | Self::Select { out, .. }
+            | Self::NewTable { out }
+            | Self::Project { out, .. }
+            | Self::LoadCell { out, .. } => Some(*out),
+            Self::SetTable { .. }
+            | Self::SetGlobal { .. }
+            | Self::MakePack { .. }
+            | Self::Call { .. }
+            | Self::MethodCall { .. }
+            | Self::VarArgs { .. }
+            | Self::OpenCell { .. }
+            | Self::StoreCell { .. }
+            | Self::SetList { .. } => None,
+        }
+    }
+
+    /// Returns the value pack defined by this instruction, if it exists.
+    #[inline]
+    fn defined_pack(&self) -> Option<PackId> {
+        match self {
+            Self::MakePack { out, .. }
+            | Self::Call { out, .. }
+            | Self::MethodCall { out, .. }
+            | Self::VarArgs { out } => Some(*out),
+            _ => None,
+        }
+    }
+
+    /// Returns immutable values read by this instruction.
+    #[inline]
+    pub(crate) fn used_values(&self) -> SmallVec<[ValueId; 3]> {
+        match self {
+            Self::Const { .. }
+            | Self::GetGlobal { .. }
+            | Self::NewTable { .. }
+            | Self::VarArgs { .. }
+            | Self::LoadCell { .. } => SmallVec::new(),
+            Self::Copy { value, .. }
+            | Self::SetGlobal { value, .. }
+            | Self::Unary { value, .. }
+            | Self::OpenCell { value, .. }
+            | Self::StoreCell { value, .. } => smallvec![*value],
+            Self::Closure { captures, .. } => captures
+                .iter()
+                .filter_map(|capture| match capture {
+                    Capture::Copy(value) => Some(*value),
+                    Capture::Share(_) => None,
+                })
+                .collect(),
+            Self::GetTable { table, key, .. } => smallvec![*table, *key],
+            Self::SetTable { table, key, value } => smallvec![*table, *key, *value],
+            Self::Binary { lhs, rhs, .. } => smallvec![*lhs, *rhs],
+            Self::Concat { operands, .. } => operands.clone(),
+            Self::Select {
+                condition,
+                then_value,
+                else_value,
+                ..
+            } => smallvec![*condition, *then_value, *else_value],
+            Self::MakePack { head, .. } => head.iter().copied().collect(),
+            Self::Project { .. } => SmallVec::new(),
+            Self::Call { function, .. } => smallvec![*function],
+            Self::MethodCall { object, .. } => smallvec![*object],
+            Self::SetList { table, .. } => smallvec![*table],
+        }
+    }
+
+    /// Returns value packs read by this instruction.
+    #[inline]
+    fn used_packs(&self) -> SmallVec<[PackId; 3]> {
+        match self {
+            Self::MakePack { tail, .. } => tail.iter().copied().collect(),
+            Self::Project { pack, .. } => smallvec![*pack],
+            Self::Call { args, .. } | Self::MethodCall { args, .. } => smallvec![*args],
+            Self::SetList { values, .. } => smallvec![*values],
+            _ => SmallVec::new(),
+        }
+    }
 }
 
 /// A block in the control flow graph.
 #[derive(Debug, Clone)]
 pub struct Block {
+    /// Values defined when control enters the block, supplied by an incoming [`Edge`].
+    pub params: Vec<ValueId>,
     /// Values produced by the bytecode block exit.
     pub outputs: Vec<ValueId>,
     /// Instructions in evaluation order.
@@ -271,13 +312,325 @@ pub struct Block {
     pub exit: BlockExit,
 }
 
+/// An edge between two blocks.
+#[derive(Debug, Clone)]
+pub struct Edge {
+    /// The target block of this edge.
+    pub target: usize,
+    /// Values bound to the target block's parameters.
+    pub params: Vec<ValueId>,
+}
+
+impl Edge {
+    /// Creates a new edge pointing to a target with no parameters.
+    #[inline]
+    pub const fn empty(target: usize) -> Self {
+        Self {
+            target,
+            params: Vec::new(),
+        }
+    }
+}
+
+/// An exit from a block.
+#[derive(Debug, Clone)]
+pub enum BlockExit {
+    /// Continues into the next bytecode block.
+    Fallthrough(Edge),
+    /// Transfers control to one block.
+    Jump(Edge),
+    /// Transfers control based on a condition value.
+    Branch {
+        condition: ValueId,
+        then_edge: Edge,
+        else_edge: Edge,
+    },
+    /// Starts a numeric loop.
+    NumericFor {
+        body_edge: Edge,
+        exit_edge: Edge,
+        variable: ValueId,
+        start: ValueId,
+        end: ValueId,
+        step: ValueId,
+    },
+    /// Continues a numeric loop.
+    NumericForLoop { body_edge: Edge, exit_edge: Edge },
+    /// Starts a generic loop.
+    GenericFor {
+        /// First block in the loop body.
+        body_edge: Edge,
+        /// Block containing the generic loop operation.
+        loop_block: usize, // this is structural metadata, not an actual edge.
+        /// Values produced for the source loop variables.
+        variables: SmallVec<[ValueId; 3]>,
+        /// Iterator, state, and initial control values.
+        values: [ValueId; 3],
+    },
+    /// Continues a generic loop.
+    GenericForLoop {
+        body_edge: Edge,
+        exit_edge: Edge,
+        variables: SmallVec<[ValueId; 3]>,
+    },
+    /// Returns a value pack.
+    Return(PackId),
+}
+
+impl BlockExit {
+    /// Returns immutable values read by this block exit.
+    #[inline]
+    fn used_values(&self) -> SmallVec<[ValueId; 3]> {
+        match self {
+            Self::Fallthrough(_)
+            | Self::Jump(_)
+            | Self::NumericForLoop { .. }
+            | Self::Return(_) => SmallVec::new(),
+            Self::Branch { condition, .. } => smallvec![*condition],
+            Self::NumericFor {
+                start, end, step, ..
+            } => smallvec![*start, *end, *step],
+            Self::GenericFor { values, .. } => SmallVec::from_slice(values),
+            Self::GenericForLoop { .. } => SmallVec::new(),
+        }
+    }
+
+    /// Returns outgoing edge references from this block exit.
+    #[inline]
+    pub(crate) fn edges(&self) -> SmallVec<[&Edge; 2]> {
+        match self {
+            Self::Fallthrough(edge) | Self::Jump(edge) => smallvec![edge],
+            Self::Branch {
+                then_edge,
+                else_edge,
+                ..
+            }
+            | Self::NumericFor {
+                body_edge: then_edge,
+                exit_edge: else_edge,
+                ..
+            }
+            | Self::NumericForLoop {
+                body_edge: then_edge,
+                exit_edge: else_edge,
+            }
+            | Self::GenericForLoop {
+                body_edge: then_edge,
+                exit_edge: else_edge,
+                ..
+            } => smallvec![then_edge, else_edge],
+            Self::GenericFor { body_edge, .. } => smallvec![body_edge],
+            Self::Return(_) => SmallVec::new(),
+        }
+    }
+
+    /// Returns outgoing mutable edge references from this block exit.
+    #[inline]
+    pub(crate) fn edges_mut(&mut self) -> SmallVec<[&mut Edge; 2]> {
+        match self {
+            Self::Fallthrough(edge) | Self::Jump(edge) => smallvec![edge],
+            Self::Branch {
+                then_edge,
+                else_edge,
+                ..
+            }
+            | Self::NumericFor {
+                body_edge: then_edge,
+                exit_edge: else_edge,
+                ..
+            }
+            | Self::NumericForLoop {
+                body_edge: then_edge,
+                exit_edge: else_edge,
+            }
+            | Self::GenericForLoop {
+                body_edge: then_edge,
+                exit_edge: else_edge,
+                ..
+            } => smallvec![then_edge, else_edge],
+            Self::GenericFor { body_edge, .. } => smallvec![body_edge],
+            Self::Return(_) => SmallVec::new(),
+        }
+    }
+
+    /// Returns successor blocks referenced by this block exit.
+    pub(crate) fn targets(&self) -> SmallVec<[usize; 2]> {
+        self.edges().iter().map(|e| e.target).collect()
+    }
+
+    /// Returns a formatter for this block exit.
+    #[cfg(feature = "visualize")]
+    pub(crate) fn display(&self) -> impl fmt::Display + '_ {
+        DisplayBlockExit(self)
+    }
+}
+
+/// A CSR representation of a Control Flow Graph.
+#[derive(Debug, Clone)]
+pub struct ControlFlowGraph<T> {
+    nodes: Box<[T]>,
+
+    // Outgoing edges (successors)
+    out_offsets: Box<[usize]>,
+    out_edges: Box<[usize]>,
+
+    // Incoming edges (predecessors)
+    in_offsets: Box<[usize]>,
+    in_edges: Box<[usize]>,
+}
+
+impl<T> ControlFlowGraph<T> {
+    pub fn from_nodes_and_exits<I, E>(nodes_iter: I) -> Self
+    where
+        I: IntoIterator<Item = (T, E)>,
+        I::IntoIter: ExactSizeIterator,
+        E: IntoIterator<Item = usize>,
+    {
+        let iter = nodes_iter.into_iter();
+        let count = iter.len();
+
+        let mut nodes = Vec::with_capacity(count);
+        let mut out_offsets = Vec::with_capacity(count + 1);
+        out_offsets.push(0);
+
+        let mut out_edges = Vec::new();
+        let mut in_degrees = vec![0; count];
+
+        for (payload, exits) in iter {
+            nodes.push(payload);
+            let edge_start = out_edges.len();
+            for target in exits {
+                // This duplication check exists because of a true edge case, a Luau optimization miss where
+                // the compiler generates a branch with identical exits. Occurs in controlflow35 testcase,
+                // tested on releases 0.720 through 0.736 (bytecode v9 - v14) on all optimization levels.
+                //
+                // FIR out-degree is at most two, so this is effectivelly free (even though it hurts, conceptually.)
+                //
+                // ```
+                // 16:     JUMPXEQKN R0 K8 L3 [100]
+                //  2: L3: JUMPBACK L0
+                // ```
+                //
+                // FIR:
+                //
+                // ```
+                // %v22 = eq %v20, %v21
+                // branch %v22, bb1, bb1
+                // ```
+                //
+                // R0 is provably numeric here, but if it were an object that carried a metatable with overwritten `__eq`
+                // with a side effect, the eval of that expression would have been necessary - that being said, the jump
+                // itself is still useless :^)
+                if target < count && !out_edges[edge_start..].contains(&target) {
+                    out_edges.push(target);
+                    in_degrees[target] += 1;
+                }
+            }
+            out_offsets.push(out_edges.len());
+        }
+
+        let mut in_offsets = vec![0; count + 1];
+        for i in 0..count {
+            in_offsets[i + 1] = in_offsets[i] + in_degrees[i];
+        }
+
+        let mut in_edges = vec![0; out_edges.len()];
+        let mut in_cursor = in_offsets.clone();
+
+        for u in 0..count {
+            let start = out_offsets[u];
+            let end = out_offsets[u + 1];
+            for &v in &out_edges[start..end] {
+                in_edges[in_cursor[v]] = u;
+                in_cursor[v] += 1;
+            }
+        }
+
+        Self {
+            nodes: nodes.into_boxed_slice(),
+            out_offsets: out_offsets.into_boxed_slice(),
+            out_edges: out_edges.into_boxed_slice(),
+            in_offsets: in_offsets.into_boxed_slice(),
+            in_edges: in_edges.into_boxed_slice(),
+        }
+    }
+}
+
+impl<T> GraphView for ControlFlowGraph<T> {
+    type Node = usize;
+    type Item = T;
+
+    fn entry(&self) -> Self::Node {
+        // Control Flow Graphs always start at zero.
+        0
+    }
+
+    fn get(&self, node: Self::Node) -> Option<&Self::Item> {
+        self.nodes.get(node)
+    }
+
+    fn successors(&self, node: Self::Node) -> impl Iterator<Item = Self::Node> {
+        let start = self.out_offsets[node];
+        let end = self.out_offsets[node + 1];
+        self.out_edges[start..end].iter().copied()
+    }
+
+    fn predecessors(&self, node: Self::Node) -> impl Iterator<Item = Self::Node> {
+        let start = self.in_offsets[node];
+        let end = self.in_offsets[node + 1];
+        self.in_edges[start..end].iter().copied()
+    }
+
+    fn nodes(&self) -> impl Iterator<Item = Self::Node> {
+        0..self.nodes.len()
+    }
+
+    fn items(&self) -> impl Iterator<Item = &Self::Item> {
+        self.nodes.iter()
+    }
+
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
+impl<T> GraphViewMut for ControlFlowGraph<T> {
+    fn items_mut(&mut self) -> impl Iterator<Item = &mut Self::Item> {
+        self.nodes.iter_mut()
+    }
+}
+
+impl<T> std::ops::Index<usize> for ControlFlowGraph<T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.nodes.index(index)
+    }
+}
+
+impl<T> std::ops::IndexMut<usize> for ControlFlowGraph<T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.nodes.index_mut(index)
+    }
+}
+
+impl<T> std::ops::Index<Edge> for ControlFlowGraph<T> {
+    type Output = T;
+
+    fn index(&self, index: Edge) -> &Self::Output {
+        self.nodes.index(index.target)
+    }
+}
+
 /// A lifted function.
 #[derive(Debug, Clone)]
 pub struct Function {
     /// Bytecode proto represented by this function.
-    pub proto: ProtoId,
-    /// Formal parameter values in source order.
+    pub id: ProtoId,
+    /// Parameters in source order.
     pub params: Vec<ValueId>,
+    /// The entry edge of this function.
+    pub entry: Edge,
     /// Whether the function accepts variadic arguments.
     pub is_vararg: bool,
     /// Declared upvalue cells in slot order.
@@ -288,46 +641,63 @@ pub struct Function {
     pub packs: Arena<Pack>,
     /// Mutable cells owned by this function.
     pub cells: Arena<Cell>,
-    /// Basic blocks in bytecode order.
-    pub blocks: Vec<Block>,
+    /// Control flow graph of this function.
+    pub cfg: ControlFlowGraph<Block>,
 }
 
 impl Function {
-    /// Verifies definitions and Phi predecessor inputs.
+    /// Verifies definitions and the block edges.
     pub fn verify(&self) -> Result<()> {
+        ensure!(self.params.len() == self.cfg[self.entry.target].params.len());
+
+        // Each block must have a valid incoming edge from its predecessor, and the arg count
+        // must match.
+        for block_id in self.cfg.nodes() {
+            if self.cfg.is_reachable(block_id) {
+                for p in self.cfg.predecessors(block_id) {
+                    let edges_from_p = self.cfg[p]
+                        .exit
+                        .edges()
+                        .into_iter()
+                        .filter(|e| e.target == block_id);
+
+                    ensure!(
+                        edges_from_p.clone().count() > 0,
+                        "no edge from predecessor {p} to block {block_id}: {:?}",
+                        edges_from_p.collect::<Vec<_>>()
+                    );
+
+                    for e in edges_from_p {
+                        ensure!(
+                            e.params.len() == self.cfg[block_id].params.len(),
+                            "param count mismatch between predecessor {p} and block {block_id}: {} edge params, {} block params",
+                            e.params.len(),
+                            self.cfg[block_id].params.len()
+                        );
+                    }
+                }
+            }
+        }
+
+        // Each pack and value must be defined before use
         let mut value_defs: HashSet<_> = self.params.iter().copied().collect();
         let mut value_uses = HashSet::new();
         let mut pack_defs = HashSet::new();
         let mut pack_uses = HashSet::new();
-        let (_, predecessors) = build_graph(self.blocks.iter().map(|block| block.exit.targets()));
-
-        for (block_index, block) in self.blocks.iter().enumerate() {
+        for block in self.cfg.items() {
+            value_defs.extend(block.params.iter().copied());
             value_defs.extend(block.outputs.iter().copied());
             for instr in &block.instrs {
                 value_uses.extend(instr.used_values());
                 pack_uses.extend(instr.used_packs());
                 value_defs.extend(instr.defined_value());
                 pack_defs.extend(instr.defined_pack());
-
-                if let Instr::Phi { inputs, .. } = instr {
-                    let mut input_predecessors = HashSet::new();
-                    for &(predecessor, _) in inputs {
-                        ensure!(
-                            input_predecessors.insert(predecessor),
-                            "phi in bb{block_index} lists predecessor bb{predecessor} twice"
-                        );
-                    }
-                    let actual_predecessors: HashSet<_> =
-                        predecessors[block_index].iter().copied().collect();
-                    ensure!(
-                        input_predecessors == actual_predecessors,
-                        "phi in bb{block_index} does not describe every predecessor"
-                    );
-                }
             }
 
             value_uses.extend(block.exit.used_values());
-            pack_uses.extend(block.exit.used_packs());
+            if let BlockExit::Return(pack) = &block.exit {
+                pack_uses.insert(*pack);
+            }
         }
 
         for value in value_uses {
@@ -356,7 +726,7 @@ impl Function {
 
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "func @P{}", self.proto.0)?;
+        write!(f, "func @P{}", self.id.0)?;
         if !self.params.is_empty() {
             write!(
                 f,
@@ -373,11 +743,15 @@ impl fmt::Display for Function {
         }
 
         writeln!(f, " {{")?;
-        for (block_index, block) in self.blocks.iter().enumerate() {
+        for (block_index, block) in self.cfg.enumerate() {
             if block_index > 0 {
                 writeln!(f)?;
             }
-            writeln!(f, "bb{}:", block_index)?;
+            write!(f, "bb{}", block_index)?;
+            if !block.params.is_empty() {
+                write!(f, "({})", Punctuated::new(&block.params, DisplayValue))?;
+            }
+            writeln!(f, ":")?;
             for instr in &block.instrs {
                 writeln!(f, "    {}", DisplayInstr(self, instr))?;
             }
@@ -385,6 +759,41 @@ impl fmt::Display for Function {
         }
 
         write!(f, "}}")
+    }
+}
+
+struct Punctuated<'a, C: ?Sized, F> {
+    values: &'a C,
+    display: F,
+}
+
+impl<'a, C, F, D> Punctuated<'a, C, F>
+where
+    C: ?Sized,
+    &'a C: IntoIterator,
+    F: Fn(<&'a C as IntoIterator>::Item) -> D,
+    D: fmt::Display,
+{
+    fn new(values: &'a C, display: F) -> Self {
+        Self { values, display }
+    }
+}
+
+impl<'a, C, F, D> fmt::Display for Punctuated<'a, C, F>
+where
+    &'a C: IntoIterator,
+    F: Fn(<&'a C as IntoIterator>::Item) -> D,
+    D: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut iter = self.values.into_iter();
+        if let Some(first) = iter.next() {
+            write!(f, "{}", (self.display)(first))?;
+            for value in iter {
+                write!(f, ", {}", (self.display)(value))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -605,15 +1014,23 @@ impl fmt::Display for DisplayInstr<'_> {
                     DisplayPack(values)
                 )
             }
-            Instr::Phi { out, inputs } => {
-                write!(
-                    f,
-                    "{} = phi [{}]",
-                    DisplayValue(out),
-                    Punctuated::new(inputs, PhiInput)
-                )
-            }
         }
+    }
+}
+
+struct DisplayEdge<'a>(&'a Edge);
+
+impl fmt::Display for DisplayEdge<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "bb{}", self.0.target)?;
+        if !self.0.params.is_empty() {
+            write!(
+                formatter,
+                "({})",
+                Punctuated::new(&self.0.params, DisplayValue)
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -622,68 +1039,72 @@ struct DisplayBlockExit<'a>(&'a BlockExit);
 impl fmt::Display for DisplayBlockExit<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            BlockExit::Fallthrough(target) => write!(formatter, "fallthrough bb{target}"),
-            BlockExit::Jump(target) => write!(formatter, "jump bb{target}"),
+            BlockExit::Fallthrough(edge) => write!(formatter, "fallthrough {}", DisplayEdge(edge)),
+            BlockExit::Jump(edge) => write!(formatter, "jump {}", DisplayEdge(edge)),
             BlockExit::Branch {
                 condition,
-                then_block,
-                else_block,
+                then_edge,
+                else_edge,
             } => write!(
                 formatter,
-                "branch {}, bb{then_block}, bb{else_block}",
-                DisplayValue(condition)
+                "branch {}, {}, {}",
+                DisplayValue(condition),
+                DisplayEdge(then_edge),
+                DisplayEdge(else_edge)
             ),
             BlockExit::NumericFor {
-                body_block,
-                exit_block,
+                body_edge,
+                exit_edge,
                 variable,
                 start,
                 end,
                 step,
             } => write!(
                 formatter,
-                "forn.prep {}, {}, {}, {} -> bb{body_block}, bb{exit_block}",
+                "forn.prep {}, {}, {}, {} -> {}, {}",
                 DisplayValue(variable),
                 DisplayValue(start),
                 DisplayValue(end),
-                DisplayValue(step)
+                DisplayValue(step),
+                DisplayEdge(body_edge),
+                DisplayEdge(exit_edge)
             ),
             BlockExit::NumericForLoop {
-                body_block,
-                exit_block,
-            } => write!(formatter, "forn.loop bb{body_block}, bb{exit_block}"),
+                body_edge,
+                exit_edge,
+            } => write!(
+                formatter,
+                "forn.loop {}, {}",
+                DisplayEdge(body_edge),
+                DisplayEdge(exit_edge)
+            ),
             BlockExit::GenericFor {
-                body_block,
+                body_edge,
                 loop_block,
                 variables,
                 values,
             } => write!(
                 formatter,
-                "forg.prep [{}] in [{}] -> bb{body_block}, loop bb{loop_block}",
+                "forg.prep [{}] in [{}] -> {}, loop bb{loop_block}",
                 Punctuated::new(variables, DisplayValue),
-                Punctuated::new(values, DisplayValue)
+                Punctuated::new(values, DisplayValue),
+                DisplayEdge(body_edge)
             ),
             BlockExit::GenericForLoop {
-                body_block,
-                exit_block,
+                body_edge,
+                exit_edge,
                 variables,
             } => write!(
                 formatter,
-                "forg.loop [{}] -> bb{body_block}, bb{exit_block}",
-                Punctuated::new(variables, DisplayValue)
+                "forg.loop [{}] -> {}, {}",
+                Punctuated::new(variables, DisplayValue),
+                DisplayEdge(body_edge),
+                DisplayEdge(exit_edge)
             ),
             BlockExit::Return(values) => {
                 write!(formatter, "return {}", DisplayPack(values))
             }
         }
-    }
-}
-
-struct PhiInput<'a>(&'a (usize, ValueId));
-
-impl fmt::Display for PhiInput<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "bb{}: {}", self.0.0, DisplayValue(&self.0.1))
     }
 }
 
@@ -721,191 +1142,5 @@ impl fmt::Display for DisplayUnOp {
             UnOp::Not => write!(f, "not"),
             UnOp::Length => write!(f, "len"),
         }
-    }
-}
-
-impl Instr {
-    /// Returns the value defined by this instruction, if it exists.
-    pub(crate) fn defined_value(&self) -> Option<ValueId> {
-        match self {
-            Self::Const { out, .. }
-            | Self::Copy { out, .. }
-            | Self::GetGlobal { out, .. }
-            | Self::Closure { out, .. }
-            | Self::GetTable { out, .. }
-            | Self::Binary { out, .. }
-            | Self::Unary { out, .. }
-            | Self::Concat { out, .. }
-            | Self::Select { out, .. }
-            | Self::NewTable { out }
-            | Self::Project { out, .. }
-            | Self::LoadCell { out, .. }
-            | Self::Phi { out, .. } => Some(*out),
-            Self::SetTable { .. }
-            | Self::SetGlobal { .. }
-            | Self::MakePack { .. }
-            | Self::Call { .. }
-            | Self::MethodCall { .. }
-            | Self::VarArgs { .. }
-            | Self::OpenCell { .. }
-            | Self::StoreCell { .. }
-            | Self::SetList { .. } => None,
-        }
-    }
-
-    /// Returns the value pack defined by this instruction, if it exists.
-    fn defined_pack(&self) -> Option<PackId> {
-        match self {
-            Self::MakePack { out, .. }
-            | Self::Call { out, .. }
-            | Self::MethodCall { out, .. }
-            | Self::VarArgs { out } => Some(*out),
-            _ => None,
-        }
-    }
-
-    /// Returns immutable values read by this instruction.
-    pub(crate) fn used_values(&self) -> SmallVec<[ValueId; 3]> {
-        match self {
-            Self::Const { .. }
-            | Self::GetGlobal { .. }
-            | Self::NewTable { .. }
-            | Self::VarArgs { .. }
-            | Self::LoadCell { .. } => SmallVec::new(),
-            Self::Copy { value, .. }
-            | Self::SetGlobal { value, .. }
-            | Self::Unary { value, .. }
-            | Self::OpenCell { value, .. }
-            | Self::StoreCell { value, .. } => smallvec![*value],
-            Self::Closure { captures, .. } => captures
-                .iter()
-                .filter_map(|capture| match capture {
-                    Capture::Copy(value) => Some(*value),
-                    Capture::Share(_) => None,
-                })
-                .collect(),
-            Self::GetTable { table, key, .. } => smallvec![*table, *key],
-            Self::SetTable { table, key, value } => smallvec![*table, *key, *value],
-            Self::Binary { lhs, rhs, .. } => smallvec![*lhs, *rhs],
-            Self::Concat { operands, .. } => operands.clone(),
-            Self::Select {
-                condition,
-                then_value,
-                else_value,
-                ..
-            } => smallvec![*condition, *then_value, *else_value],
-            Self::MakePack { head, .. } => head.iter().copied().collect(),
-            Self::Project { .. } => SmallVec::new(),
-            Self::Call { function, .. } => smallvec![*function],
-            Self::MethodCall { object, .. } => smallvec![*object],
-            Self::SetList { table, .. } => smallvec![*table],
-            Self::Phi { inputs, .. } => inputs.iter().map(|(_, value)| *value).collect(),
-        }
-    }
-
-    /// Returns value packs read by this instruction.
-    fn used_packs(&self) -> SmallVec<[PackId; 3]> {
-        match self {
-            Self::MakePack { tail, .. } => tail.iter().copied().collect(),
-            Self::Project { pack, .. } => smallvec![*pack],
-            Self::Call { args, .. } | Self::MethodCall { args, .. } => smallvec![*args],
-            Self::SetList { values, .. } => smallvec![*values],
-            _ => SmallVec::new(),
-        }
-    }
-}
-
-impl BlockExit {
-    /// Returns immutable values read by this block exit.
-    fn used_values(&self) -> SmallVec<[ValueId; 3]> {
-        match self {
-            Self::Fallthrough(_)
-            | Self::Jump(_)
-            | Self::NumericForLoop { .. }
-            | Self::Return(_) => SmallVec::new(),
-            Self::Branch { condition, .. } => smallvec![*condition],
-            Self::NumericFor {
-                start, end, step, ..
-            } => smallvec![*start, *end, *step],
-            Self::GenericFor { values, .. } => SmallVec::from_slice(values),
-            Self::GenericForLoop { .. } => SmallVec::new(),
-        }
-    }
-
-    /// Returns value packs read by this block exit.
-    fn used_packs(&self) -> SmallVec<[PackId; 3]> {
-        match self {
-            Self::Return(pack) => smallvec![*pack],
-            _ => SmallVec::new(),
-        }
-    }
-
-    /// Returns successor blocks referenced by this block exit.
-    pub(crate) fn targets(&self) -> SmallVec<[usize; 3]> {
-        match self {
-            Self::Fallthrough(target) | Self::Jump(target) => smallvec![*target],
-            Self::Branch {
-                then_block,
-                else_block,
-                ..
-            }
-            | Self::NumericFor {
-                body_block: then_block,
-                exit_block: else_block,
-                ..
-            }
-            | Self::NumericForLoop {
-                body_block: then_block,
-                exit_block: else_block,
-            }
-            | Self::GenericForLoop {
-                body_block: then_block,
-                exit_block: else_block,
-                ..
-            } => smallvec![*then_block, *else_block],
-            Self::GenericFor { body_block, .. } => smallvec![*body_block],
-            Self::Return(_) => SmallVec::new(),
-        }
-    }
-
-    /// Returns a formatter for this block exit.
-    #[cfg(feature = "visualize")]
-    pub(crate) fn display(&self) -> impl fmt::Display + '_ {
-        DisplayBlockExit(self)
-    }
-}
-
-struct Punctuated<'a, C: ?Sized, F> {
-    values: &'a C,
-    display: F,
-}
-
-impl<'a, C, F, D> Punctuated<'a, C, F>
-where
-    C: ?Sized,
-    &'a C: IntoIterator,
-    F: Fn(<&'a C as IntoIterator>::Item) -> D,
-    D: fmt::Display,
-{
-    fn new(values: &'a C, display: F) -> Self {
-        Self { values, display }
-    }
-}
-
-impl<'a, C, F, D> fmt::Display for Punctuated<'a, C, F>
-where
-    &'a C: IntoIterator,
-    F: Fn(<&'a C as IntoIterator>::Item) -> D,
-    D: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut iter = self.values.into_iter();
-        if let Some(first) = iter.next() {
-            write!(f, "{}", (self.display)(first))?;
-            for value in iter {
-                write!(f, ", {}", (self.display)(value))?;
-            }
-        }
-        Ok(())
     }
 }

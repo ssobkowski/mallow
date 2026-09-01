@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Result, anyhow, ensure};
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 
 use crate::il::{DecodedInstr, Instr, Proto, reg_add, reg_range};
 use crate::operator::BinOp;
@@ -117,21 +117,21 @@ pub enum RawBlockExit {
 
 impl RawBlockExit {
     /// Returns successor targets encoded in one block exit.
-    #[must_use]
-    pub(crate) fn targets(&self) -> impl Iterator<Item = usize> {
+    #[inline]
+    pub(crate) fn targets(&self) -> SmallVec<[usize; 2]> {
         match self {
-            RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => [Some(*target), None],
+            RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => smallvec![*target],
             RawBlockExit::CondJump {
                 then_block,
                 else_block,
                 ..
-            } => [Some(*then_block), Some(*else_block)],
+            } => smallvec![*then_block, *else_block],
             RawBlockExit::FornPrep {
                 body_block,
                 exit_block,
                 ..
-            } => [Some(*body_block), Some(*exit_block)],
-            RawBlockExit::ForgPrep { body_block, .. } => [Some(*body_block), None],
+            } => smallvec![*body_block, *exit_block],
+            RawBlockExit::ForgPrep { body_block, .. } => smallvec![*body_block],
             RawBlockExit::FornLoop {
                 body_block,
                 exit_block,
@@ -141,11 +141,9 @@ impl RawBlockExit {
                 body_block,
                 exit_block,
                 ..
-            } => [Some(*body_block), Some(*exit_block)],
-            RawBlockExit::Return { .. } => [None, None],
+            } => smallvec![*body_block, *exit_block],
+            RawBlockExit::Return { .. } => SmallVec::new(),
         }
-        .into_iter()
-        .flatten()
     }
 }
 
@@ -481,7 +479,6 @@ fn rel_target_from_instr(instr_idx: usize, offset: i32, instrs: &[DecodedInstr])
 
 /// Maps an instruction PC to its containing basic block index.
 #[inline]
-#[must_use]
 fn pc_to_block_idx(entries: &[usize], pc: usize) -> usize {
     assert!(!entries.is_empty());
     assert!(entries[0] <= pc);

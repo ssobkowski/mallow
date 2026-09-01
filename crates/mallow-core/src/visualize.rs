@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use crate::ir::fir::{Block, BlockExit, Function};
-use crate::ir::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
+use crate::ir::fir::{Block, BlockExit, Edge as FirEdge, Function, ValueId};
+use crate::ir::graph::{DominatorTree, GraphView};
 
 const CHAR_W: f64 = 7.2;
 const LINE_H: f64 = 16.0;
@@ -19,8 +19,29 @@ struct NodeLabel {
     lines: Vec<(String, bool)>,
 }
 
+/// Formats a list of FIR values for the graph labels.
+fn format_values(values: &[ValueId]) -> String {
+    values
+        .iter()
+        .map(|value| format!("%v{}", value.index()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Formats block arguments as formal-to-actual bindings.
+fn format_bindings(bindings: &[(ValueId, ValueId)]) -> String {
+    bindings
+        .iter()
+        .map(|(formal, actual)| format!("%v{} <- %v{}", formal.index(), actual.index()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn build_label(idx: usize, function: &Function, block: &Block, is_entry: bool) -> NodeLabel {
     let mut header = format!("Block {idx}");
+    if !block.params.is_empty() {
+        header.push_str(&format!(" ({})", format_values(&block.params)));
+    }
     if is_entry {
         header.push_str(" (Entry)");
     }
@@ -87,9 +108,18 @@ struct Edge {
     id: String,
     src: usize,
     dst: usize,
+    /// Formal and actual values connected by this edge.
+    bindings: Vec<(ValueId, ValueId)>,
     color: &'static str,
     is_back: bool,
     src_port_order: usize,
+}
+
+impl Edge {
+    /// Formats the block-argument bindings for an ELK label.
+    fn bindings_text(&self) -> Option<String> {
+        (!self.bindings.is_empty()).then(|| format!("({})", format_bindings(&self.bindings)))
+    }
 }
 
 struct GraphPayload {
@@ -100,23 +130,20 @@ struct GraphPayload {
 }
 
 fn graph_payload(function: &Function, tag: &str) -> GraphPayload {
-    let (successors, predecessors) =
-        build_graph(function.blocks.iter().map(|block| block.exit.targets()));
-    let graph = AdjGraph::new(0, &successors, &predecessors);
-    let node_count = function.blocks.len();
-    let idoms = (node_count > 0).then(|| graph.build_idoms());
+    let node_count = function.cfg.len();
+    let idoms = (node_count > 0).then(|| function.cfg.build_idoms());
     let depths = idoms.as_ref().map_or_else(Vec::new, |idoms| {
-        dom_depths(idoms, graph.entry(), node_count)
+        dom_depths(idoms, function.cfg.entry(), node_count)
     });
 
     let labels: Vec<Option<NodeLabel>> = function
-        .blocks
-        .iter()
+        .cfg
         .enumerate()
         .map(|(index, block)| {
-            graph
+            function
+                .cfg
                 .is_reachable(index)
-                .then(|| build_label(index, function, block, index == graph.entry()))
+                .then(|| build_label(index, function, block, index == function.cfg.entry()))
         })
         .collect();
 
@@ -124,92 +151,98 @@ fn graph_payload(function: &Function, tag: &str) -> GraphPayload {
     let mut edges = Vec::new();
 
     if let Some(idoms) = idoms.as_ref() {
-        for (src, block) in function.blocks.iter().enumerate() {
-            if !graph.is_reachable(src) {
+        for (src, block) in function.cfg.enumerate() {
+            if !function.cfg.is_reachable(src) {
                 continue;
             }
 
             match &block.exit {
-                BlockExit::Jump(target) | BlockExit::Fallthrough(target) => add_edge(
+                BlockExit::Jump(edge) | BlockExit::Fallthrough(edge) => add_edge(
                     &mut edges,
                     &mut edge_counter,
-                    &graph,
+                    &function.cfg,
                     idoms,
                     src,
-                    *target,
+                    edge,
+                    &function.cfg[edge.target].params,
                     "#2196F3",
                     0,
                 ),
                 BlockExit::Branch {
-                    then_block,
-                    else_block,
+                    then_edge,
+                    else_edge,
                     ..
                 } => {
                     // Then is green and left. Else is red and right.
                     add_edge(
                         &mut edges,
                         &mut edge_counter,
-                        &graph,
+                        &function.cfg,
                         idoms,
                         src,
-                        *then_block,
+                        then_edge,
+                        &function.cfg[then_edge.target].params,
                         "#4CAF50",
                         0,
                     );
                     add_edge(
                         &mut edges,
                         &mut edge_counter,
-                        &graph,
+                        &function.cfg,
                         idoms,
                         src,
-                        *else_block,
+                        else_edge,
+                        &function.cfg[else_edge.target].params,
                         "#f44336",
                         1,
                     );
                 }
                 BlockExit::NumericFor {
-                    body_block,
-                    exit_block,
+                    body_edge,
+                    exit_edge,
                     ..
                 }
                 | BlockExit::NumericForLoop {
-                    body_block,
-                    exit_block,
+                    body_edge,
+                    exit_edge,
                 }
                 | BlockExit::GenericForLoop {
-                    body_block,
-                    exit_block,
+                    body_edge,
+                    exit_edge,
                     ..
                 } => {
                     add_edge(
                         &mut edges,
                         &mut edge_counter,
-                        &graph,
+                        &function.cfg,
                         idoms,
                         src,
-                        *body_block,
+                        body_edge,
+                        &function.cfg[body_edge.target].params,
                         "#4CAF50",
                         0,
                     );
                     add_edge(
                         &mut edges,
                         &mut edge_counter,
-                        &graph,
+                        &function.cfg,
                         idoms,
                         src,
-                        *exit_block,
+                        exit_edge,
+                        &function.cfg[exit_edge.target].params,
                         "#f44336",
                         1,
                     );
                 }
-                BlockExit::GenericFor { body_block, .. } => {
+                BlockExit::GenericFor { body_edge, .. } => {
                     add_edge(
                         &mut edges,
                         &mut edge_counter,
-                        &graph,
+                        &function.cfg,
                         idoms,
                         src,
-                        *body_block,
+                        body_edge,
+                        &function.cfg[body_edge.target].params,
                         "#4CAF50",
                         0,
                     );
@@ -241,16 +274,18 @@ fn graph_payload(function: &Function, tag: &str) -> GraphPayload {
     }
 }
 
-fn add_edge(
+fn add_edge<G: GraphView<Node = usize>>(
     edges: &mut Vec<Edge>,
     edge_counter: &mut usize,
-    graph: &AdjGraph<'_>,
+    graph: &G,
     idoms: &DominatorTree<usize>,
     src: usize,
-    dst: usize,
+    block_edge: &FirEdge,
+    target_params: &[ValueId],
     color: &'static str,
     src_port_order: usize,
 ) {
+    let dst = block_edge.target;
     if !graph.is_reachable(dst) {
         return;
     }
@@ -260,6 +295,11 @@ fn add_edge(
         id: format!("e{edge_counter}"),
         src,
         dst,
+        bindings: target_params
+            .iter()
+            .copied()
+            .zip(block_edge.params.iter().copied())
+            .collect(),
         color,
         is_back: idoms.dominates(dst, src),
         src_port_order,
@@ -269,7 +309,7 @@ fn add_edge(
 pub fn dump_cfgs(functions: &[Function], selected_index: usize, output: PathBuf) {
     let payloads: Vec<_> = functions
         .iter()
-        .map(|function| graph_payload(function, &format!("Proto {}", function.proto.0)))
+        .map(|function| graph_payload(function, &format!("Proto {}", function.id.0)))
         .collect();
 
     let selected_index = selected_index.min(payloads.len().saturating_sub(1));
@@ -339,6 +379,18 @@ fn build_elk_json(
                 "sources": [format!("block_{}_S_{}", e.src, e.id)],
                 "targets": [format!("block_{}_N_{}", e.dst, e.id)]
             });
+            if let Some(text) = e.bindings_text() {
+                let width = text.len() as f64 * CHAR_W + H_PAD * 2.0;
+                edge["labels"] = json!([{
+                    "id": format!("{}_params", e.id),
+                    "text": text,
+                    "width": width,
+                    "height": LINE_H,
+                    "layoutOptions": {
+                        "elk.edgeLabels.placement": "CENTER"
+                    }
+                }]);
+            }
             if e.is_back {
                 edge["properties"] = json!({ "elk.edge.type": "BACKEDGE" });
             }
@@ -411,4 +463,52 @@ fn build_html(graphs_json: &Value, selected_index: usize, title: &str) -> String
         .replace("__GRAPHS_JSON__", &graphs_json.to_string())
         .replace("__SELECTED_INDEX__", &selected_index.to_string())
         .replace("__BASE_TITLE__", &serde_json::to_string(title).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use id_arena::Arena;
+
+    use super::*;
+    use crate::ir::fir::Value;
+
+    /// Verifies that block arguments survive the ELK graph conversion.
+    #[test]
+    fn encodes_edge_bindings_as_label() {
+        let mut values = Arena::<Value>::new();
+        let edges = vec![Edge {
+            id: "e1".to_owned(),
+            src: 0,
+            dst: 1,
+            bindings: {
+                let formal_0 = values.alloc(Value);
+                let formal_1 = values.alloc(Value);
+                let actual_0 = values.alloc(Value);
+                let actual_1 = values.alloc(Value);
+                vec![(formal_0, actual_0), (formal_1, actual_1)]
+            },
+            color: "#2196F3",
+            is_back: false,
+            src_port_order: 0,
+        }];
+        let labels = vec![
+            Some(NodeLabel {
+                header: "Block 0".to_owned(),
+                lines: Vec::new(),
+            }),
+            Some(NodeLabel {
+                header: "Block 1 (%v0, %v1)".to_owned(),
+                lines: Vec::new(),
+            }),
+        ];
+        let out_edges = vec![vec![&edges[0]], vec![]];
+        let in_edges = vec![vec![], vec![&edges[0]]];
+
+        let graph = build_elk_json(&labels, &edges, &out_edges, &in_edges, &[0, 1], 2);
+
+        assert_eq!(
+            graph["edges"][0]["labels"][0]["text"].as_str(),
+            Some("(%v0 <- %v2, %v1 <- %v3)")
+        );
+    }
 }

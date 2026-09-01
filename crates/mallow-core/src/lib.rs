@@ -250,8 +250,8 @@ pub fn decompile_bytecode_with_diagnostics(
             let mut nested_functions: Vec<_> = functions
                 .iter()
                 .map(|function| {
-                    let diagnostics = diagnostics.for_proto(function.proto.0);
-                    ir::nir::materialize::lower(function, &diagnostics)
+                    let diagnostics = diagnostics.for_proto(function.id.0);
+                    ir::nir::lift(function, &diagnostics)
                 })
                 .collect::<Result<_>>()?;
             ir::nir::passes::run(&mut nested_functions);
@@ -270,8 +270,8 @@ pub fn decompile_bytecode_with_diagnostics(
                 match options.emit {
                     EmitMode::Ir => write!(out, "{function}"),
                     EmitMode::Nir => {
-                        let diagnostics = diagnostics.for_proto(function.proto.0);
-                        let function = ir::nir::materialize::lower(&function, &diagnostics)?;
+                        let diagnostics = diagnostics.for_proto(function.id.0);
+                        let function = ir::nir::lift(&function, &diagnostics)?;
                         write!(out, "{function:#?}")
                     }
                     EmitMode::Source => unreachable!("handled above"),

@@ -7,15 +7,14 @@ use id_arena::Arena;
 
 use super::visitor::VisitorMut;
 use super::*;
-use crate::ir::fir;
-use crate::ir::fir::PackId;
 use crate::ir::fir::region::{Predicate, Shape};
-use crate::ir::graph::{AdjGraph, DominatorTree, GraphView, build_graph};
+use crate::ir::fir::{self, Edge, PackId};
+use crate::ir::graph::{DominatorTree, GraphView};
 use crate::ir::union_find::UnionFind;
 use crate::logging::Diagnostics;
 
-/// Recognizes and materializes one FIR function as nested NIR.
-pub(crate) fn lower(function: &fir::Function, diagnostics: &Diagnostics) -> Result<Function> {
+/// Structures the FIR function into a control shape, then lifts it to NIR.
+pub(crate) fn lift(function: &fir::Function, diagnostics: &Diagnostics) -> Result<Function> {
     let shape = fir::region::structure(function, diagnostics)?;
     materialize(function, shape)
 }
@@ -65,41 +64,54 @@ struct SsaMeta {
 impl SsaMeta {
     /// Groups Phi inputs which will use the same mutable storage.
     fn build(function: &fir::Function) -> Result<Self> {
-        let (successors, predecessors) =
-            build_graph(function.blocks.iter().map(|block| block.exit.targets()));
-        let graph = AdjGraph::new(0, &successors, &predecessors);
-        let idoms = graph.build_idoms();
+        let cfg = &function.cfg;
+        let idoms = cfg.build_idoms();
 
         let mut groups = UnionFind::new();
         let mut phi_blocks = Vec::new();
         let mut loop_values = Vec::new();
 
-        for block_index in graph.post_order() {
-            let block = &function.blocks[block_index];
-            for instr in &block.instrs {
-                let fir::Instr::Phi { out, inputs } = instr else {
-                    continue;
-                };
+        // Share the identities between the params from the function signature
+        // and the actual identities used in the entry block.
+        let entry_block = &function.cfg[function.entry.target];
+        for (argument, parameter) in function.entry.params.iter().zip(&entry_block.params) {
+            groups.union(*argument, *parameter);
+        }
 
-                phi_blocks.push((*out, block_index));
-                for &(predecessor, input) in inputs {
-                    // TODO: Is this necessary?
-                    let is_loop_header_initializer = match &function.blocks[predecessor].exit {
-                        fir::BlockExit::NumericFor {
-                            body_block,
-                            variable,
-                            ..
-                        } => *body_block == block_index && variable == out,
-                        fir::BlockExit::GenericFor {
-                            body_block,
-                            variables,
-                            ..
-                        } => *body_block == block_index && variables.contains(&out),
-                        _ => false,
-                    };
+        for block_index in cfg.post_order() {
+            let block = &cfg[block_index];
+            for (i, out) in block.params.iter().enumerate() {
+                phi_blocks.push((out, block_index));
+                for p in cfg.predecessors(block_index) {
+                    let pred_block = &cfg[p];
+                    for edge in pred_block.exit.edges() {
+                        if edge.target != block_index {
+                            continue;
+                        }
 
-                    if !is_loop_header_initializer {
-                        groups.union(*out, input);
+                        let is_loop_header_initializer = match &pred_block.exit {
+                            fir::BlockExit::NumericFor {
+                                body_edge:
+                                    Edge {
+                                        target: body_block, ..
+                                    },
+                                variable,
+                                ..
+                            } => *body_block == block_index && variable == out,
+                            fir::BlockExit::GenericFor {
+                                body_edge:
+                                    Edge {
+                                        target: body_block, ..
+                                    },
+                                variables,
+                                ..
+                            } => *body_block == block_index && variables.contains(out),
+                            _ => false,
+                        };
+
+                        if !is_loop_header_initializer {
+                            groups.union(*out, edge.params[i]);
+                        }
                     }
                 }
             }
@@ -117,7 +129,7 @@ impl SsaMeta {
                     let fir::BlockExit::GenericForLoop {
                         variables: body_variables,
                         ..
-                    } = &function.blocks[*loop_block].exit
+                    } = &cfg[*loop_block].exit
                     else {
                         unreachable!("raw CFG validation guarantees the generic loop target")
                     };
@@ -150,12 +162,12 @@ impl SsaMeta {
             storage_blocks.entry(storage[&out]).or_default().push(block);
         }
 
-        let mut declarations = vec![Vec::new(); graph.len()];
+        let mut declarations = vec![Vec::new(); function.cfg.len()];
         for (storage_id, blocks) in storage_blocks {
             if initialized.contains(&storage_id) {
                 continue;
             }
-            let declaration = idoms.common_strict_dominator(graph.entry(), &blocks);
+            let declaration = idoms.common_strict_dominator(function.cfg.entry(), &blocks);
             declarations[declaration].push(storage_id);
         }
 
@@ -187,10 +199,7 @@ impl SsaMeta {
             dominator = self.idoms.idom(block);
         }
 
-        for instr in &function.blocks[block].instrs {
-            if matches!(instr, fir::Instr::Phi { .. }) {
-                continue;
-            }
+        for instr in &function.cfg[block].instrs {
             if instr
                 .used_values()
                 .into_iter()
@@ -210,17 +219,17 @@ impl SsaMeta {
     }
 
     /// Returns whether one block contains a concrete definition of the storage.
+    #[inline]
     fn block_defines_storage(
         &self,
         function: &fir::Function,
         block: usize,
         storage: ValueId,
     ) -> bool {
-        function.blocks[block].instrs.iter().any(|instr| {
-            !matches!(instr, fir::Instr::Phi { .. })
-                && instr
-                    .defined_value()
-                    .is_some_and(|value| self.storage(value) == storage)
+        function.cfg[block].instrs.iter().any(|instr| {
+            instr
+                .defined_value()
+                .is_some_and(|value| self.storage(value) == storage)
         })
     }
 }
@@ -239,7 +248,7 @@ impl Initializations {
         let mut initialization_blocks = HashSet::new();
         collect_initialization_blocks(shape, &mut initialization_blocks);
 
-        let mut by_block = vec![Vec::new(); function.blocks.len()];
+        let mut by_block = vec![Vec::new(); function.cfg.len()];
         let mut prologue = Vec::new();
         for (block, storages) in ssa.declarations.iter().enumerate() {
             if initialization_blocks.contains(&block) {
@@ -362,7 +371,7 @@ impl<'a> Materializer<'a> {
         let cell_locals = self.cell_locals()?;
         let body = self.region(shape)?;
         let function = Function {
-            id: self.function.proto,
+            id: self.function.id,
             locals: self.locals,
             packs: self.packs,
             params,
@@ -380,8 +389,8 @@ impl<'a> Materializer<'a> {
         let mut cell_locals = HashMap::new();
         for instr in self
             .function
-            .blocks
-            .iter()
+            .cfg
+            .items()
             .flat_map(|block| block.instrs.iter())
         {
             let fir::Instr::OpenCell { cell, value } = instr else {
@@ -505,7 +514,7 @@ impl<'a> Materializer<'a> {
 
     /// Materializes every instruction in one FIR block.
     fn block(&self, block: usize) -> Result<Vec<Stmt>> {
-        let Some(block_ref) = self.function.blocks.get(block) else {
+        let Some(block_ref) = self.function.cfg.get(block) else {
             bail!("shape references invalid bb{block}")
         };
         let mut stmts: Vec<_> = self
@@ -517,9 +526,6 @@ impl<'a> Materializer<'a> {
             .map(|storage| self.initialization(*storage))
             .collect::<Result<_>>()?;
         for instr in &block_ref.instrs {
-            if matches!(instr, fir::Instr::Phi { .. }) {
-                continue;
-            }
             stmts.push(self.instr(instr)?);
         }
         Ok(stmts)
@@ -679,9 +685,6 @@ impl<'a> Materializer<'a> {
                 index: *index,
                 values: self.pack_value(*values)?,
             }),
-            fir::Instr::Phi { .. } => {
-                unreachable!("Phi instructions are skipped by block materialization")
-            }
         }
     }
 

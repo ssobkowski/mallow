@@ -7,6 +7,7 @@ pub(crate) mod visitor;
 use std::collections::HashMap;
 
 use id_arena::{Arena, Id};
+pub(crate) use materialize::lift;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 

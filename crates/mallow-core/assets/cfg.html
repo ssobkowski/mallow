@@ -175,11 +175,24 @@
 
       function renderSvg(layout, nodeLabels, edgeColors) {
         const MARGIN = 24;
-        let maxX = 0,
-          maxY = 0;
+        let maxX = layout.width ?? 0,
+          maxY = layout.height ?? 0;
         for (const n of layout.children ?? []) {
           maxX = Math.max(maxX, n.x + n.width);
           maxY = Math.max(maxY, n.y + n.height);
+        }
+        for (const edge of layout.edges ?? []) {
+          for (const label of edge.labels ?? []) {
+            if (
+              typeof label.x !== "number" ||
+              typeof label.y !== "number" ||
+              typeof label.width !== "number" ||
+              typeof label.height !== "number"
+            )
+              continue;
+            maxX = Math.max(maxX, label.x + label.width);
+            maxY = Math.max(maxY, label.y + label.height);
+          }
         }
 
         const svg = el("svg", {
@@ -278,6 +291,43 @@
                   '"Cascadia Mono", "Consolas", "Courier New", monospace',
                 "font-size": "12",
                 "font-weight": line.bold ? "bold" : "normal",
+                fill: TEXT_BODY,
+              }),
+            );
+          }
+        }
+
+        for (const edge of layout.edges ?? []) {
+          for (const label of edge.labels ?? []) {
+            if (
+              typeof label.x !== "number" ||
+              typeof label.y !== "number" ||
+              typeof label.width !== "number" ||
+              typeof label.height !== "number" ||
+              typeof label.text !== "string"
+            )
+              continue;
+
+            const padding = 3;
+            g.appendChild(
+              el("rect", {
+                x: label.x - padding,
+                y: label.y - 1,
+                width: label.width + padding * 2,
+                height: label.height + 2,
+                fill: "#1a1a1a",
+                stroke: "none",
+              }),
+            );
+            g.appendChild(
+              tx(label.text, {
+                x: label.x + label.width / 2,
+                y: label.y + label.height / 2 + 4,
+                "text-anchor": "middle",
+                "font-family":
+                  '"Cascadia Mono", "Consolas", "Courier New", monospace',
+                "font-size": "12",
+                "font-weight": "normal",
                 fill: TEXT_BODY,
               }),
             );

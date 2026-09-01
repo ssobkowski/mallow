@@ -13,8 +13,8 @@ use crate::il::{
     self, ChildProtoId, ConstId, Count, DecodedInstr, ImportPath, Proto, ProtoId, reg_add,
     reg_range,
 };
-use crate::ir::fir::{Cell, CellId, CellOrigin, Number};
-use crate::ir::graph::{AdjGraph, GraphView, build_graph};
+use crate::ir::fir::{Cell, CellId, CellOrigin, ControlFlowGraph, Edge, Number};
+use crate::ir::graph::{GraphView as _, GraphViewMut as _};
 use crate::operator::{BinOp, UnOp};
 
 pub const CAPTURE_VAL: u8 = 0;
@@ -111,14 +111,14 @@ struct FunctionCaptures {
 
 impl FunctionCaptures {
     /// Finds captured register generations and allocates their cells in bytecode order.
-    fn analyze(raw_blocks: &[RawBlock], cells: &mut Arena<Cell>) -> Result<Self> {
+    fn analyze(cfg: &ControlFlowGraph<RawBlock<'_>>, cells: &mut Arena<Cell>) -> Result<Self> {
         let mut state = CaptureState::default();
-        let mut block_states = vec![CaptureState::default(); raw_blocks.len()];
+        let mut block_states = vec![CaptureState::default(); cfg.len()];
 
         let mut seen = HashSet::new();
         let mut capture_order = Vec::new();
 
-        for (block_index, block) in raw_blocks.iter().enumerate() {
+        for (block_index, block) in cfg.enumerate() {
             block_states[block_index] = state.clone();
 
             for decoded in block.instrs {
@@ -165,15 +165,13 @@ impl FunctionCaptures {
 }
 
 /// Mutable state for lifting one function directly into flat IR.
-struct FunctionLifter<'c, 'g> {
+struct FunctionLifter<'c> {
     /// Proto currently being lifted.
     proto: &'c Proto,
     /// Chunk that owns constants and child protos.
     chunk: &'c Chunk,
-    /// Raw bytecode blocks in instruction order.
-    raw_blocks: &'c [RawBlock<'c>],
-    /// Graph used to construct register SSA.
-    graph: &'g AdjGraph<'g>,
+    /// A control flow graph over the raw blocks.
+    graph: ControlFlowGraph<RawBlock<'c>>,
     /// Mutable cells owned by the function.
     cells: Arena<Cell>,
     /// Cell for each declared upvalue.
@@ -182,13 +180,12 @@ struct FunctionLifter<'c, 'g> {
     captures: FunctionCaptures,
 }
 
-impl<'a, 'g> FunctionLifter<'a, 'g> {
+impl<'c> FunctionLifter<'c> {
     /// Creates lifting state for one already analyzed raw function.
     fn new(
-        proto: &'a Proto,
-        chunk: &'a Chunk,
-        raw_blocks: &'a [RawBlock],
-        graph: &'g AdjGraph<'g>,
+        proto: &'c Proto,
+        chunk: &'c Chunk,
+        graph: ControlFlowGraph<RawBlock<'c>>,
     ) -> Result<Self> {
         let mut cells = Arena::new();
         let upvalues = (0..proto.num_upvals)
@@ -198,12 +195,11 @@ impl<'a, 'g> FunctionLifter<'a, 'g> {
                 })
             })
             .collect();
-        let captures = FunctionCaptures::analyze(raw_blocks, &mut cells)?;
+        let captures = FunctionCaptures::analyze(&graph, &mut cells)?;
 
         Ok(Self {
             proto,
             chunk,
-            raw_blocks,
             graph,
             cells,
             upvalues,
@@ -212,72 +208,79 @@ impl<'a, 'g> FunctionLifter<'a, 'g> {
     }
 
     /// Lifts blocks, seals SSA, resolves aliases, and verifies the function.
-    fn lift(mut self) -> Result<Function> {
-        let mut ssa = Ssa::new(self.graph, self.proto.max_stack_size);
+    fn lift(self) -> Result<Function> {
+        let mut ssa = Ssa::new(&self.graph, self.proto.max_stack_size);
         let mut packs = Arena::new();
 
         let mut params: Vec<_> = (0..self.proto.num_params)
             .map(|reg| {
                 let value = ssa.alloc();
-                ssa.write_reg(self.graph.entry(), reg, value);
+                ssa.write_entry(reg, value);
                 value
             })
             .collect();
 
-        let mut blocks = vec![None; self.raw_blocks.len()];
+        let mut blocks = vec![None; self.graph.len()];
         for block_index in self.graph.reverse_post_order() {
             blocks[block_index] = Some(self.lift_block(block_index, &mut ssa, &mut packs)?);
-            ssa.mark_filled(block_index);
         }
 
-        let mut blocks: Vec<_> = blocks
-            .into_iter()
-            .enumerate()
-            .map(|(block, value)| {
-                value.with_context(|| format!("reachable bb{block} was not lifted"))
-            })
-            .collect::<Result<_>>()?;
-        let (values, aliases) = ssa.finish(&mut blocks);
-        resolve_aliases(&mut blocks, &aliases);
+        for (block_index, block) in blocks.iter().enumerate() {
+            if block.is_none() {
+                anyhow::bail!("reachable bb{block_index} was not lifted");
+            }
+        }
+
+        let mut cfg = ControlFlowGraph::from_nodes_and_exits(blocks.into_iter().map(|block| {
+            let block = block.expect("validated above");
+            let targets = block.exit.targets();
+            (block, targets)
+        }));
+
+        let (values, aliases, entry) = ssa.finish(&mut cfg);
+
+        resolve_aliases(&mut cfg, &aliases);
         for p in &mut params {
             *p = resolve_alias(*p, &aliases)
         }
 
         let function = Function {
-            proto: self.proto.id,
+            id: self.proto.id,
             params,
+            entry,
             is_vararg: self.proto.is_vararg,
             upvalues: self.upvalues,
             values,
             packs,
             cells: self.cells,
-            blocks,
+            cfg,
         };
-        function
-            .verify()
-            .with_context(|| format!("invalid direct IR for proto {}", function.proto.0))?;
+
+        // #[cfg(debug_assertions)]
+        // function.verify()?;
+
         Ok(function)
     }
 
     /// Lifts one complete bytecode block.
-    fn lift_block(
-        &mut self,
+    fn lift_block<'l, 'g>(
+        &'l self,
         block: usize,
-        ssa: &mut Ssa<'g, AdjGraph<'g>>,
-        packs: &mut Arena<Pack>,
+        ssa: &'l mut Ssa<'g, ControlFlowGraph<RawBlock<'c>>>,
+        packs: &'l mut Arena<Pack>,
     ) -> Result<Block> {
         BlockLifter::new(self, ssa, packs, block)?.lift()
     }
 }
 
 /// Mutable state for lifting one complete basic block.
-struct BlockLifter<'lift, 'source, 'graph> {
+struct BlockLifter<'l, 'c, 'g> {
     /// Function-wide lifting state.
-    function: &'lift mut FunctionLifter<'source, 'graph>,
+    function: &'l FunctionLifter<'c>,
     /// Function SSA state.
-    ssa: &'lift mut Ssa<'graph, AdjGraph<'graph>>,
+    ssa: &'l mut Ssa<'g, ControlFlowGraph<RawBlock<'c>>>,
     /// Function pack arena.
-    packs: &'lift mut Arena<Pack>,
+    packs: &'l mut Arena<Pack>,
 
     /// Block currently being lifted.
     block: usize,
@@ -294,12 +297,12 @@ struct BlockLifter<'lift, 'source, 'graph> {
     capture_state: CaptureState,
 }
 
-impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
+impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     /// Creates a lifter for one raw bytecode block.
     fn new(
-        function: &'lift mut FunctionLifter<'source, 'graph>,
-        ssa: &'lift mut Ssa<'graph, AdjGraph<'graph>>,
-        packs: &'lift mut Arena<Pack>,
+        function: &'l FunctionLifter<'c>,
+        ssa: &'l mut Ssa<'g, ControlFlowGraph<RawBlock<'c>>>,
+        packs: &'l mut Arena<Pack>,
         block: usize,
     ) -> Result<Self> {
         let capture_state = function.captures.block_states[block].clone();
@@ -322,15 +325,13 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
             self.flush_pending_before(instr)?;
             self.lift_instr(instr)?;
         }
+        self.ssa.mark_filled(self.block);
 
-        let mut outputs = Vec::new();
-        let exit = lower_exit(
-            &self.function.raw_blocks[self.block],
-            &mut self,
-            &mut outputs,
-        )?;
+        let (exit, outputs) = self.lift_exit()?;
 
         Ok(Block {
+            // Block params will be filled by ssa.finish()
+            params: Vec::new(),
             outputs,
             instrs: self.emitted,
             exit,
@@ -339,8 +340,8 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
 
     /// Returns the instructions for the current block.
     #[inline]
-    const fn instrs(&self) -> &[DecodedInstr] {
-        &self.function.raw_blocks[self.block].instrs
+    fn instrs(&self) -> &[DecodedInstr] {
+        &self.function.graph[self.block].instrs
     }
 
     /// Returns the instruction at a given position.
@@ -609,7 +610,7 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
                 }) if Count::from(arg_count).is_variadic() && base >= reg_add(func, 2) => true,
                 _ => bail!(
                     "malformed bytecode: NAMECALL at {:?} is not followed by CALL",
-                    self.current_pc().expect("")
+                    self.current_pc()
                 ),
             },
             _ => false,
@@ -1262,6 +1263,149 @@ impl<'lift, 'source, 'graph> BlockLifter<'lift, 'source, 'graph> {
         }
         Ok(())
     }
+
+    /// Lifts a [`RawBlockExit`] to a [`BlockExit`] after its body has been lifted.
+    ///
+    /// Returns a tuple of the lifted [`BlockExit`] and a vector of output values.
+    fn lift_exit(&mut self) -> Result<(BlockExit, Vec<ValueId>)> {
+        let raw = &self.function.graph[self.block];
+        let mut outputs = Vec::new();
+        let exit = match &raw.exit {
+            RawBlockExit::Jump(target) => {
+                self.flush_pending();
+                self.apply_exit_writes(raw, &mut outputs);
+                BlockExit::Jump(Edge::empty(*target))
+            }
+            RawBlockExit::Fallthrough(target) => {
+                self.flush_pending();
+                self.apply_exit_writes(raw, &mut outputs);
+                BlockExit::Fallthrough(Edge::empty(*target))
+            }
+            RawBlockExit::CondJump {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.flush_pending();
+                let condition = match cond {
+                    Cond::Unary(reg) => self.read_reg(*reg),
+                    Cond::Binary { lhs, op, rhs } => {
+                        let lhs = self.read_reg(*lhs);
+                        let rhs = match rhs {
+                            CondRhs::Reg(reg) => self.read_reg(*reg),
+                            CondRhs::Const(index) => self.emit_constant(ConstId(*index))?,
+                            CondRhs::Nil => self.constant(ir::Constant::Nil),
+                            CondRhs::Bool(value) => self.constant(ir::Constant::Bool(*value)),
+                        };
+                        self.binary(lhs, *op, rhs)
+                    }
+                };
+                self.apply_exit_writes(raw, &mut outputs);
+                BlockExit::Branch {
+                    condition,
+                    then_edge: Edge::empty(*then_block),
+                    else_edge: Edge::empty(*else_block),
+                }
+            }
+            RawBlockExit::FornPrep {
+                base,
+                body_block,
+                exit_block,
+            } => {
+                self.flush_pending();
+                let start = self.read_reg(reg_add(*base, 2));
+                let end = self.read_reg(*base);
+                let step = self.read_reg(reg_add(*base, 1));
+                self.apply_exit_writes(raw, &mut outputs);
+                let variable = self.ssa.read_reg(*body_block, reg_add(*base, 2));
+                BlockExit::NumericFor {
+                    body_edge: Edge::empty(*body_block),
+                    exit_edge: Edge::empty(*exit_block),
+                    variable,
+                    start,
+                    end,
+                    step,
+                }
+            }
+            RawBlockExit::FornLoop {
+                body_block,
+                exit_block,
+                ..
+            } => {
+                self.flush_pending();
+                self.apply_exit_writes(raw, &mut outputs);
+                BlockExit::NumericForLoop {
+                    body_edge: Edge::empty(*body_block),
+                    exit_edge: Edge::empty(*exit_block),
+                }
+            }
+            RawBlockExit::ForgPrep {
+                base,
+                body_block,
+                exit_block,
+            } => {
+                self.flush_pending();
+                let values = [
+                    self.read_reg(*base),
+                    self.read_reg(reg_add(*base, 1)),
+                    self.read_reg(reg_add(*base, 2)),
+                ];
+                self.apply_exit_writes(raw, &mut outputs);
+                let variables = raw
+                    .exit_writes
+                    .iter()
+                    .map(|reg| self.ssa.read_reg(*body_block, *reg))
+                    .collect();
+                BlockExit::GenericFor {
+                    body_edge: Edge::empty(*body_block),
+                    loop_block: *exit_block,
+                    variables,
+                    values,
+                }
+            }
+            RawBlockExit::ForgLoop {
+                base,
+                body_block,
+                exit_block,
+                result_count,
+            } => {
+                self.flush_pending();
+                self.apply_exit_writes(raw, &mut outputs);
+                let variables = (0..*result_count)
+                    .map(|index| {
+                        let reg = reg_add(reg_add(*base, 3), index as u8);
+                        self.ssa.read_reg(*body_block, reg)
+                    })
+                    .collect();
+                BlockExit::GenericForLoop {
+                    body_edge: Edge::empty(*body_block),
+                    exit_edge: Edge::empty(*exit_block),
+                    variables,
+                }
+            }
+            RawBlockExit::Return { base, count } => match Count::from(*count) {
+                Count::Number(count) => {
+                    self.flush_pending();
+                    let values = self.read_regs(*base, count);
+                    BlockExit::Return(self.fixed_pack(values))
+                }
+                Count::Variadic => {
+                    let pack = self.take_variadic_from(*base)?;
+                    BlockExit::Return(pack)
+                }
+            },
+        };
+        Ok((exit, outputs))
+    }
+
+    /// Applies register definitions produced by a bytecode block exit.
+    fn apply_exit_writes(&mut self, raw: &RawBlock, outputs: &mut Vec<ValueId>) {
+        for &reg in &raw.exit_writes {
+            let value = self.value();
+            self.ssa.write_reg(self.block, reg, value);
+            outputs.push(value);
+        }
+    }
 }
 
 /// Returns the binary operator encoded by an arithmetic instruction.
@@ -1292,153 +1436,6 @@ const fn unop_for_instr(instr: il::Instr) -> UnOp {
     }
 }
 
-/// Lowers one raw block exit after its body has been lifted.
-fn lower_exit(
-    raw: &RawBlock,
-    lifter: &mut BlockLifter<'_, '_, '_>,
-    outputs: &mut Vec<ValueId>,
-) -> Result<BlockExit> {
-    let exit = match &raw.exit {
-        RawBlockExit::Jump(target) => {
-            lifter.flush_pending();
-            apply_exit_writes(raw, lifter, outputs);
-            BlockExit::Jump(*target)
-        }
-        RawBlockExit::Fallthrough(target) => {
-            lifter.flush_pending();
-            apply_exit_writes(raw, lifter, outputs);
-            BlockExit::Fallthrough(*target)
-        }
-        RawBlockExit::CondJump {
-            cond,
-            then_block,
-            else_block,
-        } => {
-            lifter.flush_pending();
-            let condition = match cond {
-                Cond::Unary(reg) => lifter.read_reg(*reg),
-                Cond::Binary { lhs, op, rhs } => {
-                    let lhs = lifter.read_reg(*lhs);
-                    let rhs = match rhs {
-                        CondRhs::Reg(reg) => lifter.read_reg(*reg),
-                        CondRhs::Const(index) => lifter.emit_constant(ConstId(*index))?,
-                        CondRhs::Nil => lifter.constant(ir::Constant::Nil),
-                        CondRhs::Bool(value) => lifter.constant(ir::Constant::Bool(*value)),
-                    };
-                    lifter.binary(lhs, *op, rhs)
-                }
-            };
-            apply_exit_writes(raw, lifter, outputs);
-            BlockExit::Branch {
-                condition,
-                then_block: *then_block,
-                else_block: *else_block,
-            }
-        }
-        RawBlockExit::FornPrep {
-            base,
-            body_block,
-            exit_block,
-        } => {
-            lifter.flush_pending();
-            let start = lifter.read_reg(reg_add(*base, 2));
-            let end = lifter.read_reg(*base);
-            let step = lifter.read_reg(reg_add(*base, 1));
-            apply_exit_writes(raw, lifter, outputs);
-            let variable = lifter.ssa.read_reg(*body_block, reg_add(*base, 2));
-            BlockExit::NumericFor {
-                body_block: *body_block,
-                exit_block: *exit_block,
-                variable,
-                start,
-                end,
-                step,
-            }
-        }
-        RawBlockExit::FornLoop {
-            body_block,
-            exit_block,
-            ..
-        } => {
-            lifter.flush_pending();
-            apply_exit_writes(raw, lifter, outputs);
-            BlockExit::NumericForLoop {
-                body_block: *body_block,
-                exit_block: *exit_block,
-            }
-        }
-        RawBlockExit::ForgPrep {
-            base,
-            body_block,
-            exit_block,
-        } => {
-            lifter.flush_pending();
-            let values = [
-                lifter.read_reg(*base),
-                lifter.read_reg(reg_add(*base, 1)),
-                lifter.read_reg(reg_add(*base, 2)),
-            ];
-            apply_exit_writes(raw, lifter, outputs);
-            let variables = raw
-                .exit_writes
-                .iter()
-                .map(|reg| lifter.ssa.read_reg(*body_block, *reg))
-                .collect();
-            BlockExit::GenericFor {
-                body_block: *body_block,
-                loop_block: *exit_block,
-                variables,
-                values,
-            }
-        }
-        RawBlockExit::ForgLoop {
-            base,
-            body_block,
-            exit_block,
-            result_count,
-        } => {
-            lifter.flush_pending();
-            apply_exit_writes(raw, lifter, outputs);
-            let variables = (0..*result_count)
-                .map(|index| {
-                    let reg = reg_add(reg_add(*base, 3), index as u8);
-                    lifter.ssa.read_reg(*body_block, reg)
-                })
-                .collect();
-            BlockExit::GenericForLoop {
-                body_block: *body_block,
-                exit_block: *exit_block,
-                variables,
-            }
-        }
-        RawBlockExit::Return { base, count } => match Count::from(*count) {
-            Count::Number(count) => {
-                lifter.flush_pending();
-                let values = lifter.read_regs(*base, count);
-                BlockExit::Return(lifter.fixed_pack(values))
-            }
-            Count::Variadic => {
-                let pack = lifter.take_variadic_from(*base)?;
-                BlockExit::Return(pack)
-            }
-        },
-    };
-    Ok(exit)
-}
-
-/// Applies register definitions produced by a bytecode block exit.
-fn apply_exit_writes(
-    raw: &RawBlock,
-    lifter: &mut BlockLifter<'_, '_, '_>,
-    outputs: &mut Vec<ValueId>,
-) {
-    for &reg in &raw.exit_writes {
-        let value = lifter.value();
-        lifter.ssa.write_reg(lifter.block, reg, value);
-        outputs.push(value);
-    }
-}
-
 /// Resolves one value through the trivial-Phi alias map.
 fn resolve_alias(mut value: ValueId, aliases: &HashMap<ValueId, ValueId>) -> ValueId {
     while let Some(&alias) = aliases.get(&value) {
@@ -1448,8 +1445,8 @@ fn resolve_alias(mut value: ValueId, aliases: &HashMap<ValueId, ValueId>) -> Val
 }
 
 /// Rewrites all block references to surviving SSA values.
-fn resolve_aliases(blocks: &mut [Block], aliases: &HashMap<ValueId, ValueId>) {
-    for block in blocks {
+fn resolve_aliases(cfg: &mut ControlFlowGraph<Block>, aliases: &HashMap<ValueId, ValueId>) {
+    for block in cfg.items_mut() {
         for output in &mut block.outputs {
             *output = resolve_alias(*output, aliases);
         }
@@ -1519,12 +1516,6 @@ fn resolve_instr(instr: &mut ir::Instr, aliases: &HashMap<ValueId, ValueId>) {
         ir::Instr::MethodCall { object, .. } => resolve(object),
         ir::Instr::OpenCell { value, .. } | ir::Instr::StoreCell { value, .. } => resolve(value),
         ir::Instr::SetList { table, .. } => resolve(table),
-        ir::Instr::Phi { out, inputs } => {
-            resolve(out);
-            for (_, value) in inputs {
-                resolve(value);
-            }
-        }
     }
 }
 
@@ -1722,10 +1713,11 @@ pub(crate) fn lift(chunk: &Chunk) -> Result<Vec<Function>> {
         .iter()
         .map(|proto| {
             let raw_blocks = reachable_raw_blocks(proto)?;
-            let (successors, predecessors) =
-                build_graph(raw_blocks.iter().map(|block| block.exit.targets()));
-            let graph = AdjGraph::new(0, &successors, &predecessors);
-            FunctionLifter::new(proto, chunk, &raw_blocks, &graph)?.lift()
+            let cfg = ControlFlowGraph::from_nodes_and_exits(raw_blocks.into_iter().map(|block| {
+                let targets = block.exit.targets();
+                (block, targets)
+            }));
+            FunctionLifter::new(proto, chunk, cfg)?.lift()
         })
         .collect::<Result<_>>()?;
     Ok(functions)
