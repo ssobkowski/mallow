@@ -14,16 +14,24 @@ use crate::ir::union_find::UnionFind;
 use crate::logging::Diagnostics;
 
 /// Structures the FIR function into a control shape, then lifts it to NIR.
-pub(crate) fn lift(function: &fir::Function, diagnostics: &Diagnostics) -> Result<Function> {
-    let shape = fir::region::structure(function, diagnostics)?;
+pub(crate) fn lift(function: fir::Function, diagnostics: &Diagnostics) -> Result<Function> {
+    let shape = fir::region::structure(&function, diagnostics)?;
     materialize(function, shape)
 }
 
 /// Converts one verified control shape into NIR with distinct FIR SSA symbols.
-pub(crate) fn materialize(function: &fir::Function, shape: Shape) -> Result<Function> {
-    let ssa = SsaMeta::build(function)?;
-    let initializations = Initializations::build(function, &ssa, &shape);
-    Materializer::new(function, &ssa, initializations).materialize(shape)
+pub(crate) fn materialize(function: fir::Function, shape: Shape) -> Result<Function> {
+    let mut result = {
+        let ssa = SsaMeta::build(&function)?;
+        let initializations = Initializations::build(&function, &ssa, &shape);
+        Materializer::new(&function, &ssa, initializations).materialize(shape)?
+    };
+    for (target, source) in result.bindings.iter_mut().zip(function.bindings) {
+        target.cells = source.cells;
+    }
+    result.debug = function.debug;
+    result.upvalues = function.upvalues;
+    Ok(result)
 }
 
 /// Unifies NIR symbols which point to the same underlying storage.
@@ -46,6 +54,13 @@ pub(crate) fn destroy_ssa(function: &mut Function) {
     }
     for local in function.cell_locals.values_mut() {
         rewriter.visit_local(local);
+    }
+    for binding in &mut function.bindings {
+        for local in &mut binding.locals {
+            rewriter.visit_local(local);
+        }
+        binding.locals.sort_unstable_by_key(|local| local.index());
+        binding.locals.dedup();
     }
     rewriter.visit_stmts(&mut function.prologue);
     rewriter.visit_region(&mut function.body);
@@ -369,14 +384,32 @@ impl<'a> Materializer<'a> {
             .map(|storage| self.initialization(*storage))
             .collect::<Result<_>>()?;
         let cell_locals = self.cell_locals()?;
+        let bindings = self
+            .function
+            .bindings
+            .iter()
+            .map(|binding| {
+                let locals = binding
+                    .values
+                    .iter()
+                    .map(|value| self.local(*value))
+                    .collect::<Result<_>>()?;
+                Ok(DebugBinding {
+                    locals,
+                    cells: Vec::new(),
+                })
+            })
+            .collect::<Result<_>>()?;
         let body = self.region(shape)?;
         let function = Function {
             id: self.function.id,
+            debug: Default::default(),
+            bindings,
             locals: self.locals,
             packs: self.packs,
             params,
             is_vararg: self.function.is_vararg,
-            upvalues: self.function.upvalues.clone(),
+            upvalues: Vec::new(),
             cell_locals,
             prologue,
             body,

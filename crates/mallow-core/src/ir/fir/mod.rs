@@ -16,7 +16,8 @@ use smallvec::{SmallVec, smallvec};
 use smol_str::SmolStr;
 
 use crate::common::ByteString;
-use crate::il::ProtoId;
+use crate::il::{ProtoId, ProtoTypeInfo};
+use crate::ir::Debug;
 use crate::ir::graph::{GraphView, GraphViewMut};
 use crate::operator::{BinOp, UnOp};
 
@@ -622,11 +623,26 @@ impl<T> std::ops::Index<Edge> for ControlFlowGraph<T> {
     }
 }
 
+/// FIR identities associated with one named bytecode local.
+#[derive(Debug, Clone, Default)]
+pub struct DebugBinding {
+    /// Immutable values held by the local during its lifetime.
+    pub values: Vec<ValueId>,
+    /// Mutable captured cells held by the local during its lifetime.
+    pub cells: Vec<CellId>,
+}
+
 /// A lifted function.
 #[derive(Debug, Clone)]
 pub struct Function {
     /// Bytecode proto represented by this function.
     pub id: ProtoId,
+    /// Source information preserved from the bytecode proto.
+    pub debug: Debug,
+    /// Type info sourced from the bytecode.
+    pub type_info: ProtoTypeInfo,
+    /// FIR identities associated with each entry in [`Debug::locals`].
+    pub bindings: Vec<DebugBinding>,
     /// Parameters in source order.
     pub params: Vec<ValueId>,
     /// The entry edge of this function.
@@ -648,7 +664,7 @@ pub struct Function {
 impl Function {
     /// Verifies definitions and the block edges.
     pub fn verify(&self) -> Result<()> {
-        ensure!(self.params.len() == self.cfg[self.entry.target].params.len());
+        ensure!(self.entry.params.len() == self.cfg[self.entry.target].params.len());
 
         // Each block must have a valid incoming edge from its predecessor, and the arg count
         // must match.

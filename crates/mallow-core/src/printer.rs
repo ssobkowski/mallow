@@ -5,17 +5,8 @@ use crate::ast::{
 use crate::common::{ByteString, escape_bytes};
 use crate::operator::{BinOp, UnOp};
 
-pub fn print(block: &Block, top_comments: &[String]) -> String {
+pub fn print(block: &Block) -> String {
     let mut buf = String::new();
-
-    if !top_comments.is_empty() {
-        for comment in top_comments {
-            buf.push_str("-- ");
-            buf.push_str(comment);
-            buf.push('\n');
-        }
-        buf.push('\n');
-    }
 
     let mut printer = AstPrinter::new();
     printer.walk_block(block);
@@ -772,11 +763,7 @@ fn choose_string_style(value: &ByteString) -> StringStyle {
     };
 
     let level = long_string_level(text);
-    let newline_count = value
-        .as_ref()
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count();
+    let newline_count = value.as_ref().iter().filter(|byte| **byte == b'\n').count();
     let quoted_cost = 2 + escaped_len(value.as_ref()) + newline_count * QUOTED_NEWLINE_STYLE_COST;
     let long_cost = long_string_len(text, level) + LONG_STRING_STYLE_COST;
 
@@ -843,7 +830,7 @@ mod tests {
             ],
         }]);
 
-        assert_eq!(print(&block, &[]), "return 42, 42i, -42i\n");
+        assert_eq!(print(&block), "return 42, 42i, -42i\n");
     }
 
     #[test]
@@ -852,7 +839,7 @@ mod tests {
             values: vec![Expr::Literal(Literal::Integer(i64::MIN))],
         }]);
 
-        assert_eq!(print(&block, &[]), "return (-9223372036854775807i - 1i)\n");
+        assert_eq!(print(&block), "return (-9223372036854775807i - 1i)\n");
     }
 
     #[test]
@@ -891,7 +878,7 @@ mod tests {
         let block = Block::with_stmts(vec![Stmt::Return {
             values: vec![Expr::Literal(Literal::String(value))],
         }]);
-        print(&block, &[])
+        print(&block)
     }
 
     #[test]

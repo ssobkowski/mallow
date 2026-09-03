@@ -1,5 +1,6 @@
 use smol_str::SmolStr;
 
+use crate::common::ByteString;
 use crate::ty::canonical::{TypeId, TypeLiteral, TypePackId, TypePackTail};
 use crate::ty::store::TypeStore;
 
@@ -134,7 +135,7 @@ impl BuiltinLiteral {
     /// Creates the owned literal stored in the canonical type graph.
     fn to_owned(&self) -> TypeLiteral {
         match self {
-            Self::String(value) => TypeLiteral::String((*value).to_owned()),
+            Self::String(value) => TypeLiteral::String(ByteString::from(*value)),
             Self::Boolean(value) => TypeLiteral::Boolean(*value),
         }
     }

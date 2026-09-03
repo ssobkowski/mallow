@@ -1,62 +1,90 @@
-//! SSA-first whole-program type inference.
-//!
-//! Lowering reads lifted SSA, the engine solves immutable relations over a
-//! small mutable world, and output imports solved types back into functions.
+//! Whole-program type inference for FIR.
 
-// mod captures;
-// mod engine;
-// mod keys;
-// mod lower;
-// mod output;
-// mod program;
-// mod world;
+mod engine;
+mod keys;
+mod lower;
+mod program;
+mod world;
 
-// use engine::Engine;
-// use keys::ValueKey;
-// use lower::lower_functions;
+use std::collections::HashMap;
 
-use crate::fir::Function;
-// use crate::hil::ty::builtins::BuiltinEnvironment;
-// use crate::hil::ty::store::TypeStore;
+use super::bytecode::ProtoTypeContext;
+use super::store::TypeStore;
+use crate::il::ProtoId;
+use crate::ir::Unit;
+use crate::ir::fir::{CellId, Function, ValueId};
+use crate::ty::canonical::TypeId;
 
-/// Runs whole-program type inference over lifted SSA and writes inferred types.
-pub fn run(_functions: &mut [Function]) {
-    // let mut type_store = TypeStore::new();
-    // let builtins = BuiltinEnvironment::new(&mut type_store);
-    // let primitives = type_store.primitives();
-    // let mut program = lower_functions(functions, &builtins, &primitives);
+use keys::ValueKey;
+use program::InferenceProgram;
 
-    // for function in functions.iter() {
-    //     for (symbol, type_id) in function.types.monomorphic_symbol_types() {
-    //         let imported = type_store.import(function.types.type_store(), type_id);
-    //         program.seed(ValueKey::Symbol(function.proto, symbol), imported);
-    //     }
-    // }
+/// Types inferred for one complete FIR unit.
+pub(crate) struct Output {
+    /// Canonical graph that owns every inferred type.
+    store: TypeStore,
+    /// Materialized types indexed by stable FIR identity.
+    values: HashMap<ValueKey, TypeId>,
+}
 
-    // let mut engine = Engine::new(program, functions, &builtins, &mut type_store);
-    // engine.solve();
+impl Output {
+    /// Returns the inferred type for one immutable FIR value.
+    pub(crate) fn value(&self, proto: ProtoId, value: ValueId) -> Option<TypeId> {
+        self.values.get(&ValueKey::Value(proto, value)).copied()
+    }
 
-    // // TODO: Calls below should be one function like `engine.finalize()` that consume
-    // //       the engine returning the inferred types. Perhaps include `engine.solve()`
-    // //       too, which further allows for a single public function like `solve_types(...)`.
-    // engine.prepare_output();
+    /// Returns the inferred type for one mutable FIR cell.
+    pub(crate) fn cell(&self, proto: ProtoId, cell: CellId) -> Option<TypeId> {
+        self.values.get(&ValueKey::Cell(proto, cell)).copied()
+    }
 
-    // let inferred: Vec<_> = engine
-    //     .symbol_keys()
-    //     .into_iter()
-    //     .filter_map(|(proto, symbol, key)| {
-    //         engine
-    //             .resolved_value_type(key)
-    //             .map(|type_id| (proto, symbol, type_id))
-    //     })
-    //     .collect();
-    // drop(engine);
+    /// Joins several inferred types in the output graph.
+    pub(crate) fn join(&mut self, types: impl IntoIterator<Item = TypeId>) -> Option<TypeId> {
+        let types: std::collections::HashSet<_> = types.into_iter().collect();
+        match types.len() {
+            0 => None,
+            1 => types.into_iter().next(),
+            _ => Some(self.store.join_all(types)),
+        }
+    }
 
-    // for (proto, symbol, type_id) in inferred {
-    //     if let Some(function) = functions.get_mut(proto.0 as usize) {
-    //         function
-    //             .types
-    //             .import_inferred_symbol_type(symbol, &type_store, type_id);
-    //     }
-    // }
+    /// Returns the canonical graph that owns every returned type ID.
+    pub(crate) fn into_store(self) -> TypeStore {
+        self.store
+    }
+}
+
+/// Infers types for a complete FIR unit.
+pub(crate) fn run(unit: &Unit<Function>) -> Output {
+    let mut store = TypeStore::new();
+    let mut program = lower::lower_functions(unit, &mut store);
+    seed_bytecode_types(&mut program, unit, &mut store);
+
+    engine::run(program, unit, store)
+}
+
+/// Seeds parameter and upvalue identities from coarse bytecode type records.
+fn seed_bytecode_types(
+    program: &mut InferenceProgram,
+    unit: &Unit<Function>,
+    store: &mut TypeStore,
+) {
+    for function in unit.functions() {
+        let context = ProtoTypeContext::from_type_info(
+            &function.type_info,
+            unit.userdata_names().unwrap_or(&[]),
+            store,
+        );
+        for (index, value) in function.params.iter().enumerate() {
+            let Some(ty) = context.param(index) else {
+                continue;
+            };
+            program.seed(ValueKey::Value(function.id, *value), ty);
+        }
+        for (index, cell) in function.upvalues.iter().enumerate() {
+            let Some(ty) = context.upvalue(index) else {
+                continue;
+            };
+            program.seed(ValueKey::Cell(function.id, *cell), ty);
+        }
+    }
 }

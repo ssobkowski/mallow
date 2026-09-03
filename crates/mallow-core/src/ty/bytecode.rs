@@ -1,13 +1,17 @@
 use super::canonical::TypeId;
 use super::store::TypeStore;
-use crate::disasm::Chunk;
-use crate::il::{BytecodeType, Proto, TypeTag};
+use crate::il::{BytecodeType, ProtoTypeInfo, TypeTag};
+use crate::ir::UserdataTypeMapping;
 
-/// Decodes one compact bytecode tag into a canonical graph ID.
+/// Decodes a compact bytecode tag into a canonical graph ID.
 ///
 /// Luau bytecode stores only a coarse tag, so this returns `None` when a
-/// tagged userdata name cannot be recovered from its chunk.
-fn decode_type_tag(tag: TypeTag, chunk: &Chunk, store: &mut TypeStore) -> Option<TypeId> {
+/// tagged userdata name cannot be recovered from the unit metadata.
+fn decode_type_tag(
+    tag: TypeTag,
+    mappings: &[UserdataTypeMapping],
+    store: &mut TypeStore,
+) -> Option<TypeId> {
     let ty = match tag.ty {
         BytecodeType::Nil => store.primitives().nil,
         BytecodeType::Boolean => store.primitives().boolean,
@@ -23,15 +27,11 @@ fn decode_type_tag(tag: TypeTag, chunk: &Chunk, store: &mut TypeStore) -> Option
         BytecodeType::Any => store.primitives().any,
         BytecodeType::Unknown(_) => store.primitives().unknown,
         BytecodeType::TaggedUserdata(index) => {
-            let name = chunk.userdata_type_mappings.as_ref().and_then(|mappings| {
-                mappings
-                    .iter()
-                    .find(|mapping| mapping.index == index)
-                    .and_then(|mapping| mapping.name)
-                    .and_then(|name| chunk.get_string(name))
-                    .and_then(|name| name.as_utf8().map(str::to_owned))
-            })?;
-
+            let name = mappings
+                .iter()
+                .find(|mapping| mapping.index == index)
+                .and_then(|mapping| mapping.name.as_ref())
+                .and_then(|name| name.as_utf8())?;
             store.named(name)
         }
     };
@@ -68,34 +68,35 @@ pub struct ProtoTypeContext {
 }
 
 impl ProtoTypeContext {
-    /// Builds a type context from the compact type records attached to `proto`.
-    pub fn from_proto(proto: &Proto, chunk: &Chunk, type_store: &mut TypeStore) -> Self {
-        let params = proto
-            .type_info
+    /// Builds a type context from compact bytecode type records.
+    pub fn from_type_info(
+        type_info: &ProtoTypeInfo,
+        mappings: &[UserdataTypeMapping],
+        type_store: &mut TypeStore,
+    ) -> Self {
+        let params = type_info
             .function
             .as_ref()
             .map(|function| {
                 function
                     .params
                     .iter()
-                    .map(|tag| alloc_bytecode_tag(type_store, *tag, chunk))
+                    .map(|tag| decode_type_tag(*tag, mappings, type_store))
                     .collect()
             })
             .unwrap_or_default();
 
-        let upvalues = proto
-            .type_info
+        let upvalues = type_info
             .upvalues
             .iter()
-            .map(|tag| alloc_bytecode_tag(type_store, *tag, chunk))
+            .map(|tag| decode_type_tag(*tag, mappings, type_store))
             .collect();
 
-        let locals = proto
-            .type_info
+        let locals = type_info
             .locals
             .iter()
             .filter_map(|local| {
-                let ty = alloc_bytecode_tag(type_store, local.ty, chunk)?;
+                let ty = decode_type_tag(local.ty, mappings, type_store)?;
                 Some(LocalTypeBinding {
                     ty,
                     register: local.register,
@@ -114,14 +115,14 @@ impl ProtoTypeContext {
 
     /// Returns the bytecode type for a function parameter, if one exists.
     #[inline]
-    pub fn param(&self, index: u8) -> Option<TypeId> {
-        self.params.get(index as usize).copied().flatten()
+    pub fn param(&self, index: usize) -> Option<TypeId> {
+        self.params.get(index).copied().flatten()
     }
 
     /// Returns the bytecode type for an upvalue, if one exists.
     #[inline]
-    pub fn upvalue(&self, index: u8) -> Option<TypeId> {
-        self.upvalues.get(index as usize).copied().flatten()
+    pub fn upvalue(&self, index: usize) -> Option<TypeId> {
+        self.upvalues.get(index).copied().flatten()
     }
 
     /// Returns the local type active for `register` at `pc`, if one exists.
@@ -132,9 +133,4 @@ impl ProtoTypeContext {
             .find(|local| local.register == register && local.start_pc <= pc && pc < local.end_pc)
             .map(|local| local.ty)
     }
-}
-
-/// Allocates one decoded bytecode tag in `store`.
-fn alloc_bytecode_tag(store: &mut TypeStore, tag: TypeTag, chunk: &Chunk) -> Option<TypeId> {
-    decode_type_tag(tag, chunk, store)
 }

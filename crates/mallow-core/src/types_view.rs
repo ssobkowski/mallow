@@ -5,8 +5,10 @@ use std::fmt;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
+use crate::ir::Unit;
 use crate::ir::fir::Function;
 use crate::ty::canonical::{Type, TypeId, TypeLiteral, TypePackId, TypePackTail};
+use crate::ty::inference::Output;
 use crate::ty::store::TypeStore;
 
 /// Inferred types indexed by named locals from debug information.
@@ -34,24 +36,28 @@ struct LocalType {
 }
 
 impl TypesView {
-    /// Builds a source-level view from functions after inference has completed.
-    pub(crate) fn from_inferred(functions: &[Function]) -> Self {
-        let mut store = TypeStore::new();
+    /// Builds a source-level view from one FIR unit and its inference output.
+    pub(crate) fn from_inferred(unit: &Unit<Function>, mut output: Output) -> Self {
         let mut locals = Vec::new();
 
-        for function in functions {
-            for local in function.symbols.debug_locals() {
-                let types: Vec<_> = local
-                    .symbols
+        for function in unit.functions() {
+            for (local, binding) in function.debug.locals.iter().zip(&function.bindings) {
+                let types: Vec<_> = binding
+                    .values
                     .iter()
-                    .filter_map(|symbol| function.types.inferred_symbol_type(*symbol))
-                    .map(|type_id| store.import(function.types.type_store(), type_id))
+                    .filter_map(|value| output.value(function.id, *value))
+                    .chain(
+                        binding
+                            .cells
+                            .iter()
+                            .filter_map(|cell| output.cell(function.id, *cell)),
+                    )
                     .collect();
 
-                let type_id = merge_types(&mut store, types);
+                let type_id = output.join(types);
                 locals.push(LocalType {
-                    name: local.name.clone(),
-                    proto: function.proto.0,
+                    name: local.name.to_string(),
+                    proto: function.id.0,
                     start_pc: local.start_pc,
                     end_pc: local.end_pc,
                     type_id,
@@ -59,6 +65,7 @@ impl TypesView {
             }
         }
 
+        let store = output.into_store();
         let mut locals_by_name: HashMap<String, SmallVec<_>> = HashMap::new();
         for (index, local) in locals.iter().enumerate() {
             locals_by_name
@@ -125,20 +132,6 @@ impl TypesView {
             type_id,
         }
     }
-}
-
-/// Combines inferred SSA versions that belong to one source declaration.
-fn merge_types(store: &mut TypeStore, types: Vec<TypeId>) -> Option<TypeId> {
-    let distinct: HashSet<_> = types.into_iter().collect();
-
-    if distinct.is_empty() {
-        return None;
-    }
-    if distinct.len() == 1 {
-        return distinct.into_iter().next();
-    }
-
-    Some(store.union_all(distinct))
 }
 
 /// One canonical type owned by a [`TypesView`].
@@ -392,7 +385,7 @@ impl<'a> TypeFormatter<'a> {
             Type::Integer => formatter.write_str("integer"),
             Type::Buffer => formatter.write_str("buffer"),
             Type::Named(name) => write!(formatter, "{name}"),
-            Type::Literal(TypeLiteral::String(value)) => write!(formatter, "{value:?}"),
+            Type::Literal(TypeLiteral::String(value)) => write!(formatter, "\"{value}\""),
             Type::Literal(TypeLiteral::Boolean(value)) => write!(formatter, "{value}"),
             Type::Table => formatter.write_str("table"),
             Type::TableShape { fields, indexer } => {
@@ -432,7 +425,7 @@ impl<'a> TypeFormatter<'a> {
                     if index != 0 {
                         formatter.write_str(", ")?;
                     }
-                    write!(formatter, "{}: ", method.method.field())?;
+                    write!(formatter, "{}: ", method.method.as_str())?;
                     self.format(method.ty, formatter)?;
                 }
                 formatter.write_str("}")

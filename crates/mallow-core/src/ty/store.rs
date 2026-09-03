@@ -686,6 +686,7 @@ mod tests {
     use std::hash::{Hash, Hasher};
 
     use super::{HashConsArena, MetamethodType, Type, TypeLiteral, TypeStore};
+    use crate::common::ByteString;
     use crate::ty::canonical::{Metamethod, RuntimeKind, TypePackTail};
 
     /// A test value whose every fingerprint collides.
@@ -708,6 +709,18 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(arena.intern(Colliding(1)), first);
         assert_eq!(arena.len(), 2);
+    }
+
+    /// String singleton types retain bytes that are not valid UTF-8.
+    #[test]
+    fn string_literals_preserve_arbitrary_bytes() {
+        let mut store = TypeStore::new();
+        let value = ByteString::from(vec![0xff, 0x00, b'a']);
+        let literal = store.literal(TypeLiteral::String(value.clone()));
+        assert_eq!(
+            store.get(literal),
+            &Type::Literal(TypeLiteral::String(value))
+        );
     }
 
     /// Foreign child IDs are rejected instead of silently indexing another graph.

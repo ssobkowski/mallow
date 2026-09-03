@@ -1116,6 +1116,13 @@ pub struct LocalDebug {
     pub register: u8,
 }
 
+#[derive(Debug, Clone)]
+pub struct LineInfo {
+    pub interval_log2: u8,
+    pub deltas: Vec<u8>,
+    pub anchors: Vec<i32>,
+}
+
 /// A free-standing representation of value's type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BytecodeType {
@@ -1247,7 +1254,10 @@ pub struct Proto {
     pub consts: Vec<Constant>,
     pub child_protos: Vec<ProtoId>,
     pub debug_name: Option<StringId>,
+    pub line_defined: u64,
+    pub line_info: Option<LineInfo>,
     pub locals: Vec<LocalDebug>,
+    pub upvalue_names: Vec<Option<StringId>>,
 }
 
 impl Proto {

@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::il::ProtoId;
+use crate::ir::Debug;
 use crate::ir::fir::{CellId, Constant, PackId, ValueId};
 use crate::ir::nir::visitor::{Visitor, walk_expr, walk_pack_expr};
 use crate::operator::{BinOp, UnOp};
@@ -446,11 +447,24 @@ impl Region {
     }
 }
 
+/// NIR identities associated with one named bytecode local.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DebugBinding {
+    /// Source locals produced from the declaration's FIR values.
+    pub(crate) locals: Vec<LocalId>,
+    /// Mutable cells held by the declaration during its lifetime.
+    pub(crate) cells: Vec<CellId>,
+}
+
 /// One nested function before AST naming and emission.
 #[derive(Debug, Clone)]
 pub(crate) struct Function {
     /// Bytecode prototype represented by this function.
     pub(crate) id: ProtoId,
+    /// Source information preserved from the bytecode proto.
+    pub(crate) debug: Debug,
+    /// NIR identities associated with each entry in [`Debug::locals`].
+    pub(crate) bindings: Vec<DebugBinding>,
     /// Source-representable locals.
     pub(crate) locals: Arena<Local>,
     /// First-class pack locals.

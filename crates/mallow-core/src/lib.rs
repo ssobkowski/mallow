@@ -6,8 +6,9 @@ mod il;
 mod ir;
 mod logging;
 mod operator;
-mod ty;
 mod printer;
+mod ty;
+mod types_view;
 
 #[cfg(feature = "visualize")]
 mod visualize;
@@ -18,8 +19,8 @@ pub use logging::{
 };
 
 use crate::disasm::Chunk;
-use crate::il::{BytecodeType, ProtoId, TypeTag};
-use crate::ir::fir;
+use crate::il::{BytecodeType, TypeTag};
+use crate::ir::{Unit, fir};
 use crate::logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget};
 
 /// Output form produced by bytecode decompilation.
@@ -45,9 +46,6 @@ pub struct DecompileOptions {
     /// Spill emitter-introduced locals into table storage when Luau's local limit
     /// is exceeded.
     pub spill_locals: bool,
-    /// Emit conservative decompiler-inferred type annotations in addition to
-    /// bytecode-recovered type annotations.
-    pub infer_types: bool,
     /// Maximum number of post-region pass iterations per function.
     pub max_pass_iterations: usize,
 }
@@ -57,7 +55,6 @@ impl Default for DecompileOptions {
         Self {
             emit: EmitMode::default(),
             spill_locals: false,
-            infer_types: false,
             max_pass_iterations: DEFAULT_MAX_PASS_ITERATIONS,
         }
     }
@@ -176,26 +173,25 @@ fn format_type_tag(tag: TypeTag, chunk: &Chunk) -> String {
 
 /// Lifts Luau bytecode into the FIR.
 ///
-/// Returns a tuple of the entry proto, and a vector of lifted functions.
-pub fn lift_bytecode(bytecode: &[u8]) -> Result<(ProtoId, Vec<fir::Function>)> {
+/// Returns one FIR unit containing every lifted function.
+pub fn lift_bytecode(bytecode: &[u8]) -> Result<Unit<fir::Function>> {
     lift_bytecode_with_diagnostics(bytecode, &Diagnostics::default())
 }
 
 /// Lifts Luau bytecode into the FIR using an existing diagnostics context.
 ///
-/// Returns a tuple of the entry proto, and a vector of lifted functions.
+/// Returns one FIR unit containing every lifted function.
 pub fn lift_bytecode_with_diagnostics(
     bytecode: &[u8],
     diagnostics: &Diagnostics,
-) -> Result<(ProtoId, Vec<fir::Function>)> {
+) -> Result<Unit<fir::Function>> {
     let span = tracing::info_span!("lift_bytecode", byte_len = bytecode.len());
     let _enter = span.enter();
     let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let functions = ir::fir::lift(&chunk)?;
-    Ok((chunk.entry_proto, functions))
+    ir::fir::lift(chunk)
 }
 
-pub struct TypesView;
+pub use types_view::{TypeFactory, TypePackView, TypeView, TypesView};
 
 /// Infers named-local types from Luau bytecode.
 pub fn infer_bytecode_types(bytecode: &[u8]) -> Result<TypesView> {
@@ -204,15 +200,14 @@ pub fn infer_bytecode_types(bytecode: &[u8]) -> Result<TypesView> {
 
 /// Infers named-local types using an existing diagnostics context.
 pub fn infer_bytecode_types_with_diagnostics(
-    _bytecode: &[u8],
-    _diagnostics: &Diagnostics,
+    bytecode: &[u8],
+    diagnostics: &Diagnostics,
 ) -> Result<TypesView> {
-    // let span = tracing::info_span!("infer_bytecode_types", byte_len = bytecode.len());
-    // let _enter = span.enter();
-    // let (_, functions) = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    // ty::inference::run(&mut functions);
-    // Ok(TypesView::from_inferred(&functions))
-    todo!("in works")
+    let span = tracing::info_span!("infer_bytecode_types", byte_len = bytecode.len());
+    let _enter = span.enter();
+    let unit = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    let output = ty::inference::run(&unit);
+    Ok(TypesView::from_inferred(&unit, output))
 }
 
 /// Emits Luau bytecode as cleaned source or intermediate representation text.
@@ -230,41 +225,42 @@ pub fn decompile_bytecode_with_diagnostics(
         "decompile_bytecode",
         byte_len = bytecode.len(),
         spill_locals = options.spill_locals,
-        infer_types = options.infer_types,
         max_pass_iterations = options.max_pass_iterations,
         emit = ?options.emit,
     );
     let _enter = span.enter();
 
-    // TODO: NonZeroUsize?
     ensure!(
         options.max_pass_iterations > 0,
         "max pass iterations must be greater than zero"
     );
     let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let functions = ir::fir::lift(&chunk)?;
+    let unit = ir::fir::lift(chunk)?;
+
+    // Magic number. I was too lazy to introduce a "temporary" patch for not running the inference
+    // optionally, it currently seems to fall into an infinite loop in some cases.
+    if options.max_pass_iterations == 8221 {
+        ty::inference::run(&unit);
+    }
 
     use core::fmt::Write;
 
     match options.emit {
         EmitMode::Source => {
-            let mut nested_functions: Vec<_> = functions
-                .iter()
-                .map(|function| {
-                    let diagnostics = diagnostics.for_proto(function.id.0);
-                    ir::nir::lift(function, &diagnostics)
-                })
-                .collect::<Result<_>>()?;
-            ir::nir::passes::run(&mut nested_functions);
-            for function in &mut nested_functions {
+            let mut nested_unit = unit.map_functions(|function| {
+                let diagnostics = diagnostics.for_proto(function.id.0);
+                ir::nir::lift(function, &diagnostics)
+            })?;
+            ir::nir::passes::run(&mut nested_unit);
+            for function in nested_unit.functions_mut() {
                 ir::nir::materialize::destroy_ssa(function);
             }
-            let block = emitter::emit_ast(nested_functions, chunk.entry_proto, options)?;
-            Ok(printer::print(&block, &[]))
+            let block = emitter::emit_ast(nested_unit, options)?;
+            Ok(printer::print(&block))
         }
         EmitMode::Ir | EmitMode::Nir => {
             let mut out = String::new();
-            for (index, function) in functions.into_iter().enumerate() {
+            for (index, function) in unit.into_iter().enumerate() {
                 if index != 0 {
                     out.push_str("\n\n");
                 }
@@ -272,7 +268,7 @@ pub fn decompile_bytecode_with_diagnostics(
                     EmitMode::Ir => write!(out, "{function}"),
                     EmitMode::Nir => {
                         let diagnostics = diagnostics.for_proto(function.id.0);
-                        let function = ir::nir::lift(&function, &diagnostics)?;
+                        let function = ir::nir::lift(function, &diagnostics)?;
                         write!(out, "{function:#?}")
                     }
                     EmitMode::Source => unreachable!("handled above"),
@@ -294,7 +290,7 @@ pub fn visualize_bytecode(
     let span = tracing::info_span!("visualize_bytecode", byte_len = bytecode.len());
     let _enter = span.enter();
 
-    let (entry, functions) = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    visualize::dump_cfgs(&functions, entry.0 as usize, output.as_ref().to_path_buf());
+    let unit = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    visualize::dump_cfgs(&unit, output.as_ref().to_path_buf());
     Ok(())
 }

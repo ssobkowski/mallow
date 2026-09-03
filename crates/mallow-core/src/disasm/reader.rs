@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::common::ByteString;
 use crate::disasm::Chunk;
 use crate::il::{
-    ConstId, Constant, DecodedInstr, FunctionTypeInfo, ImportPath, Instr, LocalDebug,
+    ConstId, Constant, DecodedInstr, FunctionTypeInfo, ImportPath, Instr, LineInfo, LocalDebug,
     LocalTypeInfo, Proto, ProtoId, ProtoTypeInfo, StringId, TypeTag, UserdataTypeMapping,
 };
 
@@ -28,6 +28,13 @@ macro_rules! impl_from_le_bytes {
 }
 
 impl_from_le_bytes!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+
+impl FromLeBytes for bool {
+    const SIZE: usize = 1;
+    fn from_le_slice(bytes: &[u8]) -> Self {
+        bytes[0] != 0
+    }
+}
 
 pub struct BytecodeReader<'b> {
     bytes: &'b [u8],
@@ -268,7 +275,7 @@ impl<'b> BytecodeReader<'b> {
         let max_stack_size = self.read()?;
         let num_params = self.read()?;
         let num_upvals = self.read()?;
-        let is_vararg = self.read::<u8>()? != 0;
+        let is_vararg = self.read::<bool>()?;
         let flags = self.read()?;
 
         let type_info = TypeReader::read_type_info(self, types_version, proto_id)?;
@@ -292,29 +299,37 @@ impl<'b> BytecodeReader<'b> {
             child_protos.push(ProtoId(self.read_varint()?));
         }
 
-        self.read_varint::<u64>()?; // line defined
+        let line_defined = self.read_varint::<u64>()?;
         let debug_name = self.read_string_id()?;
 
-        if self.read::<u8>()? == 1 {
-            let line_info_comp_key: u8 = self.read()?;
-            let line_interval = 1usize << line_info_comp_key;
-
+        let line_info = if self.read::<bool>()? {
+            let interval_log2: u8 = self.read()?;
+            let line_interval = 1usize << interval_log2;
+            let mut deltas = Vec::with_capacity(code_table.len());
             for _ in 0..code_table.len() {
-                self.read::<u8>()?; // small line info
+                deltas.push(self.read::<u8>()?);
             }
 
-            let intervals = if code_table.is_empty() {
+            let interval_count = if code_table.is_empty() {
                 0
             } else {
                 (code_table.len() - 1) / line_interval + 1
             };
-            for _ in 0..intervals {
-                self.read::<i32>()?; // large line info
+            let mut anchors = Vec::with_capacity(interval_count);
+            for _ in 0..interval_count {
+                anchors.push(self.read()?);
             }
-        }
+            Some(LineInfo {
+                interval_log2,
+                deltas,
+                anchors,
+            })
+        } else {
+            None
+        };
 
         // local variables and upvalues
-        let locals = if self.read::<u8>()? == 1 {
+        let (locals, upvalue_names) = if self.read::<bool>()? {
             let num_locals = self.read_varint()?;
             let mut locals = Vec::with_capacity(num_locals);
 
@@ -332,13 +347,14 @@ impl<'b> BytecodeReader<'b> {
             }
 
             let num_upvals = self.read_varint()?;
+            let mut upvalue_names = Vec::with_capacity(num_upvals);
             for _ in 0..num_upvals {
-                self.read_string_id()?; // upval name index
+                upvalue_names.push(self.read_string_id()?);
             }
 
-            locals
+            (locals, upvalue_names)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         Ok(Proto {
@@ -353,7 +369,10 @@ impl<'b> BytecodeReader<'b> {
             consts,
             child_protos,
             debug_name,
+            line_defined,
+            line_info,
             locals,
+            upvalue_names,
         })
     }
 }

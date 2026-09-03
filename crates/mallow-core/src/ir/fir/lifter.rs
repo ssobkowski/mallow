@@ -6,15 +6,16 @@ use smol_str::{SmolStr, ToSmolStr};
 
 use super::cflow::{Cond, CondRhs, RawBlock, RawBlockExit, build_raw_from_proto};
 use super::ssa::Ssa;
-use super::{self as ir, Block, BlockExit, Capture, Function, Pack, PackId, ValueId};
+use super::{self as ir, Block, BlockExit, Capture, DebugBinding, Function, Pack, PackId, ValueId};
 use crate::common::ByteString;
 use crate::disasm::Chunk;
 use crate::il::{
-    self, ChildProtoId, ConstId, Count, DecodedInstr, ImportPath, Proto, ProtoId, reg_add,
-    reg_range,
+    self, ChildProtoId, ConstId, Count, DecodedInstr, ImportPath, Proto, ProtoId, ProtoTypeInfo,
+    reg_add, reg_range,
 };
 use crate::ir::fir::{Cell, CellId, CellOrigin, ControlFlowGraph, Edge, Number};
 use crate::ir::graph::{GraphView as _, GraphViewMut as _};
+use crate::ir::{Debug, DebugLocal, Unit, UserdataTypeMapping};
 use crate::operator::{BinOp, UnOp};
 
 pub const CAPTURE_VAL: u8 = 0;
@@ -208,21 +209,26 @@ impl<'c> FunctionLifter<'c> {
     }
 
     /// Lifts blocks, seals SSA, resolves aliases, and verifies the function.
-    fn lift(self) -> Result<Function> {
+    fn lift(self, type_info: ProtoTypeInfo) -> Result<Function> {
         let mut ssa = Ssa::new(&self.graph, self.proto.max_stack_size);
         let mut packs = Arena::new();
+        let mut bindings = vec![DebugBinding::default(); self.proto.locals.len()];
 
         let mut params: Vec<_> = (0..self.proto.num_params)
             .map(|reg| {
                 let value = ssa.alloc();
                 ssa.write_entry(reg, value);
+                if let Some(index) = self.proto.local_index_at(reg, 0) {
+                    bindings[index].values.push(value);
+                }
                 value
             })
             .collect();
 
         let mut blocks = vec![None; self.graph.len()];
         for block_index in self.graph.reverse_post_order() {
-            blocks[block_index] = Some(self.lift_block(block_index, &mut ssa, &mut packs)?);
+            blocks[block_index] =
+                Some(self.lift_block(block_index, &mut ssa, &mut packs, &mut bindings)?);
         }
 
         for (block_index, block) in blocks.iter().enumerate() {
@@ -244,8 +250,21 @@ impl<'c> FunctionLifter<'c> {
             *p = resolve_alias(*p, &aliases)
         }
 
+        for binding in &mut bindings {
+            for value in &mut binding.values {
+                *value = resolve_alias(*value, &aliases);
+            }
+            binding.values.sort_unstable_by_key(|value| value.index());
+            binding.values.dedup();
+            binding.cells.sort_unstable_by_key(|cell| cell.index());
+            binding.cells.dedup();
+        }
+
         let function = Function {
             id: self.proto.id,
+            debug: resolve_debug(self.proto, self.chunk)?,
+            type_info,
+            bindings,
             params,
             entry,
             is_vararg: self.proto.is_vararg,
@@ -256,8 +275,8 @@ impl<'c> FunctionLifter<'c> {
             cfg,
         };
 
-        // #[cfg(debug_assertions)]
-        // function.verify()?;
+        #[cfg(debug_assertions)]
+        function.verify()?;
 
         Ok(function)
     }
@@ -268,8 +287,9 @@ impl<'c> FunctionLifter<'c> {
         block: usize,
         ssa: &'l mut Ssa<'g, ControlFlowGraph<RawBlock<'c>>>,
         packs: &'l mut Arena<Pack>,
+        bindings: &'l mut [DebugBinding],
     ) -> Result<Block> {
-        BlockLifter::new(self, ssa, packs, block)?.lift()
+        BlockLifter::new(self, ssa, packs, bindings, block)?.lift()
     }
 }
 
@@ -281,6 +301,8 @@ struct BlockLifter<'l, 'c, 'g> {
     ssa: &'l mut Ssa<'g, ControlFlowGraph<RawBlock<'c>>>,
     /// Function pack arena.
     packs: &'l mut Arena<Pack>,
+    /// FIR identities associated with source debug locals.
+    bindings: &'l mut [DebugBinding],
 
     /// Block currently being lifted.
     block: usize,
@@ -303,6 +325,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
         function: &'l FunctionLifter<'c>,
         ssa: &'l mut Ssa<'g, ControlFlowGraph<RawBlock<'c>>>,
         packs: &'l mut Arena<Pack>,
+        bindings: &'l mut [DebugBinding],
         block: usize,
     ) -> Result<Self> {
         let capture_state = function.captures.block_states[block].clone();
@@ -310,6 +333,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             function,
             ssa,
             packs,
+            bindings,
             block,
             cursor: 0,
             emitted: Vec::new(),
@@ -370,21 +394,21 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
         Some(self.instr_at(self.cursor.saturating_sub(1))?.word_pc)
     }
 
-    /// Allocates one immutable value identity.
+    /// Allocates a immutable value identity.
     #[inline]
     #[must_use]
     fn value(&mut self) -> ValueId {
         self.ssa.alloc()
     }
 
-    /// Allocates one value pack identity.
+    /// Allocates a value pack identity.
     #[inline]
     #[must_use]
     fn pack(&mut self) -> PackId {
         self.packs.alloc(Pack)
     }
 
-    /// Emits one fixed value pack.
+    /// Emits a fixed value pack.
     #[inline]
     #[must_use]
     fn fixed_pack(&mut self, head: Vec<ValueId>) -> PackId {
@@ -397,7 +421,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
         out
     }
 
-    /// Emits one pack with a fixed prefix and open tail.
+    /// Emits a pack with a fixed prefix and open tail.
     #[inline]
     #[must_use]
     fn open_pack(&mut self, head: Vec<ValueId>, tail: PackId) -> PackId {
@@ -427,11 +451,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             pack: deferred.pack,
             index: deferred.index,
         });
-        if let Some(cell) = self.open_cell(reg) {
-            self.emitted.push(ir::Instr::StoreCell { cell, value: out });
-        } else {
-            self.ssa.write_reg(self.block, reg, out);
-        }
+        self.write_reg(reg, out);
         Some(out)
     }
 
@@ -449,21 +469,68 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
         }
     }
 
-    /// Reads one register and emits a cell load when its storage is captured.
+    /// Associates a read value with the declaration active at this instruction.
+    fn record_debug_read(&mut self, reg: u8, value: ValueId) {
+        if let Some(pc) = self.current_pc()
+            && let Some(index) = self.function.proto.local_index_at(reg, pc)
+        {
+            self.bindings[index].values.push(value);
+        }
+    }
+
+    /// Associates a written value with the declaration visible after this instruction.
+    fn record_debug_write(&mut self, reg: u8, value: ValueId) {
+        if let Some(pc) = self.current_pc()
+            && let Some(index) = self.function.proto.local_index_after(reg, pc)
+        {
+            self.bindings[index].values.push(value);
+        }
+    }
+
+    /// Associates a read cell with the declaration active at this instruction.
+    fn record_debug_cell_read(&mut self, reg: u8, cell: CellId) {
+        if let Some(pc) = self.current_pc()
+            && let Some(index) = self.function.proto.local_index_at(reg, pc)
+        {
+            self.bindings[index].cells.push(cell);
+        }
+    }
+
+    /// Associates a written cell with the declaration visible after this instruction.
+    fn record_debug_cell_write(&mut self, reg: u8, cell: CellId) {
+        if let Some(pc) = self.current_pc()
+            && let Some(index) = self.function.proto.local_index_after(reg, pc)
+        {
+            self.bindings[index].cells.push(cell);
+        }
+    }
+
+    /// Reads a register and emits a cell load when its storage is captured.
     #[inline]
     fn read_reg(&mut self, reg: u8) -> ValueId {
         if let Some(value) = self.materialize_deferred(reg) {
+            self.record_debug_read(reg, value);
             return value;
         }
 
-        match self.open_cell(reg) {
+        let value = match self.open_cell(reg) {
             Some(cell) => {
+                self.record_debug_cell_read(reg, cell);
                 let out = self.value();
                 self.emitted.push(ir::Instr::LoadCell { out, cell });
                 out
             }
             None => self.ssa.read_reg(self.block, reg),
-        }
+        };
+        self.record_debug_read(reg, value);
+        value
+    }
+
+    /// Reads a register version from another block.
+    fn read_reg_in(&mut self, block: usize, reg: u8) -> ValueId {
+        let value = self.ssa.read_reg(block, reg);
+        self.record_debug_read(reg, value);
+        value
     }
 
     /// Reads a fixed register range in order.
@@ -475,12 +542,16 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             .collect()
     }
 
-    /// Defines one register from an already emitted immutable value.
+    /// Defines a register from an already emitted immutable value.
     #[inline]
     fn write_reg(&mut self, reg: u8, value: ValueId) {
         self.deferred[reg as usize] = None;
+        self.record_debug_write(reg, value);
         match self.open_cell(reg) {
-            Some(cell) => self.emitted.push(ir::Instr::StoreCell { cell, value }),
+            Some(cell) => {
+                self.record_debug_cell_write(reg, cell);
+                self.emitted.push(ir::Instr::StoreCell { cell, value });
+            }
             None => self.ssa.write_reg(self.block, reg, value),
         }
     }
@@ -563,6 +634,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
                 format!("reference capture has no cell for R{reg} generation {generation}")
             })?;
         self.capture_state.open(reg);
+        self.record_debug_cell_read(reg, cell);
         self.emitted.push(ir::Instr::OpenCell { cell, value });
         Ok(cell)
     }
@@ -576,6 +648,8 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             self.materialize_deferred(reg);
             let value = self.value();
             self.emitted.push(ir::Instr::LoadCell { out: value, cell });
+            self.record_debug_cell_read(reg, cell);
+            self.record_debug_read(reg, value);
             self.ssa.write_reg(self.block, reg, value);
         }
 
@@ -1317,7 +1391,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
                 let end = self.read_reg(*base);
                 let step = self.read_reg(reg_add(*base, 1));
                 self.apply_exit_writes(raw, &mut outputs);
-                let variable = self.ssa.read_reg(*body_block, reg_add(*base, 2));
+                let variable = self.read_reg_in(*body_block, reg_add(*base, 2));
                 BlockExit::NumericFor {
                     body_edge: Edge::empty(*body_block),
                     exit_edge: Edge::empty(*exit_block),
@@ -1354,7 +1428,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
                 let variables = raw
                     .exit_writes
                     .iter()
-                    .map(|reg| self.ssa.read_reg(*body_block, *reg))
+                    .map(|reg| self.read_reg_in(*body_block, *reg))
                     .collect();
                 BlockExit::GenericFor {
                     body_edge: Edge::empty(*body_block),
@@ -1374,7 +1448,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
                 let variables = (0..*result_count)
                     .map(|index| {
                         let reg = reg_add(reg_add(*base, 3), index as u8);
-                        self.ssa.read_reg(*body_block, reg)
+                        self.read_reg_in(*body_block, reg)
                     })
                     .collect();
                 BlockExit::GenericForLoop {
@@ -1402,7 +1476,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     fn apply_exit_writes(&mut self, raw: &RawBlock, outputs: &mut Vec<ValueId>) {
         for &reg in &raw.exit_writes {
             let value = self.value();
-            self.ssa.write_reg(self.block, reg, value);
+            self.write_reg(reg, value);
             outputs.push(value);
         }
     }
@@ -1705,20 +1779,105 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
         .collect()
 }
 
-/// Lifts every proto in one disassembled chunk into flat IR.
-#[inline]
-pub(crate) fn lift(chunk: &Chunk) -> Result<Vec<Function>> {
-    let functions = chunk
-        .protos
+/// Resolves one proto's debug strings from its disassembled chunk.
+fn resolve_debug(proto: &Proto, chunk: &Chunk) -> Result<Debug> {
+    let name = proto
+        .debug_name
+        .map(|name| {
+            chunk
+                .get_string(name)
+                .with_context(|| format!("missing debug name string {}", name.0))
+        })
+        .transpose()?;
+    let locals = proto
+        .locals
         .iter()
-        .map(|proto| {
-            let raw_blocks = reachable_raw_blocks(proto)?;
-            let cfg = ControlFlowGraph::from_nodes_and_exits(raw_blocks.into_iter().map(|block| {
-                let targets = block.exit.targets();
-                (block, targets)
-            }));
-            FunctionLifter::new(proto, chunk, cfg)?.lift()
+        .map(|local| {
+            Ok(DebugLocal {
+                name: chunk
+                    .get_string(local.name)
+                    .with_context(|| format!("missing local name string {}", local.name.0))?,
+                register: local.register,
+                start_pc: local.start_pc,
+                end_pc: local.end_pc,
+            })
         })
         .collect::<Result<_>>()?;
-    Ok(functions)
+    let upvalues = proto
+        .upvalue_names
+        .iter()
+        .map(|name| {
+            name.map(|name| {
+                chunk
+                    .get_string(name)
+                    .with_context(|| format!("missing upvalue name string {}", name.0))
+            })
+            .transpose()
+        })
+        .collect::<Result<_>>()?;
+
+    Ok(Debug {
+        name,
+        locals,
+        upvalues,
+    })
+}
+
+/// Mutable state for lifting a [`Chunk`].
+struct UnitLifter {
+    chunk: Chunk,
+}
+
+impl UnitLifter {
+    fn new(chunk: Chunk) -> Self {
+        Self { chunk }
+    }
+
+    fn lift(mut self) -> Result<Unit<Function>> {
+        let functions = self.lift_functions()?;
+        let userdata_names = self.take_userdata_names();
+
+        Ok(Unit::from_vec(
+            self.chunk.entry_proto,
+            functions,
+            userdata_names,
+        ))
+    }
+
+    fn lift_functions(&mut self) -> Result<Vec<Function>> {
+        let mut functions = Vec::with_capacity(self.chunk.protos.len());
+        for index in 0..self.chunk.protos.len() {
+            let proto = &mut self.chunk.protos[index];
+            let type_info = std::mem::take(&mut proto.type_info);
+            functions.push(self.lift_function(index, type_info)?);
+        }
+        Ok(functions)
+    }
+
+    fn lift_function(&self, index: usize, type_info: ProtoTypeInfo) -> Result<Function> {
+        let proto = &self.chunk.protos[index];
+        let raw_blocks = reachable_raw_blocks(proto)?;
+        let cfg = ControlFlowGraph::from_nodes_and_exits(raw_blocks.into_iter().map(|block| {
+            let targets = block.exit.targets();
+            (block, targets)
+        }));
+        FunctionLifter::new(proto, &self.chunk, cfg)?.lift(type_info)
+    }
+
+    fn take_userdata_names(&mut self) -> Option<Vec<UserdataTypeMapping>> {
+        self.chunk.userdata_type_mappings.take().map(|names| {
+            names
+                .into_iter()
+                .map(|mapping| UserdataTypeMapping {
+                    index: mapping.index,
+                    name: mapping.name.and_then(|id| self.chunk.get_string(id)),
+                })
+                .collect()
+        })
+    }
+}
+
+/// Lifts every proto in one disassembled chunk into a flat IR unit.
+pub(crate) fn lift(chunk: Chunk) -> Result<Unit<Function>> {
+    UnitLifter::new(chunk).lift()
 }

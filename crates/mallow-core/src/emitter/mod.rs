@@ -13,43 +13,40 @@ use storage::Storage;
 use crate::ast::Identifier;
 use crate::common::is_valid_luau_identifier;
 use crate::il::ProtoId;
+use crate::ir::Unit;
 use crate::ir::fir::{CellId, Constant, Number};
 use crate::ir::nir;
 use crate::operator::{BinOp, CompoundBinOp};
 use crate::{DecompileOptions, ast};
 
 /// Emits a materialized NIR program with the default naming policy.
-pub(crate) fn emit_ast(
-    functions: Vec<nir::Function>,
-    entry: ProtoId,
-    options: DecompileOptions,
-) -> Result<ast::Block> {
-    emit_ast_with_namer(functions, entry, options, PlainNamer::default())
+pub(crate) fn emit_ast(unit: Unit<nir::Function>, options: DecompileOptions) -> Result<ast::Block> {
+    emit_ast_with_namer(unit, options, PlainNamer::default())
 }
 
 /// Emits a materialized NIR program with a caller-provided naming policy.
 pub(crate) fn emit_ast_with_namer<N: Namer>(
-    functions: Vec<nir::Function>,
-    entry: ProtoId,
+    unit: Unit<nir::Function>,
     options: DecompileOptions,
     mut namer: N,
 ) -> Result<ast::Block> {
+    let entry = unit.entry();
     let EmittedFunction { body, .. } =
-        emit_function(&functions, options, &mut namer, entry, HashMap::new())?;
+        emit_function(&unit, options, &mut namer, entry, HashMap::new())?;
     Ok(body)
 }
 
 /// Emits one function under the storage aliases supplied by its closure.
 fn emit_function<N: Namer>(
-    functions: &[nir::Function],
+    unit: &Unit<nir::Function>,
     options: DecompileOptions,
     namer: &mut N,
     id: ProtoId,
     inherited_cells: HashMap<CellId, Storage>,
 ) -> Result<EmittedFunction> {
-    let function = &functions[id.0 as usize];
+    let function = &unit[id];
     let plan = FunctionPlan::build(function, &inherited_cells, options.spill_locals, namer)?;
-    FunctionEmitter::new(functions, options, namer, function, plan).emit()
+    FunctionEmitter::new(unit, options, namer, function, plan).emit()
 }
 
 /// AST parts produced for one function prototype.
@@ -69,7 +66,7 @@ enum ExprContext {
 
 /// Lowers one fully planned NIR function into AST nodes.
 struct FunctionEmitter<'f, 'n, N: Namer> {
-    functions: &'f [nir::Function],
+    unit: &'f Unit<nir::Function>,
     options: DecompileOptions,
     namer: &'n mut N,
     function: &'f nir::Function,
@@ -82,14 +79,14 @@ struct FunctionEmitter<'f, 'n, N: Namer> {
 impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
     /// Creates one mechanical function lowerer.
     fn new(
-        functions: &'f [nir::Function],
+        unit: &'f Unit<nir::Function>,
         options: DecompileOptions,
         namer: &'n mut N,
         function: &'f nir::Function,
         plan: FunctionPlan,
     ) -> Self {
         Self {
-            functions,
+            unit,
             options,
             namer,
             function,
@@ -662,7 +659,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
 
     /// Lowers one closure and maps positional captures to child upvalue cells.
     fn lower_closure(&mut self, proto: ProtoId, captures: &[nir::Capture]) -> Result<ast::Expr> {
-        let child_upvalues = &self.functions[proto.0 as usize].upvalues;
+        let child_upvalues = &self.unit[proto].upvalues;
         ensure!(
             child_upvalues.len() == captures.len(),
             "closure capture count does not match child upvalues"
@@ -677,13 +674,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             inherited.insert(cell, storage);
         }
 
-        let child = emit_function(
-            self.functions,
-            self.options,
-            &mut *self.namer,
-            proto,
-            inherited,
-        )?;
+        let child = emit_function(self.unit, self.options, &mut *self.namer, proto, inherited)?;
         Ok(ast::Expr::AnonymousFunction {
             params: child.params,
             body: child.body,

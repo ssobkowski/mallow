@@ -135,10 +135,6 @@ struct DecompileArgs {
     #[arg(long)]
     spill_locals: bool,
 
-    /// Emit conservative decompiler-inferred type annotations
-    #[arg(long)]
-    infer_types: bool,
-
     /// Maximum number of cleanup pass iterations per function
     #[arg(
         long,
@@ -154,7 +150,6 @@ impl DecompileArgs {
         DecompileOptions {
             emit: self.emit.mode(),
             spill_locals: self.spill_locals,
-            infer_types: self.infer_types,
             max_pass_iterations: self.max_pass_iterations,
         }
     }

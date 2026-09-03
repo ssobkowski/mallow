@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
+use crate::Unit;
 use crate::ir::fir::{Block, BlockExit, Edge as FirEdge, Function, ValueId};
 use crate::ir::graph::{DominatorTree, GraphView};
 
@@ -306,20 +307,19 @@ fn add_edge<G: GraphView<Node = usize>>(
     });
 }
 
-pub fn dump_cfgs(functions: &[Function], selected_index: usize, output: PathBuf) {
-    let payloads: Vec<_> = functions
-        .iter()
-        .map(|function| graph_payload(function, &format!("Proto {}", function.id.0)))
+pub fn dump_cfgs(unit: &Unit<Function>, output: PathBuf) {
+    let payloads: Vec<_> = unit
+        .functions()
+        .map(|function| graph_payload(&function, &format!("Proto {}", function.id.0)))
         .collect();
 
-    let selected_index = selected_index.min(payloads.len().saturating_sub(1));
-    let title = payloads.get(selected_index).map_or_else(
+    let title = payloads.get(unit.entry().0 as usize).map_or_else(
         || "CFG".to_owned(),
         |payload| format!("CFG: {}", payload.tag),
     );
 
     let graphs_json = build_graphs_json(&payloads);
-    let html = build_html(&graphs_json, selected_index, &title);
+    let html = build_html(&graphs_json, unit.entry().0 as usize, &title);
 
     std::fs::write(&output, &html).expect("failed to write cfg html");
 }

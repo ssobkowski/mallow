@@ -5,6 +5,8 @@ use std::hash::Hash;
 use id_arena::Id;
 use smol_str::SmolStr;
 
+use crate::common::ByteString;
+
 /// Stable identity for one canonical type node.
 pub type TypeId = Id<Type>;
 
@@ -148,20 +150,20 @@ pub enum RuntimeKind {
     Function,
 }
 
-/// A singleton value represented by a HIL type node.
+/// A singleton value represented by a canonical type node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeLiteral {
-    /// One exact string value.
-    String(String),
+    /// One exact byte string value.
+    String(ByteString),
     /// One exact boolean value.
     Boolean(bool),
 }
 
-/// One node in the canonical HIL type graph.
+/// One node in the canonical type graph.
 ///
 /// Every recursive edge is an ID. Nodes therefore have one owner and one
 /// canonical identity, while graph construction remains centralized in
-/// [`crate::hil::ty::store::TypeStore`].
+/// [`crate::ty::store::TypeStore`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// The empty type and lattice bottom.

@@ -1,1009 +1,896 @@
-//! Lowering from lifted SSA HIL to immutable inference relations.
+//! Lowering from FIR to immutable inference constraints.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::captures::CaptureResolver;
-use super::keys::{ObjectKey, PackKey, ValueKey};
-use super::program::{InferenceProgram, PackRelation, ValueRelation};
-use crate::hil::cflow::cfg::{Block, BlockExit, ControlFlowGraph};
-use crate::hil::cflow::graph::GraphView as _;
-use crate::hil::ir::{Capture, CellId, Expr, Stmt, TableItem, ValuePack};
-use crate::hil::lifted::LiftedFunction;
-use crate::hil::lifter::ssa::SymbolId;
-use crate::hil::ty::builtins::{BuiltinEnvironment, BuiltinPath};
-use crate::hil::ty::canonical::{PrimitiveIds, TypeId};
-use crate::hil::ty::inference::keys::BranchPredicate;
-use crate::hil::visitor::{Visitor, walk_block_exit, walk_expr};
+use super::TypeStore;
+use super::keys::{BranchPredicate, ObjectKey, PackKey, ValueKey};
+use super::program::{Constraint, InferenceProgram};
+use crate::il::ProtoId;
+use crate::ir::Unit;
+use crate::ir::fir::{
+    BlockExit, Capture, CellId, Constant, Edge, Function, Instr, Number, PackId, ValueId,
+};
+use crate::ir::graph::GraphView as _;
+use crate::operator::BinOp;
+use crate::ty::canonical::{TypeId, TypeLiteral};
 
-/// Lowers all lifted functions into one whole-program relation graph.
-pub fn lower_functions(
-    functions: &[LiftedFunction],
-    builtins: &BuiltinEnvironment,
-    primitives: &PrimitiveIds,
-) -> InferenceProgram {
+/// Lowers all FIR functions into one whole-program constraint set.
+pub fn lower_functions(unit: &Unit<Function>, store: &mut TypeStore) -> InferenceProgram {
+    let cell_facts = CellFacts::analyze(unit);
     let mut program = InferenceProgram::default();
-    let captures = CaptureResolver::new(functions);
-    for function in functions {
-        FunctionLowerer::new(
-            function,
-            functions,
-            &captures,
-            builtins,
-            primitives,
-            &mut program,
-        )
-        .lower();
+    for function in unit.functions() {
+        FunctionLowerer::new(function, unit, &cell_facts, store, &mut program).lower();
     }
     program
 }
 
-/// Proto-local allocator and relation writer.
-struct FunctionLowerer<'a> {
-    function: &'a LiftedFunction,
-    functions: &'a [LiftedFunction],
-    builtins: &'a BuiltinEnvironment,
-    primitives: &'a PrimitiveIds,
-    program: &'a mut InferenceProgram,
-
+/// Coordinates FIR traversal and constraint writing for a function.
+struct FunctionLowerer<'u, 's, 'p> {
+    /// Immutable FIR source.
+    source: FunctionSource<'u>,
+    /// Facts known at each block entry.
     branch_facts: BranchFacts,
-    next_value: u32,
-    next_pack: u32,
-    next_object: u32,
-    has_return: bool,
+    /// Mutable constraint writer.
+    writer: ConstraintWriter<'s, 'p>,
 }
 
-impl<'a> FunctionLowerer<'a> {
+impl<'u, 's, 'p> FunctionLowerer<'u, 's, 'p> {
+    /// Creates a lowerer for a function.
     fn new(
-        function: &'a LiftedFunction,
-        functions: &'a [LiftedFunction],
-        captures: &'a CaptureResolver,
-        builtins: &'a BuiltinEnvironment,
-        primitives: &'a PrimitiveIds,
-        program: &'a mut InferenceProgram,
+        function: &'u Function,
+        unit: &'u Unit<Function>,
+        cell_facts: &CellFacts,
+        store: &'s mut TypeStore,
+        program: &'p mut InferenceProgram,
     ) -> Self {
         Self {
-            function,
-            functions,
-            builtins,
-            primitives,
-            program,
-            branch_facts: BranchFacts::analyze(function, captures),
-            next_value: 0,
-            next_pack: 0,
-            next_object: 0,
-            has_return: false,
+            source: FunctionSource { function, unit },
+            branch_facts: BranchFacts::analyze(function, cell_facts),
+            writer: ConstraintWriter {
+                store,
+                program,
+                next_value: 0,
+                next_pack: 0,
+            },
         }
     }
 
-    /// Lowers one function body into the shared program.
-    fn lower(mut self) {
-        self.program.touch_pack(self.return_pack());
-        if self.function.is_vararg {
-            self.program.touch_pack(self.vararg_pack());
-        }
-        for parameter in self.function.symbols.params() {
-            self.program.touch_value(self.symbol_value(*parameter));
-        }
-        for upvalue in self.function.symbols.upvalue_cells() {
-            self.program.touch_value(self.cell_value(*upvalue));
-        }
+    /// Lowers the complete function.
+    fn lower(self) {
+        let Self {
+            source,
+            branch_facts,
+            mut writer,
+        } = self;
 
-        for i in 0..self.function.cfg.len() {
-            if !self.branch_facts.is_reachable(i) {
+        writer.touch_owned_keys(source);
+        writer.lower_entry(source);
+
+        for block_index in source.function.cfg.nodes() {
+            if !branch_facts.is_reachable(block_index) {
                 continue;
             }
 
-            let state = self.branch_facts.incoming(i).clone();
-            BlockLowerer {
-                flw: &mut self,
-                block: i,
-                state,
+            let state = branch_facts.incoming(block_index);
+            let block = &source.function.cfg[block_index];
+            for instruction in &block.instrs {
+                writer.lower_instruction(source, block_index, state, instruction);
             }
-            .lower();
-        }
-
-        // TODO: This seems too defensive? No return pack = no return. Only a case for genuinely infinite loop functions.
-        if !self.has_return {
-            self.program.push_pack(
-                self.return_pack(),
-                PackRelation::Sequence {
-                    head: Vec::new(),
-                    tail: None,
-                },
+            writer.lower_exit(
+                source,
+                block_index,
+                state,
+                branch_facts.aliases(),
+                &block.exit,
             );
         }
     }
+}
 
-    /// Returns the key for a symbol in the current proto.
-    fn symbol_value(&self, symbol: SymbolId) -> ValueKey {
-        ValueKey::Symbol(self.function.proto, symbol)
+/// Immutable FIR data used while lowering a function.
+#[derive(Clone, Copy)]
+struct FunctionSource<'u> {
+    /// Function being lowered.
+    function: &'u Function,
+    /// Unit containing the function and its children.
+    unit: &'u Unit<Function>,
+}
+
+impl FunctionSource<'_> {
+    /// Returns the function identity.
+    fn id(self) -> ProtoId {
+        self.function.id
     }
 
-    /// Returns the key for a mutable cell in the current proto.
-    fn cell_value(&self, cell: CellId) -> ValueKey {
-        ValueKey::Cell(self.function.proto, cell)
+    /// Returns a scalar key owned by this function.
+    fn value_key(self, value: ValueId) -> ValueKey {
+        ValueKey::Value(self.id(), value)
     }
 
-    /// Allocates a temporary scalar value.
-    fn temp_value(&mut self) -> ValueKey {
-        let value = ValueKey::Temp(self.function.proto, self.next_value);
-        self.next_value = self
-            .next_value
-            .checked_add(1)
-            .expect("one proto exhausted temporary value IDs");
-        self.program.touch_value(value);
-        value
+    /// Returns a pack key owned by this function.
+    fn pack_key(self, pack: PackId) -> PackKey {
+        PackKey::Pack(self.id(), pack)
     }
 
-    /// Allocates a temporary pack.
-    fn temp_pack(&mut self) -> PackKey {
-        let pack = PackKey::Temp(self.function.proto, self.next_pack);
-        self.next_pack = self
-            .next_pack
-            .checked_add(1)
-            .expect("one proto exhausted temporary pack IDs");
-        self.program.touch_pack(pack);
-        pack
-    }
-
-    /// Allocates a table object key.
-    fn object_key(&mut self) -> ObjectKey {
-        let key = ObjectKey {
-            proto: self.function.proto,
-            index: self.next_object,
-        };
-        self.next_object = self
-            .next_object
-            .checked_add(1)
-            .expect("one proto exhausted object keys");
-        key
-    }
-
-    /// Returns the current function's vararg pack.
-    fn vararg_pack(&self) -> PackKey {
-        PackKey::VarArgs(self.function.proto)
-    }
-
-    /// Returns the current function's return pack.
-    fn return_pack(&self) -> PackKey {
-        PackKey::Returns(self.function.proto)
-    }
-
-    /// Creates a scalar projection from one pack.
-    fn project_pack(&mut self, pack: PackKey, index: usize) -> ValueKey {
-        let value = self.temp_value();
-        self.program
-            .push_value(value, ValueRelation::FromPack { pack, index });
-        value
-    }
-
-    /// Creates a temporary that produces one known type.
-    fn produced_temp(&mut self, ty: TypeId) -> ValueKey {
-        let value = self.temp_value();
-        self.program.push_value(value, ValueRelation::Produce(ty));
-        value
+    /// Returns a cell key owned by this function.
+    fn cell_key(self, cell: CellId) -> ValueKey {
+        ValueKey::Cell(self.id(), cell)
     }
 }
 
-/// Block-local allocator and relation writer.
-struct BlockLowerer<'a, 'f> {
-    flw: &'a mut FunctionLowerer<'f>,
-    block: usize,
-    /// Branch facts at the current point in the block.
-    state: BlockState,
+/// Mutable state used to write inference constraints.
+struct ConstraintWriter<'s, 'p> {
+    /// Canonical types shared by this inference run.
+    store: &'s mut TypeStore,
+    /// Whole-program constraint set being built.
+    program: &'p mut InferenceProgram,
+    /// Next scalar identity for a fused FIR operation.
+    next_value: u32,
+    /// Next pack identity for a fused FIR operation.
+    next_pack: u32,
 }
 
-impl BlockLowerer<'_, '_> {
-    fn lower(mut self) {
-        let block = self.flw.function.cfg.get(self.block);
-        for stmt in block.stmts() {
-            self.lower_statement(stmt);
+impl ConstraintWriter<'_, '_> {
+    /// Creates keys for all FIR-owned identities and function interface packs.
+    fn touch_owned_keys(&mut self, src: FunctionSource<'_>) {
+        for (value, _) in src.function.values.iter() {
+            self.program.touch_value(src.value_key(value));
         }
-        self.lower_exit(block.exit());
+        for (pack, _) in src.function.packs.iter() {
+            self.program.touch_pack(src.pack_key(pack));
+        }
+        for (cell, _) in src.function.cells.iter() {
+            self.program.touch_value(src.cell_key(cell));
+        }
+
+        self.program.touch_pack(PackKey::Returns(src.id()));
+        if src.function.is_vararg {
+            self.program.touch_pack(PackKey::VarArgs(src.id()));
+        }
     }
 
-    /// Lowers one statement.
-    fn lower_statement(&mut self, statement: &Stmt) {
-        match statement {
-            Stmt::Assign { left, value } => {
-                let value = self.lower_expr(value);
-                self.assign_lvalue(left, value);
+    /// Connects entry-edge arguments to the FIR entry block parameters.
+    fn lower_entry(&mut self, src: FunctionSource<'_>) {
+        let target = &src.function.cfg[src.function.entry.target];
+        for (&source, &target) in src.function.entry.params.iter().zip(&target.params) {
+            self.program.push(Constraint::Flow {
+                source: src.value_key(source),
+                target: src.value_key(target),
+            });
+        }
+    }
+
+    /// Lowers a flat FIR instruction.
+    fn lower_instruction(
+        &mut self,
+        src: FunctionSource<'_>,
+        block: usize,
+        state: &BlockState,
+        instruction: &Instr,
+    ) {
+        match instruction {
+            Instr::Const { out, value } => {
+                let ty = self.constant_type(value);
+                self.program.push(Constraint::Produce {
+                    value: src.value_key(*out),
+                    ty,
+                });
             }
-            Stmt::AssignMany { left, values } => {
-                let values = self.lower_value_pack(values);
-                for (index, lvalue) in left.iter().enumerate() {
-                    let value = self.flw.project_pack(values, index);
-                    self.assign_lvalue(lvalue, value);
+            Instr::Copy { out, value } => {
+                let source = self.used_value(src, block, state, *value);
+                self.program.push(Constraint::Flow {
+                    source,
+                    target: src.value_key(*out),
+                });
+            }
+            Instr::Closure {
+                out,
+                proto,
+                captures,
+            } => self.lower_closure(src, block, state, *out, *proto, captures),
+            Instr::GetTable { out, table, key } => {
+                let table = self.used_value(src, block, state, *table);
+                let key = self.used_value(src, block, state, *key);
+                self.program.push(Constraint::GetTable {
+                    table,
+                    key,
+                    output: src.value_key(*out),
+                });
+            }
+            Instr::SetTable { table, key, value } => {
+                let table = self.used_value(src, block, state, *table);
+                let key = self.used_value(src, block, state, *key);
+                let value = self.used_value(src, block, state, *value);
+                self.program
+                    .push(Constraint::SetTable { table, key, value });
+            }
+            Instr::GetGlobal { out, name } => {
+                let global = ValueKey::Global(name.clone());
+                if let Some(ty) = self.store.builtin(name) {
+                    self.program.push(Constraint::Produce {
+                        value: global.clone(),
+                        ty,
+                    });
                 }
+                self.program.push(Constraint::Flow {
+                    source: global,
+                    target: src.value_key(*out),
+                });
             }
-            Stmt::SetList { table, values, .. } => {
-                let object = self.flw.symbol_value(*table);
-                let values = self.lower_value_pack(values);
-                let aggregate = self.flw.temp_value();
-                self.flw
-                    .program
-                    .push_value(aggregate, ValueRelation::FromPackValues { pack: values });
-                let index = self.flw.temp_value();
-                self.flw
-                    .program
-                    .push_value(index, ValueRelation::Produce(self.flw.primitives.number));
-                self.flw.program.push_value(
-                    object,
-                    ValueRelation::WriteIndex {
-                        index,
-                        value: aggregate,
+            Instr::SetGlobal { name, value } => {
+                let value = self.used_value(src, block, state, *value);
+                self.program.push(Constraint::Flow {
+                    source: value,
+                    target: ValueKey::Global(name.clone()),
+                });
+            }
+            Instr::Binary { out, lhs, op, rhs } => {
+                let lhs = self.used_value(src, block, state, *lhs);
+                let rhs = self.used_value(src, block, state, *rhs);
+                self.program.push(Constraint::Binary {
+                    lhs,
+                    op: *op,
+                    rhs,
+                    output: src.value_key(*out),
+                });
+            }
+            Instr::Unary { out, op, value } => {
+                let value = self.used_value(src, block, state, *value);
+                self.program.push(Constraint::Unary {
+                    operand: value,
+                    op: *op,
+                    output: src.value_key(*out),
+                });
+            }
+            Instr::Concat { out, operands } => {
+                self.lower_concat(src, block, state, *out, operands);
+            }
+            Instr::Select {
+                out,
+                condition,
+                then_value,
+                else_value,
+            } => {
+                let _ = self.used_value(src, block, state, *condition);
+                let then_value = self.used_value(src, block, state, *then_value);
+                let else_value = self.used_value(src, block, state, *else_value);
+                let output = src.value_key(*out);
+                self.program.push(Constraint::Flow {
+                    source: then_value,
+                    target: output.clone(),
+                });
+                self.program.push(Constraint::Flow {
+                    source: else_value,
+                    target: output,
+                });
+            }
+            Instr::NewTable { out } => {
+                self.program.push(Constraint::IncludeObject {
+                    value: src.value_key(*out),
+                    object: ObjectKey {
+                        proto: src.id(),
+                        value: *out,
                     },
-                );
+                });
             }
-            Stmt::Call(call) => {
-                self.lower_call(call);
+            Instr::MakePack { out, head, tail } => {
+                let head = head
+                    .iter()
+                    .map(|value| self.used_value(src, block, state, *value))
+                    .collect();
+                self.program.push(Constraint::Sequence {
+                    pack: src.pack_key(*out),
+                    head,
+                    tail: tail.map(|pack| src.pack_key(pack)),
+                });
             }
-            Stmt::OpenCell { cell, value } | Stmt::StoreCell { cell, value } => {
-                let value = self.lower_expr(value);
-                self.flw
-                    .program
-                    .push_value(self.flw.cell_value(*cell), ValueRelation::FlowFrom(value));
+            Instr::Project { out, pack, index } => {
+                self.program.push(Constraint::ProjectPack {
+                    pack: src.pack_key(*pack),
+                    index: *index,
+                    output: src.value_key(*out),
+                });
             }
-            Stmt::LoadCell { target, cell } => {
-                self.flw.program.push_value(
-                    self.flw.symbol_value(*target),
-                    ValueRelation::FlowFrom(self.flw.cell_value(*cell)),
-                );
+            Instr::Call {
+                out,
+                function,
+                args,
+            } => {
+                let function = self.used_value(src, block, state, *function);
+                self.program.push(Constraint::Call {
+                    callee: function,
+                    args: src.pack_key(*args),
+                    returns: src.pack_key(*out),
+                });
             }
-            Stmt::Phi(phi) => {
-                let target = self.flw.symbol_value(phi.target);
-                for (_, operand) in &phi.operands {
-                    let operand = self.flw.symbol_value(*operand);
-                    self.flw
-                        .program
-                        .push_value(target, ValueRelation::FlowFrom(operand));
-                }
-            }
-        }
-    }
-
-    /// Assigns a lowered value to one lvalue expression.
-    fn assign_lvalue(&mut self, lvalue: &Expr, value: ValueKey) {
-        match lvalue {
-            Expr::Symbol(symbol) => {
-                let target = self.flw.symbol_value(*symbol);
-                if matches!(value, ValueKey::Symbol(_, _)) {
-                    self.flw
-                        .program
-                        .push_value(target, ValueRelation::SameAs(value));
-                } else {
-                    self.flw
-                        .program
-                        .push_value(target, ValueRelation::FlowFrom(value));
-                }
-            }
-            Expr::GetField { obj, field } => {
-                let object = self.lower_expr(obj);
-                self.flw.program.push_value(
-                    object,
-                    ValueRelation::WriteField {
-                        field: field.clone(),
-                        value,
-                        definite: false,
-                    },
-                );
-            }
-            Expr::GetIndex { obj, index } => {
-                let object = self.lower_expr(obj);
-                let index = self.lower_expr(index);
-                self.flw
-                    .program
-                    .push_value(object, ValueRelation::WriteIndex { index, value });
-            }
-            _ => {
-                let target = self.lower_expr(lvalue);
-                self.flw
-                    .program
-                    .push_value(target, ValueRelation::FlowFrom(value));
-            }
-        }
-    }
-
-    /// Lowers one expression list.
-    fn lower_value_pack(&mut self, values: &ValuePack) -> PackKey {
-        let head = values
-            .head()
-            .iter()
-            .map(|value| self.lower_expr(value))
-            .collect();
-        let tail = values.tail().map(|value| self.lower_expr_pack(value));
-        let pack = self.flw.temp_pack();
-        self.flw
-            .program
-            .push_pack(pack, PackRelation::Sequence { head, tail });
-        pack
-    }
-
-    /// Lowers one expression in multivalue context.
-    fn lower_expr_pack(&mut self, expression: &Expr) -> PackKey {
-        match expression {
-            Expr::Call { .. } | Expr::MethodCall { .. } => self.lower_call(expression),
-            Expr::VarArgs => self.flw.vararg_pack(),
-            _ => {
-                let value = self.lower_expr(expression);
-                let pack = self.flw.temp_pack();
-                self.flw.program.push_pack(
-                    pack,
-                    PackRelation::Sequence {
-                        head: vec![value],
-                        tail: None,
-                    },
-                );
-                pack
-            }
-        }
-    }
-
-    /// Lowers one call expression and returns its result pack.
-    fn lower_call(&mut self, expression: &Expr) -> PackKey {
-        let returns = self.flw.temp_pack();
-        match expression {
-            Expr::Call { fun, args } => {
-                let callee = self.lower_expr(fun);
-                let args = self.lower_value_pack(args);
-                self.flw
-                    .program
-                    .push_value(callee, ValueRelation::Call { args, returns });
-            }
-            Expr::MethodCall {
+            Instr::MethodCall {
+                out,
                 object,
                 method,
                 args,
             } => {
-                let object = self.lower_expr(object);
-                let callee = self.flw.temp_value();
-                self.flw.program.push_value(
-                    object,
-                    ValueRelation::ReadField {
-                        field: method.clone(),
-                        output: callee,
-                    },
-                );
-                let user_args = self.lower_value_pack(args);
-                let args = self.flw.temp_pack();
-                self.flw.program.push_pack(
-                    args,
-                    PackRelation::Sequence {
-                        head: vec![object],
-                        tail: Some(user_args),
-                    },
-                );
-                self.flw
-                    .program
-                    .push_value(callee, ValueRelation::Call { args, returns });
-            }
-            _ => unreachable!("call lowering requires a call expression"),
-        }
-        self.state
-            .invalidate(&self.flw.branch_facts.mutable_indices);
-        returns
-    }
+                let object = self.used_value(src, block, state, *object);
+                let key = self.fresh_value(src.id());
+                let key_type = self
+                    .store
+                    .literal(TypeLiteral::String(method.clone().into()));
+                self.program.push(Constraint::Produce {
+                    value: key.clone(),
+                    ty: key_type,
+                });
 
-    /// Lowers one scalar expression.
-    fn lower_expr(&mut self, expression: &Expr) -> ValueKey {
-        if let Some(path) = BuiltinPath::from_expr(expression)
-            && self.flw.builtins.get_path(&path).is_some()
-        {
-            let value = self.flw.temp_value();
-            self.flw
-                .program
-                .push_value(value, ValueRelation::Builtin(path));
-            return value;
-        }
+                let callee = self.fresh_value(src.id());
+                self.program.push(Constraint::GetTable {
+                    table: object.clone(),
+                    key,
+                    output: callee.clone(),
+                });
 
-        match expression {
-            Expr::Nil => self.flw.produced_temp(self.flw.primitives.nil),
-            Expr::Number(_) => self.flw.produced_temp(self.flw.primitives.number),
-            Expr::String(_) => self.flw.produced_temp(self.flw.primitives.string),
-            Expr::Bool(_) => self.flw.produced_temp(self.flw.primitives.boolean),
-            Expr::Symbol(sym) => match self.flw.branch_facts.predicate(&self.state, *sym) {
-                Some(predicate) => {
-                    let key = ValueKey::Occurrence(self.flw.function.proto, self.block, *sym);
-                    self.flw.program.push_value(
-                        key,
-                        ValueRelation::Filter {
-                            source: self.flw.symbol_value(*sym),
-                            predicate,
-                        },
-                    );
-                    key
-                }
-                None => self.flw.symbol_value(*sym),
-            },
-            Expr::Closure { proto, captures } => {
-                let value = self.flw.temp_value();
-                self.flw
-                    .program
-                    .push_value(value, ValueRelation::Closure(*proto));
-                let function = self
-                    .flw
-                    .functions
-                    .get(proto.0 as usize)
-                    .filter(|function| function.proto == *proto)
-                    .expect("closure proto must index its lifted function");
-                assert_eq!(
-                    captures.len(),
-                    function.symbols.upvalue_cells().len(),
-                    "closure captures must match child upvalues"
+                let call_args = self.fresh_pack(src.id());
+                self.program.push(Constraint::Sequence {
+                    pack: call_args,
+                    head: vec![object],
+                    tail: Some(src.pack_key(*args)),
+                });
+                self.program.push(Constraint::Call {
+                    callee,
+                    args: call_args,
+                    returns: src.pack_key(*out),
+                });
+            }
+            Instr::VarArgs { out } => {
+                assert!(
+                    src.function.is_vararg,
+                    "non-variadic function must not read variadic arguments"
                 );
-                for (&capture, &upvalue) in captures.iter().zip(function.symbols.upvalue_cells()) {
-                    let child = ValueKey::Cell(*proto, upvalue);
-                    let relation = match capture {
-                        Capture::Copy(symbol) => {
-                            ValueRelation::FlowFrom(self.lower_expr(&Expr::Symbol(symbol)))
-                        }
-                        Capture::Share(cell) => {
-                            ValueRelation::SameStorage(self.flw.cell_value(cell))
-                        }
-                    };
-                    self.flw.program.push_value(child, relation);
-                }
-                value
+                self.program.push(Constraint::Sequence {
+                    pack: src.pack_key(*out),
+                    head: Vec::new(),
+                    tail: Some(PackKey::VarArgs(src.id())),
+                });
             }
-            Expr::Global(_) => self.flw.temp_value(),
-            Expr::VarArgs => {
-                let pack = self.flw.vararg_pack();
-                self.flw.project_pack(pack, 0)
+            Instr::OpenCell { cell, value } | Instr::StoreCell { cell, value } => {
+                let value = self.used_value(src, block, state, *value);
+                self.program.push(Constraint::Flow {
+                    source: value,
+                    target: src.cell_key(*cell),
+                });
             }
-            Expr::Table { items } => {
-                let value = self.flw.temp_value();
-                let object = self.flw.object_key();
-                self.flw
-                    .program
-                    .push_value(value, ValueRelation::NewObject(object));
-                for item in items {
-                    match item {
-                        TableItem::List(values) => {
-                            let values = self.lower_value_pack(values);
-                            let aggregate = self.flw.temp_value();
-                            self.flw.program.push_value(
-                                aggregate,
-                                ValueRelation::FromPackValues { pack: values },
-                            );
-                            let index = self.flw.produced_temp(self.flw.primitives.number);
-                            self.flw.program.push_value(
-                                value,
-                                ValueRelation::WriteIndex {
-                                    index,
-                                    value: aggregate,
-                                },
-                            );
-                        }
-                        TableItem::Index(index @ Expr::String(field), item_value) => {
-                            let item_value = self.lower_expr(item_value);
-                            if let Some(field) = field.as_utf8() {
-                                self.flw.program.push_value(
-                                    value,
-                                    ValueRelation::WriteField {
-                                        field: field.into(),
-                                        value: item_value,
-                                        definite: true,
-                                    },
-                                );
-                            } else {
-                                let index = self.lower_expr(index);
-                                self.flw.program.push_value(
-                                    value,
-                                    ValueRelation::WriteIndex {
-                                        index,
-                                        value: item_value,
-                                    },
-                                );
-                            }
-                        }
-                        TableItem::Index(index, item_value) => {
-                            let index = self.lower_expr(index);
-                            let item_value = self.lower_expr(item_value);
-                            self.flw.program.push_value(
-                                value,
-                                ValueRelation::WriteIndex {
-                                    index,
-                                    value: item_value,
-                                },
-                            );
-                        }
-                    }
-                }
-                value
+            Instr::LoadCell { out, cell } => {
+                self.program.push(Constraint::Flow {
+                    source: src.cell_key(*cell),
+                    target: src.value_key(*out),
+                });
             }
-            Expr::Call { .. } | Expr::MethodCall { .. } => {
-                let returns = self.lower_call(expression);
-                self.flw.project_pack(returns, 0)
-            }
-            Expr::Binary { lhs, op, rhs } => {
-                let lhs = self.lower_expr(lhs);
-                let rhs = self.lower_expr(rhs);
-                let output = self.flw.temp_value();
-                self.flw.program.push_value(
-                    lhs,
-                    ValueRelation::Binary {
-                        op: *op,
-                        rhs,
-                        output,
-                    },
-                );
-                output
-            }
-            Expr::Unary { op, expr } => {
-                let operand = self.lower_expr(expr);
-                let output = self.flw.temp_value();
-                self.flw
-                    .program
-                    .push_value(operand, ValueRelation::Unary { op: *op, output });
-                output
-            }
-            Expr::GetField { obj, field } => {
-                let object = self.lower_expr(obj);
-                let output = self.flw.temp_value();
-                self.flw.program.push_value(
-                    object,
-                    ValueRelation::ReadField {
-                        field: field.clone(),
-                        output,
-                    },
-                );
-                output
-            }
-            Expr::GetIndex { obj, index } => {
-                let object = self.lower_expr(obj);
-                let index = self.lower_expr(index);
-                let output = self.flw.temp_value();
-                self.flw
-                    .program
-                    .push_value(object, ValueRelation::ReadIndex { index, output });
-                output
-            }
-            Expr::IfElse {
-                condition,
-                then_expr,
-                else_expr,
+            Instr::SetList {
+                table,
+                index: _,
+                values,
             } => {
-                self.lower_expr(condition);
-                let then_value = self.lower_expr(then_expr);
-                let else_value = self.lower_expr(else_expr);
-                let output = self.flw.temp_value();
-                self.flw
-                    .program
-                    .push_value(output, ValueRelation::FlowFrom(then_value));
-                self.flw
-                    .program
-                    .push_value(output, ValueRelation::FlowFrom(else_value));
-                output
+                let table = self.used_value(src, block, state, *table);
+                self.program.push(Constraint::WriteList {
+                    table,
+                    values: src.pack_key(*values),
+                });
             }
         }
     }
 
-    /// Lowers one CFG exit.
-    fn lower_exit(&mut self, exit: &BlockExit) {
+    /// Lowers closure identity and its explicit FIR captures.
+    fn lower_closure(
+        &mut self,
+        src: FunctionSource<'_>,
+        block: usize,
+        state: &BlockState,
+        out: ValueId,
+        proto: ProtoId,
+        captures: &[Capture],
+    ) {
+        self.program.push(Constraint::IncludeClosure {
+            value: src.value_key(out),
+            proto,
+        });
+
+        let child = &src.unit[proto];
+
+        for (&capture, &upvalue) in captures.iter().zip(&child.upvalues) {
+            let target = ValueKey::Cell(proto, upvalue);
+            match capture {
+                Capture::Copy(value) => {
+                    let source = self.used_value(src, block, state, value);
+                    self.program.push(Constraint::Flow { source, target });
+                }
+                Capture::Share(cell) => {
+                    let source = src.cell_key(cell);
+                    self.program.push(Constraint::Flow {
+                        source: source.clone(),
+                        target: target.clone(),
+                    });
+                    self.program.push(Constraint::Flow {
+                        source: target,
+                        target: source,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Lowers an FIR concat as its right-associative binary operations.
+    fn lower_concat(
+        &mut self,
+        src: FunctionSource<'_>,
+        block: usize,
+        state: &BlockState,
+        out: ValueId,
+        operands: &[ValueId],
+    ) {
+        // Lifter ensures there are at least two operands.
+        let mut rhs = self.used_value(src, block, state, operands[operands.len() - 1]);
+        for index in (0..operands.len() - 1).rev() {
+            let lhs = self.used_value(src, block, state, operands[index]);
+            let output = if index == 0 {
+                src.value_key(out)
+            } else {
+                self.fresh_value(src.id())
+            };
+            self.program.push(Constraint::Binary {
+                lhs,
+                op: BinOp::Concat,
+                rhs,
+                output: output.clone(),
+            });
+            rhs = output;
+        }
+    }
+
+    /// Lowers constraints and edges carried by a block exit.
+    fn lower_exit(
+        &mut self,
+        src: FunctionSource<'_>,
+        block: usize,
+        state: &BlockState,
+        aliases: &ValueAliases,
+        exit: &BlockExit,
+    ) {
         match exit {
-            BlockExit::CondJump { cond, .. } => {
-                self.lower_expr(cond);
+            BlockExit::Fallthrough(edge) | BlockExit::Jump(edge) => {
+                self.lower_edge(src, state, edge);
             }
-            BlockExit::Return(values) => {
-                self.flw.has_return = true;
-                let values = self.lower_value_pack(values);
-                self.flw.program.push_pack(
-                    self.flw.return_pack(),
-                    PackRelation::Sequence {
-                        head: Vec::new(),
-                        tail: Some(values),
-                    },
-                );
+            BlockExit::Branch {
+                condition,
+                then_edge,
+                else_edge,
+            } => {
+                let _ = self.used_value(src, block, state, *condition);
+                let then_state = state.with_predicate(*condition, BranchPredicate::Truthy, aliases);
+                let else_state = state.with_predicate(*condition, BranchPredicate::Falsy, aliases);
+                self.lower_edge(src, &then_state, then_edge);
+                self.lower_edge(src, &else_state, else_edge);
             }
-            BlockExit::FornPrep {
-                var,
+            BlockExit::NumericFor {
+                body_edge,
+                exit_edge,
+                variable,
                 start,
                 end,
                 step,
+            } => {
+                let number = self.store.primitives().number;
+                self.program.push(Constraint::Produce {
+                    value: src.value_key(*variable),
+                    ty: number,
+                });
+                for value in [*start, *end, *step] {
+                    let value = self.used_value(src, block, state, value);
+                    self.program.push(Constraint::Require { value, ty: number });
+                }
+                self.lower_edge(src, state, body_edge);
+                self.lower_edge(src, state, exit_edge);
+            }
+            BlockExit::NumericForLoop {
+                body_edge,
+                exit_edge,
+            }
+            | BlockExit::GenericForLoop {
+                body_edge,
+                exit_edge,
                 ..
             } => {
-                let variable = self.flw.symbol_value(*var);
-                self.flw
-                    .program
-                    .push_value(variable, ValueRelation::Produce(self.flw.primitives.number));
-                self.lower_expr(start);
-                self.lower_expr(end);
-                self.lower_expr(step);
+                self.lower_edge(src, state, body_edge);
+                self.lower_edge(src, state, exit_edge);
             }
-            BlockExit::ForgPrep { exprs, .. } => {
-                for expression in exprs {
-                    self.lower_expr(expression);
-                }
+            BlockExit::GenericFor {
+                body_edge,
+                variables,
+                values,
+                ..
+            } => {
+                self.lower_generic_for(src, block, state, variables, *values);
+                self.lower_edge(src, state, body_edge);
             }
-            BlockExit::ForgLoop { vars, .. } => {
-                for variable in vars {
-                    self.flw
-                        .program
-                        .touch_value(self.flw.symbol_value(*variable));
-                }
+            BlockExit::Return(values) => {
+                self.program.push(Constraint::Sequence {
+                    pack: PackKey::Returns(src.id()),
+                    head: Vec::new(),
+                    tail: Some(src.pack_key(*values)),
+                });
             }
-            BlockExit::FornLoop { .. } | BlockExit::Jump(_) | BlockExit::Fallthrough(_) => {}
         }
     }
-}
-/// Contains information about symbol branch refinements for a function.
-#[derive(Default)]
-struct BranchFacts {
-    map: SymbolMap,
-    incoming: Vec<BlockState>,
-    mutable_indices: Vec<usize>,
-}
 
-impl BranchFacts {
-    /// Analyzes the branch facts for the given function.
-    fn analyze(function: &LiftedFunction, captures: &CaptureResolver) -> Self {
-        let mutable_symbols = MutableSymbolCollector::collect(function, captures);
-        let map = SymbolMap::build(function, captures, &mutable_symbols);
+    /// Lowers the implicit iterator call represented by a generic-for exit.
+    fn lower_generic_for(
+        &mut self,
+        src: FunctionSource<'_>,
+        block: usize,
+        state: &BlockState,
+        variables: &[ValueId],
+        values: [ValueId; 3],
+    ) {
+        let iterator = self.used_value(src, block, state, values[0]);
+        let iterator_state = self.used_value(src, block, state, values[1]);
+        let control = self.used_value(src, block, state, values[2]);
+        let args = self.fresh_pack(src.id());
+        self.program.push(Constraint::Sequence {
+            pack: args,
+            head: vec![iterator_state, control],
+            tail: None,
+        });
 
-        let mut mutable_indices: Vec<_> = mutable_symbols
-            .into_iter()
-            .filter_map(|symbol| map.get(symbol))
-            .collect();
-        mutable_indices.sort_unstable();
-        mutable_indices.dedup();
+        let returns = self.fresh_pack(src.id());
+        self.program.push(Constraint::Call {
+            callee: iterator,
+            args,
+            returns,
+        });
+        for (index, &variable) in variables.iter().enumerate() {
+            self.program.push(Constraint::ProjectPack {
+                pack: returns,
+                index,
+                output: src.value_key(variable),
+            });
+        }
+    }
 
-        let mut facts = Self {
-            incoming: vec![BlockState::Unreachable; function.cfg.len()],
-            map,
-            mutable_indices,
+    /// Connects outgoing edge arguments to the target block parameters.
+    fn lower_edge(&mut self, src: FunctionSource<'_>, state: &BlockState, edge: &Edge) {
+        if matches!(state, BlockState::Unreachable) {
+            return;
+        }
+
+        let target = &src.function.cfg[edge.target];
+        for (&source, &target) in edge.params.iter().zip(&target.params) {
+            self.program.push(Constraint::Flow {
+                source: src.value_key(source),
+                target: src.value_key(target),
+            });
+        }
+    }
+
+    /// Returns the canonical type produced by a FIR constant.
+    fn constant_type(&mut self, value: &Constant) -> TypeId {
+        let primitives = self.store.primitives();
+        match value {
+            Constant::Nil => primitives.nil,
+            Constant::Number(Number::Integer(_)) => primitives.integer,
+            Constant::Number(Number::Float(_)) => primitives.number,
+            Constant::String(value) => self.store.literal(TypeLiteral::String(value.clone())),
+            Constant::Bool(value) => self.store.literal(TypeLiteral::Boolean(*value)),
+        }
+    }
+
+    /// Returns the branch-refined key used at a value occurrence.
+    fn used_value(
+        &mut self,
+        src: FunctionSource<'_>,
+        block: usize,
+        state: &BlockState,
+        value: ValueId,
+    ) -> ValueKey {
+        let Some(predicate) = state.predicate(value) else {
+            return src.value_key(value);
         };
 
-        facts.incoming[function.cfg.entry()] =
-            BlockState::Reachable(vec![SymbolFact::Unrefined; facts.map.len()]);
-        facts.propagate_down(&function.cfg);
+        let occurrence = ValueKey::Occurrence(src.id(), block, value);
+        self.program.push(Constraint::Filter {
+            source: src.value_key(value),
+            target: occurrence.clone(),
+            predicate,
+        });
+        occurrence
+    }
+
+    /// Allocates a scalar key for semantics fused into an FIR operation.
+    fn fresh_value(&mut self, proto: ProtoId) -> ValueKey {
+        let value = ValueKey::Synthetic(proto, self.next_value);
+        self.next_value += 1;
+        self.program.touch_value(value.clone());
+        value
+    }
+
+    /// Allocates a pack key for semantics fused into an FIR operation.
+    fn fresh_pack(&mut self, proto: ProtoId) -> PackKey {
+        let pack = PackKey::Synthetic(proto, self.next_pack);
+        self.next_pack += 1;
+        self.program.touch_pack(pack);
+        pack
+    }
+}
+
+/// Mutability of explicit FIR cells after shared captures are resolved.
+#[derive(Default)]
+struct CellFacts {
+    /// Cells that can be changed after their initial value is captured.
+    mutable: HashSet<ValueKey>,
+}
+
+impl CellFacts {
+    /// Finds mutable storage by following only explicit shared captures.
+    fn analyze(unit: &Unit<Function>) -> Self {
+        let mut facts = Self::default();
+        let mut shared = HashMap::<_, Vec<_>>::new();
+        let mut queue = VecDeque::new();
+
+        for function in unit.functions() {
+            for block in function.cfg.nodes() {
+                for instruction in &function.cfg[block].instrs {
+                    match instruction {
+                        Instr::StoreCell { cell, .. } => {
+                            let cell = ValueKey::Cell(function.id, *cell);
+                            if facts.mutable.insert(cell.clone()) {
+                                queue.push_back(cell);
+                            }
+                        }
+                        Instr::Closure {
+                            proto, captures, ..
+                        } => {
+                            let child = &unit[*proto];
+                            for (&capture, &upvalue) in captures.iter().zip(&child.upvalues) {
+                                let Capture::Share(cell) = capture else {
+                                    continue;
+                                };
+                                let parent = ValueKey::Cell(function.id, cell);
+                                let child = ValueKey::Cell(*proto, upvalue);
+                                shared
+                                    .entry(parent.clone())
+                                    .or_default()
+                                    .push(child.clone());
+                                shared.entry(child).or_default().push(parent);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        while let Some(cell) = queue.pop_front() {
+            for shared_cell in shared.get(&cell).into_iter().flatten() {
+                if facts.mutable.insert(shared_cell.clone()) {
+                    queue.push_back(shared_cell.clone());
+                }
+            }
+        }
+
         facts
     }
 
-    /// Returns whether the block is reachable.
-    #[inline]
+    /// Returns whether one cell can change after it is opened.
+    fn is_mutable(&self, proto: ProtoId, cell: CellId) -> bool {
+        self.mutable.contains(&ValueKey::Cell(proto, cell))
+    }
+}
+
+/// Immutable FIR values that always carry the same runtime value.
+#[derive(Default)]
+struct ValueAliases {
+    /// Alias source for copied values and loads from immutable cells.
+    source: HashMap<ValueId, ValueId>,
+}
+
+impl ValueAliases {
+    /// Finds stable copies and reads from immutable storage.
+    fn analyze(function: &Function, cell_facts: &CellFacts) -> Self {
+        let mut aliases = Self::default();
+        let mut first_load = HashMap::new();
+        for block in function.cfg.nodes() {
+            for instruction in &function.cfg[block].instrs {
+                match instruction {
+                    Instr::Copy { out, value } => {
+                        aliases.source.insert(*out, *value);
+                    }
+                    Instr::LoadCell { out, cell } if !cell_facts.is_mutable(function.id, *cell) => {
+                        let source = *first_load.entry(*cell).or_insert(*out);
+                        if source != *out {
+                            aliases.source.insert(*out, source);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        aliases
+    }
+
+    /// Returns the oldest stable identity for a value.
+    fn canonical(&self, mut value: ValueId) -> ValueId {
+        let mut remaining = self.source.len();
+        while let Some(source) = self.source.get(&value).copied() {
+            assert!(remaining > 0, "FIR value aliases must not form a cycle");
+            remaining -= 1;
+            value = source;
+        }
+        value
+    }
+
+    /// Copies canonical predicates to every equivalent value.
+    fn expand(&self, predicates: &mut HashMap<ValueId, BranchPredicate>) {
+        for &value in self.source.keys() {
+            let canonical = self.canonical(value);
+            if let Some(predicate) = predicates.get(&canonical).copied() {
+                predicates.insert(value, predicate);
+            }
+        }
+    }
+}
+
+/// Contains immutable-value branch facts at each block entry.
+struct BranchFacts {
+    /// Incoming facts indexed by block.
+    incoming: Vec<BlockState>,
+    /// Stable value aliases used by branch conditions.
+    aliases: ValueAliases,
+}
+
+impl BranchFacts {
+    /// Propagates branch facts through FIR edges and block parameters.
+    fn analyze(function: &Function, cell_facts: &CellFacts) -> Self {
+        let aliases = ValueAliases::analyze(function, cell_facts);
+        let mut facts = Self {
+            incoming: vec![BlockState::Unreachable; function.cfg.len()],
+            aliases,
+        };
+        facts.incoming[function.entry.target] = BlockState::reachable();
+
+        let mut queue = VecDeque::from([function.entry.target]);
+        while let Some(source) = queue.pop_front() {
+            let state = facts.incoming[source].clone();
+            match &function.cfg[source].exit {
+                BlockExit::Branch {
+                    condition,
+                    then_edge,
+                    else_edge,
+                } => {
+                    let then_state = state
+                        .with_predicate(*condition, BranchPredicate::Truthy, &facts.aliases)
+                        .through_edge(function, then_edge, &facts.aliases);
+                    if facts.merge_into(then_edge.target, then_state) {
+                        queue.push_back(then_edge.target);
+                    }
+
+                    let else_state = state
+                        .with_predicate(*condition, BranchPredicate::Falsy, &facts.aliases)
+                        .through_edge(function, else_edge, &facts.aliases);
+                    if facts.merge_into(else_edge.target, else_state) {
+                        queue.push_back(else_edge.target);
+                    }
+                }
+                exit => {
+                    for edge in exit.edges() {
+                        let candidate = state.clone().through_edge(function, edge, &facts.aliases);
+                        if facts.merge_into(edge.target, candidate) {
+                            queue.push_back(edge.target);
+                        }
+                    }
+                }
+            }
+        }
+
+        facts
+    }
+
+    /// Returns the stable aliases used by branch propagation.
+    fn aliases(&self) -> &ValueAliases {
+        &self.aliases
+    }
+
+    /// Returns whether a block can be reached.
     fn is_reachable(&self, block: usize) -> bool {
         matches!(self.incoming.get(block), Some(BlockState::Reachable(_)))
     }
 
-    /// Returns the incoming facts for one block.
-    #[inline]
+    /// Returns facts known when control enters a block.
     fn incoming(&self, block: usize) -> &BlockState {
         &self.incoming[block]
     }
 
-    /// Returns the branch predicate for a symbol in the current state, if one is known.
-    #[inline]
-    fn predicate(&self, state: &BlockState, symbol: SymbolId) -> Option<BranchPredicate> {
-        let index = self.map.get(symbol)?;
-
-        match state {
-            BlockState::Unreachable => None,
-            BlockState::Reachable(predicates) => match predicates[index] {
-                SymbolFact::Unrefined => None,
-                SymbolFact::Refined(predicate) => Some(predicate),
-            },
-        }
-    }
-
-    /// Iteratively propagates branch facts down the control flow graph.
-    fn propagate_down(&mut self, cfg: &ControlFlowGraph) {
-        let mut queue = VecDeque::from([cfg.entry()]);
-
-        while let Some(source) = queue.pop_front() {
-            let mut state = match self.incoming[source].clone() {
-                BlockState::Unreachable => continue,
-                state => state,
-            };
-
-            let block = cfg.get(source);
-            if CallDetector::in_block(block) {
-                state.invalidate(&self.mutable_indices);
-            }
-
-            match block.exit() {
-                BlockExit::CondJump {
-                    cond: Expr::Symbol(sym),
-                    then_block,
-                    else_block,
-                } => {
-                    let index = self.map.get(*sym).expect(
-                        "symbols used in CondJump should have been propagated by SymbolMapBuilder",
-                    );
-                    let truthy = state.with_predicate(index, BranchPredicate::Truthy);
-                    let falsy = state.with_predicate(index, BranchPredicate::Falsy);
-
-                    if self.merge_into(*then_block, truthy) {
-                        queue.push_back(*then_block);
-                    }
-                    if self.merge_into(*else_block, falsy) {
-                        queue.push_back(*else_block);
-                    }
-                }
-                other => {
-                    for target in other.targets() {
-                        if self.merge_into(target, state.clone()) {
-                            queue.push_back(target);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Merges a candidate block into the incoming block at the given target index, only
-    /// if the facts strictly match.
+    /// Merges facts that hold on every known path into a block.
     fn merge_into(&mut self, target: usize, candidate: BlockState) -> bool {
-        match (&mut self.incoming[target], &candidate) {
-            (BlockState::Unreachable, BlockState::Reachable(_)) => {
-                self.incoming[target] = candidate;
+        match (&mut self.incoming[target], candidate) {
+            (_, BlockState::Unreachable) => false,
+            (entry @ BlockState::Unreachable, candidate) => {
+                *entry = candidate;
                 true
             }
             (BlockState::Reachable(existing), BlockState::Reachable(candidate)) => {
-                let mut changed = false;
-                for (existing, candidate) in existing.iter_mut().zip(candidate) {
-                    let merged = existing.meet(*candidate);
-                    changed |= *existing != merged;
-                    *existing = merged;
-                }
-                changed
-            }
-            _ => false,
-        }
-    }
-}
-
-/// Collects symbols whose bindings can be changed by a closure call.
-#[derive(Default)]
-struct MutableSymbolCollector {
-    /// Symbols backed by bindings that a call may change.
-    symbols: HashSet<SymbolId>,
-}
-
-impl MutableSymbolCollector {
-    /// Returns load symbols for mutable cells used by one function.
-    fn collect(function: &LiftedFunction, captures: &CaptureResolver) -> HashSet<SymbolId> {
-        let mutable_upvalues: HashSet<_> = function
-            .symbols
-            .upvalue_cells()
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, cell)| {
-                (captures.storage(function.proto, slot)
-                    == super::captures::StorageMutability::Mutable)
-                    .then_some(*cell)
-            })
-            .collect();
-        let mut symbols = HashSet::new();
-        for block in function.cfg.blocks() {
-            for statement in block.stmts() {
-                if let Stmt::LoadCell { target, cell } = statement
-                    && (mutable_upvalues.contains(cell)
-                        || matches!(
-                            function.symbols.cells()[*cell].origin,
-                            crate::hil::ir::CellOrigin::CapturedRegister { .. }
-                        ))
-                {
-                    symbols.insert(*target);
-                }
+                let old_len = existing.len();
+                existing.retain(|value, predicate| candidate.get(value) == Some(predicate));
+                existing.len() != old_len
             }
         }
-        symbols
     }
 }
 
-/// Detects calls in one HIL node.
-///
-/// The branch analysis treats every call as a possible write to shared
-/// storage because call targets are solved after relations are lowered.
-#[derive(Default)]
-struct CallDetector {
-    /// Whether the visited node contains a call.
-    found: bool,
-}
-
-impl CallDetector {
-    /// Returns whether a block contains a call.
-    fn in_block(block: &Block) -> bool {
-        let mut detector = Self::default();
-        detector.visit_block(block);
-        detector.found
-    }
-}
-
-impl Visitor for CallDetector {
-    /// Records calls and continues into their arguments and callee expressions.
-    fn visit_expr(&mut self, expression: &Expr) {
-        if matches!(expression, Expr::Call { .. } | Expr::MethodCall { .. }) {
-            self.found = true;
-            return;
-        }
-        walk_expr(self, expression);
-    }
-}
-
-struct SymbolMapBuilder<'a> {
-    map: &'a mut SymbolMap,
-}
-
-impl Visitor for SymbolMapBuilder<'_> {
-    fn visit_block_exit(&mut self, exit: &BlockExit) {
-        if let BlockExit::CondJump { cond, .. } = exit
-            && let Expr::Symbol(sym) = cond
-        {
-            self.map.add(*sym);
-        }
-
-        walk_block_exit(self, exit);
-    }
-}
-
-/// A sparse-to-dense symbol map.
-#[derive(Default)]
-struct SymbolMap {
-    /// Dense branch index for each canonical symbol.
-    symbol_to_index: HashMap<SymbolId, usize>,
-    /// Stable value aliases used to find canonical branch symbols.
-    aliases: HashMap<SymbolId, SymbolId>,
-    /// Canonical symbols in dense index order.
-    symbols: Vec<SymbolId>,
-}
-
-impl SymbolMap {
-    /// Builds branch symbols and aliases for read-only upvalue bindings.
-    fn build(
-        function: &LiftedFunction,
-        captures: &CaptureResolver,
-        mutable_symbols: &HashSet<SymbolId>,
-    ) -> Self {
-        let mut map = Self::default();
-        let _ = captures;
-        let mut loads_by_cell: HashMap<CellId, Vec<SymbolId>> = HashMap::new();
-        for block in function.cfg.blocks() {
-            for statement in block.stmts() {
-                if let Stmt::LoadCell { target, cell } = statement {
-                    loads_by_cell.entry(*cell).or_default().push(*target);
-                }
-            }
-        }
-        for loads in loads_by_cell.into_values() {
-            map.alias_group(loads);
-        }
-
-        // Stable symbol copies use one branch key across those reads.
-        for block in function.cfg.blocks() {
-            for statement in block.stmts() {
-                let Stmt::Assign {
-                    left: Expr::Symbol(target),
-                    value: Expr::Symbol(source),
-                } = statement
-                else {
-                    continue;
-                };
-                if !mutable_symbols.contains(target) && !mutable_symbols.contains(source) {
-                    map.alias(*target, *source);
-                }
-            }
-        }
-        SymbolMapBuilder { map: &mut map }.visit_graph(&function.cfg);
-        map
-    }
-
-    /// Gives every load from one cell the same branch key.
-    fn alias_group<I>(&mut self, symbols: I)
-    where
-        I: IntoIterator<Item = SymbolId>,
-    {
-        let mut symbols = symbols.into_iter();
-        let Some(first) = symbols.next() else {
-            return;
-        };
-        for symbol in std::iter::once(first).chain(symbols) {
-            self.alias(symbol, first);
-        }
-    }
-
-    /// Records that `target` contains the same stable value as `source`.
-    fn alias(&mut self, target: SymbolId, source: SymbolId) {
-        self.aliases.insert(target, source);
-    }
-
-    /// Returns the branch key for one symbol.
-    fn canonical(&self, mut symbol: SymbolId) -> SymbolId {
-        let mut remaining = self.aliases.len();
-        while let Some(&source) = self.aliases.get(&symbol) {
-            if source == symbol {
-                return symbol;
-            }
-            assert!(remaining > 0, "branch symbol aliases must not form a cycle");
-            remaining -= 1;
-            symbol = source;
-        }
-        symbol
-    }
-
-    /// Adds a symbol to the map, if it is not already present. Returns the dense index of the symbol.
-    #[inline]
-    fn add(&mut self, symbol: SymbolId) -> usize {
-        let symbol = self.canonical(symbol);
-        *self.symbol_to_index.entry(symbol).or_insert_with(|| {
-            let index = self.symbols.len();
-            self.symbols.push(symbol);
-            index
-        })
-    }
-
-    /// Returns the dense index of the symbol, if it is present in the map.
-    #[inline]
-    fn get(&self, symbol: SymbolId) -> Option<usize> {
-        self.symbol_to_index.get(&self.canonical(symbol)).copied()
-    }
-
-    /// Returns the length of the symbol map.
-    #[inline]
-    fn len(&self) -> usize {
-        self.symbols.len()
-    }
-}
-
-/// Represents the refinement state of a block in the control flow graph.
-#[derive(Default, Clone)]
+/// Facts known along a control-flow path.
+#[derive(Clone)]
 enum BlockState {
-    /// The block is not reachable.
-    #[default]
+    /// The path cannot execute.
     Unreachable,
-    /// The block is reachable. Contains a dense map from symbol IDs to their branch predicates.
-    /// None means the symbol is not refined on this edge.
-    Reachable(Vec<SymbolFact>),
+    /// Predicates known for immutable FIR values.
+    Reachable(HashMap<ValueId, BranchPredicate>),
 }
 
 impl BlockState {
-    /// Removes branch facts for mutable storage after a possible call.
-    fn invalidate(&mut self, mutable_indices: &[usize]) {
-        let BlockState::Reachable(predicates) = self else {
-            return;
+    /// Creates a reachable state with no refinements.
+    fn reachable() -> Self {
+        Self::Reachable(HashMap::new())
+    }
+
+    /// Returns the known predicate for a immutable value.
+    fn predicate(&self, value: ValueId) -> Option<BranchPredicate> {
+        match self {
+            Self::Unreachable => None,
+            Self::Reachable(predicates) => predicates.get(&value).copied(),
+        }
+    }
+
+    /// Adds a predicate or marks a contradictory path unreachable.
+    fn with_predicate(
+        &self,
+        value: ValueId,
+        predicate: BranchPredicate,
+        aliases: &ValueAliases,
+    ) -> Self {
+        let Self::Reachable(predicates) = self else {
+            return Self::Unreachable;
         };
-        for &index in mutable_indices {
-            predicates[index] = SymbolFact::Unrefined;
+        let value = aliases.canonical(value);
+        if predicates
+            .get(&value)
+            .is_some_and(|known| *known != predicate)
+        {
+            return Self::Unreachable;
         }
+
+        let mut predicates = predicates.clone();
+        predicates.insert(value, predicate);
+        aliases.expand(&mut predicates);
+        Self::Reachable(predicates)
     }
 
-    /// Returns a new `BlockState` with the given state vector.
-    #[inline]
-    fn with_predicate(&self, symbol: usize, predicate: BranchPredicate) -> Self {
-        match self {
-            BlockState::Unreachable => BlockState::Unreachable,
-            BlockState::Reachable(state) => match state[symbol].refine(predicate) {
-                Ok(fact) => {
-                    let mut state = state.clone();
-                    state[symbol] = fact;
-                    BlockState::Reachable(state)
-                }
-                Err(Contradiction) => BlockState::Unreachable,
-            },
+    /// Transfers known predicates to the target block parameters of an edge.
+    fn through_edge(mut self, function: &Function, edge: &Edge, aliases: &ValueAliases) -> Self {
+        let Self::Reachable(predicates) = &mut self else {
+            return self;
+        };
+        let target = &function.cfg[edge.target];
+        let transferred: Vec<_> = edge
+            .params
+            .iter()
+            .zip(&target.params)
+            .filter_map(|(&source, &target)| {
+                predicates
+                    .get(&source)
+                    .copied()
+                    .map(|predicate| (aliases.canonical(target), predicate))
+            })
+            .collect();
+        for target in &target.params {
+            predicates.remove(target);
+            predicates.remove(&aliases.canonical(*target));
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SymbolFact {
-    Unrefined,
-    Refined(BranchPredicate),
-}
-
-struct Contradiction;
-
-impl SymbolFact {
-    /// Applies another predicate along the same execution path.
-    fn refine(self, predicate: BranchPredicate) -> Result<Self, Contradiction> {
-        match self {
-            Self::Unrefined => Ok(Self::Refined(predicate)),
-            Self::Refined(existing) if existing == predicate => Ok(self),
-            Self::Refined(_) => Err(Contradiction),
-        }
-    }
-
-    /// Retains facts guaranteed by both incoming paths.
-    fn meet(self, other: Self) -> Self {
-        if self == other { self } else { Self::Unrefined }
+        predicates.extend(transferred);
+        aliases.expand(predicates);
+        self
     }
 }

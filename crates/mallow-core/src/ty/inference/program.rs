@@ -1,277 +1,199 @@
-//! Immutable inference relations produced from lifted SSA.
+//! Stable constraints produced directly from FIR.
 
-use std::collections::HashMap;
-
-use smol_str::SmolStr;
+use std::collections::HashSet;
 
 use super::keys::{BranchPredicate, ObjectKey, PackKey, ValueKey};
-use crate::hil::ty::builtins::BuiltinPath;
-use crate::hil::ty::canonical::TypeId;
 use crate::il::ProtoId;
 use crate::operator::{BinOp, UnOp};
+use crate::ty::canonical::TypeId;
 
-/// One relation attached to one scalar value.
+/// a inference constraint.
 ///
-/// The lowerer writes these relations while it reads the SSA program. They
-/// are descriptions, not actions. The engine later turns them into rules.
-///
-/// The key passed to `InferenceProgram::push_value` is the value receiving
-/// the relation. For example, a `ReadField` relation is attached to the
-/// object being read, while a `Binary` relation is attached to its left
-/// operand.
+/// The same constraint form is used with stable FIR keys before installation
+/// and dense world IDs while solving. This keeps lowering and solving on one
+/// semantic vocabulary.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ValueRelation {
-    /// Says that this value can produce `ty`.
-    ///
-    /// ```lua
-    /// local value = 123
-    /// ```
-    ///
-    /// The temporary for `123` produces `number`.
-    Produce(TypeId),
-    /// Says that this value must be usable as `ty`.
-    ///
-    /// ```lua
-    /// local result = value + 1
-    /// ```
-    ///
-    /// The addition needs `value` to be a number. The current lowerer usually
-    /// records this need inside `Binary` or `Unary` instead.
-    Require(TypeId),
-    /// Connects this value to another value so type and identity facts can
-    /// flow from the other value. Requirements can also flow back.
-    ///
-    /// ```lua
-    /// local result = calculate()
-    /// ```
-    ///
-    /// The result variable receives facts from the temporary holding the call
-    /// result.
-    FlowFrom(ValueKey),
-    /// Says that two SSA values name the same runtime value.
-    ///
-    /// ```lua
-    /// local other = value
-    /// ```
-    SameAs(ValueKey),
-    /// Says that two values are possible contents of one mutable storage cell.
-    ///
-    /// This relation is used for different SSA versions of an upvalue and for
-    /// captures that share storage with their parent.
-    SameStorage(ValueKey),
-    /// Reads one value from a pack at a given position.
-    ///
-    /// ```lua
-    /// local first, second = get_values()
-    /// ```
-    ///
-    /// This creates one relation for `first` and one for `second`.
-    FromPack {
-        /// Pack being read.
-        pack: PackKey,
-        /// Zero-based position to read.
-        index: usize,
+pub enum Constraint<V, P, O> {
+    /// The value produces a type.
+    Produce {
+        /// Value producing the type.
+        value: V,
+        /// Produced type.
+        ty: TypeId,
     },
-    /// Collects all values that a pack can produce.
-    ///
-    /// ```lua
-    /// local values = { get_values() }
-    /// ```
-    FromPackValues {
-        /// Pack being collected.
-        pack: PackKey,
+    /// The value requires a type.
+    Require {
+        /// Value that must support the type.
+        value: V,
+        /// Required type.
+        ty: TypeId,
     },
-    /// Makes a branch-specific value from another value.
-    ///
-    /// ```lua
-    /// if value then
-    ///     -- the truthy value is used here
-    /// end
-    /// ```
-    ///
-    /// The current lowerer does not emit this relation yet.
+    /// Sends type and identity facts from a value to another.
+    Flow {
+        /// Value providing facts.
+        source: V,
+        /// Value receiving facts.
+        target: V,
+    },
+    /// Sends produced facts except `nil` from a value to another.
+    NonNilFlow {
+        /// Value providing facts.
+        source: V,
+        /// Value receiving facts.
+        target: V,
+    },
+    /// Sends a branch-specific part of a value to an occurrence.
     Filter {
-        /// Value before branch filtering.
-        source: ValueKey,
-        /// Test used by the branch.
+        /// Value tested by the branch.
+        source: V,
+        /// Value used inside the branch.
+        target: V,
+        /// Branch test to apply.
         predicate: BranchPredicate,
     },
-    /// Gives a value one concrete table identity.
-    ///
-    /// ```lua
-    /// local object = {}
-    /// ```
-    NewObject(ObjectKey),
-    /// Gives a value one concrete closure identity.
-    ///
-    /// ```lua
-    /// local function_value = function(value)
-    ///     return value
-    /// end
-    /// ```
-    Closure(ProtoId),
-    /// Gives a value one known builtin identity.
-    ///
-    /// ```lua
-    /// local write = print
-    /// ```
-    Builtin(BuiltinPath),
-    /// Writes a named field on every table carried by this value.
-    ///
-    /// ```lua
-    /// object.name = value
-    /// ```
-    WriteField {
-        /// Name of the field being written.
-        field: SmolStr,
-        /// Value written to the field.
-        value: ValueKey,
-        /// Whether table construction definitely created this field.
-        definite: bool,
+    /// Adds a table allocation to a value.
+    IncludeObject {
+        /// Value carrying the table.
+        value: V,
+        /// Table allocation identity.
+        object: O,
     },
-    /// Reads a named field from every table carried by this value.
-    ///
-    /// ```lua
-    /// local value = object.name
-    /// ```
-    ReadField {
-        /// Name of the field being read.
-        field: SmolStr,
-        /// Value receiving the field contents.
-        output: ValueKey,
+    /// Adds a closure to a value.
+    IncludeClosure {
+        /// Value carrying the closure.
+        value: V,
+        /// Lifted closure proto.
+        proto: ProtoId,
     },
-    /// Writes through a dynamic index on every table carried by this value.
-    ///
-    /// ```lua
-    /// object[index] = value
-    /// ```
-    WriteIndex {
-        /// Value used as the index.
-        index: ValueKey,
-        /// Value written at the index.
-        value: ValueKey,
+    /// Keeps a value equal to a pack position.
+    ProjectPack {
+        /// Pack being read.
+        pack: P,
+        /// Zero-based position being read.
+        index: usize,
+        /// Value receiving the position.
+        output: V,
     },
-    /// Reads through a dynamic index from every table carried by this value.
-    ///
-    /// ```lua
-    /// local value = object[index]
-    /// ```
-    ///
-    /// The current engine combines all dynamic table values instead of
-    /// tracking each key separately.
-    ReadIndex {
-        /// Value used as the index.
-        index: ValueKey,
+    /// Adds a sequence alternative to a pack.
+    Sequence {
+        /// Pack receiving the alternative.
+        pack: P,
+        /// Values guaranteed at the start of the alternative.
+        head: Vec<V>,
+        /// Remaining sequence, or `None` when the alternative ends.
+        tail: Option<P>,
+    },
+    /// Sends every source alternative after an offset to a target pack.
+    SlicePack {
+        /// Pack providing alternatives.
+        source: P,
+        /// Number of leading positions to skip.
+        offset: usize,
+        /// Pack receiving the suffix alternatives.
+        target: P,
+    },
+    /// Writes through a key on every table carried by a value.
+    SetTable {
+        /// Value carrying the tables.
+        table: V,
+        /// Value used as the key.
+        key: V,
+        /// Value written at the key.
+        value: V,
+    },
+    /// Writes a pack into the array part of every table carried by a value.
+    WriteList {
+        /// Value carrying the tables.
+        table: V,
+        /// Pack carrying the values.
+        values: P,
+    },
+    /// Reads through a key from every table carried by a value.
+    GetTable {
+        /// Value carrying the tables.
+        table: V,
+        /// Value used as the key.
+        key: V,
         /// Value receiving the table contents.
-        output: ValueKey,
+        output: V,
     },
-    /// Calls this value with an argument pack and a result pack.
-    ///
-    /// ```lua
-    /// local result = function_value(argument)
-    /// ```
+    /// Calls a value with an argument and result pack.
     Call {
+        /// Value being called.
+        callee: V,
         /// Arguments supplied at the call site.
-        args: PackKey,
+        args: P,
         /// Results received at the call site.
-        returns: PackKey,
+        returns: P,
     },
-    /// Evaluates a binary operation and stores its result.
-    ///
-    /// ```lua
-    /// local result = left + right
-    /// ```
+    /// Applies a binary operation.
     Binary {
+        /// Left-hand value.
+        lhs: V,
         /// Operation being evaluated.
         op: BinOp,
         /// Right-hand value.
-        rhs: ValueKey,
+        rhs: V,
         /// Value receiving the result.
-        output: ValueKey,
+        output: V,
     },
-    /// Evaluates a unary operation and stores its result.
-    ///
-    /// ```lua
-    /// local result = -value
-    /// ```
+    /// Applies a unary operation.
     Unary {
+        /// Value being operated on.
+        operand: V,
         /// Operation being evaluated.
         op: UnOp,
         /// Value receiving the result.
-        output: ValueKey,
+        output: V,
     },
 }
 
-/// One relation attached to a multivalue pack.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PackRelation {
-    /// A fixed prefix followed by an optional remaining pack.
-    Sequence {
-        /// Values guaranteed at the start of this alternative.
-        head: Vec<ValueKey>,
-        /// Remaining values, or `None` when this alternative ends.
-        tail: Option<PackKey>,
-    },
-}
+pub type ProgramConstraint = Constraint<ValueKey, PackKey, ObjectKey>;
 
-/// Relations and seeds collected across all lifted SSA protos.
 #[derive(Debug, Default)]
 pub struct InferenceProgram {
-    value_relations: HashMap<ValueKey, Vec<ValueRelation>>,
-    pack_relations: HashMap<PackKey, Vec<PackRelation>>,
-    seeds: HashMap<ValueKey, Vec<TypeId>>,
+    values: HashSet<ValueKey>,
+    packs: HashSet<PackKey>,
+    constraints: Vec<ProgramConstraint>,
 }
 
 impl InferenceProgram {
-    /// Ensures a scalar value key exists even if no relation is attached yet.
+    /// Ensures a scalar value exists even when it has no constraint yet.
     pub fn touch_value(&mut self, key: ValueKey) {
-        self.value_relations.entry(key).or_default();
+        self.values.insert(key);
     }
 
-    /// Ensures a pack key exists even if no relation is attached yet.
+    /// Ensures a pack exists even when it has no constraint yet.
     pub fn touch_pack(&mut self, key: PackKey) {
-        self.pack_relations.entry(key).or_default();
+        self.packs.insert(key);
     }
 
-    /// Adds one scalar relation unless it is already present.
-    pub fn push_value(&mut self, key: ValueKey, relation: ValueRelation) {
-        let relations = self.value_relations.entry(key).or_default();
-        if !relations.contains(&relation) {
-            relations.push(relation);
-        }
+    /// Adds a inference constraint.
+    pub fn push(&mut self, constraint: ProgramConstraint) {
+        self.constraints.push(constraint);
     }
 
-    /// Adds one pack relation unless it is already present.
-    pub fn push_pack(&mut self, key: PackKey, relation: PackRelation) {
-        let relations = self.pack_relations.entry(key).or_default();
-        if !relations.contains(&relation) {
-            relations.push(relation);
-        }
+    /// Adds an exact type supplied by bytecode metadata.
+    pub fn seed(&mut self, value: ValueKey, ty: TypeId) {
+        self.push(Constraint::Produce {
+            value: value.clone(),
+            ty,
+        });
+        self.push(Constraint::Require { value, ty });
     }
 
-    /// Adds a type already known from bytecode for one scalar value.
-    pub fn seed(&mut self, key: ValueKey, ty: TypeId) {
-        self.seeds.entry(key).or_default().push(ty);
+    /// Returns all scalar identities owned by the program.
+    pub fn values(&self) -> impl Iterator<Item = &ValueKey> {
+        self.values.iter()
     }
 
-    /// Returns an iterator over scalar relations.
-    pub fn value_relations(&self) -> impl Iterator<Item = (ValueKey, &[ValueRelation])> + '_ {
-        self.value_relations
-            .iter()
-            .map(|(key, relations)| (*key, relations.as_slice()))
+    /// Returns all pack identities owned by the program.
+    pub fn packs(&self) -> impl Iterator<Item = PackKey> + '_ {
+        self.packs.iter().copied()
     }
 
-    /// Returns an iterator over pack relations.
-    pub fn pack_relations(&self) -> impl Iterator<Item = (PackKey, &[PackRelation])> + '_ {
-        self.pack_relations
-            .iter()
-            .map(|(key, relations)| (*key, relations.as_slice()))
-    }
-
-    /// Returns an iterator over seeded types.
-    pub fn seeds(&self) -> impl Iterator<Item = (ValueKey, &[TypeId])> + '_ {
-        self.seeds
-            .iter()
-            .map(|(key, types)| (*key, types.as_slice()))
+    /// Consumes the program and returns its constraints.
+    pub fn into_constraints(self) -> impl Iterator<Item = ProgramConstraint> {
+        self.constraints.into_iter()
     }
 }
