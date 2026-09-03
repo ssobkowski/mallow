@@ -1,11 +1,14 @@
 //! Type-specific ownership and canonical graph operations.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::{DefaultHasher, Hash, Hasher as _};
 
 use id_arena::{Arena, Id};
+use smallvec::{SmallVec, smallvec};
 use smol_str::SmolStr;
 
+use super::builtins;
 use super::canonical::{
     MetamethodType, PrimitiveIds, RuntimeKind, Type, TypeId, TypeLiteral, TypePack, TypePackId,
     TypePackTail,
@@ -26,7 +29,7 @@ fn fingerprint<T: Hash>(value: &T) -> u64 {
 #[derive(Debug)]
 pub struct HashConsArena<T: Hash + Eq> {
     arena: Arena<T>,
-    buckets: HashMap<u64, Vec<Id<T>>>,
+    buckets: HashMap<u64, SmallVec<[Id<T>; 1]>>,
 }
 
 impl<T: Hash + Eq> Default for HashConsArena<T> {
@@ -50,17 +53,25 @@ impl<T: Hash + Eq> HashConsArena<T> {
     #[must_use]
     pub fn intern(&mut self, value: T) -> Id<T> {
         let fp = fingerprint(&value);
-        if let Some(candidates) = self.buckets.get(&fp)
-            && let Some(id) = candidates
-                .iter()
-                .find(|id| self.arena.get(**id) == Some(&value))
-        {
-            return *id;
+        match self.buckets.entry(fp) {
+            Entry::Occupied(mut entry) => {
+                if let Some(&id) = entry
+                    .get()
+                    .iter()
+                    .find(|&&id| self.arena.get(id) == Some(&value))
+                {
+                    return id;
+                }
+                let id = self.arena.alloc(value);
+                entry.get_mut().push(id);
+                id
+            }
+            Entry::Vacant(entry) => {
+                let id = self.arena.alloc(value);
+                entry.insert(smallvec![id]);
+                id
+            }
         }
-
-        let id = self.arena.alloc(value);
-        self.buckets.entry(fp).or_default().push(id);
-        id
     }
 
     /// Returns the value addressed by `id`, or `None` for a foreign ID.
@@ -83,12 +94,14 @@ pub struct TypeStore {
     types: HashConsArena<Type>,
     /// Collision-safe storage for function argument and return packs.
     packs: HashConsArena<TypePack>,
-    /// IDs of nodes allocated during initialization.
+    /// IDs of primitive nodes allocated during initialization.
     primitives: PrimitiveIds,
+    /// Global builtin roots stored in this graph.
+    builtin_globals: HashMap<&'static str, TypeId>,
 }
 
 impl TypeStore {
-    /// Creates a type store and allocates its primitive graph nodes.
+    /// Creates a type store and materializes its primitive and builtin nodes.
     #[must_use]
     pub fn new() -> Self {
         let mut types = HashConsArena::new();
@@ -110,17 +123,39 @@ impl TypeStore {
             vector: types.intern(Type::Vector),
             buffer: types.intern(Type::Buffer),
         };
-        Self {
+
+        let mut store = Self {
             types,
             packs: HashConsArena::new(),
             primitives,
+            builtin_globals: HashMap::new(),
+        };
+
+        // Lower builtin roots here because their IDs belong to this store.
+        let definitions = builtins::definitions();
+        store.builtin_globals.reserve(definitions.len());
+        for definition in definitions {
+            let ty = definition.intern(&mut store);
+            let previous = store.builtin_globals.insert(definition.name(), ty);
+            assert!(
+                previous.is_none(),
+                "generated builtin globals must be unique"
+            );
         }
+
+        store
     }
 
     /// Borrows primitive IDs without copying the complete primitive set.
     #[inline]
     pub const fn primitives(&self) -> &PrimitiveIds {
         &self.primitives
+    }
+
+    /// Returns the type bound to one builtin global.
+    #[inline]
+    pub fn builtin(&self, name: &str) -> Option<TypeId> {
+        self.builtin_globals.get(name).copied()
     }
 
     /// Returns the node for `id`, panicking if it came from another store.
@@ -165,7 +200,6 @@ impl TypeStore {
     }
 
     /// Creates a type pack after validating every referenced type ID.
-    #[inline]
     #[must_use]
     pub fn pack(&mut self, head: Vec<TypeId>, tail: Option<TypePackTail>) -> TypePackId {
         for id in &head {
@@ -179,7 +213,6 @@ impl TypeStore {
     }
 
     /// Creates a structural table shape with ordered, unique field names.
-    #[inline]
     #[must_use]
     pub fn table_shape(
         &mut self,
@@ -204,139 +237,11 @@ impl TypeStore {
     }
 
     /// Creates a function signature from canonical argument and return packs.
-    #[inline]
     #[must_use]
     pub fn function_signature(&mut self, params: TypePackId, returns: TypePackId) -> TypeId {
         self.assert_pack(params);
         self.assert_pack(returns);
         self.intern_node(Type::FunctionSignature { params, returns })
-    }
-
-    /// Imports one graph node from another store through canonical constructors.
-    ///
-    /// IDs are arena-owned, so copying an ID directly would create a foreign
-    /// reference. This operation recursively copies child nodes and packs,
-    /// while memoizing each source ID and reusing existing target nodes.
-    #[must_use]
-    pub fn import(&mut self, source: &TypeStore, id: TypeId) -> TypeId {
-        source.assert_type(id);
-        if self.types.get(id).is_some() {
-            return id;
-        }
-        let mut type_memo = HashMap::new();
-        let mut pack_memo = HashMap::new();
-        self.import_node(source, id, &mut type_memo, &mut pack_memo)
-    }
-
-    /// Recursively imports one node with per-operation memoization.
-    #[must_use]
-    fn import_node(
-        &mut self,
-        source: &TypeStore,
-        id: TypeId,
-        type_memo: &mut HashMap<TypeId, TypeId>,
-        pack_memo: &mut HashMap<TypePackId, TypePackId>,
-    ) -> TypeId {
-        if let Some(target) = type_memo.get(&id) {
-            return *target;
-        }
-        let node = source.get(id).clone();
-        let target = match node {
-            Type::Never => self.primitives().never,
-            Type::Unknown => self.primitives().unknown,
-            Type::Any => self.primitives().any,
-            Type::Nil => self.primitives().nil,
-            Type::String => self.primitives().string,
-            Type::Number => self.primitives().number,
-            Type::Boolean => self.primitives().boolean,
-            Type::Thread => self.primitives().thread,
-            Type::Userdata => self.primitives().userdata,
-            Type::Vector => self.primitives().vector,
-            Type::Integer => self.primitives().integer,
-            Type::Buffer => self.primitives().buffer,
-            Type::Named(name) => self.named(name),
-            Type::Literal(literal) => self.literal(literal),
-            Type::Table => self.primitives().table,
-            Type::TableShape { fields, indexer } => {
-                let mut imported_fields = Vec::with_capacity(fields.len());
-                for (name, child) in fields {
-                    imported_fields
-                        .push((name, self.import_node(source, child, type_memo, pack_memo)));
-                }
-                let indexer = if let Some((key, value)) = indexer {
-                    Some((
-                        self.import_node(source, key, type_memo, pack_memo),
-                        self.import_node(source, value, type_memo, pack_memo),
-                    ))
-                } else {
-                    None
-                };
-                self.table_shape(imported_fields, indexer)
-            }
-            Type::Function => self.primitives().function,
-            Type::FunctionSignature { params, returns } => {
-                let params = self.import_pack(source, params, type_memo, pack_memo);
-                let returns = self.import_pack(source, returns, type_memo, pack_memo);
-                self.function_signature(params, returns)
-            }
-            Type::Union(parts) => {
-                let mut imported = Vec::with_capacity(parts.len());
-                for child in parts {
-                    imported.push(self.import_node(source, child, type_memo, pack_memo));
-                }
-                self.union_all(imported)
-            }
-            Type::Intersection(parts) => {
-                let mut imported = Vec::with_capacity(parts.len());
-                for child in parts {
-                    imported.push(self.import_node(source, child, type_memo, pack_memo));
-                }
-                self.intersection_all(imported)
-            }
-            Type::WithMetatable { base, methods } => {
-                let base = self.import_node(source, base, type_memo, pack_memo);
-                let mut imported_methods = Vec::with_capacity(methods.len());
-                for method in methods {
-                    imported_methods.push(MetamethodType {
-                        method: method.method,
-                        ty: self.import_node(source, method.ty, type_memo, pack_memo),
-                    });
-                }
-                self.with_metatable(base, imported_methods)
-            }
-        };
-        type_memo.insert(id, target);
-        target
-    }
-
-    /// Recursively imports one type pack with per-operation memoization.
-    #[must_use]
-    fn import_pack(
-        &mut self,
-        source: &TypeStore,
-        id: TypePackId,
-        type_memo: &mut HashMap<TypeId, TypeId>,
-        pack_memo: &mut HashMap<TypePackId, TypePackId>,
-    ) -> TypePackId {
-        if let Some(target) = pack_memo.get(&id) {
-            return *target;
-        }
-        let pack = source.get_pack(id);
-
-        let mut head = Vec::with_capacity(pack.head.len());
-        for child in &pack.head {
-            head.push(self.import_node(source, *child, type_memo, pack_memo));
-        }
-
-        let tail = pack.tail.as_ref().map(|tail| match tail {
-            TypePackTail::Homogeneous(id) => {
-                TypePackTail::Homogeneous(self.import_node(source, *id, type_memo, pack_memo))
-            }
-        });
-
-        let target = self.pack(head, tail);
-        pack_memo.insert(id, target);
-        target
     }
 
     /// Creates a metatabled type with ordered, unique method entries.
@@ -482,7 +387,6 @@ impl TypeStore {
     }
 
     /// Computes a left fold of [`Self::join`].
-    #[inline]
     #[must_use]
     pub fn join_all<I>(&mut self, members: I) -> TypeId
     where
@@ -555,7 +459,6 @@ impl TypeStore {
     }
 
     /// Returns the broad runtime category of a type, following metatable bases.
-    #[must_use]
     pub fn runtime_kind(&self, id: TypeId) -> Option<RuntimeKind> {
         match self.get(id) {
             Type::Nil => Some(RuntimeKind::Nil),
@@ -782,8 +685,8 @@ enum CombineMethod {
 mod tests {
     use std::hash::{Hash, Hasher};
 
-    use super::{HashConsArena, MetamethodType, RuntimeKind, Type, TypeLiteral, TypeStore};
-    use crate::ty::canonical::{Metamethod, TypePackTail};
+    use super::{HashConsArena, MetamethodType, Type, TypeLiteral, TypeStore};
+    use crate::ty::canonical::{Metamethod, RuntimeKind, TypePackTail};
 
     /// A test value whose every fingerprint collides.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -814,6 +717,27 @@ mod tests {
         let mut first = TypeStore::new();
         let second = TypeStore::new();
         let _ = first.table_shape(vec![("field".into(), second.primitives().string)], None);
+    }
+
+    /// Builtin globals and their table fields use the canonical graph.
+    #[test]
+    fn builtin_globals_are_canonical_graph_roots() {
+        let store = TypeStore::new();
+        assert_eq!(store.builtin("_VERSION"), Some(store.primitives().string));
+        assert!(store.builtin("missing").is_none());
+
+        let math = store
+            .builtin("math")
+            .expect("math must be a builtin global");
+        let Type::TableShape { fields, indexer } = store.get(math) else {
+            panic!("math must be stored as a table shape")
+        };
+        assert!(indexer.is_none());
+        let abs = fields
+            .iter()
+            .find_map(|(name, ty)| (name == "abs").then_some(*ty))
+            .expect("math.abs must be stored in the math table shape");
+        assert!(matches!(store.get(abs), Type::FunctionSignature { .. }));
     }
 
     /// Canonical table shapes reject duplicate field names.
@@ -897,36 +821,6 @@ mod tests {
         );
         assert!(!store.is_subtype(metatabled_number, table));
         assert!(store.is_subtype(metatabled_number, number));
-    }
-
-    /// Nested graph and pack imports copy every child and reuse target nodes.
-    #[test]
-    fn imports_nested_function_graphs_without_foreign_ids() {
-        let mut source = TypeStore::new();
-        let field = source.literal(TypeLiteral::String("field".into()));
-        let shape = source.table_shape(vec![("value".into(), field)], None);
-        let number = source.primitives().number;
-        let params = source.pack(vec![shape], Some(TypePackTail::Homogeneous(number)));
-        let returns = source.pack(Vec::new(), None);
-        let function = source.function_signature(params, returns);
-
-        let mut target = TypeStore::new();
-        let imported = target.import(&source, function);
-        let reused = target.import(&source, function);
-        assert_eq!(imported, reused);
-        let Type::FunctionSignature { params, returns } = target.get(imported) else {
-            panic!("imported node must remain a function signature")
-        };
-        assert_eq!(target.get_pack(*returns).head.len(), 0);
-        assert_eq!(target.get_pack(*params).head.len(), 1);
-        assert_eq!(
-            target.get_pack(*params).tail,
-            Some(TypePackTail::Homogeneous(target.primitives().number))
-        );
-        let Type::TableShape { fields, .. } = target.get(target.get_pack(*params).head[0]) else {
-            panic!("nested table shape must be imported")
-        };
-        assert_eq!(fields.len(), 1);
     }
 
     /// Broad table/function nodes remain distinct from empty structural nodes.

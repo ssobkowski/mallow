@@ -15,12 +15,12 @@
 // use keys::ValueKey;
 // use lower::lower_functions;
 
-use crate::hil::lifted::LiftedFunction;
+use crate::fir::Function;
 // use crate::hil::ty::builtins::BuiltinEnvironment;
 // use crate::hil::ty::store::TypeStore;
 
 /// Runs whole-program type inference over lifted SSA and writes inferred types.
-pub fn run(_functions: &mut [LiftedFunction]) {
+pub fn run(_functions: &mut [Function]) {
     // let mut type_store = TypeStore::new();
     // let builtins = BuiltinEnvironment::new(&mut type_store);
     // let primitives = type_store.primitives();

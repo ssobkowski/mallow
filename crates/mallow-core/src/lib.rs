@@ -6,6 +6,7 @@ mod il;
 mod ir;
 mod logging;
 mod operator;
+mod ty;
 mod printer;
 
 #[cfg(feature = "visualize")]

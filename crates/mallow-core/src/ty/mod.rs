@@ -1,6 +1,6 @@
 //! Constraint-based lattice type inference.
 
-pub mod builtins;
+mod builtins;
 pub mod bytecode;
 pub mod canonical;
 pub mod inference;

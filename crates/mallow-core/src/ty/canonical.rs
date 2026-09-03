@@ -1,4 +1,4 @@
-//! The canonical, ID-backed HIL type graph.
+//! The canonical, ID-backed type graph.
 
 use std::hash::Hash;
 
@@ -25,6 +25,7 @@ pub struct TypePack {
 pub enum TypePackTail {
     /// `...T`: repeats one type.
     Homogeneous(TypeId),
+    // TODO: Generic `T...`.
 }
 
 /// Identifies a Luau metamethod by its runtime operation.

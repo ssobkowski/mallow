@@ -1,132 +1,45 @@
-use std::collections::HashMap;
-
 use smol_str::SmolStr;
 
-use crate::hil::ir::Expr;
-use crate::hil::ty::canonical::{TypeId, TypeLiteral, TypePackId, TypePackTail};
-use crate::hil::ty::store::TypeStore;
+use crate::ty::canonical::{TypeId, TypeLiteral, TypePackId, TypePackTail};
+use crate::ty::store::TypeStore;
 
-/// Immutable builtin types allocated once for an inference session.
+/// Returns every generated builtin definition.
+pub(super) fn definitions() -> &'static [BuiltinDefinition] {
+    generated_builtin_definitions()
+}
+
+/// One generated global builtin.
 #[derive(Debug)]
-pub struct BuiltinEnvironment {
-    /// Global names mapped to their lowered graph types.
-    globals: HashMap<&'static str, TypeId>,
-    /// Static namespace and field names mapped to their lowered graph types.
-    namespace_fields: HashMap<&'static str, HashMap<&'static str, TypeId>>,
-}
-
-/// Stable symbolic reference into a [`BuiltinEnvironment`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum BuiltinPath {
-    /// A direct global builtin.
-    Global(SmolStr),
-    /// A field exported by a global builtin namespace.
-    NamespaceField {
-        /// Global namespace name.
-        namespace: SmolStr,
-        /// Field selected from the namespace.
-        field: SmolStr,
-    },
-}
-
-impl BuiltinPath {
-    /// Recognizes a syntactic builtin path without allocating its type.
-    #[must_use]
-    pub fn from_expr(expr: &Expr) -> Option<Self> {
-        match expr {
-            Expr::Global(name) => Some(Self::Global(name.clone())),
-            Expr::GetField { obj, field } => {
-                let Expr::Global(namespace) = obj.as_ref() else {
-                    return None;
-                };
-                Some(Self::NamespaceField {
-                    namespace: namespace.clone(),
-                    field: field.clone(),
-                })
-            }
-            _ => None,
-        }
-    }
-}
-
-impl BuiltinEnvironment {
-    /// Builds every builtin type exactly once.
-    #[must_use]
-    pub fn new(type_store: &mut TypeStore) -> Self {
-        let definitions = generated_builtin_definitions();
-        let mut globals = HashMap::with_capacity(definitions.len());
-        let mut namespace_fields = HashMap::new();
-        for definition in definitions {
-            let previous = globals.insert(definition.name, definition.scheme.intern(type_store));
-            assert!(
-                previous.is_none(),
-                "generated builtin globals must be unique"
-            );
-
-            let fields = namespace_fields
-                .entry(definition.name)
-                .or_insert_with(HashMap::new);
-            for field in definition.fields {
-                let previous = fields.insert(field.name, field.scheme.intern(type_store));
-                assert!(
-                    previous.is_none(),
-                    "generated builtin namespace fields must be unique"
-                );
-            }
-        }
-        Self {
-            globals,
-            namespace_fields,
-        }
-    }
-
-    /// Returns the lowered type at a previously recognized builtin path.
-    #[must_use]
-    pub fn get_path(&self, path: &BuiltinPath) -> Option<TypeId> {
-        match path {
-            BuiltinPath::Global(name) => self.globals.get(name.as_str()).copied(),
-            BuiltinPath::NamespaceField { namespace, field } => self
-                .namespace_fields
-                .get(namespace.as_str())?
-                .get(field.as_str())
-                .copied(),
-        }
-    }
-}
-
-/// One generated global builtin and its independently bound namespace fields.
-#[derive(Debug)]
-struct BuiltinDefinition {
+pub(super) struct BuiltinDefinition {
     /// Global name.
     name: &'static str,
     /// Global generated type definition.
     scheme: BuiltinSchemeDefinition,
-    /// Direct namespace field schemes.
-    fields: &'static [BuiltinFieldDefinition],
 }
 
-/// One direct field exported by a builtin namespace.
-#[derive(Debug)]
-struct BuiltinFieldDefinition {
-    /// Exported field name.
-    name: &'static str,
-    /// Independently instantiated field scheme.
-    scheme: BuiltinSchemeDefinition,
+impl BuiltinDefinition {
+    /// Returns the global name.
+    pub(super) const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Interns the definition in `store`.
+    pub(super) fn intern(&self, store: &mut TypeStore) -> TypeId {
+        self.scheme.intern(store)
+    }
 }
 
 /// One generated builtin type body and its retained binder definitions.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct BuiltinSchemeDefinition {
     /// Generic binders retained for the future inference rewrite.
     binders: &'static [BuiltinBinderDefinition],
-    /// Owned type tree to intern.
+    /// Static type tree to intern.
     body: BuiltinType,
 }
 
 /// One generated generic binder retained with its substitution kind.
 #[derive(Debug)]
-#[allow(dead_code)]
 enum BuiltinBinderDefinition {
     /// A binder substituted by one type.
     Type(&'static str),
@@ -141,9 +54,8 @@ impl BuiltinSchemeDefinition {
     }
 }
 
-/// An owned builtin type tree generated before runtime type IDs exist.
+/// A static builtin type tree generated before runtime type IDs exist.
 #[derive(Debug)]
-#[allow(dead_code)]
 enum BuiltinType {
     /// One canonical primitive kind.
     Primitive(BuiltinPrimitive),
@@ -174,7 +86,7 @@ enum BuiltinType {
 }
 
 impl BuiltinType {
-    /// Recursively interns this owned tree into the session's canonical store.
+    /// Recursively interns this static tree into the session's canonical store.
     fn intern(&self, store: &mut TypeStore) -> TypeId {
         match self {
             Self::Primitive(primitive) => primitive.id(store),
@@ -211,7 +123,6 @@ impl BuiltinType {
 
 /// A static singleton literal used by a generated builtin definition.
 #[derive(Debug)]
-#[allow(dead_code)]
 enum BuiltinLiteral {
     /// One exact string value.
     String(&'static str),
@@ -231,7 +142,6 @@ impl BuiltinLiteral {
 
 /// A primitive builtin kind mapped to the store's preallocated IDs.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 enum BuiltinPrimitive {
     /// Bottom type.
     Never,
@@ -277,7 +187,7 @@ impl BuiltinPrimitive {
     }
 }
 
-/// An owned fixed-prefix function type pack.
+/// A static fixed-prefix function type pack.
 #[derive(Debug)]
 struct BuiltinPack {
     /// Fixed positional elements.
@@ -295,7 +205,7 @@ impl BuiltinPack {
     }
 }
 
-/// The open tail of an owned builtin type pack.
+/// The open tail of a static builtin type pack.
 #[derive(Debug)]
 enum BuiltinPackTail {
     /// Repeats one type indefinitely.
