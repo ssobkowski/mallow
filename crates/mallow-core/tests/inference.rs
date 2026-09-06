@@ -148,12 +148,12 @@ fn variadic_calls_forward_extra_arguments(view: TypesView) {
 }
 
 /// Parameters of builtin functions are inferred from their call sites.
-#[ignore = "not yet supported"]
 #[inference_test(fixture = "builtins01")]
 fn builtin_function_parameters_are_inferred(view: TypesView) {
     let ty = view.types();
 
     assert_eq!(view.local("substring"), ty.string());
+    assert_eq!(view.local("d"), ty.number());
 }
 
 /// Metamethod-dependent values retain the result type of their operation.
@@ -237,7 +237,6 @@ fn body_constraints_prevent_false_identity_relations(view: TypesView) {
 }
 
 /// Additive branches retain both matching number and vector operands.
-#[ignore = "not yet supported"]
 #[inference_test(fixture = "arithmetic01")]
 fn additive_branches_keep_matching_number_and_vector_types(view: TypesView) {
     let ty = view.types();

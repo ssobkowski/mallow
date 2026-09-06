@@ -71,7 +71,8 @@ impl AsRef<[u8]> for ByteString {
 }
 
 /// Escapes bytes for use inside a quoted Luau string literal.
-pub fn escape_bytes(bytes: &[u8]) -> String {
+pub fn escape_bytes<S: AsRef<[u8]>>(bytes: S) -> String {
+    let bytes = bytes.as_ref();
     let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
         match byte {

@@ -7,11 +7,7 @@ use crate::il::ProtoId;
 use crate::operator::{BinOp, UnOp};
 use crate::ty::canonical::TypeId;
 
-/// a inference constraint.
-///
-/// The same constraint form is used with stable FIR keys before installation
-/// and dense world IDs while solving. This keeps lowering and solving on one
-/// semantic vocabulary.
+/// An inference constraint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constraint<V, P, O> {
     /// The value produces a type.

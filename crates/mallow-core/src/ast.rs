@@ -10,7 +10,7 @@ use crate::operator::{BinOp, CompoundBinOp, UnOp};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeLiteral {
     /// One exact string value.
-    String(String),
+    String(ByteString),
     /// One exact boolean value.
     Boolean(bool),
 }
@@ -24,14 +24,14 @@ pub struct TypePack {
     /// Fixed positional elements before an optional variadic tail.
     pub head: Vec<Type>,
     /// Variadic tail, when the pack is open.
-    pub tail: Option<TypePackTail>,
+    pub tail: Option<Box<TypePackTail>>,
 }
 
 /// One open tail in a printable Luau type pack.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypePackTail {
     /// A homogeneous `...T` tail that repeats one element type.
-    Homogeneous(Box<Type>),
+    Homogeneous(Type),
 }
 
 /// A source-level Luau type annotation.
@@ -448,6 +448,13 @@ pub struct Typed<T> {
 impl<T> Typed<T> {
     pub const fn new(node: T, ty: Type) -> Self {
         Self { node, ty: Some(ty) }
+    }
+
+    pub fn maybe(node: T, ty: Option<Type>) -> Self {
+        match ty {
+            Some(ty) => Self::new(node, ty),
+            None => Self::untyped(node),
+        }
     }
 
     pub const fn untyped(node: T) -> Self {

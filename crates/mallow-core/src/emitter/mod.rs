@@ -17,28 +17,36 @@ use crate::ir::Unit;
 use crate::ir::fir::{CellId, Constant, Number};
 use crate::ir::nir;
 use crate::operator::{BinOp, CompoundBinOp};
+use crate::ty::canonical::TypeId;
+use crate::ty::inference::Output as InferenceOutput;
 use crate::{DecompileOptions, ast};
 
 /// Emits a materialized NIR program with the default naming policy.
-pub(crate) fn emit_ast(unit: Unit<nir::Function>, options: DecompileOptions) -> Result<ast::Block> {
-    emit_ast_with_namer(unit, options, PlainNamer::default())
+pub(crate) fn emit_ast(
+    unit: Unit<nir::Function>,
+    types: &InferenceOutput,
+    options: DecompileOptions,
+) -> Result<ast::Block> {
+    emit_ast_with_namer(unit, types, options, PlainNamer::default())
 }
 
 /// Emits a materialized NIR program with a caller-provided naming policy.
 pub(crate) fn emit_ast_with_namer<N: Namer>(
     unit: Unit<nir::Function>,
+    types: &InferenceOutput,
     options: DecompileOptions,
     mut namer: N,
 ) -> Result<ast::Block> {
     let entry = unit.entry();
     let EmittedFunction { body, .. } =
-        emit_function(&unit, options, &mut namer, entry, HashMap::new())?;
+        emit_function(&unit, types, options, &mut namer, entry, HashMap::new())?;
     Ok(body)
 }
 
 /// Emits one function under the storage aliases supplied by its closure.
 fn emit_function<N: Namer>(
     unit: &Unit<nir::Function>,
+    types: &InferenceOutput,
     options: DecompileOptions,
     namer: &mut N,
     id: ProtoId,
@@ -46,7 +54,7 @@ fn emit_function<N: Namer>(
 ) -> Result<EmittedFunction> {
     let function = &unit[id];
     let plan = FunctionPlan::build(function, &inherited_cells, options.spill_locals, namer)?;
-    FunctionEmitter::new(unit, options, namer, function, plan).emit()
+    FunctionEmitter::new(unit, types, options, namer, function, plan).emit()
 }
 
 /// AST parts produced for one function prototype.
@@ -64,22 +72,22 @@ enum ExprContext {
     OpenTail,
 }
 
-/// Lowers one fully planned NIR function into AST nodes.
+/// Lifts one fully planned NIR function into AST nodes.
 struct FunctionEmitter<'f, 'n, N: Namer> {
     unit: &'f Unit<nir::Function>,
+    types: &'f InferenceOutput,
     options: DecompileOptions,
     namer: &'n mut N,
     function: &'f nir::Function,
     plan: FunctionPlan,
-    /// Placeholder claimed once for every discard slot in this function.
     discard: Option<ast::Identifier>,
     next_scope: usize,
 }
 
 impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
-    /// Creates one mechanical function lowerer.
     fn new(
         unit: &'f Unit<nir::Function>,
+        types: &'f InferenceOutput,
         options: DecompileOptions,
         namer: &'n mut N,
         function: &'f nir::Function,
@@ -87,6 +95,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
     ) -> Self {
         Self {
             unit,
+            types,
             options,
             namer,
             function,
@@ -109,7 +118,8 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                     .name()
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("function parameter was spilled"))?;
-                Ok(ast::Typed::untyped(ast::Parameter::Regular(name)))
+                let ty = self.type_of_local(*local);
+                Ok(ast::Typed::maybe(ast::Parameter::Regular(name), ty))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut params = params;
@@ -118,8 +128,8 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         }
 
         let mut stmts = self.scope_prefix(0)?;
-        self.lower_stmts(&self.function.prologue, 0, &mut stmts)?;
-        self.lower_region(&self.function.body, 0, &mut stmts)?;
+        self.lift_stmts(&self.function.prologue, 0, &mut stmts)?;
+        self.lift_region(&self.function.body, 0, &mut stmts)?;
 
         Ok(EmittedFunction {
             params,
@@ -127,18 +137,25 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         })
     }
 
-    /// Emits the spill table required at one scope entry.
+    /// Emits the declarations required at one scope entry.
     fn scope_prefix(&self, scope: usize) -> Result<Vec<ast::Stmt>> {
         let scope = self.plan.scope(scope)?;
         let mut stmts = Vec::new();
-        if !scope.prefix_names.is_empty() {
-            stmts.push(ast::Stmt::LocalDeclaration {
-                names: scope
-                    .prefix_names
+        if !scope.prefix_bindings.is_empty() {
+            let names =
+                scope
+                    .prefix_bindings
                     .iter()
-                    .cloned()
-                    .map(ast::Typed::untyped)
-                    .collect(),
+                    .map(|&key| {
+                        let name =
+                            self.plan.binding(key)?.name().cloned().ok_or_else(|| {
+                                anyhow::anyhow!("prefix binding must have a name")
+                            })?;
+                        Ok(ast::Typed::maybe(name, self.type_of_binding(key)))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+            stmts.push(ast::Stmt::LocalDeclaration {
+                names,
                 values: Vec::new(),
             });
         }
@@ -170,26 +187,131 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         scope
     }
 
-    /// Lowers one child region inside a fresh lexical scope.
-    fn lower_child_scope(&mut self, region: &nir::Region) -> Result<ast::Block> {
+    /// Returns the resolved type of a local.
+    fn type_of_local(&self, local: nir::LocalId) -> Option<ast::Type> {
+        let type_id = self
+            .types
+            .value(self.function.id, self.function.locals[local].source)?;
+        Some(self.lift_type(type_id))
+    }
+
+    /// Returns the resolved type of a cell.
+    fn type_of_cell(&self, cell: CellId) -> Option<ast::Type> {
+        let type_id = self.types.cell(self.function.id, cell)?;
+        Some(self.lift_type(type_id))
+    }
+
+    /// Returns the resolved type of one planned binding.
+    fn type_of_binding(&self, key: BindingKey) -> Option<ast::Type> {
+        match key {
+            BindingKey::Local(local) => self.type_of_local(local),
+            BindingKey::Cell(cell) => self.type_of_cell(cell),
+            BindingKey::Pack(_) => None,
+        }
+    }
+
+    /// Lifts a store-owned Type to an AST owned Type.
+    fn lift_type(&self, type_id: TypeId) -> ast::Type {
+        use crate::ty::canonical;
+
+        match self.types.get(type_id) {
+            canonical::Type::Any => ast::Type::Any,
+            canonical::Type::Unknown => ast::Type::Unknown,
+            canonical::Type::Never => ast::Type::Never,
+            canonical::Type::Nil => ast::Type::Nil,
+            canonical::Type::String => ast::Type::String,
+            canonical::Type::Number => ast::Type::Number,
+            canonical::Type::Boolean => ast::Type::Boolean,
+            canonical::Type::Thread => ast::Type::Thread,
+            canonical::Type::Userdata => ast::Type::Userdata,
+            canonical::Type::Vector => ast::Type::Vector,
+            canonical::Type::Integer => ast::Type::Integer,
+            canonical::Type::Buffer => ast::Type::Buffer,
+            canonical::Type::Named(s) => ast::Type::Named(s.clone()),
+            canonical::Type::Literal(lit) => ast::Type::Literal(match lit {
+                canonical::TypeLiteral::String(s) => ast::TypeLiteral::String(s.clone()),
+                canonical::TypeLiteral::Boolean(b) => ast::TypeLiteral::Boolean(*b),
+            }),
+            canonical::Type::Union(ids) => {
+                ast::Type::Union(ids.iter().map(|id| self.lift_type(*id)).collect())
+            }
+            canonical::Type::Intersection(ids) => {
+                ast::Type::Intersection(ids.iter().map(|id| self.lift_type(*id)).collect())
+            }
+            canonical::Type::WithMetatable { base, methods } => ast::Type::WithMetatable {
+                base: Box::new(self.lift_type(*base)),
+                metatable: methods
+                    .iter()
+                    .map(|m| (m.method.as_str().into(), self.lift_type(m.ty)))
+                    .collect(),
+            },
+            canonical::Type::Table => ast::Type::Table {
+                fields: HashMap::new(),
+                array: Some(Box::new((ast::Type::Any, ast::Type::Any))),
+            },
+            canonical::Type::TableShape { fields, indexer } => ast::Type::Table {
+                fields: fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.lift_type(*v)))
+                    .collect(),
+                array: indexer
+                    .and_then(|(k, v)| Some(Box::new((self.lift_type(k), self.lift_type(v))))),
+            },
+            canonical::Type::Function => ast::Type::Function {
+                params: ast::TypePack {
+                    head: Vec::new(),
+                    tail: Some(Box::new(ast::TypePackTail::Homogeneous(ast::Type::Any))),
+                },
+                returns: ast::TypePack {
+                    head: Vec::new(),
+                    tail: Some(Box::new(ast::TypePackTail::Homogeneous(ast::Type::Any))),
+                },
+            },
+            canonical::Type::FunctionSignature { params, returns } => {
+                let params = self.types.get_pack(*params);
+                let returns = self.types.get_pack(*returns);
+                ast::Type::Function {
+                    params: ast::TypePack {
+                        head: params.head.iter().map(|v| self.lift_type(*v)).collect(),
+                        tail: params.tail.as_ref().map(
+                            |canonical::TypePackTail::Homogeneous(t)| {
+                                Box::new(ast::TypePackTail::Homogeneous(self.lift_type(*t)))
+                            },
+                        ),
+                    },
+                    returns: ast::TypePack {
+                        head: returns.head.iter().map(|v| self.lift_type(*v)).collect(),
+                        tail: returns.tail.as_ref().map(
+                            |canonical::TypePackTail::Homogeneous(t)| {
+                                Box::new(ast::TypePackTail::Homogeneous(self.lift_type(*t)))
+                            },
+                        ),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Lifts one child region inside a fresh lexical scope.
+    fn lift_child_scope(&mut self, region: &nir::Region) -> Result<ast::Block> {
         let scope = self.child_scope();
         let mut stmts = self.scope_prefix(scope)?;
-        self.lower_region(region, scope, &mut stmts)?;
+        self.lift_region(region, scope, &mut stmts)?;
         Ok(ast::Block::with_stmts(stmts))
     }
 
-    /// Lowers one structured region into the current AST statement buffer.
-    fn lower_region(
+    /// Lifts one structured region into the current AST statement buffer.
+    fn lift_region(
         &mut self,
         region: &nir::Region,
         scope: usize,
         out: &mut Vec<ast::Stmt>,
     ) -> Result<()> {
         match region {
-            nir::Region::Block { stmts, .. } => self.lower_stmts(stmts, scope, out)?,
+            nir::Region::Block { stmts, .. } => self.lift_stmts(stmts, scope, out)?,
             nir::Region::Sequence(nodes) => {
                 for node in nodes {
-                    self.lower_region(node, scope, out)?;
+                    self.lift_region(node, scope, out)?;
                 }
             }
             nir::Region::If {
@@ -197,10 +319,10 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 then_branch,
                 else_branch,
             } => {
-                let condition = self.lower_expr(condition)?;
-                let then_body = self.lower_child_scope(then_branch)?;
+                let condition = self.lift_expr(condition)?;
+                let then_body = self.lift_child_scope(then_branch)?;
                 let else_clause = if let Some(else_branch) = else_branch {
-                    let mut body = self.lower_child_scope(else_branch)?;
+                    let mut body = self.lift_child_scope(else_branch)?;
                     Some(match body.stmts.as_slice() {
                         [ast::Stmt::If(_)] => {
                             let Some(ast::Stmt::If(nested)) = body.stmts.pop() else {
@@ -220,13 +342,13 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 }));
             }
             nir::Region::While { condition, body } => {
-                let condition = self.lower_expr(condition)?;
-                let body = self.lower_child_scope(body)?;
+                let condition = self.lift_expr(condition)?;
+                let body = self.lift_child_scope(body)?;
                 out.push(ast::Stmt::While { condition, body });
             }
             nir::Region::RepeatUntil { condition, body } => {
-                let body = self.lower_child_scope(body)?;
-                let condition = self.lower_expr(condition)?;
+                let body = self.lift_child_scope(body)?;
+                let condition = self.lift_expr(condition)?;
                 out.push(ast::Stmt::RepeatUntil { condition, body });
             }
             nir::Region::NumericFor {
@@ -242,10 +364,10 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                     .name()
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("numeric-for variable was spilled"))?;
-                let start = self.lower_expr(start)?;
-                let end = self.lower_expr(end)?;
-                let step = Some(self.lower_expr(step)?);
-                let body = self.lower_child_scope(body)?;
+                let start = self.lift_expr(start)?;
+                let end = self.lift_expr(end)?;
+                let step = Some(self.lift_expr(step)?);
+                let body = self.lift_child_scope(body)?;
                 out.push(ast::Stmt::NumericFor {
                     var,
                     start,
@@ -278,30 +400,30 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                         } else {
                             ExprContext::Scalar
                         };
-                        self.lower_expr_in(value, context)
+                        self.lift_expr_in(value, context)
                     })
                     .collect::<Result<_>>()?;
-                let body = self.lower_child_scope(body)?;
+                let body = self.lift_child_scope(body)?;
                 out.push(ast::Stmt::GenericFor { vars, exprs, body });
             }
             nir::Region::Continue => out.push(ast::Stmt::Continue),
             nir::Region::Break => out.push(ast::Stmt::Break),
             nir::Region::Return(values) => out.push(ast::Stmt::Return {
-                values: self.lower_pack(values)?,
+                values: self.lift_pack(values)?,
             }),
         }
         Ok(())
     }
 
-    /// Lowers a flat statement list.
-    fn lower_stmts(
+    /// Lifts a flat statement list.
+    fn lift_stmts(
         &mut self,
         stmts: &[nir::Stmt],
         scope: usize,
         out: &mut Vec<ast::Stmt>,
     ) -> Result<()> {
         for stmt in stmts {
-            self.lower_stmt(stmt, scope, out)?;
+            self.lift_stmt(stmt, scope, out)?;
         }
         Ok(())
     }
@@ -310,14 +432,14 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
     fn eval_pack(&mut self, value: &nir::PackExpr, out: &mut Vec<ast::Stmt>) -> Result<()> {
         match value {
             nir::PackExpr::Call { .. } | nir::PackExpr::MethodCall { .. } => {
-                let mut values = self.lower_pack(value)?;
-                ensure!(values.len() == 1, "call pack must lower to one expression");
+                let mut values = self.lift_pack(value)?;
+                ensure!(values.len() == 1, "call pack must be one expression");
                 out.push(ast::Stmt::Expression {
                     expr: values.pop().expect("the call produced one expression"),
                 });
             }
             nir::PackExpr::Values { .. } => {
-                let values = self.lower_pack(value)?;
+                let values = self.lift_pack(value)?;
                 if !values.is_empty() {
                     out.push(ast::Stmt::Comment {
                         text: "the following code evaluates an unused value pack".to_string(),
@@ -336,7 +458,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
     }
 
     /// Binds one multivalue result into one list of places.
-    fn lower_bind_many(
+    fn lift_bind_many(
         &mut self,
         targets: &[nir::Place],
         values: &nir::PackExpr,
@@ -346,27 +468,27 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         /// One prepared binding inside a multibind.
         enum Slot {
             /// Declares one new name in this statement's scope.
-            Fresh(SmolStr),
+            Fresh((Identifier, Option<ast::Type>)),
             /// Reuses existing source storage.
             Existing(Storage),
             /// Writes one non-storage place.
             Place(ast::Expr),
         }
 
-        let rhs = self.lower_pack(values)?;
+        let rhs = self.lift_pack(values)?;
         let slots: Vec<_> = targets
             .iter()
             .map(|target| {
                 Ok(match target {
                     // A discard slot always joins the fresh declaration group.
-                    nir::Place::Discard => Slot::Fresh(self.discard_name().0),
+                    nir::Place::Discard => Slot::Fresh((self.discard_name(), None)),
                     nir::Place::Local(local) => {
                         if self
                             .plan
                             .claim_declaration(BindingKey::Local(*local), scope)
                             && let Some(name) = self.plan.local(*local)?.name().cloned()
                         {
-                            Slot::Fresh(name.0)
+                            Slot::Fresh((name, self.type_of_local(*local)))
                         } else {
                             Slot::Existing(self.plan.local(*local)?.clone())
                         }
@@ -375,13 +497,13 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                         if self.plan.claim_declaration(BindingKey::Cell(*cell), scope)
                             && let Some(name) = self.plan.cell(*cell)?.name().cloned()
                         {
-                            Slot::Fresh(name.0)
+                            Slot::Fresh((name, self.type_of_cell(*cell)))
                         } else {
                             Slot::Existing(self.plan.cell(*cell)?.clone())
                         }
                     }
                     nir::Place::Global(_) | nir::Place::Table { .. } => {
-                        Slot::Place(self.lower_place(target)?)
+                        Slot::Place(self.lift_place(target)?)
                     }
                 })
             })
@@ -391,7 +513,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             let names = slots
                 .into_iter()
                 .map(|slot| match slot {
-                    Slot::Fresh(name) => ast::Typed::untyped(Identifier(name)),
+                    Slot::Fresh((name, ty)) => ast::Typed::maybe(name, ty),
                     Slot::Existing(_) | Slot::Place(_) => unreachable!("all slots are fresh"),
                 })
                 .collect();
@@ -402,7 +524,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         let fresh: Vec<_> = slots
             .iter()
             .filter_map(|slot| match slot {
-                Slot::Fresh(name) => Some(ast::Typed::untyped(Identifier(name.clone()))),
+                Slot::Fresh((name, ty)) => Some(ast::Typed::maybe(name.clone(), ty.clone())),
                 Slot::Existing(_) | Slot::Place(_) => None,
             })
             .collect();
@@ -415,7 +537,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         let lhs = slots
             .into_iter()
             .map(|slot| match slot {
-                Slot::Fresh(name) => ast::Expr::Named(Identifier(name)),
+                Slot::Fresh((name, _)) => ast::Expr::Named(name),
                 Slot::Existing(storage) => storage.expr(),
                 Slot::Place(place) => place,
             })
@@ -424,8 +546,8 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         Ok(())
     }
 
-    /// Lowers one NIR statement.
-    fn lower_stmt(
+    /// Lifts one NIR statement.
+    fn lift_stmt(
         &mut self,
         stmt: &nir::Stmt,
         scope: usize,
@@ -441,11 +563,12 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                         out.push(ast::Stmt::CompoundAssignment {
                             lhs: self.plan.local(*local)?.expr(),
                             op,
-                            rhs: self.lower_expr(rhs)?,
+                            rhs: self.lift_expr(rhs)?,
                         });
                     } else {
-                        let value = self.lower_expr(value)?;
-                        self.bind_storage(self.plan.local(*local)?, value, declaration, out);
+                        let value = self.lift_expr(value)?;
+                        let ty = self.type_of_local(*local);
+                        self.bind_storage(self.plan.local(*local)?, value, declaration, ty, out);
                     }
                 }
                 nir::Place::Cell(cell) => {
@@ -454,16 +577,17 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                         out.push(ast::Stmt::CompoundAssignment {
                             lhs: self.plan.cell(*cell)?.expr(),
                             op,
-                            rhs: self.lower_expr(rhs)?,
+                            rhs: self.lift_expr(rhs)?,
                         });
                     } else {
-                        let value = self.lower_expr(value)?;
-                        self.bind_storage(self.plan.cell(*cell)?, value, declaration, out);
+                        let value = self.lift_expr(value)?;
+                        let ty = self.type_of_cell(*cell);
+                        self.bind_storage(self.plan.cell(*cell)?, value, declaration, ty, out);
                     }
                 }
                 nir::Place::Global(_) | nir::Place::Table { .. } => {
-                    let target = self.lower_place(target)?;
-                    let value = self.lower_expr(value)?;
+                    let target = self.lift_place(target)?;
+                    let value = self.lift_expr(value)?;
                     out.push(ast::Stmt::Assignment {
                         lhs: vec![target],
                         rhs: vec![value],
@@ -474,19 +598,19 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 }
             },
             nir::Stmt::BindMany { targets, values } => {
-                self.lower_bind_many(targets, values, scope, out)?;
+                self.lift_bind_many(targets, values, scope, out)?;
             }
             nir::Stmt::BindPack { local, value } => {
                 let packed = ast::Expr::FunctionCall {
                     func: Box::new(field(global("table"), "pack")),
-                    args: self.lower_pack(value)?,
+                    args: self.lift_pack(value)?,
                 };
                 out.push(ast::Stmt::Comment {
                     text: "the following code preserves a value pack that cannot be represented"
                         .to_string(),
                 });
                 let declaration = self.plan.claim_declaration(BindingKey::Pack(*local), scope);
-                self.bind_storage(self.plan.pack(*local)?, packed, declaration, out);
+                self.bind_storage(self.plan.pack(*local)?, packed, declaration, None, out);
             }
             nir::Stmt::Eval { value } => self.eval_pack(value, out)?,
             nir::Stmt::OpenCell { cell, value, .. } => {
@@ -504,7 +628,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 index,
                 values,
                 ..
-            } => self.lower_set_list(table, *index, values, out)?,
+            } => self.lift_set_list(table, *index, values, out)?,
         }
         Ok(())
     }
@@ -515,11 +639,12 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         storage: &Storage,
         value: ast::Expr,
         declaration: bool,
+        ty: Option<ast::Type>,
         out: &mut Vec<ast::Stmt>,
     ) {
         if declaration && let Some(name) = storage.name() {
             out.push(ast::Stmt::LocalDeclaration {
-                names: vec![ast::Typed::untyped(name.clone())],
+                names: vec![ast::Typed::maybe(name.clone(), ty)],
                 values: vec![value],
             });
         } else {
@@ -530,15 +655,15 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         }
     }
 
-    /// Lowers a table list write while preserving open-pack length.
-    fn lower_set_list(
+    /// Lifts a table list write while preserving open-pack length.
+    fn lift_set_list(
         &mut self,
         table: &nir::Expr,
         index: u32,
         values: &nir::PackExpr,
         out: &mut Vec<ast::Stmt>,
     ) -> Result<()> {
-        let table = self.lower_expr(table)?;
+        let table = self.lift_expr(table)?;
         if let Some(length) = values.fixed_len() {
             let lhs = (0..length)
                 .map(|offset| ast::Expr::Index {
@@ -550,7 +675,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 .collect();
             out.push(ast::Stmt::Assignment {
                 lhs,
-                rhs: self.lower_pack(values)?,
+                rhs: self.lift_pack(values)?,
             });
             return Ok(());
         }
@@ -565,7 +690,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         let temp = self.plan.names.internal("pack");
         let packed = ast::Expr::FunctionCall {
             func: Box::new(field(global("table"), "pack")),
-            args: self.lower_pack(values)?,
+            args: self.lift_pack(values)?,
         };
         out.push(ast::Stmt::Comment {
             text: "the following code preserves an open table value list".to_string(),
@@ -584,52 +709,52 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         Ok(())
     }
 
-    /// Lowers one writable NIR place.
-    fn lower_place(&mut self, place: &nir::Place) -> Result<ast::Expr> {
+    /// Lifts one writable NIR place.
+    fn lift_place(&mut self, place: &nir::Place) -> Result<ast::Expr> {
         Ok(match place {
             nir::Place::Local(local) => self.plan.local(*local)?.expr(),
             nir::Place::Cell(cell) => self.plan.cell(*cell)?.expr(),
             nir::Place::Global(name) => global_name(name),
             nir::Place::Discard => unreachable!("discard places are never read"),
             nir::Place::Table { table, key } => {
-                table_access(self.lower_expr(table)?, key, self.lower_expr(key)?)
+                table_access(self.lift_expr(table)?, key, self.lift_expr(key)?)
             }
         })
     }
 
-    /// Lowers one expression in a context which keeps only one value.
-    fn lower_expr(&mut self, expr: &nir::Expr) -> Result<ast::Expr> {
-        self.lower_expr_in(expr, ExprContext::Scalar)
+    /// Lifts one expression in a context which keeps only one value.
+    fn lift_expr(&mut self, expr: &nir::Expr) -> Result<ast::Expr> {
+        self.lift_expr_in(expr, ExprContext::Scalar)
     }
 
-    /// Lowers one scalar expression for its surrounding Luau syntax.
-    fn lower_expr_in(&mut self, expr: &nir::Expr, context: ExprContext) -> Result<ast::Expr> {
+    /// Lifts one scalar expression for its surrounding Luau syntax.
+    fn lift_expr_in(&mut self, expr: &nir::Expr, context: ExprContext) -> Result<ast::Expr> {
         Ok(match expr {
             nir::Expr::Local(local) => self.plan.local(*local)?.expr(),
             nir::Expr::Constant(value) => constant(value),
-            nir::Expr::Closure { proto, captures } => self.lower_closure(*proto, captures)?,
+            nir::Expr::Closure { proto, captures } => self.lift_closure(*proto, captures)?,
             nir::Expr::GetTable { table, key } => {
-                table_access(self.lower_expr(table)?, key, self.lower_expr(key)?)
+                table_access(self.lift_expr(table)?, key, self.lift_expr(key)?)
             }
             nir::Expr::GetGlobal(name) => global_name(name),
             nir::Expr::Binary { lhs, op, rhs } => ast::Expr::Binary {
-                lhs: Box::new(self.lower_expr(lhs)?),
+                lhs: Box::new(self.lift_expr(lhs)?),
                 op: *op,
-                rhs: Box::new(self.lower_expr(rhs)?),
+                rhs: Box::new(self.lift_expr(rhs)?),
             },
             nir::Expr::Unary { op, value } => ast::Expr::Unary {
                 op: *op,
-                expr: Box::new(self.lower_expr(value)?),
+                expr: Box::new(self.lift_expr(value)?),
             },
             nir::Expr::Concat(values) => {
                 let mut values = values.iter().rev();
                 let Some(last) = values.next() else {
                     bail!("NIR concat cannot be empty")
                 };
-                let mut combined = self.lower_expr(last)?;
+                let mut combined = self.lift_expr(last)?;
                 for value in values {
                     combined = ast::Expr::Binary {
-                        lhs: Box::new(self.lower_expr(value)?),
+                        lhs: Box::new(self.lift_expr(value)?),
                         op: BinOp::Concat,
                         rhs: Box::new(combined),
                     };
@@ -641,24 +766,24 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 then_value,
                 else_value,
             } => ast::Expr::IfElse {
-                condition: Box::new(self.lower_expr(condition)?),
-                then_expr: Box::new(self.lower_expr(then_value)?),
-                else_expr: Box::new(self.lower_expr(else_value)?),
+                condition: Box::new(self.lift_expr(condition)?),
+                then_expr: Box::new(self.lift_expr(then_value)?),
+                else_expr: Box::new(self.lift_expr(else_value)?),
             },
             nir::Expr::Table { items } => {
-                let mut lowered = Vec::new();
+                let mut lifted = Vec::new();
                 for item in items {
-                    lowered.extend(self.lower_table_item(item)?);
+                    lifted.extend(self.lift_table_item(item)?);
                 }
-                ast::Expr::Table { items: lowered }
+                ast::Expr::Table { items: lifted }
             }
-            nir::Expr::Project { pack, index } => self.lower_project(pack, *index, context)?,
+            nir::Expr::Project { pack, index } => self.lift_project(pack, *index, context)?,
             nir::Expr::LoadCell(cell) => self.plan.cell(*cell)?.expr(),
         })
     }
 
-    /// Lowers one closure and maps positional captures to child upvalue cells.
-    fn lower_closure(&mut self, proto: ProtoId, captures: &[nir::Capture]) -> Result<ast::Expr> {
+    /// Lifts one closure and maps positional captures to child upvalue cells.
+    fn lift_closure(&mut self, proto: ProtoId, captures: &[nir::Capture]) -> Result<ast::Expr> {
         let child_upvalues = &self.unit[proto].upvalues;
         ensure!(
             child_upvalues.len() == captures.len(),
@@ -674,15 +799,22 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             inherited.insert(cell, storage);
         }
 
-        let child = emit_function(self.unit, self.options, &mut *self.namer, proto, inherited)?;
+        let child = emit_function(
+            self.unit,
+            self.types,
+            self.options,
+            &mut *self.namer,
+            proto,
+            inherited,
+        )?;
         Ok(ast::Expr::AnonymousFunction {
             params: child.params,
             body: child.body,
         })
     }
 
-    /// Lowers one scalar projection from a value pack.
-    fn lower_project(
+    /// Lifts one scalar projection from a value pack.
+    fn lift_project(
         &mut self,
         pack: &nir::PackExpr,
         index: usize,
@@ -695,7 +827,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             });
         }
 
-        let mut values = self.lower_pack(pack)?;
+        let mut values = self.lift_pack(pack)?;
         if index == 0 && values.len() == 1 {
             let value = values.pop().unwrap();
             return if context == ExprContext::OpenTail {
@@ -713,8 +845,8 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         })
     }
 
-    /// Lowers one NIR pack into a Luau expression list.
-    fn lower_pack(&mut self, pack: &nir::PackExpr) -> Result<Vec<ast::Expr>> {
+    /// Lifts one NIR pack into a Luau expression list.
+    fn lift_pack(&mut self, pack: &nir::PackExpr) -> Result<Vec<ast::Expr>> {
         Ok(match pack {
             nir::PackExpr::Local(local) => {
                 let packed = self.plan.pack(*local)?.expr();
@@ -735,40 +867,40 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                     } else {
                         ExprContext::Scalar
                     };
-                    values.push(self.lower_expr_in(value, context)?);
+                    values.push(self.lift_expr_in(value, context)?);
                 }
                 if let Some(tail) = tail {
-                    values.extend(self.lower_pack(tail)?);
+                    values.extend(self.lift_pack(tail)?);
                 }
                 values
             }
             nir::PackExpr::Call { function, args } => vec![ast::Expr::FunctionCall {
-                func: Box::new(self.lower_expr(function)?),
-                args: self.lower_pack(args)?,
+                func: Box::new(self.lift_expr(function)?),
+                args: self.lift_pack(args)?,
             }],
             nir::PackExpr::MethodCall {
                 object,
                 method,
                 args,
             } => vec![ast::Expr::MethodCall {
-                object: Box::new(self.lower_expr(object)?),
+                object: Box::new(self.lift_expr(object)?),
                 method: ast::Identifier::new(method.clone()),
-                args: self.lower_pack(args)?,
+                args: self.lift_pack(args)?,
             }],
             nir::PackExpr::VarArgs => vec![ast::Expr::Vararg],
         })
     }
 
-    /// Lowers one table item into a vector of AST table items.
-    fn lower_table_item(&mut self, item: &nir::TableItem) -> Result<Vec<ast::TableItem>> {
+    /// Lifts one table item into a vector of AST table items.
+    fn lift_table_item(&mut self, item: &nir::TableItem) -> Result<Vec<ast::TableItem>> {
         Ok(match item {
             nir::TableItem::List(pack) => self
-                .lower_pack(pack)?
+                .lift_pack(pack)?
                 .into_iter()
                 .map(|value| ast::TableItem::Implicit { value })
                 .collect(),
             nir::TableItem::Index(key, value) => {
-                let value = self.lower_expr(value)?;
+                let value = self.lift_expr(value)?;
                 if let nir::Expr::Constant(Constant::String(s)) = key
                     && is_valid_luau_identifier(s)
                 {
@@ -780,7 +912,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                     }]
                 } else {
                     vec![ast::TableItem::Indexed {
-                        index: self.lower_expr(key)?,
+                        index: self.lift_expr(key)?,
                         value,
                     }]
                 }
@@ -840,7 +972,7 @@ fn global(name: impl Into<SmolStr>) -> ast::Expr {
 }
 
 /// Chooses field syntax when a constant string key permits it.
-fn table_access(base: ast::Expr, key: &nir::Expr, lowered_key: ast::Expr) -> ast::Expr {
+fn table_access(base: ast::Expr, key: &nir::Expr, ast_key: ast::Expr) -> ast::Expr {
     if let nir::Expr::Constant(Constant::String(value)) = key
         && let Some(field_name) = value.as_utf8()
         && is_valid_luau_identifier(field_name)
@@ -849,7 +981,7 @@ fn table_access(base: ast::Expr, key: &nir::Expr, lowered_key: ast::Expr) -> ast
     } else {
         ast::Expr::Index {
             base: Box::new(base),
-            index: Box::new(lowered_key),
+            index: Box::new(ast_key),
         }
     }
 }

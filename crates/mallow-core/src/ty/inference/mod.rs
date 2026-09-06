@@ -1,4 +1,4 @@
-//! Whole-program type inference for FIR.
+//! FIR Type Inference.
 
 mod engine;
 mod keys;
@@ -13,28 +13,39 @@ use super::store::TypeStore;
 use crate::il::ProtoId;
 use crate::ir::Unit;
 use crate::ir::fir::{CellId, Function, ValueId};
-use crate::ty::canonical::TypeId;
+use crate::ty::canonical::{Type, TypeId, TypePack, TypePackId};
 
 use keys::ValueKey;
 use program::InferenceProgram;
 
-/// Types inferred for one complete FIR unit.
+/// Types inferred for a FIR unit.
+#[derive(Debug)]
 pub(crate) struct Output {
     /// Canonical graph that owns every inferred type.
     store: TypeStore,
-    /// Materialized types indexed by stable FIR identity.
+    /// Materialized types indexed by a FIR identity.
     values: HashMap<ValueKey, TypeId>,
 }
 
 impl Output {
-    /// Returns the inferred type for one immutable FIR value.
+    /// Returns the inferred type for an immutable FIR value.
     pub(crate) fn value(&self, proto: ProtoId, value: ValueId) -> Option<TypeId> {
         self.values.get(&ValueKey::Value(proto, value)).copied()
     }
 
-    /// Returns the inferred type for one mutable FIR cell.
+    /// Returns the inferred type for a mutable FIR cell.
     pub(crate) fn cell(&self, proto: ProtoId, cell: CellId) -> Option<TypeId> {
         self.values.get(&ValueKey::Cell(proto, cell)).copied()
+    }
+
+    /// Returns the inferred DAG type of a type id.
+    pub(crate) fn get(&self, id: TypeId) -> &Type {
+        self.store.get(id)
+    }
+
+    /// Returns the inferred DAG type pack of a type pack id.
+    pub(crate) fn get_pack(&self, id: TypePackId) -> &TypePack {
+        self.store.get_pack(id)
     }
 
     /// Joins several inferred types in the output graph.
@@ -53,7 +64,7 @@ impl Output {
     }
 }
 
-/// Infers types for a complete FIR unit.
+/// Infers types for a FIR unit.
 pub(crate) fn run(unit: &Unit<Function>) -> Output {
     let mut store = TypeStore::new();
     let mut program = lower::lower_functions(unit, &mut store);

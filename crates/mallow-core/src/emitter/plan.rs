@@ -69,8 +69,8 @@ struct ScopeFacts<'a> {
 pub(crate) struct ScopePlan {
     /// Spill table declared by the scope, when one is needed.
     pub(crate) spill_table: Option<Identifier>,
-    /// Regular locals that must exist before the first statement.
-    pub(crate) prefix_names: Vec<Identifier>,
+    /// Bindings that must exist before the first statement.
+    pub(crate) prefix_bindings: Vec<BindingKey>,
 }
 
 /// Complete storage and naming plan for one NIR function.
@@ -142,7 +142,7 @@ impl FunctionPlan {
             let spill_table = needs_spill.then(|| names.internal("values"));
             let mut remaining_optional_names = optional_named;
             let mut spill_index = 1usize;
-            let mut prefix_names = Vec::new();
+            let mut prefix_bindings = Vec::new();
 
             for binding in bindings {
                 let named = binding.must_be_named() || remaining_optional_names > 0;
@@ -153,7 +153,7 @@ impl FunctionPlan {
                     let suggestion = namer.name(binding.name_context());
                     let name = names.claim(suggestion);
                     if binding.declaration == Declaration::Prefix {
-                        prefix_names.push(name.clone());
+                        prefix_bindings.push(binding.key);
                     }
                     Storage::Named(name)
                 } else {
@@ -178,7 +178,7 @@ impl FunctionPlan {
                 inherited_count + mandatory_count + optional_named + usize::from(needs_spill);
             scopes.push(ScopePlan {
                 spill_table,
-                prefix_names,
+                prefix_bindings,
             });
         }
 
@@ -219,6 +219,15 @@ impl FunctionPlan {
         self.packs
             .get(&pack)
             .ok_or_else(|| anyhow::anyhow!("missing source storage for pack {}", pack.index()))
+    }
+
+    /// Returns storage for one planned binding.
+    pub(crate) fn binding(&self, key: BindingKey) -> Result<&Storage> {
+        match key {
+            BindingKey::Local(local) => self.local(local),
+            BindingKey::Cell(cell) => self.cell(cell),
+            BindingKey::Pack(pack) => self.pack(pack),
+        }
     }
 
     /// Claims one pending declaration in the given source scope.

@@ -237,25 +237,26 @@ pub fn decompile_bytecode_with_diagnostics(
     let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
     let unit = ir::fir::lift(chunk)?;
 
-    // Magic number. I was too lazy to introduce a "temporary" patch for not running the inference
-    // optionally, it currently seems to fall into an infinite loop in some cases.
-    if options.max_pass_iterations == 8221 {
-        ty::inference::run(&unit);
-    }
-
     use core::fmt::Write;
 
     match options.emit {
         EmitMode::Source => {
+            let inference_span = tracing::info_span!("type_inference");
+            let types = {
+                let _enter = inference_span.enter();
+                ty::inference::run(&unit)
+            };
+
             let mut nested_unit = unit.map_functions(|function| {
                 let diagnostics = diagnostics.for_proto(function.id.0);
                 ir::nir::lift(function, &diagnostics)
             })?;
+
             ir::nir::passes::run(&mut nested_unit);
             for function in nested_unit.functions_mut() {
                 ir::nir::materialize::destroy_ssa(function);
             }
-            let block = emitter::emit_ast(nested_unit, options)?;
+            let block = emitter::emit_ast(nested_unit, &types, options)?;
             Ok(printer::print(&block))
         }
         EmitMode::Ir | EmitMode::Nir => {

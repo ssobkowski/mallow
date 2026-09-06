@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use id_arena::{Arena, Id};
 use smol_str::SmolStr;
 
 use super::Output;
@@ -12,11 +13,11 @@ use crate::il::ProtoId;
 use crate::ir::Unit;
 use crate::ir::fir::Function;
 use crate::operator::{BinOp, UnOp};
-use crate::ty::canonical::{Type, TypeId, TypeLiteral};
+use crate::ty::canonical::{RuntimeKind, Type, TypeId, TypeLiteral, TypePackId, TypePackTail};
 use crate::ty::store::TypeStore;
 
-/// a installed constraint using dense world identities.
 type Rule = Constraint<ValueId, PackId, ObjectId>;
+type RuleId = Id<Rule>;
 
 /// Solves all constraints in a program to a fixed point.
 pub(super) fn run(program: InferenceProgram, unit: &Unit<Function>, types: TypeStore) -> Output {
@@ -34,7 +35,7 @@ enum Activation {
     /// Connects a call argument to a closure parameter.
     CallParameter {
         /// Rule that owns the connection.
-        rule: usize,
+        rule: RuleId,
         /// Closure receiving the argument.
         proto: ProtoId,
         /// Zero-based parameter position.
@@ -43,14 +44,14 @@ enum Activation {
     /// Connects extra call arguments to a closure vararg pack.
     CallVarArgs {
         /// Rule that owns the connection.
-        rule: usize,
+        rule: RuleId,
         /// Closure receiving the extra arguments.
         proto: ProtoId,
     },
     /// Connects a closure result to a call result.
     CallReturn {
         /// Rule that owns the connection.
-        rule: usize,
+        rule: RuleId,
         /// Closure producing the result.
         proto: ProtoId,
         /// Zero-based result position.
@@ -59,7 +60,7 @@ enum Activation {
     /// Connects a table write to a concrete object.
     SetTable {
         /// Rule that owns the connection.
-        rule: usize,
+        rule: RuleId,
         /// Object receiving the write.
         object: ObjectId,
         /// Exact field, or `None` for a dynamic index.
@@ -68,7 +69,7 @@ enum Activation {
     /// Connects a table read to a concrete object.
     GetTable {
         /// Rule that owns the connection.
-        rule: usize,
+        rule: RuleId,
         /// Object providing the value.
         object: ObjectId,
         /// Exact field, or `None` for a dynamic index.
@@ -96,14 +97,14 @@ enum TableKey {
 /// Pending rule queue with duplicate suppression.
 #[derive(Debug, Default)]
 struct RuleQueue {
-    queue: VecDeque<usize>,
-    queued: HashSet<usize>,
+    queue: VecDeque<RuleId>,
+    queued: HashSet<RuleId>,
 }
 
 impl RuleQueue {
     /// Adds a rule to the queue if it is not already pending.
     #[inline]
-    fn push(&mut self, rule: usize) {
+    fn push(&mut self, rule: RuleId) {
         if self.queued.insert(rule) {
             self.queue.push_back(rule);
         }
@@ -111,7 +112,7 @@ impl RuleQueue {
 
     /// Removes the next pending rule.
     #[inline]
-    fn pop(&mut self) -> Option<usize> {
+    fn pop(&mut self) -> Option<RuleId> {
         let rule = self.queue.pop_front()?;
         self.queued.remove(&rule);
         Some(rule)
@@ -119,7 +120,7 @@ impl RuleQueue {
 
     /// Extends the queue with the given rules.
     #[inline]
-    fn extend(&mut self, rules: impl IntoIterator<Item = usize>) {
+    fn extend(&mut self, rules: impl IntoIterator<Item = RuleId>) {
         for rule in rules {
             self.push(rule);
         }
@@ -129,18 +130,18 @@ impl RuleQueue {
 /// Reverse dependency index from changed facts to rules.
 #[derive(Debug, Default)]
 struct Subscriptions {
-    values: HashMap<ValueId, HashSet<usize>>,
-    packs: HashMap<PackId, HashSet<usize>>,
+    values: HashMap<ValueId, HashSet<RuleId>>,
+    packs: HashMap<PackId, HashSet<RuleId>>,
 }
 
 impl Subscriptions {
     /// Records that `rule` must rerun when `value` changes.
-    fn value(&mut self, value: ValueId, rule: usize) {
+    fn value(&mut self, value: ValueId, rule: RuleId) {
         self.values.entry(value).or_default().insert(rule);
     }
 
     /// Records that `rule` must rerun when `pack` shape changes.
-    fn pack(&mut self, pack: PackId, rule: usize) {
+    fn pack(&mut self, pack: PackId, rule: RuleId) {
         self.packs.entry(pack).or_default().insert(rule);
     }
 }
@@ -150,7 +151,7 @@ struct Engine<'u> {
     types: TypeStore,
     world: World,
     unit: &'u Unit<Function>,
-    rules: Vec<Rule>,
+    rules: Arena<Rule>,
     subscriptions: Subscriptions,
     queue: RuleQueue,
     activations: HashSet<Activation>,
@@ -167,7 +168,7 @@ impl<'u> Engine<'u> {
             types,
             world: World::new(never, unknown),
             unit,
-            rules: Vec::new(),
+            rules: Arena::new(),
             subscriptions: Subscriptions::default(),
             queue: RuleQueue::default(),
             activations: HashSet::new(),
@@ -184,10 +185,9 @@ impl<'u> Engine<'u> {
         // Pack shapes must settle before return signatures request projections.
         self.solve();
 
-        let protos: Vec<_> = self.unit.functions().map(|function| function.id).collect();
-        for proto in protos {
+        for proto in self.unit.functions().map(|function| function.id) {
             let returns = self.pack_for_key(PackKey::Returns(proto));
-            let width = self.pack_width(returns, &mut HashSet::new());
+            let width = self.pack_width(returns);
             for index in 0..width {
                 self.ensure_projection(returns, index);
             }
@@ -200,8 +200,7 @@ impl<'u> Engine<'u> {
     /// Applies queued constraints until no known fact changes.
     fn solve(&mut self) {
         while let Some(rule_id) = self.queue.pop() {
-            let rule = self.rules[rule_id].clone();
-            self.apply(rule_id, rule);
+            self.apply(rule_id);
         }
     }
 
@@ -216,29 +215,27 @@ impl<'u> Engine<'u> {
     }
 
     /// Adds a rule and subscribes it to its direct inputs.
-    fn add_rule(&mut self, rule: Rule) -> usize {
-        let id = self.rules.len();
-        self.subscribe_rule(id, &rule);
-        self.rules.push(rule);
+    fn add_rule(&mut self, rule: Rule) {
+        let id = self.rules.alloc(rule);
+        self.subscribe_rule(id);
         self.queue.push(id);
-        id
     }
 
-    /// Adds a flow rule once.
+    /// Adds a flow rule.
     fn add_flow_rule(&mut self, source: ValueId, target: ValueId) {
         if self.flow_rules.insert((source, target, FlowKind::Full)) {
             self.add_rule(Rule::Flow { source, target });
         }
     }
 
-    /// Adds a non-nil flow rule once.
+    /// Adds a non-nil flow rule.
     fn add_non_nil_flow_rule(&mut self, source: ValueId, target: ValueId) {
         if self.flow_rules.insert((source, target, FlowKind::NonNil)) {
             self.add_rule(Rule::NonNilFlow { source, target });
         }
     }
 
-    /// Adds a pack-slice rule once.
+    /// Adds a pack-slice rule.
     fn add_slice_rule(&mut self, source: PackId, offset: usize, target: PackId) {
         if self.slice_rules.insert((source, offset, target)) {
             self.add_rule(Rule::SlicePack {
@@ -249,16 +246,16 @@ impl<'u> Engine<'u> {
         }
     }
 
-    /// Adds a list write rule once.
+    /// Adds a list write rule.
     fn add_write_list_rule(&mut self, table: ValueId, values: PackId) {
         if self.write_list_rules.insert((table, values)) {
             self.add_rule(Rule::WriteList { table, values });
         }
     }
 
-    /// Registers the facts that can wake `rule`.
-    fn subscribe_rule(&mut self, id: usize, rule: &Rule) {
-        match rule {
+    /// Registers the facts that can wake a rule with the given id.
+    fn subscribe_rule(&mut self, id: RuleId) {
+        match &self.rules[id] {
             Rule::Produce { .. }
             | Rule::Require { .. }
             | Rule::IncludeObject { .. }
@@ -434,64 +431,67 @@ impl<'u> Engine<'u> {
     }
 
     /// Applies a rule.
-    fn apply(&mut self, rule_id: usize, rule: Rule) {
-        match rule {
+    fn apply(&mut self, rule: RuleId) {
+        match &self.rules[rule] {
             Rule::Produce { value, ty } => {
-                self.produce(value, ty);
+                self.produce(*value, *ty);
             }
             Rule::Require { value, ty } => {
-                self.require(value, ty);
+                self.require(*value, *ty);
             }
-            Rule::Flow { source, target } => self.flow(source, target),
-            Rule::NonNilFlow { source, target } => self.non_nil_flow(source, target),
+            Rule::Flow { source, target } => self.flow(*source, *target),
+            Rule::NonNilFlow { source, target } => self.non_nil_flow(*source, *target),
             Rule::Filter {
                 source,
                 target,
                 predicate,
-            } => self.filter(source, target, predicate),
+            } => self.filter(*source, *target, *predicate),
             Rule::IncludeObject { value, object } => {
-                self.include_object(value, object);
+                self.include_object(*value, *object);
             }
             Rule::IncludeClosure { value, proto } => {
-                self.include_closure(value, proto);
+                self.include_closure(*value, *proto);
             }
             Rule::ProjectPack {
                 pack,
                 index,
                 output,
-            } => self.project_pack(pack, index, output),
+            } => self.project_pack(*pack, *index, *output),
             Rule::Sequence { pack, head, tail } => {
-                if let WorldChange::Changed(()) = self
-                    .world
-                    .add_pack_alternative(pack, PackAlternative { head, tail })
-                {
-                    self.pack_changed(pack);
+                if let WorldChange::Changed(()) = self.world.add_pack_alternative(
+                    *pack,
+                    PackAlternative {
+                        head: head.clone(),
+                        tail: *tail,
+                    },
+                ) {
+                    self.pack_changed(*pack);
                 }
             }
             Rule::SlicePack {
                 source,
                 offset,
                 target,
-            } => self.slice_pack(source, offset, target),
-            Rule::SetTable { table, key, value } => self.set_table(rule_id, table, key, value),
-            Rule::WriteList { table, values } => self.write_list(table, values),
-            Rule::GetTable { table, key, output } => self.get_table(rule_id, table, key, output),
+            } => self.slice_pack(*source, *offset, *target),
+            Rule::SetTable { table, key, value } => self.set_table(rule, *table, *key, *value),
+            Rule::WriteList { table, values } => self.write_list(*table, *values),
+            Rule::GetTable { table, key, output } => self.get_table(rule, *table, *key, *output),
             Rule::Call {
                 callee,
                 args,
                 returns,
-            } => self.call(rule_id, callee, args, returns),
+            } => self.call(rule, *callee, *args, *returns),
             Rule::Binary {
                 lhs,
                 op,
                 rhs,
                 output,
-            } => self.binary(lhs, op, rhs, output),
+            } => self.binary(*lhs, *op, *rhs, *output),
             Rule::Unary {
                 operand,
                 op,
                 output,
-            } => self.unary(operand, op, output),
+            } => self.unary(*operand, *op, *output),
         }
     }
 
@@ -664,7 +664,7 @@ impl<'u> Engine<'u> {
     }
 
     /// Applies a table write to every known object identity.
-    fn set_table(&mut self, rule_id: usize, table: ValueId, key: ValueId, value: ValueId) {
+    fn set_table(&mut self, rule: RuleId, table: ValueId, key: ValueId, value: ValueId) {
         let Some(key_kind) = self.table_key(key) else {
             return;
         };
@@ -679,7 +679,7 @@ impl<'u> Engine<'u> {
                 TableKey::Fields(fields) => {
                     for field in fields {
                         if !self.activations.insert(Activation::SetTable {
-                            rule: rule_id,
+                            rule,
                             object,
                             field: Some(field.clone()),
                         }) {
@@ -691,7 +691,7 @@ impl<'u> Engine<'u> {
                 }
                 TableKey::Dynamic => {
                     if !self.activations.insert(Activation::SetTable {
-                        rule: rule_id,
+                        rule,
                         object,
                         field: None,
                     }) {
@@ -733,10 +733,12 @@ impl<'u> Engine<'u> {
     }
 
     /// Applies a table read to every known object identity.
-    fn get_table(&mut self, rule_id: usize, table: ValueId, key: ValueId, output: ValueId) {
+    fn get_table(&mut self, rule: RuleId, table: ValueId, key: ValueId, output: ValueId) {
         let Some(key_kind) = self.table_key(key) else {
             return;
         };
+        self.read_static_table(table, key, &key_kind, output);
+
         let objects: Vec<_> = self.world.values[table]
             .identities
             .objects
@@ -748,7 +750,7 @@ impl<'u> Engine<'u> {
                 TableKey::Fields(fields) => {
                     for field in fields {
                         if !self.activations.insert(Activation::GetTable {
-                            rule: rule_id,
+                            rule,
                             object,
                             field: Some(field.clone()),
                         }) {
@@ -761,7 +763,7 @@ impl<'u> Engine<'u> {
                 }
                 TableKey::Dynamic => {
                     if !self.activations.insert(Activation::GetTable {
-                        rule: rule_id,
+                        rule,
                         object,
                         field: None,
                     }) {
@@ -775,8 +777,136 @@ impl<'u> Engine<'u> {
         }
     }
 
+    /// Adds facts from statically known function signatures at a callsite.
+    fn call_static(&mut self, callee: ValueId, args: PackId, returns: PackId) {
+        let callee_ty = self.world.values[callee].lower;
+        let signatures = self.function_signatures_of(callee_ty);
+        let argument_width = self.pack_width(args);
+        let projections: Vec<_> = self.world.packs[returns]
+            .projections
+            .iter()
+            .map(|(index, value)| (*index, *value))
+            .collect();
+
+        for (params, function_returns) in signatures {
+            let parameter_width = self.types.get_pack(params).head.len();
+            for index in 0..argument_width.max(parameter_width) {
+                let Some(parameter) = self.pack_type_at(params, index) else {
+                    continue;
+                };
+                let argument = self.ensure_projection(args, index);
+                self.require(argument, parameter);
+            }
+
+            for (index, target) in &projections {
+                let ty = self
+                    .pack_type_at(function_returns, *index)
+                    .unwrap_or(self.types.primitives().nil);
+                self.produce(*target, ty);
+            }
+        }
+    }
+
+    /// Finds static function signatures nested in a callable type.
+    fn function_signatures_of(&self, ty: TypeId) -> Vec<(TypePackId, TypePackId)> {
+        let mut signatures = Vec::new();
+        match self.types.get(ty) {
+            Type::FunctionSignature { params, returns } => signatures.push((*params, *returns)),
+            Type::Union(parts) | Type::Intersection(parts) => {
+                for part in parts {
+                    signatures.extend(self.function_signatures_of(*part));
+                }
+            }
+            Type::WithMetatable { base, .. } => {
+                signatures.extend(self.function_signatures_of(*base));
+            }
+            _ => {}
+        }
+        signatures
+    }
+
+    /// Returns one fixed or homogeneous type-pack position.
+    fn pack_type_at(&self, pack: TypePackId, index: usize) -> Option<TypeId> {
+        let pack = self.types.get_pack(pack);
+        if let Some(ty) = pack.head.get(index) {
+            return Some(*ty);
+        }
+        pack.tail.as_ref().map(|TypePackTail::Homogeneous(ty)| *ty)
+    }
+
+    /// Adds values exposed by statically known table shapes.
+    fn read_static_table(
+        &mut self,
+        table: ValueId,
+        key: ValueId,
+        key_kind: &TableKey,
+        output: ValueId,
+    ) {
+        let table_ty = self.world.values[table].lower;
+        let key_ty = self.world.values[key].lower;
+        let mut values = Vec::new();
+        self.collect_static_table_values(table_ty, key_ty, key_kind, &mut values);
+        for ty in values {
+            self.produce(output, ty);
+        }
+    }
+
+    /// Finds values exposed by one structural table type.
+    fn collect_static_table_values(
+        &mut self,
+        table_ty: TypeId,
+        key_ty: TypeId,
+        key_kind: &TableKey,
+        values: &mut Vec<TypeId>,
+    ) {
+        match self.types.get(table_ty).clone() {
+            Type::TableShape { fields, indexer } => match key_kind {
+                TableKey::Fields(names) => {
+                    for name in names {
+                        if let Some((_, ty)) = fields.iter().find(|(field, _)| field == name) {
+                            values.push(*ty);
+                        } else if let Some((index_key, index_value)) = indexer {
+                            if self.types.overlaps(key_ty, index_key) {
+                                values.push(index_value);
+                            } else {
+                                values.push(self.types.primitives().nil);
+                            }
+                        } else {
+                            values.push(self.types.primitives().nil);
+                        }
+                    }
+                }
+                TableKey::Dynamic => {
+                    if let Some((index_key, index_value)) = indexer {
+                        if self.types.overlaps(key_ty, index_key) {
+                            values.push(index_value);
+                        } else {
+                            values.push(self.types.primitives().nil);
+                        }
+                    } else {
+                        values.push(self.types.primitives().nil);
+                    }
+                }
+            },
+            Type::Table => values.push(self.types.primitives().unknown),
+            Type::Any => values.push(self.types.primitives().any),
+            Type::Unknown => values.push(self.types.primitives().unknown),
+            Type::Union(parts) | Type::Intersection(parts) => {
+                for part in parts {
+                    self.collect_static_table_values(part, key_ty, key_kind, values);
+                }
+            }
+            Type::WithMetatable { base, .. } => {
+                self.collect_static_table_values(base, key_ty, key_kind, values);
+            }
+            _ => {}
+        }
+    }
+
     /// Connects a callsite to every known closure identity.
-    fn call(&mut self, rule_id: usize, callee: ValueId, args: PackId, returns: PackId) {
+    fn call(&mut self, rule: RuleId, callee: ValueId, args: PackId, returns: PackId) {
+        self.call_static(callee, args, returns);
+
         let closures: Vec<_> = self.world.values[callee]
             .identities
             .closures
@@ -789,11 +919,10 @@ impl<'u> Engine<'u> {
             };
 
             for (index, parameter) in function.params.iter().copied().enumerate() {
-                if self.activations.insert(Activation::CallParameter {
-                    rule: rule_id,
-                    proto,
-                    index,
-                }) {
+                if self
+                    .activations
+                    .insert(Activation::CallParameter { rule, proto, index })
+                {
                     let argument = self.ensure_projection(args, index);
                     let formal = self.value_for_key(ValueKey::Value(proto, parameter));
                     self.add_flow_rule(argument, formal);
@@ -801,10 +930,9 @@ impl<'u> Engine<'u> {
             }
 
             if function.is_vararg
-                && self.activations.insert(Activation::CallVarArgs {
-                    rule: rule_id,
-                    proto,
-                })
+                && self
+                    .activations
+                    .insert(Activation::CallVarArgs { rule, proto })
             {
                 let varargs = self.pack_for_key(PackKey::VarArgs(proto));
                 self.add_slice_rule(args, function.params.len(), varargs);
@@ -817,11 +945,10 @@ impl<'u> Engine<'u> {
                 .map(|(index, value)| (*index, *value))
                 .collect();
             for (index, target) in projections {
-                if self.activations.insert(Activation::CallReturn {
-                    rule: rule_id,
-                    proto,
-                    index,
-                }) {
+                if self
+                    .activations
+                    .insert(Activation::CallReturn { rule, proto, index })
+                {
                     let source = self.ensure_projection(return_pack, index);
                     self.add_flow_rule(source, target);
                 }
@@ -973,7 +1100,12 @@ impl<'u> Engine<'u> {
     }
 
     /// Returns the finite width currently described by a pack.
-    fn pack_width(&self, pack: PackId, visiting: &mut HashSet<PackId>) -> usize {
+    fn pack_width(&self, pack: PackId) -> usize {
+        let mut visiting = HashSet::new();
+        self.pack_width_inner(pack, &mut visiting)
+    }
+
+    fn pack_width_inner(&self, pack: PackId, visiting: &mut HashSet<PackId>) -> usize {
         if !visiting.insert(pack) {
             return 0;
         }
@@ -984,7 +1116,7 @@ impl<'u> Engine<'u> {
                 alternative.head.len()
                     + alternative
                         .tail
-                        .map(|tail| self.pack_width(tail, visiting))
+                        .map(|tail| self.pack_width_inner(tail, visiting))
                         .unwrap_or(0)
             })
             .max()
@@ -1175,20 +1307,18 @@ impl<'u> Engine<'u> {
         let vector = self.types.primitives().vector;
 
         if let Some(lhs_ty) = self.evidence_type(lhs) {
-            if self.types.overlaps(lhs_ty, number) {
-                self.require(rhs, number);
-            }
-            if self.types.overlaps(lhs_ty, vector) {
-                self.require(rhs, vector);
+            match self.types.runtime_kind(lhs_ty) {
+                Some(RuntimeKind::Number) => self.require(lhs, number),
+                Some(RuntimeKind::Vector) => self.require(lhs, vector),
+                _ => {}
             }
         }
 
         if let Some(rhs_ty) = self.evidence_type(rhs) {
-            if self.types.overlaps(rhs_ty, number) {
-                self.require(lhs, number);
-            }
-            if self.types.overlaps(rhs_ty, vector) {
-                self.require(lhs, vector);
+            match self.types.runtime_kind(rhs_ty) {
+                Some(RuntimeKind::Number) => self.require(rhs, number),
+                Some(RuntimeKind::Vector) => self.require(rhs, vector),
+                _ => {}
             }
         }
     }

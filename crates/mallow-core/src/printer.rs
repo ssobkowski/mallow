@@ -2,7 +2,7 @@ use crate::ast::{
     Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Type, TypeLiteral, TypePack,
     TypePackTail, TypePrecedence, Typed,
 };
-use crate::common::{ByteString, escape_bytes};
+use crate::common::{ByteString, escape_bytes, is_valid_luau_identifier};
 use crate::operator::{BinOp, UnOp};
 
 pub fn print(block: &Block) -> String {
@@ -458,7 +458,7 @@ impl AstPrinter {
                     if wrote {
                         self.write(", ");
                     }
-                    self.write(name.as_str());
+                    self.write_type_field_name(name.as_str());
                     self.write(": ");
                     self.write_type(ty, TypePrecedence::Lowest);
                     wrote = true;
@@ -509,6 +509,17 @@ impl AstPrinter {
         }
     }
 
+    /// Writes one table field name in valid Luau type syntax.
+    fn write_type_field_name(&mut self, name: &str) {
+        if is_valid_luau_identifier(name) {
+            self.write(name);
+        } else {
+            self.write("[\"");
+            self.write(&escape_bytes(name.as_bytes()));
+            self.write("\"]");
+        }
+    }
+
     /// Writes one homogeneous type-pack tail.
     fn write_type_pack_tail(&mut self, tail: &TypePackTail) {
         match tail {
@@ -547,7 +558,7 @@ impl AstPrinter {
         match literal {
             TypeLiteral::String(value) => {
                 self.write("\"");
-                self.write(&escape_bytes(value.as_bytes()));
+                self.write(&escape_bytes(value));
                 self.write("\"");
             }
             TypeLiteral::Boolean(value) => self.write(if *value { "true" } else { "false" }),
@@ -811,13 +822,31 @@ mod tests {
         Type::Function {
             params: TypePack {
                 head: Vec::new(),
-                tail: Some(TypePackTail::Homogeneous(Box::new(Type::Unknown))),
+                tail: Some(Box::new(TypePackTail::Homogeneous(Type::Unknown))),
             },
             returns: TypePack {
                 head: vec![Type::Unknown],
                 tail: None,
             },
         }
+    }
+
+    /// Invalid table field names use string-key syntax.
+    #[test]
+    fn prints_invalid_table_type_fields_as_indexed_properties() {
+        let ty = Type::Table {
+            fields: HashMap::from([
+                ("if".into(), Type::String),
+                ("1".into(), Type::Number),
+                ("key.with.dots".into(), Type::Boolean),
+            ]),
+            array: None,
+        };
+
+        assert_eq!(
+            render_type(&ty),
+            "{ [\"1\"]: number, [\"if\"]: string, [\"key.with.dots\"]: boolean }"
+        );
     }
 
     #[test]

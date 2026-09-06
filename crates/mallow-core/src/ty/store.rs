@@ -251,7 +251,7 @@ impl TypeStore {
         for entry in &methods {
             self.assert_type(entry.ty);
         }
-        debug_assert!(
+        assert!(
             methods
                 .windows(2)
                 .all(|pair| pair[0].method != pair[1].method),
