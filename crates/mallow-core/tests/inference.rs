@@ -191,6 +191,23 @@ fn escaped_table_write_remains_optional(view: TypesView) {
     );
 }
 
+/// Constructor writes create required fields and indexer values.
+#[inference_test(fixture = "tables02")]
+fn table_constructor_writes_are_required(view: TypesView) {
+    let ty = view.types();
+
+    assert_eq!(view.local("record"), ty.table([("value", ty.number())]));
+    assert_eq!(view.local("indexed"), ty.string());
+    assert_eq!(
+        view.local("construct"),
+        ty.function([ty.number()], [ty.string()])
+    );
+
+    let choice = ty.table([("left", ty.number()), ("right", ty.optional(ty.number()))]);
+    assert_eq!(view.local("choice"), choice);
+    assert_eq!(view.local("choose"), ty.function([ty.boolean()], [choice]));
+}
+
 /// Callable `__index` supplies the indexed result type.
 #[ignore = "not yet supported"]
 #[inference_test(fixture = "metatables02")]

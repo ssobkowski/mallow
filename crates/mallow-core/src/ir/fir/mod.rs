@@ -1,5 +1,6 @@
 //! Flat intermediate representation used before source structuring.
 
+pub(crate) mod analysis;
 pub(crate) mod region;
 
 mod cflow;

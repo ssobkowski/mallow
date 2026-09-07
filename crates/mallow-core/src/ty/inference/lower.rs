@@ -7,6 +7,7 @@ use super::keys::{BranchPredicate, ObjectKey, PackKey, ValueKey};
 use super::program::{Constraint, InferenceProgram};
 use crate::il::ProtoId;
 use crate::ir::Unit;
+use crate::ir::fir::analysis::TableConstructorWrites;
 use crate::ir::fir::{
     BlockExit, Capture, CellId, Constant, Edge, Function, Instr, Number, PackId, ValueId,
 };
@@ -30,6 +31,8 @@ struct FunctionLowerer<'u, 's, 'p> {
     source: FunctionSource<'u>,
     /// Facts known at each block entry.
     branch_facts: BranchFacts,
+    /// Writes that initialize fresh table allocations.
+    table_constructor_writes: TableConstructorWrites,
     /// Mutable constraint writer.
     writer: ConstraintWriter<'s, 'p>,
 }
@@ -46,6 +49,7 @@ impl<'u, 's, 'p> FunctionLowerer<'u, 's, 'p> {
         Self {
             source: FunctionSource { function, unit },
             branch_facts: BranchFacts::analyze(function, cell_facts),
+            table_constructor_writes: TableConstructorWrites::analyze(function),
             writer: ConstraintWriter {
                 store,
                 program,
@@ -60,6 +64,7 @@ impl<'u, 's, 'p> FunctionLowerer<'u, 's, 'p> {
         let Self {
             source,
             branch_facts,
+            table_constructor_writes,
             mut writer,
         } = self;
 
@@ -73,8 +78,15 @@ impl<'u, 's, 'p> FunctionLowerer<'u, 's, 'p> {
 
             let state = branch_facts.incoming(block_index);
             let block = &source.function.cfg[block_index];
-            for instruction in &block.instrs {
-                writer.lower_instruction(source, block_index, state, instruction);
+            for (instruction_index, instruction) in block.instrs.iter().enumerate() {
+                writer.lower_instruction(
+                    source,
+                    block_index,
+                    instruction_index,
+                    state,
+                    &table_constructor_writes,
+                    instruction,
+                );
             }
             writer.lower_exit(
                 source,
@@ -165,7 +177,9 @@ impl ConstraintWriter<'_, '_> {
         &mut self,
         src: FunctionSource<'_>,
         block: usize,
+        instruction_index: usize,
         state: &BlockState,
+        table_constructor_writes: &TableConstructorWrites,
         instruction: &Instr,
     ) {
         match instruction {
@@ -201,8 +215,12 @@ impl ConstraintWriter<'_, '_> {
                 let table = self.used_value(src, block, state, *table);
                 let key = self.used_value(src, block, state, *key);
                 let value = self.used_value(src, block, state, *value);
-                self.program
-                    .push(Constraint::SetTable { table, key, value });
+                let constraint = if table_constructor_writes.contains(block, instruction_index) {
+                    Constraint::InitTable { table, key, value }
+                } else {
+                    Constraint::SetTable { table, key, value }
+                };
+                self.program.push(constraint);
             }
             Instr::GetGlobal { out, name } => {
                 let global = ValueKey::Global(name.clone());

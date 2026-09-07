@@ -97,6 +97,15 @@ pub enum Constraint<V, P, O> {
         /// Value written at the key.
         value: V,
     },
+    /// Writes an initial field to every table carried by a value at construction.
+    InitTable {
+        /// Value carrying the tables.
+        table: V,
+        /// Value used as the key.
+        key: V,
+        /// Value written at the key.
+        value: V,
+    },
     /// Writes a pack into the array part of every table carried by a value.
     WriteList {
         /// Value carrying the tables.

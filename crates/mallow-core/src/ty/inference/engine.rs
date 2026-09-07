@@ -94,6 +94,15 @@ enum TableKey {
     Dynamic,
 }
 
+/// How a table write affects missing values.
+#[derive(Clone, Copy)]
+enum TableWriteKind {
+    /// A constructor write guarantees that the value exists.
+    Initial,
+    /// A later write leaves the value optional.
+    Later,
+}
+
 /// Pending rule queue with duplicate suppression.
 #[derive(Debug, Default)]
 struct RuleQueue {
@@ -183,7 +192,7 @@ impl<'u> Engine<'u> {
     /// Solves and materializes a complete inference result.
     fn run(mut self) -> Output {
         // Pack shapes must settle before return signatures request projections.
-        self.solve();
+        self.solve_with_table_absence();
 
         for proto in self.unit.functions().map(|function| function.id) {
             let returns = self.pack_for_key(PackKey::Returns(proto));
@@ -192,9 +201,24 @@ impl<'u> Engine<'u> {
                 self.ensure_projection(returns, index);
             }
         }
-        self.solve();
+        self.solve_with_table_absence();
 
         self.materialize()
+    }
+
+    /// Solves explicit before adding absent table reads.
+    ///
+    /// This sounds counterintuitive, but adding eager table optionals would cause
+    /// broad lobotomy across the whole unit, in case a GetTable were applied before
+    /// InitTable and because facts only grow (one way), it would be impossible
+    /// to get rid of that nil after.
+    fn solve_with_table_absence(&mut self) {
+        loop {
+            self.solve();
+            if !self.add_absent_table_reads() {
+                break;
+            }
+        }
     }
 
     /// Applies queued constraints until no known fact changes.
@@ -268,7 +292,7 @@ impl<'u> Engine<'u> {
             Rule::Filter { source, .. } => self.subscriptions.value(*source, id),
             Rule::ProjectPack { pack, .. } => self.subscriptions.pack(*pack, id),
             Rule::SlicePack { source, .. } => self.subscriptions.pack(*source, id),
-            Rule::SetTable { table, key, value } => {
+            Rule::SetTable { table, key, value } | Rule::InitTable { table, key, value } => {
                 self.subscriptions.value(*table, id);
                 self.subscriptions.value(*key, id);
                 self.subscriptions.value(*value, id);
@@ -386,6 +410,11 @@ impl<'u> Engine<'u> {
                 key: self.world.value_for_key(key),
                 value: self.world.value_for_key(value),
             },
+            Constraint::InitTable { table, key, value } => Rule::InitTable {
+                table: self.world.value_for_key(table),
+                key: self.world.value_for_key(key),
+                value: self.world.value_for_key(value),
+            },
             Constraint::WriteList { table, values } => {
                 let table = self.world.value_for_key(table);
                 let values = self.world.pack_for_key(values);
@@ -473,7 +502,12 @@ impl<'u> Engine<'u> {
                 offset,
                 target,
             } => self.slice_pack(*source, *offset, *target),
-            Rule::SetTable { table, key, value } => self.set_table(rule, *table, *key, *value),
+            Rule::SetTable { table, key, value } => {
+                self.write_table(rule, *table, *key, *value, TableWriteKind::Later)
+            }
+            Rule::InitTable { table, key, value } => {
+                self.write_table(rule, *table, *key, *value, TableWriteKind::Initial)
+            }
             Rule::WriteList { table, values } => self.write_list(*table, *values),
             Rule::GetTable { table, key, output } => self.get_table(rule, *table, *key, *output),
             Rule::Call {
@@ -664,7 +698,14 @@ impl<'u> Engine<'u> {
     }
 
     /// Applies a table write to every known object identity.
-    fn set_table(&mut self, rule: RuleId, table: ValueId, key: ValueId, value: ValueId) {
+    fn write_table(
+        &mut self,
+        rule: RuleId,
+        table: ValueId,
+        key: ValueId,
+        value: ValueId,
+        kind: TableWriteKind,
+    ) {
         let Some(key_kind) = self.table_key(key) else {
             return;
         };
@@ -677,6 +718,8 @@ impl<'u> Engine<'u> {
         for object in objects {
             match &key_kind {
                 TableKey::Fields(fields) => {
+                    let has_exact_initial_field =
+                        matches!(kind, TableWriteKind::Initial) && fields.len() == 1;
                     for field in fields {
                         if !self.activations.insert(Activation::SetTable {
                             rule,
@@ -686,7 +729,25 @@ impl<'u> Engine<'u> {
                             continue;
                         }
                         let target = self.world.object_field(object, field.clone()).value();
-                        self.add_non_nil_flow_rule(value, target);
+                        let presence = &mut self.world.objects[object]
+                            .fields
+                            .get_mut(field)
+                            .expect("a requested object field must exist")
+                            .presence;
+                        match kind {
+                            TableWriteKind::Initial if has_exact_initial_field => {
+                                presence.record_initial();
+                            }
+                            TableWriteKind::Later => presence.record_later(),
+                            TableWriteKind::Initial => {}
+                        }
+                        match kind {
+                            TableWriteKind::Initial => self.add_flow_rule(value, target),
+                            TableWriteKind::Later => {
+                                self.produce(target, self.types.primitives().nil);
+                                self.add_non_nil_flow_rule(value, target);
+                            }
+                        }
                     }
                 }
                 TableKey::Dynamic => {
@@ -697,10 +758,21 @@ impl<'u> Engine<'u> {
                     }) {
                         continue;
                     }
-                    let keys = self.world.objects[object].keys;
-                    let values = self.world.objects[object].values;
+                    let state = &mut self.world.objects[object];
+                    let keys = state.keys;
+                    let values = state.values;
+                    match kind {
+                        TableWriteKind::Initial => state.indexer_presence.record_initial(),
+                        TableWriteKind::Later => state.indexer_presence.record_later(),
+                    }
                     self.add_flow_rule(key, keys);
-                    self.add_non_nil_flow_rule(value, values);
+                    match kind {
+                        TableWriteKind::Initial => self.add_flow_rule(value, values),
+                        TableWriteKind::Later => {
+                            self.produce(values, self.types.primitives().nil);
+                            self.add_non_nil_flow_rule(value, values);
+                        }
+                    }
                 }
             }
         }
@@ -749,32 +821,68 @@ impl<'u> Engine<'u> {
             match &key_kind {
                 TableKey::Fields(fields) => {
                     for field in fields {
-                        if !self.activations.insert(Activation::GetTable {
+                        let source = self.world.object_field(object, field.clone()).value();
+                        if self.activations.insert(Activation::GetTable {
                             rule,
                             object,
                             field: Some(field.clone()),
                         }) {
-                            continue;
+                            self.add_flow_rule(source, output);
                         }
-                        let source = self.world.object_field(object, field.clone()).value();
-                        self.add_flow_rule(source, output);
-                        self.produce(output, self.types.primitives().nil);
                     }
                 }
                 TableKey::Dynamic => {
-                    if !self.activations.insert(Activation::GetTable {
+                    if self.activations.insert(Activation::GetTable {
                         rule,
                         object,
                         field: None,
                     }) {
-                        continue;
+                        let values = self.world.objects[object].values;
+                        self.add_flow_rule(values, output);
                     }
-                    let values = self.world.objects[object].values;
-                    self.add_flow_rule(values, output);
-                    self.produce(output, self.types.primitives().nil);
                 }
             }
         }
+    }
+
+    /// Adds `nil` to reads not covered by a table initializer.
+    ///
+    /// Returns whether any read gained a new type.
+    fn add_absent_table_reads(&mut self) -> bool {
+        let reads: Vec<_> = self
+            .activations
+            .iter()
+            .filter_map(|activation| {
+                let Activation::GetTable {
+                    rule,
+                    object,
+                    field,
+                } = activation
+                else {
+                    return None;
+                };
+                let Rule::GetTable { output, .. } = &self.rules[*rule] else {
+                    unreachable!("a table-read activation must belong to a table-read rule");
+                };
+                Some((*object, field.clone(), *output))
+            })
+            .collect();
+
+        let mut changed = false;
+        for (object, field, output) in reads {
+            let presence = match field {
+                Some(field) => self.world.objects[object].fields[&field].presence,
+                None => self.world.objects[object].indexer_presence,
+            };
+            if presence.is_required() {
+                continue;
+            }
+
+            let old = self.world.values[output].lower;
+            self.produce(output, self.types.primitives().nil);
+            changed |= old != self.world.values[output].lower;
+        }
+        changed
     }
 
     /// Adds facts from statically known function signatures at a callsite.
@@ -1191,30 +1299,32 @@ impl<'u> Engine<'u> {
         let mut field_values: Vec<_> = state
             .fields
             .iter()
-            .map(|(name, value)| (name.clone(), *value))
+            .map(|(name, field)| (name.clone(), field.value, field.presence))
             .collect();
         let keys = state.keys;
         let values = state.values;
+        let indexer_presence = state.indexer_presence;
 
-        field_values.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        field_values.sort_unstable_by(|(lhs, _, _), (rhs, _, _)| lhs.cmp(rhs));
         let mut fields = Vec::with_capacity(field_values.len());
-        for (name, value) in field_values {
-            if let Some(value) = self.materialize_value(value, visiting) {
-                let value = self.types.join(value, self.types.primitives().nil);
+        for (name, value, presence) in field_values {
+            if let Some(mut value) = self.materialize_value(value, visiting) {
+                if !presence.is_required() {
+                    value = self.types.join(value, self.types.primitives().nil);
+                }
                 fields.push((name, value));
             }
         }
 
-        let indexer = match (
-            self.materialize_value(keys, visiting),
-            self.materialize_value(values, visiting),
-        ) {
-            (Some(key), Some(value)) => {
-                let value = self.types.join(value, self.types.primitives().nil);
-                Some((key, value))
-            }
-            _ => None,
-        };
+        let indexer = self
+            .materialize_value(keys, visiting)
+            .zip(self.materialize_value(values, visiting))
+            .map(|(key, mut value)| {
+                if !indexer_presence.is_required() {
+                    value = self.types.join(value, self.types.primitives().nil);
+                }
+                (key, value)
+            });
         self.types.table_shape(fields, indexer)
     }
 

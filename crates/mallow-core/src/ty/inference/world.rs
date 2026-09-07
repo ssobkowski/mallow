@@ -56,15 +56,57 @@ pub struct PackState {
     pub projections: HashMap<usize, ValueId>,
 }
 
+/// Whether a table slot is guaranteed to exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TableValuePresence {
+    /// No write guarantees the slot.
+    #[default]
+    Unknown,
+    /// A constructor write guarantees the slot.
+    Required,
+    /// A later write may add or remove the slot.
+    Optional,
+}
+
+impl TableValuePresence {
+    /// Records a constructor write.
+    pub fn record_initial(&mut self) {
+        if *self != Self::Optional {
+            *self = Self::Required;
+        }
+    }
+
+    /// Records a write after construction.
+    pub fn record_later(&mut self) {
+        *self = Self::Optional;
+    }
+
+    /// Returns whether the slot is guaranteed to exist.
+    pub fn is_required(self) -> bool {
+        self == Self::Required
+    }
+}
+
+/// Mutable facts for one exact table field.
+#[derive(Debug)]
+pub struct ObjectFieldState {
+    /// Values stored in the field.
+    pub value: ValueId,
+    /// Whether the field is guaranteed to exist.
+    pub presence: TableValuePresence,
+}
+
 /// Mutable facts for one table allocation.
 #[derive(Debug)]
 pub struct ObjectState {
-    /// Values stored under exact string keys.
-    pub fields: HashMap<SmolStr, ValueId>,
+    /// Values and presence facts under exact string keys.
+    pub fields: HashMap<SmolStr, ObjectFieldState>,
     /// Types used as dynamic keys.
     pub keys: ValueId,
     /// Types written through dynamic indexes.
     pub values: ValueId,
+    /// Whether the dynamic index is guaranteed to contain a value.
+    pub indexer_presence: TableValuePresence,
 }
 
 /// Result of an operation that may change the inference world.
@@ -156,6 +198,7 @@ impl World {
                     fields: HashMap::new(),
                     keys,
                     values,
+                    indexer_presence: TableValuePresence::Unknown,
                 });
                 self.object_by_key.insert(key, object);
                 object
@@ -167,10 +210,16 @@ impl World {
     #[must_use]
     pub fn object_field(&mut self, object: ObjectId, name: SmolStr) -> WorldChange<ValueId> {
         match self.objects[object].fields.get(&name) {
-            Some(value) => WorldChange::Unchanged(*value),
+            Some(field) => WorldChange::Unchanged(field.value),
             None => {
                 let value = self.fresh_value();
-                self.objects[object].fields.insert(name, value);
+                self.objects[object].fields.insert(
+                    name,
+                    ObjectFieldState {
+                        value,
+                        presence: TableValuePresence::Unknown,
+                    },
+                );
                 WorldChange::Changed(value)
             }
         }
@@ -217,5 +266,25 @@ impl World {
     /// Returns all stable value keys currently allocated.
     pub fn value_keys(&self) -> impl Iterator<Item = (ValueKey, ValueId)> {
         self.value_by_key.iter().map(|(key, id)| (key.clone(), *id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TableValuePresence;
+
+    /// A later write keeps a slot optional regardless of rule order.
+    #[test]
+    fn later_write_dominates_initial_presence() {
+        let mut initial_then_later = TableValuePresence::Unknown;
+        initial_then_later.record_initial();
+        initial_then_later.record_later();
+
+        let mut later_then_initial = TableValuePresence::Unknown;
+        later_then_initial.record_later();
+        later_then_initial.record_initial();
+
+        assert_eq!(initial_then_later, TableValuePresence::Optional);
+        assert_eq!(later_then_initial, TableValuePresence::Optional);
     }
 }
