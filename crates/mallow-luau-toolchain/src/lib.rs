@@ -40,10 +40,13 @@ const INSTALLATION_MANIFEST_NAME: &str = ".manifest";
 const SOURCE_ARCHIVE_NAME: &str = ".archive";
 
 /// Version marker for the line-oriented installation manifest format.
-const INSTALLATION_MANIFEST_VERSION: &str = "mallow-toolchain-manifest-v2";
+const INSTALLATION_MANIFEST_VERSION: &str = "mallow-toolchain-manifest-v3";
 
-/// Number of executables required for a complete Luau installation.
+/// Number of executables known to the toolchain manager.
 const TOOL_COUNT: usize = 4;
+
+/// Number of executables required to compile and run Luau.
+const REQUIRED_TOOL_COUNT: usize = 3;
 
 /// Maximum time allowed for a single HTTP request, including response transfer.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -310,9 +313,14 @@ impl Tool {
         }
     }
 
-    /// Returns all tools that must be present for an installation to be complete.
+    /// Returns all tools that may be present in an installation.
     const fn all() -> [Self; TOOL_COUNT] {
         [Self::Luau, Self::Analyze, Self::Compile, Self::Ast]
+    }
+
+    /// Returns the tools required to compile and run Luau.
+    const fn required() -> [Self; REQUIRED_TOOL_COUNT] {
+        [Self::Luau, Self::Analyze, Self::Compile]
     }
 
     /// Returns this tool's stable position in manifest and digest arrays.
@@ -371,12 +379,13 @@ impl Installation {
         self.tool_path(Tool::Compile)
     }
 
-    /// Returns the verified AST parser path.
-    pub fn ast_path(&self) -> PathBuf {
-        self.tool_path(Tool::Ast)
+    /// Returns the verified path for the AST parser, when available.
+    pub fn ast_path(&self) -> Option<PathBuf> {
+        let path = self.tool_path(Tool::Ast);
+        is_valid_executable(&path).then_some(path)
     }
 
-    /// Builds a process command for one verified tool.
+    /// Builds a process command for one installed tool.
     pub fn command(&self, tool: Tool) -> Command {
         Command::new(self.tool_path(tool))
     }
@@ -396,9 +405,9 @@ impl Installation {
         self.command(Tool::Compile)
     }
 
-    /// Builds a process command for the AST parser.
-    pub fn ast(&self) -> Command {
-        self.command(Tool::Ast)
+    /// Builds a process command for the AST parser, when available.
+    pub fn ast(&self) -> Option<Command> {
+        self.ast_path().map(Command::new)
     }
 }
 
@@ -854,12 +863,12 @@ impl Manager {
         self.command(selector, Tool::Compile)
     }
 
-    /// Builds a command for the selected release's AST parser.
-    pub fn ast<'a, S>(&self, selector: S) -> Result<Command, Error>
+    /// Builds a command for the selected release's AST parser, when available.
+    pub fn ast<'a, S>(&self, selector: S) -> Result<Option<Command>, Error>
     where
         S: Into<VersionSelector<'a>>,
     {
-        self.command(selector, Tool::Ast)
+        Ok(self.install(selector)?.ast())
     }
 }
 
@@ -898,12 +907,14 @@ struct InstallationManifest {
     /// Lowercase SHA-256 digest of the verified source archive.
     archive_sha256: String,
     /// Lowercase SHA-256 digests in [`Tool::all`] order.
-    tool_sha256: [String; TOOL_COUNT],
+    ///
+    /// A missing digest means the release does not ship that optional tool.
+    tool_sha256: [Option<String>; TOOL_COUNT],
 }
 
 impl InstallationManifest {
     /// Creates manifest metadata from the archive identity and extracted tool digests.
-    fn new(expected_archive_sha256: &str, tool_sha256: [String; TOOL_COUNT]) -> Self {
+    fn new(expected_archive_sha256: &str, tool_sha256: [Option<String>; TOOL_COUNT]) -> Self {
         Self {
             archive_sha256: expected_archive_sha256.to_ascii_lowercase(),
             tool_sha256,
@@ -915,10 +926,10 @@ impl InstallationManifest {
         format!(
             "{INSTALLATION_MANIFEST_VERSION}\narchive_sha256={}\nluau_sha256={}\nluau_analyze_sha256={}\nluau_compile_sha256={}\nluau_ast_sha256={}\n",
             self.archive_sha256,
-            self.tool_sha256[0],
-            self.tool_sha256[1],
-            self.tool_sha256[2],
-            self.tool_sha256[3],
+            self.tool_sha256[0].as_deref().unwrap_or("missing"),
+            self.tool_sha256[1].as_deref().unwrap_or("missing"),
+            self.tool_sha256[2].as_deref().unwrap_or("missing"),
+            self.tool_sha256[3].as_deref().unwrap_or("missing"),
         )
         .into_bytes()
     }
@@ -1011,11 +1022,11 @@ fn read_verified_source_archive(
     Some(archive)
 }
 
-/// Validates, hashes, and optionally extracts every required archive tool.
+/// Validates, hashes, and optionally extracts every archive tool.
 fn process_archive_tools(
     archive: &[u8],
     destination: Option<&Path>,
-) -> Result<[String; TOOL_COUNT], Error> {
+) -> Result<[Option<String>; TOOL_COUNT], Error> {
     ensure_archive_size(archive.len())?;
 
     let mut archive_reader = ZipArchive::new(Cursor::new(archive))
@@ -1099,10 +1110,9 @@ fn process_archive_tools(
         digests[tool_index] = Some(finish_digest(hasher));
     }
 
-    if let Some(missing) = Tool::all()
+    if let Some(missing) = Tool::required()
         .into_iter()
-        .enumerate()
-        .find_map(|(index, tool)| digests[index].is_none().then_some(tool))
+        .find(|tool| digests[tool.index()].is_none())
     {
         return Err(Error::InvalidArchive(format!(
             "archive does not contain {}",
@@ -1110,7 +1120,7 @@ fn process_archive_tools(
         )));
     }
 
-    Ok(digests.map(Option::unwrap))
+    Ok(digests)
 }
 
 /// Reads and validates a bounded manifest from an existing installation.
@@ -1148,10 +1158,16 @@ fn parse_installation_manifest(bytes: &[u8]) -> Option<InstallationManifest> {
     }
 
     let archive_sha256 = parse_manifest_digest(lines.next()?, "archive_sha256=")?;
-    let luau_sha256 = parse_manifest_digest(lines.next()?, "luau_sha256=")?;
-    let analyze_sha256 = parse_manifest_digest(lines.next()?, "luau_analyze_sha256=")?;
-    let compile_sha256 = parse_manifest_digest(lines.next()?, "luau_compile_sha256=")?;
-    let ast_sha256 = parse_manifest_digest(lines.next()?, "luau_ast_sha256=")?;
+    let luau_sha256 = Some(parse_manifest_digest(lines.next()?, "luau_sha256=")?);
+    let analyze_sha256 = Some(parse_manifest_digest(
+        lines.next()?,
+        "luau_analyze_sha256=",
+    )?);
+    let compile_sha256 = Some(parse_manifest_digest(
+        lines.next()?,
+        "luau_compile_sha256=",
+    )?);
+    let ast_sha256 = parse_optional_manifest_digest(lines.next()?, "luau_ast_sha256=")?;
 
     if lines.next().is_some() {
         return None;
@@ -1168,6 +1184,16 @@ fn parse_manifest_digest(line: &str, prefix: &str) -> Option<String> {
     let value = line.strip_prefix(prefix)?;
     validate_hash(value).ok()?;
     Some(value.to_ascii_lowercase())
+}
+
+/// Parses one optional manifest SHA-256 field.
+fn parse_optional_manifest_digest(line: &str, prefix: &str) -> Option<Option<String>> {
+    let value = line.strip_prefix(prefix)?;
+    if value == "missing" {
+        return Some(None);
+    }
+
+    Some(Some(parse_manifest_digest(line, prefix)?))
 }
 
 /// Rejects release strings that could escape the cache directory.
@@ -1257,10 +1283,15 @@ fn is_valid_installation(path: &Path, expected_archive_sha256: &str) -> bool {
         return false;
     }
 
-    Tool::all().into_iter().enumerate().all(|(index, tool)| {
+    Tool::all().into_iter().all(|tool| {
         let tool_path = path.join(tool.file_name());
-        is_valid_executable(&tool_path)
-            && digest_file(&tool_path).is_ok_and(|actual| actual == trusted_tool_sha256[index])
+        match trusted_tool_sha256[tool.index()].as_ref() {
+            Some(expected) => {
+                is_valid_executable(&tool_path)
+                    && digest_file(&tool_path).is_ok_and(|actual| actual == *expected)
+            }
+            None => !tool_path.exists(),
+        }
     })
 }
 
@@ -1402,7 +1433,7 @@ mod tests {
         assert_eq!(fs::read(installation.luau_path()).unwrap(), b"luau");
         assert_eq!(fs::read(installation.analyze_path()).unwrap(), b"analyze");
         assert_eq!(fs::read(installation.compiler_path()).unwrap(), b"compile");
-        assert_eq!(fs::read(installation.ast_path()).unwrap(), b"ast");
+        assert_eq!(fs::read(installation.ast_path().unwrap()).unwrap(), b"ast");
         assert_eq!(
             fs::read(installation.path().join(SOURCE_ARCHIVE_NAME)).unwrap(),
             bytes
@@ -1411,7 +1442,38 @@ mod tests {
             installation.command(Tool::Compile).get_program(),
             installation.compiler_path()
         );
-        assert_eq!(installation.ast().get_program(), installation.ast_path());
+        assert_eq!(
+            installation.ast().unwrap().get_program(),
+            installation.ast_path().unwrap()
+        );
+    }
+
+    /// Installs historical releases that do not ship the optional AST parser.
+    #[test]
+    fn archive_without_ast_installs_runtime_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let bytes = archive(&[
+            (format!("bin/{}", os_bin!("luau")), b"luau".as_slice()),
+            (
+                format!("bin/{}", os_bin!("luau-analyze")),
+                b"analyze".as_slice(),
+            ),
+            (
+                format!("bin/{}", os_bin!("luau-compile")),
+                b"compile".as_slice(),
+            ),
+        ]);
+        let hash = digest(&bytes);
+        let installation = cache
+            .install_archive(&fixture_release(), &bytes, &hash)
+            .unwrap();
+
+        assert_eq!(fs::read(installation.luau_path()).unwrap(), b"luau");
+        assert_eq!(fs::read(installation.compiler_path()).unwrap(), b"compile");
+        assert!(installation.ast_path().is_none());
+        assert!(installation.ast().is_none());
+        assert!(is_valid_installation(installation.path(), &hash));
     }
 
     /// Resolves a relative cache root before commands can change their working directory.
@@ -1571,7 +1633,7 @@ mod tests {
         assert_eq!(fs::read(installation.luau_path()).unwrap(), b"luau");
         assert_eq!(fs::read(installation.analyze_path()).unwrap(), b"analyze");
         assert_eq!(fs::read(installation.compiler_path()).unwrap(), b"compile");
-        assert_eq!(fs::read(installation.ast_path()).unwrap(), b"ast");
+        assert_eq!(fs::read(installation.ast_path().unwrap()).unwrap(), b"ast");
     }
 
     /// Repairs an installation when one executable no longer matches its manifest digest.
@@ -1610,7 +1672,7 @@ mod tests {
             b"forged-compile",
             b"forged-ast",
         ];
-        let forged_hashes = forged_contents.map(digest);
+        let forged_hashes = forged_contents.map(|contents| Some(digest(contents)));
         for (tool, contents) in Tool::all().into_iter().zip(forged_contents) {
             fs::write(installation.tool_path(tool), contents).unwrap();
         }

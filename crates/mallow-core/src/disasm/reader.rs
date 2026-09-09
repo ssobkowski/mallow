@@ -91,13 +91,13 @@ impl<'b> BytecodeReader<'b> {
     pub fn read_chunk(&mut self) -> Result<Chunk> {
         let version: u8 = self.read()?;
         ensure!(
-            matches!(version, 5 | 6 | 7 | 8 | 9),
+            matches!(version, 5..=9),
             "unsupported bytecode version {version}; expected version 5, 6, 7, 8, or 9",
         );
 
         let types_version: u8 = self.read()?;
         ensure!(
-            matches!(types_version, 1 | 2 | 3),
+            matches!(types_version, 1..=3),
             "invalid types version {types_version}; expected 1, 2, or 3",
         );
 

@@ -1,6 +1,6 @@
 # mallow-luau-toolchain
 
-Crate that manages Luau binaries (`luau`, `luau-compile`, `luau-analyze` and `luau-ast`) used by [mallow-core/tests](TODO) to run tests across various Luau versions and the [builtin definition generator](TODO).
+Crate that manages Luau binaries (`luau`, `luau-compile`, `luau-analyze` and, when available, `luau-ast`) used by [mallow-core/tests](crates/mallow-core/tests) to run tests across various Luau versions.
 
 Every release version is kept in a centralized [registry](registry.json) along with the bytecode version the compiler produces, and hashes of the zip files.
 

@@ -1,28 +1,77 @@
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use std::{fs, thread};
 
-use libtest_mimic::{Arguments, Failed, Trial};
+use libtest_mimic::{Arguments, Completion, Failed, Trial};
 use mallow_luau_toolchain::{BytecodeVersion, Installation, Manager, Release};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
+
+const TEST_BYTECODE_VERSIONS: [BytecodeVersion; 5] = [
+    BytecodeVersion::V5,
+    BytecodeVersion::V6,
+    BytecodeVersion::V7,
+    BytecodeVersion::V8,
+    BytecodeVersion::V9,
+];
+
+static IGNORED_CASES: LazyLock<HashSet<(&'static OsStr, BytecodeVersion, OptLevel)>> =
+    LazyLock::new(|| {
+        let mut cases = HashSet::new();
+
+        // miscompiles due to an upstream bug with the luau compiler.
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V8, OptLevel::O0));
+
+        // bytecode v5 does not have vectors.
+        cases.insert((OsStr::new("vectors01"), BytecodeVersion::V5, OptLevel::O0));
+        cases.insert((OsStr::new("vectors01"), BytecodeVersion::V5, OptLevel::O1));
+        cases.insert((OsStr::new("vectors01"), BytecodeVersion::V5, OptLevel::O2));
+
+        // bytecode versions <v8 do not have integers
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V5, OptLevel::O0));
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V5, OptLevel::O1));
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V5, OptLevel::O2));
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V6, OptLevel::O0));
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V6, OptLevel::O1));
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V6, OptLevel::O2));
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V7, OptLevel::O0));
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V7, OptLevel::O1));
+        cases.insert((OsStr::new("integers01"), BytecodeVersion::V7, OptLevel::O2));
+
+        // luau generates an absurd amount of registers on O0 for this case,
+        // causing failure to compile
+        cases.insert((OsStr::new("tables17"), BytecodeVersion::V5, OptLevel::O0));
+        cases.insert((OsStr::new("tables17"), BytecodeVersion::V6, OptLevel::O0));
+        cases.insert((OsStr::new("tables17"), BytecodeVersion::V7, OptLevel::O0));
+        cases.insert((OsStr::new("tables17"), BytecodeVersion::V8, OptLevel::O0));
+        cases.insert((OsStr::new("tables17"), BytecodeVersion::V9, OptLevel::O0));
+
+        cases
+    });
 
 fn main() {
     let args = Arguments::from_args();
     let compile_timeout = parse_timeout_env("MALLOW_TEST_COMPILE_TIMEOUT", 5);
     let runtime_timeout = parse_timeout_env("MALLOW_TEST_RUNTIME_TIMEOUT", 10);
 
-    let release = manager()
-        .resolve(BytecodeVersion::V9)
-        .expect("resolve stable V9 Luau release for decompiler tests");
-    let toolchain = Arc::new(TestToolchain::new(release));
-    let trials = discover_cases(toolchain)
+    let toolchains = TEST_BYTECODE_VERSIONS
+        .into_iter()
+        .map(|version| {
+            let release = manager().resolve(version).unwrap_or_else(|error| {
+                panic!("resolve Luau release for bytecode V{version}: {error}")
+            });
+            Arc::new(TestToolchain::new(release))
+        })
+        .collect();
+    let trials = discover_cases(toolchains)
         .into_iter()
         .map(|case| {
-            Trial::test(case.trial_name(), move || {
+            Trial::ignorable_test(case.trial_name(), move || {
                 run_case(&case, compile_timeout, runtime_timeout)
             })
         })
@@ -42,7 +91,7 @@ fn parse_timeout_env(name: &str, default_secs: u64) -> Duration {
         .unwrap_or(default)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum OptLevel {
     O0,
     O1,
@@ -63,19 +112,16 @@ impl OptLevel {
 
 #[derive(Debug)]
 struct Case {
-    /// Source fixture compiled and compared by this trial.
     source_path: PathBuf,
-    /// Optimization level passed to the Luau compiler.
     opt: OptLevel,
-    /// Exact Luau release used for compilation and execution.
     toolchain: Arc<TestToolchain>,
 }
 
 impl Case {
     fn trial_name(&self) -> String {
         format!(
-            "{}/{}/{}",
-            self.toolchain.release.version,
+            "v{}/{}/{}",
+            self.toolchain.release.bytecode,
             self.source_path
                 .file_prefix()
                 .and_then(|n| n.to_str())
@@ -125,15 +171,18 @@ fn run_case(
     case: &Case,
     compile_timeout: Duration,
     runtime_timeout: Duration,
-) -> Result<(), Failed> {
+) -> Result<Completion, Failed> {
+    let bytecode = match compile_luau(case, compile_timeout)? {
+        CompileResult::Bytecode(bytecode) => bytecode,
+        CompileResult::Skipped(reason) => {
+            return Ok(Completion::ignored_with(reason));
+        }
+    };
+
     let temp_dir =
         TempDir::new().map_err(|e| Failed::from(format!("failed to create temp dir: {e}")))?;
     let decompiled_path = temp_dir.path().join("decompiled.luau");
 
-    let Some(bytecode) = compile_luau(case, compile_timeout)? else {
-        eprintln!("skip {} (luau-compile failed)", case.trial_name());
-        return Ok(());
-    };
     decompile_bytecode(
         &bytecode,
         &decompiled_path,
@@ -164,10 +213,15 @@ fn run_case(
         .into());
     }
 
-    Ok(())
+    Ok(Completion::Completed)
 }
 
-/// Runs one child process and kills it when it exceeds `timeout`.
+#[derive(Debug)]
+enum CompileResult {
+    Bytecode(Vec<u8>),
+    Skipped(String),
+}
+
 fn run_command_with_timeout(
     mut command: Command,
     timeout: Duration,
@@ -227,8 +281,7 @@ fn run_command_with_timeout(
     })
 }
 
-/// Compiles one fixture into bytecode.
-fn compile_luau(case: &Case, timeout: Duration) -> Result<Option<Vec<u8>>, Failed> {
+fn compile_luau(case: &Case, timeout: Duration) -> Result<CompileResult, Failed> {
     let mut command = case.toolchain.installation()?.compiler();
     command
         .arg("--binary")
@@ -236,10 +289,18 @@ fn compile_luau(case: &Case, timeout: Duration) -> Result<Option<Vec<u8>>, Faile
         .arg(format!("-{}", case.opt.flag()));
     let output = run_command_with_timeout(command, timeout, "luau-compile")?;
 
-    Ok(output.status.success().then_some(output.stdout))
+    if output.status.success() {
+        return Ok(CompileResult::Bytecode(output.stdout));
+    }
+
+    let reason = format!(
+        "luau-compile exited with {}: {}",
+        output.status,
+        normalize_output(&String::from_utf8_lossy(&output.stderr)).trim()
+    );
+    Ok(CompileResult::Skipped(reason))
 }
 
-/// Decompiles bytecode into the temporary source file executed by the test.
 fn decompile_bytecode(
     bytecode: &[u8],
     decompiled_path: &Path,
@@ -260,7 +321,6 @@ fn decompile_bytecode(
     Ok(())
 }
 
-/// Runs one Luau script.
 fn run_luau(
     toolchain: &TestToolchain,
     script_path: &Path,
@@ -295,8 +355,8 @@ fn normalize_output(output: &str) -> String {
     output.replace("\r\n", "\n")
 }
 
-fn discover_cases(toolchain: Arc<TestToolchain>) -> Vec<Case> {
-    let sources = fs::read_dir(cases_root())
+fn discover_cases(toolchains: Vec<Arc<TestToolchain>>) -> Vec<Case> {
+    let sources: Vec<_> = fs::read_dir(cases_root())
         .unwrap_or_else(|e| panic!("failed to read cases dir: {e}"))
         .filter_map(|entry| {
             let entry = entry.unwrap_or_else(|e| panic!("bad entry: {e}"));
@@ -304,15 +364,29 @@ fn discover_cases(toolchain: Arc<TestToolchain>) -> Vec<Case> {
             (entry.file_type().expect("file type").is_file()
                 && path.extension().and_then(|e| e.to_str()) == Some("luau"))
             .then_some(path)
-        });
+        })
+        .collect();
 
-    sources
-        .flat_map(|source| {
-            let toolchain = Arc::clone(&toolchain);
-            OptLevel::ALL.map(move |opt| Case {
-                source_path: source.clone(),
-                opt,
-                toolchain: Arc::clone(&toolchain),
+    toolchains
+        .into_iter()
+        .flat_map(|toolchain| {
+            sources.iter().cloned().flat_map(move |source| {
+                let toolchain = Arc::clone(&toolchain);
+                OptLevel::ALL.into_iter().filter_map(move |opt| {
+                    if IGNORED_CASES.contains(&(
+                        source.file_prefix().expect("invalid case name"),
+                        toolchain.release.bytecode,
+                        opt,
+                    )) {
+                        None
+                    } else {
+                        Some(Case {
+                            source_path: source.clone(),
+                            opt,
+                            toolchain: Arc::clone(&toolchain),
+                        })
+                    }
+                })
             })
         })
         .collect()
@@ -324,17 +398,13 @@ fn cases_root() -> PathBuf {
         .join("cases")
 }
 
-/// One lazily installed Luau release selected for decompiler trials.
 #[derive(Debug)]
 struct TestToolchain {
-    /// Exact release selected before trial discovery.
     release: &'static Release,
-    /// Verified installation initialized by the first executed trial.
     installation: OnceLock<Result<Installation, String>>,
 }
 
 impl TestToolchain {
-    /// Creates a lazy toolchain for one resolved release.
     fn new(release: &'static Release) -> Self {
         Self {
             release,
@@ -342,7 +412,6 @@ impl TestToolchain {
         }
     }
 
-    /// Returns the verified installation, installing it on first use.
     fn installation(&self) -> Result<&Installation, Failed> {
         self.installation
             .get_or_init(|| {
@@ -360,7 +429,6 @@ impl TestToolchain {
     }
 }
 
-/// Returns the shared Luau release manager without installing another toolchain.
 fn manager() -> &'static Manager {
     static MANAGER: OnceLock<Manager> = OnceLock::new();
 

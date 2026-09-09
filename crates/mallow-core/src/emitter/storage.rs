@@ -23,7 +23,7 @@ impl Storage {
             Self::Named(name) => Expr::Named(name.clone()),
             Self::Spilled { table, index } => Expr::Index {
                 base: Box::new(Expr::Named(table.clone())),
-                index: Box::new(Expr::Literal(Literal::Integer(*index as i64))),
+                index: Box::new(Expr::Literal(Literal::Float(*index as f64))),
             },
         }
     }

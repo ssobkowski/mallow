@@ -172,9 +172,9 @@ impl SsaMeta {
             .map(|value| storage[value])
             .collect();
 
-        let mut storage_blocks = HashMap::<ValueId, Vec<usize>>::new();
+        let mut storage_blocks: HashMap<_, Vec<_>> = HashMap::new();
         for (out, block) in phi_blocks {
-            storage_blocks.entry(storage[&out]).or_default().push(block);
+            storage_blocks.entry(storage[out]).or_default().push(block);
         }
 
         let mut declarations = vec![Vec::new(); function.cfg.len()];

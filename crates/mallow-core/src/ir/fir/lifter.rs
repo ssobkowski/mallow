@@ -365,7 +365,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     /// Returns the instructions for the current block.
     #[inline]
     fn instrs(&self) -> &[DecodedInstr] {
-        &self.function.graph[self.block].instrs
+        self.function.graph[self.block].instrs
     }
 
     /// Returns the instruction at a given position.
@@ -1760,9 +1760,9 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
 
     let mut old_to_new = vec![None; raw_blocks.len()];
     let mut next = 0;
-    for old in 0..raw_blocks.len() {
+    for (old, item) in old_to_new.iter_mut().enumerate() {
         if reachable.contains(&old) {
-            old_to_new[old] = Some(next);
+            *item = Some(next);
             next += 1;
         }
     }

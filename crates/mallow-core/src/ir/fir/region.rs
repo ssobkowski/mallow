@@ -643,7 +643,7 @@ impl LoopForest {
     fn build(graph: &RegionGraph, idoms: &DominatorTree<usize>) -> Self {
         let mut loops = HashMap::new();
         let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::new();
-        let reachable: HashSet<_> = graph.reverse_post_order().into_iter().collect();
+        let reachable: HashSet<_> = graph.reverse_post_order().collect();
 
         for latch in graph.nodes() {
             if !reachable.contains(&latch) {
@@ -692,10 +692,10 @@ impl LoopForest {
         //    entire lexical loop nest.
         // 4. Recompute exits again, because body propagation can turn an edge
         //    to a child block from an exit into an internal edge.
-        Self::recompute_exits(&graph, &mut loops);
+        Self::recompute_exits(graph, &mut loops);
         Self::rebuild_tree(&mut loops);
         Self::propagate_child_bodies(&mut loops);
-        Self::recompute_exits(&graph, &mut loops);
+        Self::recompute_exits(graph, &mut loops);
 
         // The canonical source pattern is a pre-test loop with an explicit `continue`
         // before the normal loop tail:
@@ -754,10 +754,10 @@ impl LoopForest {
         // Aggregation mutates the representative's body and latches and removes
         // sibling entries, leaving exits and containment stale. The second
         // sequence restores the same invariants as the first.
-        Self::recompute_exits(&graph, &mut loops);
+        Self::recompute_exits(graph, &mut loops);
         Self::rebuild_tree(&mut loops);
         Self::propagate_child_bodies(&mut loops);
-        Self::recompute_exits(&graph, &mut loops);
+        Self::recompute_exits(graph, &mut loops);
         let by_header = Self::rebuild_by_header(&loops);
 
         Self { loops, by_header }
@@ -951,9 +951,7 @@ impl From<ControlFlowGraph<Block>> for RegionGraph {
     fn from(cfg: ControlFlowGraph<Block>) -> Self {
         // We rebuild the CSR to include a virtual exit node at the end.
         let blocks = cfg.nodes;
-        let mut nodes: Vec<_> = (0..blocks.len())
-            .map(|b| RecognizedShape::Block(b))
-            .collect();
+        let mut nodes: Vec<_> = (0..blocks.len()).map(RecognizedShape::Block).collect();
         let mut in_offsets = cfg.in_offsets.into_vec();
         let mut in_edges = cfg.in_edges.into_vec();
 
@@ -1075,7 +1073,7 @@ impl<'d> Structurer<'d> {
 
     /// Recursively structures the region graph into a [`RecognizedShape`] tree.
     fn structure(&self) -> RecognizedShape {
-        let nodes = self.graph.reverse_post_order().into_iter().collect();
+        let nodes = self.graph.reverse_post_order().collect();
         let exits = [self.graph.exit()].into_iter().collect();
         let scope = Scope {
             entry: self.graph.entry(),
@@ -2173,10 +2171,9 @@ impl<'d> Structurer<'d> {
         if let Some(lcd) = self
             .ipdoms
             .lowest_common_dominator(loop_info.exits.iter().copied())
+            && loop_info.exits.contains(&lcd)
         {
-            if loop_info.exits.contains(&lcd) {
-                return Some(lcd);
-            }
+            return Some(lcd);
         }
 
         // 3. Fallback: Check if all exits share a single, identical external target.
