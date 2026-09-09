@@ -1,8 +1,7 @@
 use crate::ast::{
-    Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Type, TypeLiteral, TypePack,
-    TypePackTail, TypePrecedence, Typed,
+    Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Type, TypePrecedence, Typed,
 };
-use crate::common::{ByteString, escape_bytes, is_valid_luau_identifier};
+use crate::common::{ByteString, escape_bytes};
 use crate::operator::{BinOp, UnOp};
 
 pub fn print(block: &Block) -> String {
@@ -116,21 +115,12 @@ impl AstPrinter {
             Stmt::If(if_stmt) => {
                 self.walk_if_stmt(if_stmt, true);
             }
-            Stmt::LocalFunction {
-                name,
-                params,
-                body,
-                returns,
-            } => {
+            Stmt::LocalFunction { name, params, body } => {
                 self.write("local function ");
                 self.write(name.as_str());
                 self.write("(");
                 self.write_params(params);
                 self.write(")");
-                if let Some(returns) = returns {
-                    self.write(": ");
-                    self.write_return_type_pack(returns);
-                }
                 self.newline();
                 self.indent += 1;
                 self.walk_block(body);
@@ -441,127 +431,25 @@ impl AstPrinter {
             Type::String => self.write("string"),
             Type::Number => self.write("number"),
             Type::Boolean => self.write("boolean"),
-            Type::Table { fields, array } => {
-                self.write("{ ");
-                let mut wrote = false;
-                if let Some(array) = array {
-                    let (key, value) = array.as_ref();
-                    self.write("[");
-                    self.write_type(key, TypePrecedence::Lowest);
-                    self.write("]: ");
-                    self.write_type(value, TypePrecedence::Lowest);
-                    wrote = true;
-                }
-                let mut fields: Vec<_> = fields.iter().collect();
-                fields.sort_unstable_by_key(|(lhs, _)| *lhs);
-                for (name, ty) in fields {
-                    if wrote {
-                        self.write(", ");
-                    }
-                    self.write_type_field_name(name.as_str());
-                    self.write(": ");
-                    self.write_type(ty, TypePrecedence::Lowest);
-                    wrote = true;
-                }
-                self.write(" }");
-            }
-            Type::Function { params, returns } => {
-                self.write("(");
-                self.write_punctuated(&params.head, ", ", |p, ty| {
-                    p.write_type(ty, TypePrecedence::Lowest)
-                });
-                if let Some(tail) = &params.tail {
-                    if !params.head.is_empty() {
-                        self.write(", ");
-                    }
-                    self.write_type_pack_tail(tail);
-                }
-                self.write(") -> ");
-                self.write_return_type_pack(returns);
-            }
+            Type::Table => self.write("{ [any]: any }"),
+            Type::Function => self.write("(...any) -> ...any"),
             Type::Thread => self.write("thread"),
             Type::Userdata => self.write("userdata"),
             Type::Vector => self.write("vector"),
             Type::Integer => self.write("integer"),
             Type::Buffer => self.write("buffer"),
             Type::Unknown => self.write("unknown"),
-            Type::Never => self.write("never"),
             Type::Any => self.write("any"),
             Type::Named(name) => self.write(name.as_str()),
-            Type::Literal(literal) => self.write_type_literal(literal),
             Type::Union(types) => {
                 self.write_punctuated(types, " | ", |p, ty| {
                     p.write_type(ty, TypePrecedence::Union);
                 });
             }
-            Type::Intersection(types) => {
-                self.write_punctuated(types, " & ", |p, ty| {
-                    p.write_type(ty, TypePrecedence::Intersection);
-                });
-            }
-            Type::WithMetatable { base, .. } => {
-                self.write_type(base, TypePrecedence::Lowest);
-            }
         }
 
         if needs_parens {
             self.write(")");
-        }
-    }
-
-    /// Writes one table field name in valid Luau type syntax.
-    fn write_type_field_name(&mut self, name: &str) {
-        if is_valid_luau_identifier(name) {
-            self.write(name);
-        } else {
-            self.write("[\"");
-            self.write(&escape_bytes(name.as_bytes()));
-            self.write("\"]");
-        }
-    }
-
-    /// Writes one homogeneous type-pack tail.
-    fn write_type_pack_tail(&mut self, tail: &TypePackTail) {
-        match tail {
-            TypePackTail::Homogeneous(ty) => {
-                self.write("...");
-                self.write_type(ty, TypePrecedence::Lowest);
-            }
-        }
-    }
-
-    /// Writes a function return pack with the parentheses required by Luau.
-    fn write_return_type_pack(&mut self, returns: &TypePack) {
-        let return_count = returns.head.len() + usize::from(returns.tail.is_some());
-        if return_count == 0 {
-            self.write("()");
-        } else if return_count > 1 {
-            self.write("(");
-            self.write_punctuated(&returns.head, ", ", |printer, ty| {
-                printer.write_type(ty, TypePrecedence::Lowest);
-            });
-            if let Some(tail) = &returns.tail {
-                if !returns.head.is_empty() {
-                    self.write(", ");
-                }
-                self.write_type_pack_tail(tail);
-            }
-            self.write(")");
-        } else if let Some(ty) = returns.head.first() {
-            self.write_type(ty, TypePrecedence::Lowest);
-        } else if let Some(tail) = &returns.tail {
-            self.write_type_pack_tail(tail);
-        }
-    }
-
-    fn write_type_literal(&mut self, literal: &TypeLiteral) {
-        match literal {
-            TypeLiteral::String(value) => {
-                self.write("\"");
-                self.write(&escape_bytes(value));
-                self.write("\"");
-            }
-            TypeLiteral::Boolean(value) => self.write(if *value { "true" } else { "false" }),
         }
     }
 
@@ -787,13 +675,11 @@ fn choose_string_style(value: &ByteString) -> StringStyle {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::{
         AstPrinter, StringStyle, choose_string_style, escape_bytes, escaped_len, long_string_level,
         long_string_text, print,
     };
-    use crate::ast::{Block, Expr, Literal, Stmt, Type, TypePack, TypePackTail, TypePrecedence};
+    use crate::ast::{Block, Expr, Literal, Stmt, Type, TypePrecedence};
     use crate::common::ByteString;
 
     fn render_type(ty: &Type) -> String {
@@ -802,51 +688,10 @@ mod tests {
         printer.finish()
     }
 
+    /// Broad table metadata prints as a legal Luau table annotation.
     #[test]
-    fn prints_table_type_with_array_descriptor_and_named_fields() {
-        let ty = Type::Table {
-            fields: HashMap::from([
-                ("zeta".into(), Type::Boolean),
-                ("alpha".into(), Type::String),
-            ]),
-            array: Some(Box::new((Type::String, Type::Number))),
-        };
-
-        assert_eq!(
-            render_type(&ty),
-            "{ [string]: number, alpha: string, zeta: boolean }"
-        );
-    }
-
-    fn unknown_function_type() -> Type {
-        Type::Function {
-            params: TypePack {
-                head: Vec::new(),
-                tail: Some(Box::new(TypePackTail::Homogeneous(Type::Unknown))),
-            },
-            returns: TypePack {
-                head: vec![Type::Unknown],
-                tail: None,
-            },
-        }
-    }
-
-    /// Invalid table field names use string-key syntax.
-    #[test]
-    fn prints_invalid_table_type_fields_as_indexed_properties() {
-        let ty = Type::Table {
-            fields: HashMap::from([
-                ("if".into(), Type::String),
-                ("1".into(), Type::Number),
-                ("key.with.dots".into(), Type::Boolean),
-            ]),
-            array: None,
-        };
-
-        assert_eq!(
-            render_type(&ty),
-            "{ [\"1\"]: number, [\"if\"]: string, [\"key.with.dots\"]: boolean }"
-        );
+    fn prints_broad_table_type() {
+        assert_eq!(render_type(&Type::Table), "{ [any]: any }");
     }
 
     #[test]
@@ -871,35 +716,12 @@ mod tests {
         assert_eq!(print(&block), "return (-9223372036854775807i - 1i)\n");
     }
 
+    /// Optional broad function metadata keeps the function type parenthesized.
     #[test]
     fn prints_optional_function_type_with_function_parenthesized() {
-        let ty = Type::Union(vec![unknown_function_type(), Type::Nil]);
+        let ty = Type::Union(vec![Type::Function, Type::Nil]);
 
-        assert_eq!(render_type(&ty), "((...unknown) -> unknown) | nil");
-    }
-
-    #[test]
-    fn prints_function_return_union_without_changing_function_type() {
-        let ty = Type::Function {
-            params: TypePack::default(),
-            returns: TypePack {
-                head: vec![Type::Union(vec![Type::Unknown, Type::Nil])],
-                tail: None,
-            },
-        };
-
-        assert_eq!(render_type(&ty), "() -> unknown | nil");
-    }
-
-    /// Unions nested in intersections retain the required parentheses.
-    #[test]
-    fn prints_union_child_of_intersection_parenthesized() {
-        let ty = Type::Intersection(vec![
-            Type::Union(vec![Type::String, Type::Number]),
-            Type::Boolean,
-        ]);
-
-        assert_eq!(render_type(&ty), "(string | number) & boolean");
+        assert_eq!(render_type(&ty), "((...any) -> ...any) | nil");
     }
 
     /// Prints one byte string as a return value.

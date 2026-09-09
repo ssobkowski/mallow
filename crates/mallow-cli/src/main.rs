@@ -128,7 +128,7 @@ struct DecompileArgs {
     output: Option<PathBuf>,
 
     /// Output form to emit
-    #[arg(long, value_enum, default_value = "ir")]
+    #[arg(long, value_enum, default_value = "source")]
     emit: Emit,
 
     /// Spill emitter-introduced locals into table storage when Luau's local limit is exceeded

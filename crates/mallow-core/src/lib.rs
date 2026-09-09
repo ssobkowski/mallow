@@ -1,4 +1,5 @@
 mod ast;
+mod bytecode_types;
 mod common;
 mod disasm;
 mod emitter;
@@ -7,8 +8,6 @@ mod ir;
 mod logging;
 mod operator;
 mod printer;
-mod ty;
-mod types_view;
 
 #[cfg(feature = "visualize")]
 mod visualize;
@@ -191,25 +190,6 @@ pub fn lift_bytecode_with_diagnostics(
     ir::fir::lift(chunk)
 }
 
-pub use types_view::{TypeFactory, TypePackView, TypeView, TypesView};
-
-/// Infers named-local types from Luau bytecode.
-pub fn infer_bytecode_types(bytecode: &[u8]) -> Result<TypesView> {
-    infer_bytecode_types_with_diagnostics(bytecode, &Diagnostics::default())
-}
-
-/// Infers named-local types using an existing diagnostics context.
-pub fn infer_bytecode_types_with_diagnostics(
-    bytecode: &[u8],
-    diagnostics: &Diagnostics,
-) -> Result<TypesView> {
-    let span = tracing::info_span!("infer_bytecode_types", byte_len = bytecode.len());
-    let _enter = span.enter();
-    let unit = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    let output = ty::inference::run(&unit);
-    Ok(TypesView::from_inferred(&unit, output))
-}
-
 /// Emits Luau bytecode as cleaned source or intermediate representation text.
 pub fn decompile_bytecode(bytecode: &[u8], options: DecompileOptions) -> Result<String> {
     decompile_bytecode_with_diagnostics(bytecode, options, &Diagnostics::default())
@@ -241,12 +221,7 @@ pub fn decompile_bytecode_with_diagnostics(
 
     match options.emit {
         EmitMode::Source => {
-            let inference_span = tracing::info_span!("type_inference");
-            let types = {
-                let _enter = inference_span.enter();
-                ty::inference::run(&unit)
-            };
-
+            let types = bytecode_types::BytecodeTypes::read(&unit);
             let mut nested_unit = unit.map_functions(|function| {
                 let diagnostics = diagnostics.for_proto(function.id.0);
                 ir::nir::lift(function, &diagnostics)

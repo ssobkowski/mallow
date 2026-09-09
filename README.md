@@ -19,8 +19,7 @@ Input (`fib.luau`):
 ```luau
 local memo: {number} = {}
 
-local fib: (number) -> number
-fib = function(n: number)
+local function fib(n: number)
     if memo[n] then
         return memo[n]
     end
@@ -37,13 +36,11 @@ print(fib(24))
 Decompiled output:
 
 ```luau
--- Decompiled by mallow 0.3.2
-
+-- Decompiled with mallow 0.5.0
+local v2
 local v0 = {}
 local v1 = nil
-local v2
-v2 = function(p0)
-    -- proto 0: upvalues = [v0, v2]
+v2 = function(p0: number)
     if v0[p0] then
         return v0[p0]
     elseif p0 <= 1 then
@@ -54,6 +51,7 @@ v2 = function(p0)
     end
 end
 print(v2(24))
+local v3 = v2
 return
 ```
 
@@ -116,28 +114,10 @@ mallow roundtrip -i <source.luau> --luau-release 0.650
 mallow roundtrip -i <source.luau> --luau-bytecode 8
 ```
 
-The same IR output is available after compilation:
-
-```sh
-mallow roundtrip -i <source.luau> --emit=ir
-```
-
 **visualize** - generate an interactive CFG as HTML (requires `--features visualize`):
 
 ```sh
 mallow visualize -i <bytecode> -o <output.html>
-```
-
-### Type Inference
-
-Luau by default does not include any type info in the bytecode, unless compiled with the `-t1` flag. `-O2` may keep some function param types, if the compiler deems them beneficial to the runtime; but those are can only be trivial types, like `number` or `string` - no unions, named userdata, table types etc.
-
-mallow has a custom type inference engine, that recovers both factual bytecode types (if present), and non-trivial types that can't be inferred naturally by native tools like `luau-analyze` or various LSPs. Due to the inherent nature of this indeterminable problem, this is gated behind a `--infer-types` flag. This flag can only be used with the `decompile` or `roundtrip` command.
-
-Example output with type inference (`fib.luau`):
-
-```luau
-[TODO]
 ```
 
 ## Testing

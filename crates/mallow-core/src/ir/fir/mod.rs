@@ -1,6 +1,5 @@
 //! Flat intermediate representation used before source structuring.
 
-pub(crate) mod analysis;
 pub(crate) mod region;
 
 mod cflow;
@@ -27,11 +26,6 @@ pub type ValueId = Id<Value>;
 
 /// Stable identity for one IR value pack.
 pub type PackId = Id<Pack>;
-
-// TODO: Once type inference gets solved, see whether those two structs will hold the types,
-//       or the types will be held in the centralized type store and indexed dynamically.
-//       If the latter, then remove these structs and arena allocators for them, and use
-//       a monotonically increasing counter instead.
 
 /// One immutable IR value identity.
 #[derive(Debug, Clone, Default)]

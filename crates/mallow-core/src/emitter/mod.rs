@@ -11,20 +11,19 @@ use smol_str::SmolStr;
 use storage::Storage;
 
 use crate::ast::Identifier;
+use crate::bytecode_types::BytecodeTypes;
 use crate::common::is_valid_luau_identifier;
 use crate::il::ProtoId;
 use crate::ir::Unit;
 use crate::ir::fir::{CellId, Constant, Number};
 use crate::ir::nir;
 use crate::operator::{BinOp, CompoundBinOp};
-use crate::ty::canonical::TypeId;
-use crate::ty::inference::Output as InferenceOutput;
 use crate::{DecompileOptions, ast};
 
 /// Emits a materialized NIR program with the default naming policy.
 pub(crate) fn emit_ast(
     unit: Unit<nir::Function>,
-    types: &InferenceOutput,
+    types: &BytecodeTypes,
     options: DecompileOptions,
 ) -> Result<ast::Block> {
     emit_ast_with_namer(unit, types, options, PlainNamer::default())
@@ -33,20 +32,26 @@ pub(crate) fn emit_ast(
 /// Emits a materialized NIR program with a caller-provided naming policy.
 pub(crate) fn emit_ast_with_namer<N: Namer>(
     unit: Unit<nir::Function>,
-    types: &InferenceOutput,
+    types: &BytecodeTypes,
     options: DecompileOptions,
     mut namer: N,
 ) -> Result<ast::Block> {
     let entry = unit.entry();
-    let EmittedFunction { body, .. } =
+    let EmittedFunction { mut body, .. } =
         emit_function(&unit, types, options, &mut namer, entry, HashMap::new())?;
+    body.stmts.insert(
+        0,
+        ast::Stmt::Comment {
+            text: format!("Decompiled with mallow {}", env!("CARGO_PKG_VERSION")),
+        },
+    );
     Ok(body)
 }
 
 /// Emits one function under the storage aliases supplied by its closure.
 fn emit_function<N: Namer>(
     unit: &Unit<nir::Function>,
-    types: &InferenceOutput,
+    types: &BytecodeTypes,
     options: DecompileOptions,
     namer: &mut N,
     id: ProtoId,
@@ -75,7 +80,7 @@ enum ExprContext {
 /// Lifts one fully planned NIR function into AST nodes.
 struct FunctionEmitter<'f, 'n, N: Namer> {
     unit: &'f Unit<nir::Function>,
-    types: &'f InferenceOutput,
+    types: &'f BytecodeTypes,
     options: DecompileOptions,
     namer: &'n mut N,
     function: &'f nir::Function,
@@ -87,7 +92,7 @@ struct FunctionEmitter<'f, 'n, N: Namer> {
 impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
     fn new(
         unit: &'f Unit<nir::Function>,
-        types: &'f InferenceOutput,
+        types: &'f BytecodeTypes,
         options: DecompileOptions,
         namer: &'n mut N,
         function: &'f nir::Function,
@@ -151,7 +156,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                             self.plan.binding(key)?.name().cloned().ok_or_else(|| {
                                 anyhow::anyhow!("prefix binding must have a name")
                             })?;
-                        Ok(ast::Typed::maybe(name, self.type_of_binding(key)))
+                        Ok(ast::Typed::untyped(name))
                     })
                     .collect::<Result<Vec<_>>>()?;
             stmts.push(ast::Stmt::LocalDeclaration {
@@ -187,109 +192,15 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         scope
     }
 
-    /// Returns the resolved type of a local.
+    /// Returns the bytecode type of a local.
     fn type_of_local(&self, local: nir::LocalId) -> Option<ast::Type> {
-        let type_id = self
-            .types
-            .value(self.function.id, self.function.locals[local].source)?;
-        Some(self.lift_type(type_id))
+        self.types
+            .value(self.function.id, self.function.locals[local].source)
     }
 
-    /// Returns the resolved type of a cell.
+    /// Returns the bytecode type of a cell.
     fn type_of_cell(&self, cell: CellId) -> Option<ast::Type> {
-        let type_id = self.types.cell(self.function.id, cell)?;
-        Some(self.lift_type(type_id))
-    }
-
-    /// Returns the resolved type of one planned binding.
-    fn type_of_binding(&self, key: BindingKey) -> Option<ast::Type> {
-        match key {
-            BindingKey::Local(local) => self.type_of_local(local),
-            BindingKey::Cell(cell) => self.type_of_cell(cell),
-            BindingKey::Pack(_) => None,
-        }
-    }
-
-    /// Lifts a store-owned Type to an AST owned Type.
-    fn lift_type(&self, type_id: TypeId) -> ast::Type {
-        use crate::ty::canonical;
-
-        match self.types.get(type_id) {
-            canonical::Type::Any => ast::Type::Any,
-            canonical::Type::Unknown => ast::Type::Unknown,
-            canonical::Type::Never => ast::Type::Never,
-            canonical::Type::Nil => ast::Type::Nil,
-            canonical::Type::String => ast::Type::String,
-            canonical::Type::Number => ast::Type::Number,
-            canonical::Type::Boolean => ast::Type::Boolean,
-            canonical::Type::Thread => ast::Type::Thread,
-            canonical::Type::Userdata => ast::Type::Userdata,
-            canonical::Type::Vector => ast::Type::Vector,
-            canonical::Type::Integer => ast::Type::Integer,
-            canonical::Type::Buffer => ast::Type::Buffer,
-            canonical::Type::Named(s) => ast::Type::Named(s.clone()),
-            canonical::Type::Literal(lit) => ast::Type::Literal(match lit {
-                canonical::TypeLiteral::String(s) => ast::TypeLiteral::String(s.clone()),
-                canonical::TypeLiteral::Boolean(b) => ast::TypeLiteral::Boolean(*b),
-            }),
-            canonical::Type::Union(ids) => {
-                ast::Type::Union(ids.iter().map(|id| self.lift_type(*id)).collect())
-            }
-            canonical::Type::Intersection(ids) => {
-                ast::Type::Intersection(ids.iter().map(|id| self.lift_type(*id)).collect())
-            }
-            canonical::Type::WithMetatable { base, methods } => ast::Type::WithMetatable {
-                base: Box::new(self.lift_type(*base)),
-                metatable: methods
-                    .iter()
-                    .map(|m| (m.method.as_str().into(), self.lift_type(m.ty)))
-                    .collect(),
-            },
-            canonical::Type::Table => ast::Type::Table {
-                fields: HashMap::new(),
-                array: Some(Box::new((ast::Type::Any, ast::Type::Any))),
-            },
-            canonical::Type::TableShape { fields, indexer } => ast::Type::Table {
-                fields: fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), self.lift_type(*v)))
-                    .collect(),
-                array: indexer
-                    .and_then(|(k, v)| Some(Box::new((self.lift_type(k), self.lift_type(v))))),
-            },
-            canonical::Type::Function => ast::Type::Function {
-                params: ast::TypePack {
-                    head: Vec::new(),
-                    tail: Some(Box::new(ast::TypePackTail::Homogeneous(ast::Type::Any))),
-                },
-                returns: ast::TypePack {
-                    head: Vec::new(),
-                    tail: Some(Box::new(ast::TypePackTail::Homogeneous(ast::Type::Any))),
-                },
-            },
-            canonical::Type::FunctionSignature { params, returns } => {
-                let params = self.types.get_pack(*params);
-                let returns = self.types.get_pack(*returns);
-                ast::Type::Function {
-                    params: ast::TypePack {
-                        head: params.head.iter().map(|v| self.lift_type(*v)).collect(),
-                        tail: params.tail.as_ref().map(
-                            |canonical::TypePackTail::Homogeneous(t)| {
-                                Box::new(ast::TypePackTail::Homogeneous(self.lift_type(*t)))
-                            },
-                        ),
-                    },
-                    returns: ast::TypePack {
-                        head: returns.head.iter().map(|v| self.lift_type(*v)).collect(),
-                        tail: returns.tail.as_ref().map(
-                            |canonical::TypePackTail::Homogeneous(t)| {
-                                Box::new(ast::TypePackTail::Homogeneous(self.lift_type(*t)))
-                            },
-                        ),
-                    },
-                }
-            }
-        }
+        self.types.cell(self.function.id, cell)
     }
 
     /// Lifts one child region inside a fresh lexical scope.
@@ -643,6 +554,10 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
         out: &mut Vec<ast::Stmt>,
     ) {
         if declaration && let Some(name) = storage.name() {
+            let ty = match (&value, ty) {
+                (ast::Expr::Literal(ast::Literal::Nil), Some(ty)) if !type_accepts_nil(&ty) => None,
+                (_, ty) => ty,
+            };
             out.push(ast::Stmt::LocalDeclaration {
                 names: vec![ast::Typed::maybe(name.clone(), ty)],
                 values: vec![value],
@@ -939,6 +854,15 @@ fn compound_binding<'a>(
     }
     let op = CompoundBinOp::try_from(*op).ok()?;
     Some((op, rhs.as_ref()))
+}
+
+/// Returns whether a recovered bytecode type permits a nil initializer.
+fn type_accepts_nil(ty: &ast::Type) -> bool {
+    match ty {
+        ast::Type::Nil | ast::Type::Any | ast::Type::Unknown => true,
+        ast::Type::Union(types) => types.iter().any(type_accepts_nil),
+        _ => false,
+    }
 }
 
 /// Converts one NIR constant into an AST literal.
