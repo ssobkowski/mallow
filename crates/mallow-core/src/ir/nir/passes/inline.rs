@@ -3,9 +3,7 @@ use std::collections::HashMap;
 use smallvec::SmallVec;
 
 use crate::ir::fir::ValueId;
-use crate::ir::nir::visitor::{
-    VisitorMut, walk_expr_mut, walk_pack_expr_mut, walk_region_mut, walk_stmts_mut,
-};
+use crate::ir::nir::visitor::{VisitorMut, walk_expr_mut, walk_pack_expr_mut, walk_stmts_mut};
 use crate::ir::nir::{
     Capture, Expr, Function, LocalId, PackExpr, PackLocalId, Place, Region, Stmt, TableItem,
 };
@@ -598,18 +596,6 @@ struct Inliner {
 }
 
 impl VisitorMut for Inliner {
-    fn visit_region(&mut self, region: &mut Region) {
-        // Run inlining first
-        walk_region_mut(self, region);
-
-        if let Region::Sequence(nodes) = region {
-            nodes.retain(|node| !node.is_empty());
-            if nodes.len() == 1 {
-                *region = nodes.pop().expect("nodes is not empty");
-            }
-        }
-    }
-
     fn visit_stmts(&mut self, stmts: &mut Vec<Stmt>) {
         let prev_len = stmts.len();
         stmts.retain(|stmt| match stmt {

@@ -1,8 +1,9 @@
 //! Normalizes regions using the following rules:
 //!
 //! 1. If the *then* branch is empty and the *else* branch is not, swap the branches and invert the condition.
-//! 2. Canonicalize binary comparison expressions of the form `[literal] op [!literal]` to `[!literal] op [literal]`.
-//! 3. Simplify pattern `not (a [op @ ==|~=] b)` into `a [invert(op)] b`.
+//! 2. Remove empty sequence children and unwrap singleton sequences.
+//! 3. Canonicalize binary comparison expressions of the form `[literal] op [!literal]` to `[!literal] op [literal]`.
+//! 4. Simplify pattern `not (a [op @ ==|~=] b)` into `a [invert(op)] b`.
 
 use crate::ir::nir::visitor::{VisitorMut, walk_expr_mut, walk_region_mut};
 use crate::ir::nir::{Expr, Function, Region};
@@ -35,6 +36,17 @@ impl VisitorMut for Normalizer {
         }
 
         walk_region_mut(self, region);
+
+        if let Region::Sequence(nodes) = region {
+            let previous_len = nodes.len();
+            nodes.retain(|node| !node.is_empty());
+            self.changed |= nodes.len() != previous_len;
+
+            if nodes.len() == 1 {
+                *region = nodes.pop().expect("nodes is not empty");
+                self.changed = true;
+            }
+        }
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
