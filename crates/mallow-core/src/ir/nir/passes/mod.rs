@@ -1,5 +1,6 @@
 //! NIR passes run after materialization and verification.
 
+mod fold_assignments;
 mod fold_packs;
 mod fold_shapes;
 mod fold_tables;
@@ -22,6 +23,7 @@ pub(crate) fn run(unit: &mut Unit<Function>) -> bool {
             round_changed |= fold_packs::run(function);
             round_changed |= inline::run(function);
             round_changed |= fold_tables::run(function);
+            round_changed |= fold_assignments::run(function);
             round_changed |= fold_shapes::run(function);
         }
         if !round_changed {
