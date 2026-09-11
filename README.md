@@ -124,8 +124,6 @@ mallow visualize -i <bytecode> -o <output.html>
 
 Tests live in `tests/cases`. Each case is compiled with the Luau compiler, decompiled, and both versions are executed - stdout is compared for semantic equivalence rather than source text matching. Before running tests, make sure your compiler version emits a supported bytecode version.
 
-> **Note:** Testing mallow requires both the `luau` and `luau-compile` binaries in PATH.
-
 ```sh
 cargo test
 ```
