@@ -1,6 +1,8 @@
 //! Flat intermediate representation used before source structuring.
 
+pub(crate) mod folding;
 pub(crate) mod region;
+pub(crate) mod storage;
 
 mod cflow;
 mod lifter;
@@ -233,7 +235,7 @@ impl Instr {
 
     /// Returns the value pack defined by this instruction, if it exists.
     #[inline]
-    fn defined_pack(&self) -> Option<PackId> {
+    pub(crate) fn defined_pack(&self) -> Option<PackId> {
         match self {
             Self::MakePack { out, .. }
             | Self::Call { out, .. }
@@ -374,25 +376,29 @@ pub enum BlockExit {
 }
 
 impl BlockExit {
-    /// Returns immutable values read by this block exit.
-    #[inline]
+    /// Returns values read by this block exit.
     fn used_values(&self) -> SmallVec<[ValueId; 3]> {
         match self {
-            Self::Fallthrough(_)
-            | Self::Jump(_)
-            | Self::NumericForLoop { .. }
-            | Self::Return(_) => SmallVec::new(),
             Self::Branch { condition, .. } => smallvec![*condition],
             Self::NumericFor {
                 start, end, step, ..
             } => smallvec![*start, *end, *step],
             Self::GenericFor { values, .. } => SmallVec::from_slice(values),
-            Self::GenericForLoop { .. } => SmallVec::new(),
+            _ => SmallVec::new(),
+        }
+    }
+
+    /// Returns values defined by this block exit.
+    fn defined_values(&self) -> SmallVec<[ValueId; 3]> {
+        match self {
+            BlockExit::NumericFor { variable, .. } => smallvec![*variable],
+            BlockExit::GenericFor { variables, .. }
+            | BlockExit::GenericForLoop { variables, .. } => variables.clone(),
+            _ => SmallVec::new(),
         }
     }
 
     /// Returns outgoing edge references from this block exit.
-    #[inline]
     pub(crate) fn edges(&self) -> SmallVec<[&Edge; 2]> {
         match self {
             Self::Fallthrough(edge) | Self::Jump(edge) => smallvec![edge],
@@ -421,7 +427,6 @@ impl BlockExit {
     }
 
     /// Returns outgoing mutable edge references from this block exit.
-    #[inline]
     pub(crate) fn edges_mut(&mut self) -> SmallVec<[&mut Edge; 2]> {
         match self {
             Self::Fallthrough(edge) | Self::Jump(edge) => smallvec![edge],

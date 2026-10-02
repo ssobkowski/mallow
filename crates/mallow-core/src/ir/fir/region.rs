@@ -4,6 +4,7 @@ use std::fmt;
 use anyhow::{Result, ensure};
 use either::Either;
 
+use super::folding::Folding;
 use super::{Block, BlockExit, Function, Instr, PackId, ValueId};
 use crate::ir::fir::ControlFlowGraph;
 use crate::ir::graph::{DominatorTree, GraphView, Reversed, SeseGraphView};
@@ -12,8 +13,13 @@ use crate::logging::{Diagnostics, LogLevel, LogTarget};
 /// A source condition recovered from control-flow decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Predicate {
-    /// Tests one immutable IR value.
-    Value(ValueId),
+    /// Tests the branch condition of one block.
+    Value {
+        /// Condition value tested by the branch.
+        value: ValueId,
+        /// Block whose exit branches on `value`.
+        block: usize,
+    },
     /// Always succeeds.
     True,
     /// Always fails.
@@ -95,7 +101,7 @@ impl Predicate {
 impl fmt::Display for Predicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Value(value) => write!(f, "%v{}", value.index()),
+            Self::Value { value, .. } => write!(f, "%v{}", value.index()),
             Self::True => write!(f, "true"),
             Self::False => write!(f, "false"),
             Self::Not(inner) => write!(f, "not ({inner})"),
@@ -1050,13 +1056,15 @@ struct Structurer<'d> {
     ipdoms: DominatorTree<usize>,
     /// Natural loops and their lexical containment.
     loops: LoopForest,
+    /// Blocks whose instructions all fold into their branch condition.
+    condition_only_blocks: HashSet<usize>,
     /// Diagnostic destination for recognition traces and warnings.
     diagnostics: &'d Diagnostics,
 }
 
 impl<'d> Structurer<'d> {
     /// Builds all graph analyses required by region recognition.
-    fn new(cfg: &ControlFlowGraph<Block>, diagnostics: &'d Diagnostics) -> Self {
+    fn new(cfg: &ControlFlowGraph<Block>, folding: &Folding, diagnostics: &'d Diagnostics) -> Self {
         let graph = RegionGraph::from(cfg.clone());
         let ipdoms = Reversed::new(&graph).build_idoms();
 
@@ -1067,8 +1075,15 @@ impl<'d> Structurer<'d> {
             graph,
             ipdoms,
             loops,
+            condition_only_blocks: folding.condition_only_blocks().clone(),
             diagnostics,
         }
+    }
+
+    /// Returns whether a block has statements outside of its branch condition.
+    #[inline]
+    fn has_statements(&self, block: usize) -> bool {
+        !self.graph.blocks[block].instrs.is_empty() && !self.condition_only_blocks.contains(&block)
     }
 
     /// Recursively structures the region graph into a [`RecognizedShape`] tree.
@@ -1201,7 +1216,7 @@ impl<'d> Structurer<'d> {
                         merge
                     ),
                 );
-                if !self.graph.blocks[current].instrs.is_empty() {
+                if self.has_statements(current) {
                     nodes.push(RecognizedShape::Block(current));
                 }
 
@@ -1590,7 +1605,10 @@ impl<'d> Structurer<'d> {
 
         Some(ConditionalShape {
             head,
-            condition: Predicate::Value(*condition),
+            condition: Predicate::Value {
+                value: *condition,
+                block: head,
+            },
             then_entry: then_edge.target,
             else_entry: else_edge.target,
             merge: self.find_merge_point(head, scope).or_else(|| {
@@ -1967,10 +1985,14 @@ impl<'d> Structurer<'d> {
             } = &self.graph.blocks[latch].exit
             && (then_edge.target == loop_info.header) ^ (else_edge.target == loop_info.header)
         {
+            let condition = Predicate::Value {
+                value: *condition,
+                block: latch,
+            };
             let condition = if then_edge.target == loop_info.header {
-                Predicate::Value(*condition).invert()
+                condition.invert()
             } else {
-                Predicate::Value(*condition)
+                condition
             };
 
             let loop_exit = if then_edge.target == loop_info.header {
@@ -2007,9 +2029,10 @@ impl<'d> Structurer<'d> {
 
     /// Attempts to recover a `while` loop guard starting from the loop header.
     ///
-    /// A while guard is a chain of empty conditional blocks at the top of the
-    /// loop that collectively decide whether to enter the body or exit. Returns
-    /// `None` if the header does not match that shape.
+    /// A while guard is a chain of conditional blocks without statements at the
+    /// top of the loop that collectively decide whether to enter the body or exit.
+    /// A block whose instructions all fold into its branch condition counts as
+    /// having no statements. Returns `None` if the header does not match that shape.
     fn recognize_while_guard(&self, loop_info: &LoopInfo) -> Option<WhileGuard> {
         let mut visiting = HashSet::new();
         let guard = self.recognize_while_guard_node(loop_info, loop_info.header, &mut visiting)?;
@@ -2024,7 +2047,7 @@ impl<'d> Structurer<'d> {
 
     /// Tries to recursively fold `node` into the while guard as one conditional step.
     ///
-    /// A node qualifies if it is empty, has a branch exit, and both
+    /// A node qualifies if it has no statements, has a branch exit, and both
     /// outgoing edges can be classified by [`Structurer::recognize_while_guard_branch`].
     /// The resulting condition is the boolean combination that is `true`
     /// exactly when a path through this node reaches the loop body:
@@ -2036,7 +2059,7 @@ impl<'d> Structurer<'d> {
         node: usize,
         visiting: &mut HashSet<usize>,
     ) -> Option<GuardBranch> {
-        if !loop_info.body.contains(&node) || !self.graph.blocks[node].instrs.is_empty() {
+        if !loop_info.body.contains(&node) || self.has_statements(node) {
             return None;
         }
         if !visiting.insert(node) {
@@ -2068,7 +2091,10 @@ impl<'d> Structurer<'d> {
         let mut exits = then_branch.exits;
         exits.extend(else_branch.exits);
 
-        let condition = Predicate::Value(*condition);
+        let condition = Predicate::Value {
+            value: *condition,
+            block: node,
+        };
         Some(GuardBranch {
             condition: Predicate::select(condition, then_branch.condition, else_branch.condition),
             body,
@@ -2081,7 +2107,7 @@ impl<'d> Structurer<'d> {
     ///
     /// Three outcomes:
     /// - `target` is outside the loop body -> exit edge, condition `false`
-    /// - `target` is an empty conditional that itself has a loop exit ->
+    /// - `target` is a conditional without statements that itself has a loop exit ->
     ///   recurse into `recognize_while_guard_node` to fold it in
     /// - anything else -> this is the body entry, condition `true`
     fn recognize_while_guard_branch(
@@ -2100,7 +2126,7 @@ impl<'d> Structurer<'d> {
         }
 
         if !loop_info.latches.contains(&target)
-            && self.graph.blocks[target].instrs.is_empty()
+            && !self.has_statements(target)
             && matches!(&self.graph.blocks[target].exit, BlockExit::Branch { .. })
             && self.conditional_has_loop_exit(loop_info, target)
             && let Some(guard) = self.recognize_while_guard_node(loop_info, target, visiting)
@@ -2478,10 +2504,14 @@ fn conditional_branch_exits(
 }
 
 /// Structures one flat IR function without changing its blocks or instructions.
-pub(crate) fn structure(function: &Function, diagnostics: &Diagnostics) -> Result<Shape> {
+pub(crate) fn structure(
+    function: &Function,
+    folding: &Folding,
+    diagnostics: &Diagnostics,
+) -> Result<Shape> {
     ensure!(function.cfg.len() > 0, "cannot structure an empty function");
 
-    let node = Structurer::new(&function.cfg, diagnostics)
+    let node = Structurer::new(&function.cfg, folding, diagnostics)
         .structure()
         .lift()
         .normalize();

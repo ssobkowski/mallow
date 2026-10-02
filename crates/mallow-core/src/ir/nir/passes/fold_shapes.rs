@@ -128,13 +128,9 @@ impl<'a> NestedIf<'a> {
 /// end
 /// ```
 ///
-/// Condition setup in `P` stays on the false path of `A`:
+/// When `P` is empty, the folded region has this shape:
 ///
 /// ```text
-/// if not A then
-///     P
-/// end
-///
 /// if A or B then
 ///     X
 /// else
@@ -161,7 +157,7 @@ fn nested_or(parent: &Region) -> Option<Region> {
         then_branch: then_parent.clone(),
         else_branch: nested.else_branch.cloned().map(Box::new),
     };
-    with_guarded_setup(cond_parent, nested.prefix, folded)
+    without_setup(nested.prefix, folded)
 }
 
 /// Detects a [`Region::If`] whose then branch equals the else branch of an if-region
@@ -182,13 +178,9 @@ fn nested_or(parent: &Region) -> Option<Region> {
 /// end
 /// ```
 ///
-/// Condition setup in `P` stays on the false path of `A`:
+/// When `P` is empty, the folded region has this shape:
 ///
 /// ```text
-/// if not A then
-///     P
-/// end
-///
 /// if A or not B then
 ///     X
 /// else
@@ -215,32 +207,16 @@ fn nested_or_not(parent: &Region) -> Option<Region> {
         then_branch: then_parent.clone(),
         else_branch: Some(Box::new(nested.then_branch.clone())),
     };
-    with_guarded_setup(cond_parent, nested.prefix, folded)
+    without_setup(nested.prefix, folded)
 }
 
-/// Keeps nested condition setup behind the parent condition's false path.
-fn with_guarded_setup(
-    parent_condition: &Expr,
-    prefix: &[Region],
-    folded: Region,
-) -> Option<Region> {
-    if prefix.is_empty() {
-        return Some(folded);
-    }
-
-    // Only pure conditions can be repeated.
-    if !matches!(parent_condition, Expr::Constant(_) | Expr::Local(_)) {
-        return None;
-    }
-
-    Some(Region::Sequence(vec![
-        Region::If {
-            condition: Expr::not(parent_condition.clone()),
-            then_branch: Box::new(Region::Sequence(prefix.to_vec())),
-            else_branch: None,
-        },
-        folded,
-    ]))
+/// Returns the folded region when the nested condition needs no setup.
+///
+/// Setup statements run only when the parent condition fails. Hoisting them
+/// out would require evaluating the parent condition twice, and the setup may
+/// change what it reads, so such shapes stay nested.
+fn without_setup(prefix: &[Region], folded: Region) -> Option<Region> {
+    prefix.is_empty().then_some(folded)
 }
 
 /// Detects a [`Region::If`] whose 'then branch' is itself a [`Region::If`], where both
@@ -377,7 +353,6 @@ impl VisitorMut for Folder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::UnOp;
 
     /// Creates an empty flat block for shape tests.
     fn block(origin: usize) -> Region {
@@ -412,46 +387,30 @@ mod tests {
         );
     }
 
-    /// Verifies that a condition setup stays conditional when nested branches are merged.
+    /// Verifies that a nested condition with setup statements stays nested.
+    ///
+    /// Hoisting the setup would evaluate the parent condition again after the
+    /// setup ran, which can observe the setup's own writes.
     #[test]
-    fn nested_or_keeps_condition_setup_guarded() {
+    fn nested_or_keeps_condition_setup_nested() {
         let body = Region::While {
             condition: Expr::boolean(true),
             body: Box::new(block(1)),
         };
-        let setup = block(2);
-        let fallback = block(3);
         let parent = Region::If {
             condition: Expr::boolean(true),
             then_branch: Box::new(body.clone()),
             else_branch: Some(Box::new(Region::Sequence(vec![
-                setup.clone(),
+                block(2),
                 Region::If {
                     condition: Expr::boolean(false),
-                    then_branch: Box::new(body.clone()),
-                    else_branch: Some(Box::new(fallback.clone())),
+                    then_branch: Box::new(body),
+                    else_branch: Some(Box::new(block(3))),
                 },
             ]))),
         };
 
-        assert_eq!(
-            nested_or(&parent),
-            Some(Region::Sequence(vec![
-                Region::If {
-                    condition: Expr::Unary {
-                        op: UnOp::Not,
-                        value: Box::new(Expr::boolean(true)),
-                    },
-                    then_branch: Box::new(Region::Sequence(vec![setup])),
-                    else_branch: None,
-                },
-                Region::If {
-                    condition: Expr::or(Expr::boolean(true), Expr::boolean(false)),
-                    then_branch: Box::new(body),
-                    else_branch: Some(Box::new(fallback)),
-                },
-            ]))
-        );
+        assert_eq!(nested_or(&parent), None);
     }
 
     /// Verifies that matching outer and nested else branches are merged.
@@ -461,35 +420,24 @@ mod tests {
             condition: Expr::boolean(true),
             body: Box::new(block(1)),
         };
-        let setup = block(2);
         let fallback = block(3);
         let parent = Region::If {
             condition: Expr::boolean(true),
             then_branch: Box::new(body.clone()),
-            else_branch: Some(Box::new(Region::Sequence(vec![
-                setup.clone(),
-                Region::If {
-                    condition: Expr::boolean(false),
-                    then_branch: Box::new(fallback.clone()),
-                    else_branch: Some(Box::new(body.clone())),
-                },
-            ]))),
+            else_branch: Some(Box::new(Region::If {
+                condition: Expr::boolean(false),
+                then_branch: Box::new(fallback.clone()),
+                else_branch: Some(Box::new(body.clone())),
+            })),
         };
 
         assert_eq!(
             nested_or_not(&parent),
-            Some(Region::Sequence(vec![
-                Region::If {
-                    condition: Expr::not(Expr::boolean(true)),
-                    then_branch: Box::new(Region::Sequence(vec![setup])),
-                    else_branch: None,
-                },
-                Region::If {
-                    condition: Expr::or(Expr::boolean(true), Expr::not(Expr::boolean(false))),
-                    then_branch: Box::new(body),
-                    else_branch: Some(Box::new(fallback)),
-                },
-            ]))
+            Some(Region::If {
+                condition: Expr::or(Expr::boolean(true), Expr::not(Expr::boolean(false))),
+                then_branch: Box::new(body),
+                else_branch: Some(Box::new(fallback)),
+            })
         );
     }
 

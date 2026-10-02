@@ -1,5 +1,6 @@
 //! FIR Shape to NIR Region materialization and inlining.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
@@ -7,24 +8,32 @@ use id_arena::Arena;
 
 use super::visitor::VisitorMut;
 use super::*;
+use crate::ir::fir::folding::Folding;
 use crate::ir::fir::region::{Predicate, Shape};
-use crate::ir::fir::{self, Edge, PackId};
+use crate::ir::fir::storage::Storage;
+use crate::ir::fir::{self, PackId};
 use crate::ir::graph::{DominatorTree, GraphView};
-use crate::ir::union_find::UnionFind;
 use crate::logging::Diagnostics;
 
 /// Structures the FIR function into a control shape, then lifts it to NIR.
 pub(crate) fn lift(function: fir::Function, diagnostics: &Diagnostics) -> Result<Function> {
-    let shape = fir::region::structure(&function, diagnostics)?;
-    materialize(function, shape)
+    let storage = Storage::build(&function);
+    let folding = Folding::build(&function, &storage);
+    let shape = fir::region::structure(&function, &folding, diagnostics)?;
+    materialize(function, &storage, &folding, shape)
 }
 
 /// Converts one verified control shape into NIR with distinct FIR SSA symbols.
-pub(crate) fn materialize(function: fir::Function, shape: Shape) -> Result<Function> {
+pub(crate) fn materialize(
+    function: fir::Function,
+    storage: &Storage,
+    folding: &Folding,
+    shape: Shape,
+) -> Result<Function> {
     let mut result = {
-        let ssa = SsaMeta::build(&function)?;
+        let ssa = SsaMeta::build(&function, storage);
         let initializations = Initializations::build(&function, &ssa, &shape);
-        Materializer::new(&function, &ssa, initializations).materialize(shape)?
+        Materializer::new(&function, folding, &ssa, initializations).materialize(shape)?
     };
     for (target, source) in result.bindings.iter_mut().zip(function.bindings) {
         target.cells = source.cells;
@@ -67,136 +76,56 @@ pub(crate) fn destroy_ssa(function: &mut Function) {
 }
 
 /// Describes the underlying storage required by one FIR function.
-struct SsaMeta {
+struct SsaMeta<'s> {
     /// Canonical storage for every FIR value.
-    storage: HashMap<ValueId, ValueId>,
+    storage: &'s Storage,
     /// A list of synthetic nil declarations grouped by dominating block.
     declarations: Vec<Vec<ValueId>>,
     /// Immediate dominators for every reachable FIR block.
     idoms: DominatorTree<usize>,
 }
 
-impl SsaMeta {
-    /// Groups Phi inputs which will use the same mutable storage.
-    fn build(function: &fir::Function) -> Result<Self> {
+impl<'s> SsaMeta<'s> {
+    /// Places a declaration for every storage assigned through block parameters.
+    fn build(function: &fir::Function, storage: &'s Storage) -> Self {
         let cfg = &function.cfg;
         let idoms = cfg.build_idoms();
 
-        let mut groups = UnionFind::new();
-        let mut phi_blocks = Vec::new();
-        let mut loop_values = Vec::new();
-
-        // Share the identities between the params from the function signature
-        // and the actual identities used in the entry block.
-        let entry_block = &function.cfg[function.entry.target];
-        for (argument, parameter) in function.entry.params.iter().zip(&entry_block.params) {
-            groups.union(*argument, *parameter);
-        }
-
-        for block_index in cfg.post_order() {
-            let block = &cfg[block_index];
-            for (i, out) in block.params.iter().enumerate() {
-                phi_blocks.push((out, block_index));
-                for p in cfg.predecessors(block_index) {
-                    let pred_block = &cfg[p];
-                    for edge in pred_block.exit.edges() {
-                        if edge.target != block_index {
-                            continue;
-                        }
-
-                        let is_loop_header_initializer = match &pred_block.exit {
-                            fir::BlockExit::NumericFor {
-                                body_edge:
-                                    Edge {
-                                        target: body_block, ..
-                                    },
-                                variable,
-                                ..
-                            } => *body_block == block_index && variable == out,
-                            fir::BlockExit::GenericFor {
-                                body_edge:
-                                    Edge {
-                                        target: body_block, ..
-                                    },
-                                variables,
-                                ..
-                            } => *body_block == block_index && variables.contains(out),
-                            _ => false,
-                        };
-
-                        if !is_loop_header_initializer {
-                            groups.union(*out, edge.params[i]);
-                        }
-                    }
-                }
-            }
-
-            match &block.exit {
-                fir::BlockExit::NumericFor { variable, .. } => {
-                    loop_values.push(*variable);
-                }
-                fir::BlockExit::GenericFor {
-                    loop_block,
-                    variables: init_variables,
-                    ..
-                } => {
-                    loop_values.extend(init_variables.iter().copied());
-                    let fir::BlockExit::GenericForLoop {
-                        variables: body_variables,
-                        ..
-                    } = &cfg[*loop_block].exit
-                    else {
-                        unreachable!("raw CFG validation guarantees the generic loop target")
-                    };
-
-                    for (entry, body) in init_variables.iter().zip(body_variables) {
-                        groups.union(*entry, *body);
-                    }
-                }
-                fir::BlockExit::GenericForLoop { variables, .. } => {
-                    loop_values.extend(variables.iter().copied());
-                }
-                _ => {}
+        let mut storage_blocks: HashMap<_, Vec<_>> = HashMap::new();
+        for block in cfg.post_order() {
+            for param in &cfg[block].params {
+                storage_blocks
+                    .entry(storage.of(*param))
+                    .or_default()
+                    .push(block);
             }
         }
 
-        let storage: HashMap<_, _> = function
-            .values
-            .iter()
-            .map(|(value, _)| (value, groups.find(value)))
-            .collect();
-        let initialized: HashSet<_> = function
+        let params: HashSet<_> = function
             .params
             .iter()
-            .chain(loop_values.iter())
-            .map(|value| storage[value])
+            .map(|value| storage.of(*value))
             .collect();
-
-        let mut storage_blocks: HashMap<_, Vec<_>> = HashMap::new();
-        for (out, block) in phi_blocks {
-            storage_blocks.entry(storage[out]).or_default().push(block);
-        }
-
-        let mut declarations = vec![Vec::new(); function.cfg.len()];
+        let mut declarations = vec![Vec::new(); cfg.len()];
         for (storage_id, blocks) in storage_blocks {
-            if initialized.contains(&storage_id) {
+            if params.contains(&storage_id) || storage.is_loop_storage(storage_id) {
                 continue;
             }
-            let declaration = idoms.common_strict_dominator(function.cfg.entry(), &blocks);
+            let declaration = idoms.common_strict_dominator(cfg.entry(), &blocks);
             declarations[declaration].push(storage_id);
         }
 
-        Ok(Self {
+        Self {
             storage,
             declarations,
             idoms,
-        })
+        }
     }
 
     /// Returns the canonical storage for one FIR value.
     #[inline]
     fn storage(&self, value: ValueId) -> ValueId {
-        self.storage[&value]
+        self.storage.of(value)
     }
 
     /// Returns whether concrete code defines the storage before its declaration point.
@@ -260,13 +189,13 @@ struct Initializations {
 impl Initializations {
     /// Places storage without a concrete definition at its block or in the function prologue.
     fn build(function: &fir::Function, ssa: &SsaMeta, shape: &Shape) -> Self {
-        let mut initialization_blocks = HashSet::new();
-        collect_initialization_blocks(shape, &mut initialization_blocks);
+        let mut emitted_blocks = HashSet::new();
+        collect_emitted_blocks(shape, &mut emitted_blocks);
 
         let mut by_block = vec![Vec::new(); function.cfg.len()];
         let mut prologue = Vec::new();
         for (block, storages) in ssa.declarations.iter().enumerate() {
-            if initialization_blocks.contains(&block) {
+            if emitted_blocks.contains(&block) {
                 by_block[block].extend(
                     storages
                         .iter()
@@ -282,15 +211,78 @@ impl Initializations {
     }
 }
 
-/// Collects FIR blocks that can receive synthetic declarations.
-fn collect_initialization_blocks(shape: &Shape, blocks: &mut HashSet<usize>) {
+/// Collects FIR blocks which appear anywhere in the shape.
+///
+/// A block appears as a statement block, as a predicate block whose branch
+/// decides part of a condition, or as both. Declarations of statement blocks
+/// open the block itself, those of predicate-only blocks are placed right
+/// before the structured node testing the predicate. Declarations of blocks
+/// which never appear fall back to the function prologue.
+fn collect_emitted_blocks(shape: &Shape, blocks: &mut HashSet<usize>) {
     match shape {
         Shape::Block { block } => {
             blocks.insert(*block);
         }
         Shape::Sequence { nodes } => {
             for node in nodes {
-                collect_initialization_blocks(node, blocks);
+                collect_emitted_blocks(node, blocks);
+            }
+        }
+        Shape::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_predicate_blocks(condition, blocks);
+            collect_emitted_blocks(then_branch, blocks);
+            if let Some(else_branch) = else_branch {
+                collect_emitted_blocks(else_branch, blocks);
+            }
+        }
+        Shape::While { condition, body } | Shape::RepeatUntil { condition, body } => {
+            collect_predicate_blocks(condition, blocks);
+            collect_emitted_blocks(body, blocks);
+        }
+        Shape::NumericFor { body, .. } | Shape::GenericFor { body, .. } => {
+            collect_emitted_blocks(body, blocks);
+        }
+        Shape::Continue | Shape::Break | Shape::Return { .. } => {}
+    }
+}
+
+/// Collects FIR blocks whose branch decides part of a predicate.
+fn collect_predicate_blocks(predicate: &Predicate, blocks: &mut HashSet<usize>) {
+    match predicate {
+        Predicate::Value { block, .. } => {
+            blocks.insert(*block);
+        }
+        Predicate::True | Predicate::False => {}
+        Predicate::Not(inner) => collect_predicate_blocks(inner, blocks),
+        Predicate::And(lhs, rhs) | Predicate::Or(lhs, rhs) => {
+            collect_predicate_blocks(lhs, blocks);
+            collect_predicate_blocks(rhs, blocks);
+        }
+        Predicate::Select {
+            condition,
+            then_predicate,
+            else_predicate,
+        } => {
+            collect_predicate_blocks(condition, blocks);
+            collect_predicate_blocks(then_predicate, blocks);
+            collect_predicate_blocks(else_predicate, blocks);
+        }
+    }
+}
+
+/// Collects FIR blocks materialized as statement blocks.
+fn collect_statement_blocks(shape: &Shape, blocks: &mut HashSet<usize>) {
+    match shape {
+        Shape::Block { block } => {
+            blocks.insert(*block);
+        }
+        Shape::Sequence { nodes } => {
+            for node in nodes {
+                collect_statement_blocks(node, blocks);
             }
         }
         Shape::If {
@@ -298,15 +290,15 @@ fn collect_initialization_blocks(shape: &Shape, blocks: &mut HashSet<usize>) {
             else_branch,
             ..
         } => {
-            collect_initialization_blocks(then_branch, blocks);
+            collect_statement_blocks(then_branch, blocks);
             if let Some(else_branch) = else_branch {
-                collect_initialization_blocks(else_branch, blocks);
+                collect_statement_blocks(else_branch, blocks);
             }
         }
         Shape::While { body, .. }
         | Shape::RepeatUntil { body, .. }
         | Shape::NumericFor { body, .. }
-        | Shape::GenericFor { body, .. } => collect_initialization_blocks(body, blocks),
+        | Shape::GenericFor { body, .. } => collect_statement_blocks(body, blocks),
         Shape::Continue | Shape::Break | Shape::Return { .. } => {}
     }
 }
@@ -327,6 +319,16 @@ impl VisitorMut for LocalRewriter<'_> {
 struct Materializer<'f> {
     /// FIR function being converted.
     function: &'f fir::Function,
+    /// Definitions which are materialized at their single use.
+    folding: &'f Folding,
+    /// Instruction defining every FIR value.
+    value_defs: HashMap<ValueId, &'f fir::Instr>,
+    /// Instruction defining every FIR pack.
+    pack_defs: HashMap<PackId, &'f fir::Instr>,
+    /// Folded definitions already materialized at their use.
+    emitted: RefCell<Emitted>,
+    /// Blocks materialized as statement blocks.
+    statement_blocks: HashSet<usize>,
     /// NIR local arena.
     locals: Arena<Local>,
     /// NIR pack arena.
@@ -339,9 +341,23 @@ struct Materializer<'f> {
     initializations: Initializations,
 }
 
+/// Folded definitions materialized so far.
+#[derive(Debug, Default)]
+struct Emitted {
+    /// Folded values materialized at their use.
+    values: HashSet<ValueId>,
+    /// Folded packs materialized at their use.
+    packs: HashSet<PackId>,
+}
+
 impl<'a> Materializer<'a> {
     /// Creates one stable NIR identity for every FIR SSA value and pack.
-    fn new(function: &'a fir::Function, ssa: &SsaMeta, initializations: Initializations) -> Self {
+    fn new(
+        function: &'a fir::Function,
+        folding: &'a Folding,
+        ssa: &SsaMeta,
+        initializations: Initializations,
+    ) -> Self {
         let mut locals = Arena::new();
         let values = function
             .values
@@ -359,8 +375,24 @@ impl<'a> Materializer<'a> {
             .map(|(source, _)| (source, packs.alloc(PackLocal { source })))
             .collect();
 
+        let mut value_defs = HashMap::new();
+        let mut pack_defs = HashMap::new();
+        for instr in function.cfg.items().flat_map(|block| block.instrs.iter()) {
+            if let Some(value) = instr.defined_value() {
+                value_defs.insert(value, instr);
+            }
+            if let Some(pack) = instr.defined_pack() {
+                pack_defs.insert(pack, instr);
+            }
+        }
+
         Self {
             function,
+            folding,
+            value_defs,
+            pack_defs,
+            emitted: RefCell::default(),
+            statement_blocks: HashSet::new(),
             locals,
             packs,
             values,
@@ -370,7 +402,8 @@ impl<'a> Materializer<'a> {
     }
 
     /// Materializes the complete shape.
-    fn materialize(self, shape: Shape) -> Result<Function> {
+    fn materialize(mut self, shape: Shape) -> Result<Function> {
+        collect_statement_blocks(&shape, &mut self.statement_blocks);
         let params = self
             .function
             .params
@@ -401,6 +434,7 @@ impl<'a> Materializer<'a> {
             })
             .collect::<Result<_>>()?;
         let body = self.region(shape)?;
+        self.verify_folded()?;
         let function = Function {
             id: self.function.id,
             debug: Default::default(),
@@ -466,16 +500,72 @@ impl<'a> Materializer<'a> {
             .ok_or_else(|| anyhow::anyhow!("missing NIR pack for %q{}", pack.index()))
     }
 
-    /// Creates a local reference for one FIR value.
-    #[inline]
+    /// Creates the expression for one FIR value at its use.
+    ///
+    /// Folded values are rebuilt from their definition, everything else reads its local.
     fn value(&self, value: ValueId) -> Result<Expr> {
-        Ok(Expr::local(self.local(value)?))
+        if !self.folding.is_folded(value) {
+            return Ok(Expr::local(self.local(value)?));
+        }
+        // The structurer may duplicate a block, and its trees along with it.
+        self.emitted.borrow_mut().values.insert(value);
+        let Some(instr) = self.value_defs.get(&value) else {
+            bail!("folded %v{} has no defining instruction", value.index());
+        };
+        self.value_expr(instr)
     }
 
-    /// Creates a local reference for one FIR pack.
-    #[inline]
+    /// Creates the pack expression for one FIR pack at its use.
+    ///
+    /// Folded packs are rebuilt from their definition, everything else reads its pack local.
     fn pack_value(&self, pack: PackId) -> Result<PackExpr> {
-        Ok(PackExpr::local(self.pack(pack)?))
+        if !self.folding.is_pack_folded(pack) {
+            return Ok(PackExpr::local(self.pack(pack)?));
+        }
+        self.emitted.borrow_mut().packs.insert(pack);
+        let Some(instr) = self.pack_defs.get(&pack) else {
+            bail!("folded %q{} has no defining instruction", pack.index());
+        };
+        self.pack_expr(instr)
+    }
+
+    /// Checks that every positioned folded definition of a structured block was materialized.
+    ///
+    /// A folded definition which is never reached would silently drop its evaluation.
+    /// Blocks which the structurer replaced by an equivalent block are not checked.
+    fn verify_folded(&self) -> Result<()> {
+        let emitted = self.emitted.borrow();
+        for (block_id, block) in self.function.cfg.items().enumerate() {
+            if !self.statement_blocks.contains(&block_id)
+                && !self.folding.is_condition_only(block_id)
+            {
+                continue;
+            }
+            for instr in &block.instrs {
+                if let Some(value) = instr.defined_value()
+                    && self.folding.is_folded(value)
+                    && !self.folding.is_floating(value)
+                    && !emitted.values.contains(&value)
+                {
+                    bail!(
+                        "folded %v{} in @P{} bb{block_id} was never materialized",
+                        value.index(),
+                        self.function.id.0
+                    );
+                }
+                if let Some(pack) = instr.defined_pack()
+                    && self.folding.is_pack_folded(pack)
+                    && !emitted.packs.contains(&pack)
+                {
+                    bail!(
+                        "folded %q{} in @P{} bb{block_id} was never materialized",
+                        pack.index(),
+                        self.function.id.0
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Materializes one structured shape node.
@@ -495,21 +585,30 @@ impl<'a> Materializer<'a> {
                 condition,
                 then_branch,
                 else_branch,
-            } => Region::If {
-                condition: self.predicate(condition)?,
-                then_branch: Box::new(self.region(*then_branch)?),
-                else_branch: else_branch
-                    .map(|branch| self.region(*branch).map(Box::new))
-                    .transpose()?,
-            },
-            Shape::While { condition, body } => Region::While {
-                condition: self.predicate(condition)?,
-                body: Box::new(self.region(*body)?),
-            },
-            Shape::RepeatUntil { condition, body } => Region::RepeatUntil {
-                condition: self.predicate(condition)?,
-                body: Box::new(self.region(*body)?),
-            },
+            } => self.with_predicate_declarations(
+                &condition,
+                Region::If {
+                    condition: self.predicate(condition.clone())?,
+                    then_branch: Box::new(self.region(*then_branch)?),
+                    else_branch: else_branch
+                        .map(|branch| self.region(*branch).map(Box::new))
+                        .transpose()?,
+                },
+            )?,
+            Shape::While { condition, body } => self.with_predicate_declarations(
+                &condition,
+                Region::While {
+                    condition: self.predicate(condition.clone())?,
+                    body: Box::new(self.region(*body)?),
+                },
+            )?,
+            Shape::RepeatUntil { condition, body } => self.with_predicate_declarations(
+                &condition,
+                Region::RepeatUntil {
+                    condition: self.predicate(condition.clone())?,
+                    body: Box::new(self.region(*body)?),
+                },
+            )?,
             Shape::NumericFor {
                 variable,
                 start,
@@ -545,6 +644,40 @@ impl<'a> Materializer<'a> {
         })
     }
 
+    /// Places declarations of predicate-only blocks right before the node testing them.
+    fn with_predicate_declarations(&self, predicate: &Predicate, node: Region) -> Result<Region> {
+        let mut blocks = HashSet::new();
+        collect_predicate_blocks(predicate, &mut blocks);
+        let mut blocks: Vec<_> = blocks
+            .into_iter()
+            .filter(|block| !self.statement_blocks.contains(block))
+            .collect();
+        blocks.sort_unstable();
+
+        let mut nodes = Vec::new();
+        for block in blocks {
+            let stmts = self
+                .initializations
+                .by_block
+                .get(block)
+                .into_iter()
+                .flatten()
+                .map(|storage| self.initialization(*storage))
+                .collect::<Result<Vec<_>>>()?;
+            if !stmts.is_empty() {
+                nodes.push(Region::Block {
+                    origin: block,
+                    stmts,
+                });
+            }
+        }
+        if nodes.is_empty() {
+            return Ok(node);
+        }
+        nodes.push(node);
+        Ok(Region::Sequence(nodes))
+    }
+
     /// Materializes every instruction in one FIR block.
     fn block(&self, block: usize) -> Result<Vec<Stmt>> {
         let Some(block_ref) = self.function.cfg.get(block) else {
@@ -558,54 +691,39 @@ impl<'a> Materializer<'a> {
             .flatten()
             .map(|storage| self.initialization(*storage))
             .collect::<Result<_>>()?;
-        for instr in &block_ref.instrs {
-            stmts.push(self.instr(instr)?);
+        for (index, instr) in block_ref.instrs.iter().enumerate() {
+            if self.folding.is_initializer((block, index)) {
+                continue;
+            }
+            let folded = instr
+                .defined_value()
+                .is_some_and(|value| self.folding.is_folded(value))
+                || instr
+                    .defined_pack()
+                    .is_some_and(|pack| self.folding.is_pack_folded(pack));
+            if !folded {
+                stmts.push(self.instr(instr)?);
+            }
         }
         Ok(stmts)
     }
 
-    /// Materializes one FIR instruction without moving it across another instruction.
+    /// Materializes one FIR instruction as a statement.
     fn instr(&self, instr: &fir::Instr) -> Result<Stmt> {
-        let local = |out, value| {
-            Ok(Stmt::Bind {
+        if let Some(out) = instr.defined_value() {
+            return Ok(Stmt::Bind {
                 target: Place::Local(self.local(out)?),
-                value,
-            })
-        };
-        let pack = |out, value| {
-            Ok(Stmt::BindPack {
+                value: self.value_expr(instr)?,
+            });
+        }
+        if let Some(out) = instr.defined_pack() {
+            return Ok(Stmt::BindPack {
                 local: self.pack(out)?,
-                value,
-            })
-        };
+                value: self.pack_expr(instr)?,
+            });
+        }
 
         match instr {
-            fir::Instr::Const { out, value } => local(*out, Expr::Constant(value.clone())),
-            fir::Instr::Copy { out, value } => local(*out, Expr::Local(self.local(*value)?)),
-            fir::Instr::Closure {
-                out,
-                proto,
-                captures,
-            } => local(
-                *out,
-                Expr::Closure {
-                    proto: *proto,
-                    captures: captures
-                        .iter()
-                        .map(|capture| match capture {
-                            fir::Capture::Copy(value) => self.local(*value).map(Capture::Copy),
-                            fir::Capture::Share(cell) => Ok(Capture::Share(*cell)),
-                        })
-                        .collect::<Result<_>>()?,
-                },
-            ),
-            fir::Instr::GetTable { out, table, key } => local(
-                *out,
-                Expr::GetTable {
-                    table: Box::new(self.value(*table)?),
-                    key: Box::new(self.value(*key)?),
-                },
-            ),
             fir::Instr::SetTable { table, key, value } => Ok(Stmt::Bind {
                 target: Place::Table {
                     table: self.value(*table)?,
@@ -613,98 +731,14 @@ impl<'a> Materializer<'a> {
                 },
                 value: self.value(*value)?,
             }),
-            fir::Instr::GetGlobal { out, name } => local(*out, Expr::GetGlobal(name.clone())),
             fir::Instr::SetGlobal { name, value } => Ok(Stmt::Bind {
                 target: Place::Global(name.clone()),
                 value: self.value(*value)?,
             }),
-            fir::Instr::Binary { out, lhs, op, rhs } => local(
-                *out,
-                Expr::Binary {
-                    lhs: Box::new(self.value(*lhs)?),
-                    op: *op,
-                    rhs: Box::new(self.value(*rhs)?),
-                },
-            ),
-            fir::Instr::Unary { out, op, value } => local(
-                *out,
-                Expr::Unary {
-                    op: *op,
-                    value: Box::new(self.value(*value)?),
-                },
-            ),
-            fir::Instr::Concat { out, operands } => local(
-                *out,
-                Expr::Concat(
-                    operands
-                        .iter()
-                        .map(|value| self.value(*value))
-                        .collect::<Result<_>>()?,
-                ),
-            ),
-            fir::Instr::Select {
-                out,
-                condition,
-                then_value,
-                else_value,
-            } => local(
-                *out,
-                Expr::Select {
-                    condition: Box::new(self.value(*condition)?),
-                    then_value: Box::new(self.value(*then_value)?),
-                    else_value: Box::new(self.value(*else_value)?),
-                },
-            ),
-            fir::Instr::NewTable { out } => local(*out, Expr::Table { items: Vec::new() }),
-            fir::Instr::MakePack { out, head, tail } => pack(
-                *out,
-                PackExpr::Values {
-                    head: head
-                        .iter()
-                        .map(|value| self.value(*value))
-                        .collect::<Result<_>>()?,
-                    tail: tail
-                        .map(|pack| self.pack_value(pack).map(Box::new))
-                        .transpose()?,
-                },
-            ),
-            fir::Instr::Project { out, pack, index } => local(
-                *out,
-                Expr::Project {
-                    pack: Box::new(self.pack_value(*pack)?),
-                    index: *index,
-                },
-            ),
-            fir::Instr::Call {
-                out,
-                function,
-                args,
-            } => pack(
-                *out,
-                PackExpr::Call {
-                    function: Box::new(self.value(*function)?),
-                    args: Box::new(self.pack_value(*args)?),
-                },
-            ),
-            fir::Instr::MethodCall {
-                out,
-                object,
-                method,
-                args,
-            } => pack(
-                *out,
-                PackExpr::MethodCall {
-                    object: Box::new(self.value(*object)?),
-                    method: method.clone(),
-                    args: Box::new(self.pack_value(*args)?),
-                },
-            ),
-            fir::Instr::VarArgs { out } => pack(*out, PackExpr::VarArgs),
             fir::Instr::OpenCell { cell, value } => Ok(Stmt::OpenCell {
                 cell: *cell,
                 value: self.value(*value)?,
             }),
-            fir::Instr::LoadCell { out, cell } => local(*out, Expr::LoadCell(*cell)),
             fir::Instr::StoreCell { cell, value } => Ok(Stmt::Bind {
                 target: Place::Cell(*cell),
                 value: self.value(*value)?,
@@ -718,13 +752,162 @@ impl<'a> Materializer<'a> {
                 index: *index,
                 values: self.pack_value(*values)?,
             }),
+            _ => bail!("instruction defines neither a value nor a pack"),
         }
+    }
+
+    /// Materializes the expression computed by one value-defining FIR instruction.
+    fn value_expr(&self, instr: &fir::Instr) -> Result<Expr> {
+        Ok(match instr {
+            fir::Instr::Const { value, .. } => Expr::Constant(value.clone()),
+            fir::Instr::Copy { value, .. } => self.value(*value)?,
+            fir::Instr::Closure {
+                proto, captures, ..
+            } => Expr::Closure {
+                proto: *proto,
+                captures: captures
+                    .iter()
+                    .map(|capture| match capture {
+                        fir::Capture::Copy(value) => self.local(*value).map(Capture::Copy),
+                        fir::Capture::Share(cell) => Ok(Capture::Share(*cell)),
+                    })
+                    .collect::<Result<_>>()?,
+            },
+            fir::Instr::GetTable { table, key, .. } => Expr::GetTable {
+                table: Box::new(self.value(*table)?),
+                key: Box::new(self.value(*key)?),
+            },
+            fir::Instr::GetGlobal { name, .. } => Expr::GetGlobal(name.clone()),
+            fir::Instr::Binary { out, lhs, op, rhs } => {
+                if self.folding.is_mirrored(*out) {
+                    // Operands are built in evaluation order, which is right to left here.
+                    let rhs = self.value(*rhs)?;
+                    let lhs = self.value(*lhs)?;
+                    Expr::Binary {
+                        lhs: Box::new(rhs),
+                        op: match op {
+                            BinOp::Lt => BinOp::Gt,
+                            BinOp::Lte => BinOp::Gte,
+                            _ => bail!("only ordered comparisons can be mirrored"),
+                        },
+                        rhs: Box::new(lhs),
+                    }
+                } else {
+                    Expr::Binary {
+                        lhs: Box::new(self.value(*lhs)?),
+                        op: *op,
+                        rhs: Box::new(self.value(*rhs)?),
+                    }
+                }
+            }
+            fir::Instr::Unary { op, value, .. } => Expr::Unary {
+                op: *op,
+                value: Box::new(self.value(*value)?),
+            },
+            fir::Instr::Concat { operands, .. } => Expr::Concat(
+                operands
+                    .iter()
+                    .map(|value| self.value(*value))
+                    .collect::<Result<_>>()?,
+            ),
+            fir::Instr::Select {
+                condition,
+                then_value,
+                else_value,
+                ..
+            } => Expr::Select {
+                condition: Box::new(self.value(*condition)?),
+                then_value: Box::new(self.value(*then_value)?),
+                else_value: Box::new(self.value(*else_value)?),
+            },
+            fir::Instr::NewTable { out } => Expr::Table {
+                items: match self.folding.constructor(*out) {
+                    Some(initializers) => self.table_items(initializers)?,
+                    None => Vec::new(),
+                },
+            },
+            fir::Instr::Project { pack, index, .. } => Expr::Project {
+                pack: Box::new(self.pack_value(*pack)?),
+                index: *index,
+            },
+            fir::Instr::LoadCell { cell, .. } => Expr::LoadCell(*cell),
+            _ => bail!("instruction does not define a value"),
+        })
+    }
+
+    /// Materializes the initializers of a folded table constructor as table items.
+    ///
+    /// Array stores which continue the array part become list items, any other
+    /// array store becomes explicitly indexed items.
+    fn table_items(&self, initializers: &[(usize, usize)]) -> Result<Vec<TableItem>> {
+        let mut items = Vec::with_capacity(initializers.len());
+        let mut array_len = Some(0usize);
+        for &(block, index) in initializers {
+            match &self.function.cfg[block].instrs[index] {
+                fir::Instr::SetTable { key, value, .. } => {
+                    items.push(TableItem::Index(self.value(*key)?, self.value(*value)?));
+                }
+                fir::Instr::SetList {
+                    index: base,
+                    values,
+                    ..
+                } => {
+                    let values = self.pack_value(*values)?;
+                    if array_len.is_some_and(|len| *base as usize == len + 1) {
+                        array_len = values
+                            .fixed_len()
+                            .and_then(|fixed| array_len.map(|len| len + fixed));
+                        items.push(TableItem::List(values));
+                    } else {
+                        items.extend(values.into_iter().enumerate().map(|(offset, value)| {
+                            let key = Expr::Constant(fir::Constant::Number(fir::Number::Float(
+                                *base as f64 + offset as f64,
+                            )));
+                            TableItem::Index(key, value)
+                        }));
+                    }
+                }
+                _ => bail!("table constructor initializer is not a table store"),
+            }
+        }
+        Ok(items)
+    }
+
+    /// Materializes the pack computed by one pack-defining FIR instruction.
+    fn pack_expr(&self, instr: &fir::Instr) -> Result<PackExpr> {
+        Ok(match instr {
+            fir::Instr::MakePack { head, tail, .. } => PackExpr::Values {
+                head: head
+                    .iter()
+                    .map(|value| self.value(*value))
+                    .collect::<Result<_>>()?,
+                tail: tail
+                    .map(|pack| self.pack_value(pack).map(Box::new))
+                    .transpose()?,
+            },
+            fir::Instr::Call { function, args, .. } => PackExpr::Call {
+                function: Box::new(self.value(*function)?),
+                args: Box::new(self.pack_value(*args)?),
+            },
+            fir::Instr::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } => PackExpr::MethodCall {
+                object: Box::new(self.value(*object)?),
+                method: method.clone(),
+                args: Box::new(self.pack_value(*args)?),
+            },
+            fir::Instr::VarArgs { .. } => PackExpr::VarArgs,
+            _ => bail!("instruction does not define a pack"),
+        })
     }
 
     /// Materializes one predicate without resolving its FIR value references early.
     fn predicate(&self, predicate: Predicate) -> Result<Expr> {
         Ok(match predicate {
-            Predicate::Value(value) => self.value(value)?,
+            Predicate::Value { value, .. } => self.value(value)?,
             Predicate::True => Expr::boolean(true),
             Predicate::False => Expr::boolean(false),
             Predicate::Not(inner) => Expr::Unary {
