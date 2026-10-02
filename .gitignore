@@ -15,6 +15,7 @@
 !tests/**/*
 !Cargo.lock
 !Cargo.toml
+!justfile
 !README.md
 !LICENSE
 !THIRD_PARTY_NOTICES

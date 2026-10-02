@@ -120,6 +120,10 @@ mallow roundtrip -i <source.luau> --luau-bytecode 8
 mallow visualize -i <bytecode> -o <output.html>
 ```
 
+### Using just
+
+Commands can get quite verbose, so running them with [just](https://github.com/casey/just) is preferred. See: [justfile](justfile).
+
 ## Testing
 
 Tests live in `tests/cases`. Each case is compiled with the Luau compiler, decompiled, and both versions are executed - stdout is compared for semantic equivalence rather than source text matching. Before running tests, make sure your compiler version emits a supported bytecode version.
