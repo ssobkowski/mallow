@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use id_arena::Arena;
 use smallvec::SmallVec;
 
 use crate::ir::fir::ValueId;
 use crate::ir::nir::visitor::{VisitorMut, walk_expr_mut, walk_pack_expr_mut, walk_stmts_mut};
 use crate::ir::nir::{
-    Capture, Expr, Function, LocalId, PackExpr, PackLocalId, Place, Region, Stmt, TableItem,
+    Capture, Expr, Function, Local, LocalId, PackExpr, PackLocalId, Place, Region, Stmt, TableItem,
 };
 use crate::operator::BinOp;
 
@@ -19,11 +20,19 @@ pub(super) fn run(function: &mut Function) -> bool {
         return false;
     }
 
+    let Function {
+        locals,
+        prologue,
+        body,
+        ..
+    } = function;
     let mut inliner = Inliner {
+        locals,
         changed: false,
         replacements,
     };
-    inliner.visit_function(function);
+    inliner.visit_stmts(prologue);
+    inliner.visit_region(body);
     inliner.changed
 }
 
@@ -74,7 +83,7 @@ enum LocalUse<'nir> {
     Capture,
 }
 
-/// Definitions and uses for one scalar symbol.
+/// Definitions and uses for one scalar storage, across all of its symbols.
 #[derive(Debug, Default)]
 struct LocalChain<'nir> {
     /// Every definition of the symbol.
@@ -217,8 +226,8 @@ impl<'nir> UseContext<'nir> {
 /// Scalar and pack replacements owned by one rewrite.
 #[derive(Debug, Default)]
 struct Replacements {
-    /// Scalar replacements indexed by local identity.
-    locals: HashMap<LocalId, Expr>,
+    /// Scalar replacements indexed by source storage.
+    locals: HashMap<ValueId, Expr>,
     /// Pack replacements indexed by pack-local identity.
     packs: HashMap<PackLocalId, PackExpr>,
 }
@@ -234,12 +243,12 @@ impl Replacements {
 /// Def-use chains for one complete NIR function.
 #[derive(Debug, Default)]
 struct DefUse<'nir> {
-    /// Chains indexed by scalar symbol identity.
-    locals: HashMap<LocalId, LocalChain<'nir>>,
+    /// Source storage of every scalar symbol.
+    sources: HashMap<LocalId, ValueId>,
+    /// Chains indexed by scalar source storage.
+    locals: HashMap<ValueId, LocalChain<'nir>>,
     /// Chains indexed by pack symbol identity.
     packs: HashMap<PackLocalId, PackChain<'nir>>,
-    /// Number of scalar symbols for each underlying storage value.
-    storage_symbol_counts: HashMap<ValueId, usize>,
 }
 
 impl<'nir> DefUse<'nir> {
@@ -248,11 +257,8 @@ impl<'nir> DefUse<'nir> {
         let mut def_use = Self::default();
 
         for (local, data) in function.locals.iter() {
-            def_use.locals.insert(local, LocalChain::default());
-            *def_use
-                .storage_symbol_counts
-                .entry(data.source)
-                .or_default() += 1;
+            def_use.sources.insert(local, data.source);
+            def_use.locals.entry(data.source).or_default();
         }
         for (pack, _) in function.packs.iter() {
             def_use.packs.insert(pack, PackChain::default());
@@ -261,31 +267,32 @@ impl<'nir> DefUse<'nir> {
             def_use.def_local(local, LocalDefinition::Other);
         }
 
-        def_use.collect_statements(&function.prologue);
+        def_use.collect_statements(&function.prologue, None);
         def_use.collect_region(&function.body);
         def_use
     }
 
     /// Builds conservative replacements without changing the function.
     ///
-    /// Shared storage is excluded because it carries assignments which are not
-    /// explicit symbol uses. Constants may move to any single expression use.
+    /// Symbols which share storage are tracked as one chain, so an edge argument
+    /// and the block parameter it binds form one definition and one use. Storage
+    /// backing a cell is excluded because cell accesses are not explicit symbol
+    /// uses. Constants may move to any single expression use.
     /// Other scalar values and packs must have one adjacent use reached after
     /// only stable local or constant expressions.
     fn replacements(&self, function: &Function) -> Replacements {
         let mut replacements = Replacements::default();
 
-        for (local, data) in function.locals.iter() {
-            if function
-                .cell_locals
-                .values()
-                .any(|backing_local| *backing_local == local)
-                || self.storage_symbol_counts[&data.source] != 1
-            {
+        let cell_sources: HashSet<_> = function
+            .cell_locals
+            .values()
+            .map(|local| self.sources[local])
+            .collect();
+        for (source, chain) in &self.locals {
+            if cell_sources.contains(source) {
                 continue;
             }
 
-            let chain = &self.locals[&local];
             let [LocalDefinition::Bind { statement, value }] = chain.definitions.as_slice() else {
                 continue;
             };
@@ -301,7 +308,7 @@ impl<'nir> DefUse<'nir> {
                 continue;
             }
 
-            replacements.locals.insert(local, (*value).clone());
+            replacements.locals.insert(*source, (*value).clone());
         }
 
         for (local, _) in function.packs.iter() {
@@ -326,7 +333,7 @@ impl<'nir> DefUse<'nir> {
     #[inline]
     fn def_local(&mut self, local: LocalId, definition: LocalDefinition<'nir>) {
         self.locals
-            .entry(local)
+            .entry(self.sources[&local])
             .or_default()
             .definitions
             .push(definition);
@@ -335,7 +342,11 @@ impl<'nir> DefUse<'nir> {
     /// Records one scalar symbol use.
     #[inline]
     fn use_local(&mut self, local: LocalId, symbol_use: LocalUse<'nir>) {
-        self.locals.entry(local).or_default().uses.push(symbol_use);
+        self.locals
+            .entry(self.sources[&local])
+            .or_default()
+            .uses
+            .push(symbol_use);
     }
 
     /// Records one pack symbol definition.
@@ -360,20 +371,28 @@ impl<'nir> DefUse<'nir> {
         self.collect_region_after(region, None);
     }
 
-    /// Collects one region with its immediate lexical predecessor.
-    fn collect_region_after(&mut self, region: &'nir Region, previous: Option<&'nir Region>) {
-        let previous_statement = match previous {
-            Some(Region::Block { stmts, .. }) => stmts.last(),
-            _ => None,
-        };
-
+    /// Returns the statement evaluated last by a straight-line region.
+    fn last_statement(region: &'nir Region) -> Option<&'nir Stmt> {
         match region {
-            Region::Block { stmts, .. } => self.collect_statements(stmts),
+            Region::Block { stmts, .. } => stmts.last(),
+            Region::Sequence(nodes) => nodes.last().and_then(Self::last_statement),
+            _ => None,
+        }
+    }
+
+    /// Collects one region with the statement evaluated right before it.
+    fn collect_region_after(
+        &mut self,
+        region: &'nir Region,
+        previous_statement: Option<&'nir Stmt>,
+    ) {
+        match region {
+            Region::Block { stmts, .. } => self.collect_statements(stmts, previous_statement),
             Region::Sequence(nodes) => {
-                let mut previous = None;
+                let mut previous = previous_statement;
                 for node in nodes {
                     self.collect_region_after(node, previous);
-                    previous = Some(node);
+                    previous = Self::last_statement(node);
                 }
             }
             Region::If {
@@ -429,9 +448,8 @@ impl<'nir> DefUse<'nir> {
         }
     }
 
-    /// Collects definitions and uses from one statement list.
-    fn collect_statements(&mut self, statements: &'nir [Stmt]) {
-        let mut previous = None;
+    /// Collects definitions and uses from one statement list with its lexical predecessor.
+    fn collect_statements(&mut self, statements: &'nir [Stmt], mut previous: Option<&'nir Stmt>) {
         for statement in statements {
             self.collect_statement(statement, previous);
             previous = Some(statement);
@@ -588,21 +606,26 @@ const fn expr_is_stable_prefix(expr: &Expr) -> bool {
 }
 
 /// Applies scalar and pack replacements selected by one analysis.
-struct Inliner {
+struct Inliner<'a> {
+    /// Locals of the function, used to resolve their source storage.
+    locals: &'a Arena<Local>,
     /// Whether this rewrite changed the function.
     changed: bool,
     /// Replacements selected before the rewrite.
     replacements: Replacements,
 }
 
-impl VisitorMut for Inliner {
+impl VisitorMut for Inliner<'_> {
     fn visit_stmts(&mut self, stmts: &mut Vec<Stmt>) {
         let prev_len = stmts.len();
         stmts.retain(|stmt| match stmt {
             Stmt::Bind {
                 target: Place::Local(local),
                 ..
-            } => !self.replacements.locals.contains_key(local),
+            } => !self
+                .replacements
+                .locals
+                .contains_key(&self.locals[*local].source),
             Stmt::BindPack { local, .. } => !self.replacements.packs.contains_key(local),
             _ => true,
         });
@@ -613,7 +636,8 @@ impl VisitorMut for Inliner {
 
     fn visit_expr(&mut self, expr: &mut Expr) {
         while let Expr::Local(local) = expr {
-            let Some(replacement) = self.replacements.locals.get(local) else {
+            let Some(replacement) = self.replacements.locals.get(&self.locals[*local].source)
+            else {
                 break;
             };
             *expr = replacement.clone();

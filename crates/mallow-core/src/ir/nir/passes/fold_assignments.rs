@@ -8,8 +8,8 @@
 
 use id_arena::Arena;
 
-use crate::ir::fir::ValueId;
-use crate::ir::nir::visitor::{Visitor, VisitorMut, walk_expr, walk_region_mut};
+use super::StorageUse;
+use crate::ir::nir::visitor::{VisitorMut, walk_region_mut};
 use crate::ir::nir::{Expr, Function, Local, LocalId, Place, Region, Stmt};
 use crate::operator::{BinOp, UnOp};
 
@@ -21,24 +21,6 @@ pub(super) fn run(function: &mut Function) -> bool {
     };
     folder.visit_region(body);
     folder.changed
-}
-
-struct StorageUse<'a> {
-    locals: &'a Arena<Local>,
-    source: ValueId,
-    found: bool,
-}
-
-impl Visitor for StorageUse<'_> {
-    fn visit_expr(&mut self, expr: &Expr) {
-        if !self.found {
-            walk_expr(self, expr);
-        }
-    }
-
-    fn visit_local(&mut self, local: LocalId) {
-        self.found |= self.locals[local].source == self.source;
-    }
 }
 
 struct LocalBind<'a> {
@@ -79,13 +61,7 @@ impl Folder<'_> {
     }
 
     fn is_used_by(&self, local: LocalId, value: &Expr) -> bool {
-        let mut finder = StorageUse {
-            locals: self.locals,
-            source: self.locals[local].source,
-            found: false,
-        };
-        finder.visit_expr(value);
-        finder.found
+        StorageUse::in_expr(self.locals, self.locals[local].source, value)
     }
 
     fn fold_pair(&self, first: &mut Region, second: &Region) -> bool {
