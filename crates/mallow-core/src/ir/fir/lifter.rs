@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result, bail, ensure};
 use id_arena::Arena;
+use smallvec::{SmallVec, smallvec};
 use smol_str::{SmolStr, ToSmolStr};
 
 use super::cflow::{Cond, CondRhs, RawBlock, RawBlockExit, build_raw_from_proto};
@@ -122,7 +123,7 @@ impl FunctionCaptures {
         for (block_index, block) in cfg.enumerate() {
             block_states[block_index] = state.clone();
 
-            for decoded in block.instrs {
+            for decoded in block.instrs.iter() {
                 match decoded.instr {
                     il::Instr::Capture {
                         capture_type: CAPTURE_REF,
@@ -365,7 +366,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     /// Returns the instructions for the current block.
     #[inline]
     fn instrs(&self) -> &[DecodedInstr] {
-        self.function.graph[self.block].instrs
+        &self.function.graph[self.block].instrs
     }
 
     /// Returns the instruction at a given position.
@@ -1693,15 +1694,21 @@ fn thread_raw_jumps(blocks: &mut [RawBlock]) {
     }
 }
 
-/// Rewrites raw block targets after unreachable blocks are removed.
-#[inline]
+/// Rewrites raw block targets after blocks are removed or merged.
 fn remap_raw_exit(exit: &mut RawBlockExit, old_to_new: &[Option<usize>]) {
-    let remap = |target: &mut usize| {
-        *target = old_to_new[*target].expect("reachable raw block target must have a dense index")
-    };
+    for target in raw_exit_references_mut(exit) {
+        *target = old_to_new[*target].expect("referenced raw block must have a dense index");
+    }
+}
 
+/// Returns every block referenced by a raw exit.
+///
+/// Unlike [RawBlockExit::targets], this includes the loop block of a `FORGPREP`,
+/// which is not one of its CFG successors as this function returns the mechanical
+/// exits.
+fn raw_exit_references_mut(exit: &mut RawBlockExit) -> SmallVec<[&mut usize; 2]> {
     match exit {
-        RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => remap(target),
+        RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => smallvec![target],
         RawBlockExit::CondJump {
             then_block,
             else_block,
@@ -1726,15 +1733,51 @@ fn remap_raw_exit(exit: &mut RawBlockExit, old_to_new: &[Option<usize>]) {
             body_block: then_block,
             exit_block: else_block,
             ..
-        } => {
-            remap(then_block);
-            remap(else_block);
-        }
-        RawBlockExit::Return { .. } => {}
+        } => smallvec![then_block, else_block],
+        RawBlockExit::Return { .. } => SmallVec::new(),
     }
 }
 
-/// Removes unreachable raw blocks while retaining bytecode order.
+/// Merges each block into its predecessor when it has no other way in and
+/// directly follows that predecessor in bytecode order.
+fn merge_raw_chains(mut blocks: Vec<RawBlock<'_>>) -> Vec<RawBlock<'_>> {
+    // luau-compile producing V5 bytecode will generate a jump when it inlines
+    // a function, even though the two blocks could have been one block.
+
+    // The entry is referenced by the function itself.
+    let mut references = vec![0usize; blocks.len()];
+    references[0] = 1;
+    for block in &mut blocks {
+        for target in raw_exit_references_mut(&mut block.exit) {
+            references[*target] += 1;
+        }
+    }
+
+    let mut merged: Vec<RawBlock<'_>> = Vec::with_capacity(blocks.len());
+    let mut old_to_new = vec![None; blocks.len()];
+    for (old, block) in blocks.into_iter().enumerate() {
+        if let Some(previous) = merged.last_mut()
+            && let RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) = previous.exit
+            && target == old
+            && previous.exit_writes.is_empty()
+            && references[old] == 1
+        {
+            previous.instrs.to_mut().extend_from_slice(&block.instrs);
+            previous.exit_writes = block.exit_writes;
+            previous.exit = block.exit;
+        } else {
+            old_to_new[old] = Some(merged.len());
+            merged.push(block);
+        }
+    }
+
+    for block in &mut merged {
+        remap_raw_exit(&mut block.exit, &old_to_new);
+    }
+    merged
+}
+
+/// Removes unreachable raw blocks and merges straight-line chains while retaining bytecode order.
 fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
     let mut raw_blocks = build_raw_from_proto(proto)?;
     ensure!(!raw_blocks.is_empty(), "function contains no basic blocks");
@@ -1767,16 +1810,18 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
         }
     }
 
-    raw_blocks
+    let raw_blocks = raw_blocks
         .into_iter()
         .enumerate()
         .filter_map(|(old, mut block)| {
             reachable.contains(&old).then(|| {
                 remap_raw_exit(&mut block.exit, &old_to_new);
-                Ok(block)
+                block
             })
         })
-        .collect()
+        .collect();
+
+    Ok(merge_raw_chains(raw_blocks))
 }
 
 /// Resolves one proto's debug strings from its disassembled chunk.

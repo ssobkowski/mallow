@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use anyhow::{Result, anyhow, ensure};
@@ -74,7 +75,7 @@ fn find_block_entries(instrs: &[DecodedInstr]) -> Result<Vec<usize>> {
 /// Represents an unlifted block
 #[derive(Debug)]
 pub struct RawBlock<'p> {
-    pub(crate) instrs: &'p [DecodedInstr],
+    pub(crate) instrs: Cow<'p, [DecodedInstr]>,
     pub(crate) exit_writes: SmallVec<[u8; 4]>,
     pub(crate) exit: RawBlockExit,
 }
@@ -444,7 +445,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
         };
 
         raw_blocks.push(RawBlock {
-            instrs: &proto.instrs[start..body_end],
+            instrs: Cow::Borrowed(&proto.instrs[start..body_end]),
             exit_writes,
             exit,
         });

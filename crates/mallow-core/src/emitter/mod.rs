@@ -302,7 +302,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                             .ok_or_else(|| anyhow::anyhow!("generic-for variable was spilled"))
                     })
                     .collect::<Result<_>>()?;
-                let exprs = values
+                let mut exprs: Vec<_> = values
                     .iter()
                     .enumerate()
                     .map(|(index, value)| {
@@ -314,6 +314,11 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                         self.lift_expr_in(value, context)
                     })
                     .collect::<Result<_>>()?;
+
+                while exprs.last() == Some(&ast::Expr::Literal(ast::Literal::Nil)) {
+                    exprs.pop();
+                }
+
                 let body = self.lift_child_scope(body)?;
                 out.push(ast::Stmt::GenericFor { vars, exprs, body });
             }
