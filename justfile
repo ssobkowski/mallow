@@ -7,33 +7,33 @@ dev := cli + " --features luau-toolchain --"
 default:
     @just --list
 
-# Decompile a bytecode file
+# Decompile a bytecode or Luau source file
 decompile file *args:
-    {{cli}} -- decompile -i {{file}} {{args}}
+    {{cli}} -- decompile {{file}} {{args}}
 
-# Disassemble a bytecode file
+# Disassemble a bytecode or Luau source file
 disasm file *args:
-    {{cli}} -- disasm -i {{file}} {{args}}
+    {{cli}} -- disasm {{file}} {{args}}
 
-# Compile Luau source with luau-compile on PATH and decompile it
-rt file *args:
-    {{cli}} roundtrip -i {{file}} {{args}}
+# Decompile Luau source with a managed compiler, e.g. `just rt bc6 foo.luau` or `just rt 0.700 foo.luau`
+rt luau file *args:
+    {{dev}} decompile {{file}} --luau {{luau}} {{args}}
 
-# Roundtrip with the managed compiler for a bytecode version, e.g. `just rtb 6 foo.luau`
-rtb bytecode file *args:
-    {{dev}} roundtrip -i {{file}} --luau-bytecode {{bytecode}} {{args}}
+# Disassemble Luau source with a managed compiler, e.g. `just rtd bc6 foo.luau`
+rtd luau file *args:
+    {{dev}} disasm {{file}} --luau {{luau}} {{args}}
 
-# Roundtrip with an exact managed Luau release
-rtr release file *args:
-    {{dev}} roundtrip -i {{file}} --luau-release {{release}} {{args}}
+# Manage cached Luau releases, e.g. `just toolchain list --all`
+toolchain *args:
+    {{dev}} toolchain {{args}}
 
 # Decompile with a Chrome trace written to trace.json
 profile file *args:
-    cargo run -q --release -p mallow-cli --features profile -- decompile -i {{file}} --profile-output trace.json {{args}}
+    cargo run -q --release -p mallow-cli --features profile -- decompile {{file}} --profile-output trace.json {{args}}
 
 # Render a CFG visualization
 viz file out *args:
-    cargo run -q -p mallow-cli --features visualize -- visualize -i {{file}} -o {{out}} {{args}}
+    cargo run -q -p mallow-cli --features visualize,luau-toolchain -- visualize {{file}} -o {{out}} {{args}}
 
 # Run the whole test suite with every feature enabled
 test *args:

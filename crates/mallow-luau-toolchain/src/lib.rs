@@ -1,14 +1,13 @@
 //! Download, verify, cache, and run Luau release tools.
 
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use directories::ProjectDirs;
-use fs2::FileExt;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -87,6 +86,12 @@ pub enum BytecodeVersion {
     V10 = 10,
     /// Bytecode format 11.
     V11 = 11,
+    /// Bytecode format 12.
+    V12 = 12,
+    /// Bytecode format 13.
+    V13 = 13,
+    /// Bytecode format 14.
+    V14 = 14,
 }
 
 /// Error returned when a bytecode number is outside the supported range.
@@ -123,6 +128,9 @@ impl TryFrom<u8> for BytecodeVersion {
             9 => Ok(Self::V9),
             10 => Ok(Self::V10),
             11 => Ok(Self::V11),
+            12 => Ok(Self::V12),
+            13 => Ok(Self::V13),
+            14 => Ok(Self::V14),
             number => Err(InvalidBytecodeVersion { number }),
         }
     }
@@ -167,6 +175,11 @@ pub struct Release {
 }
 
 impl Release {
+    /// Reports whether this release ships an archive for the current platform.
+    pub fn is_available(&self) -> bool {
+        self.asset_for_current_platform().is_some()
+    }
+
     /// Returns the archive matching the current operating system and CPU architecture.
     fn asset_for_current_platform(&self) -> Option<&'static PlatformAsset> {
         self.assets
@@ -558,7 +571,7 @@ pub enum Error {
 /// A persistent cache rooted at the conventional per-user cache directory.
 #[derive(Clone, Debug)]
 struct Cache {
-    /// Directory containing all hash-keyed release installations.
+    /// Directory containing all release installations.
     root: PathBuf,
 }
 
@@ -585,16 +598,14 @@ impl Cache {
         &self.root
     }
 
-    /// Returns the hash-keyed root directory for a release archive.
-    fn installation_path_for_hash(&self, release: &str, sha256: &str) -> Result<PathBuf, Error> {
+    /// Returns the root directory for a release installation.
+    ///
+    /// The archive identity lives in the installation manifest, which is verified against the
+    /// registry on every access, so the directory is keyed by release alone.
+    fn installation_path(&self, release: &str) -> Result<PathBuf, Error> {
         validate_release_name(release)?;
-        validate_hash(sha256)?;
 
-        let path = self
-            .root
-            .join("installations")
-            .join(format!("{release}-{}", sha256.to_ascii_lowercase()));
-        Ok(path)
+        Ok(self.root.join("installations").join(release))
     }
 
     /// Downloads, verifies, and publishes a release archive unless already cached.
@@ -610,7 +621,7 @@ impl Cache {
                     release: release.version.to_owned(),
                     target: CURRENT_TARGET.to_owned(),
                 })?;
-        let destination = self.installation_path_for_hash(release.version, asset.sha256)?;
+        let destination = self.installation_path(release.version)?;
         self.ensure_installations_dir()?;
 
         let lock = lock_path(&destination);
@@ -621,6 +632,82 @@ impl Cache {
 
         let archive = downloader.download(asset.url)?;
         self.install_archive_unlocked(release, &archive, asset.sha256, destination)
+    }
+
+    /// Returns the verified installation of a release without downloading anything.
+    fn installed(&self, release: &Release) -> Result<Option<Installation>, Error> {
+        let Some(asset) = release.asset_for_current_platform() else {
+            return Ok(None);
+        };
+        let destination = self.installation_path(release.version)?;
+        if !path_exists(&destination)? {
+            return Ok(None);
+        }
+
+        let _guard = InstallationLock::acquire(lock_path(&destination))?;
+        Ok(is_valid_installation(&destination, asset.sha256)
+            .then(|| Installation::new(*release, destination)))
+    }
+
+    /// Removes a release installation, reporting whether anything was removed.
+    fn uninstall(&self, release: &Release) -> Result<bool, Error> {
+        let destination = self.installation_path(release.version)?;
+        if !path_exists(&destination)? {
+            return Ok(false);
+        }
+
+        let _guard = InstallationLock::acquire(lock_path(&destination))?;
+        remove_stale_destination(&destination)?;
+        Ok(true)
+    }
+
+    /// Removes every cache entry that is not a valid installation of a registry release.
+    fn prune(&self) -> Result<Vec<PathBuf>, Error> {
+        let installations = self.root.join("installations");
+        match fs::symlink_metadata(&installations) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Err(Error::InvalidInstallationsDirectory(installations)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(Error::Io(error)),
+        }
+
+        let mut removed = Vec::new();
+        for entry in fs::read_dir(&installations)? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+
+            if let Some(stem) = name.strip_suffix(".install.lock") {
+                // A held lock may belong to an older mallow installing under a legacy layout,
+                // unlinking it would let a second installer lock a fresh file concurrently.
+                if Registry::release(stem).is_none()
+                    && let Some(_guard) = InstallationLock::try_acquire(&path)?
+                {
+                    fs::remove_file(&path)?;
+                    removed.push(path);
+                }
+                continue;
+            }
+
+            if let Some(release) = Registry::release(name) {
+                let _guard = InstallationLock::acquire(lock_path(&path))?;
+                let valid = release
+                    .asset_for_current_platform()
+                    .is_some_and(|asset| is_valid_installation(&path, asset.sha256));
+                if valid {
+                    continue;
+                }
+            }
+
+            remove_stale_destination(&path)?;
+            removed.push(path);
+        }
+
+        Ok(removed)
     }
 
     /// Verifies and publishes an archive extraction into the cache.
@@ -644,7 +731,7 @@ impl Cache {
             });
         }
 
-        let destination = self.installation_path_for_hash(release.version, expected_sha256)?;
+        let destination = self.installation_path(release.version)?;
         self.ensure_installations_dir()?;
 
         let _guard = InstallationLock::acquire(lock_path(&destination))?;
@@ -710,10 +797,10 @@ impl Cache {
     }
 }
 
-/// An advisory lock guarding one hash-keyed cache destination.
+/// An advisory lock guarding one cache destination, released when the handle closes.
 struct InstallationLock {
     /// Open handle retaining the advisory lock while installation runs.
-    file: File,
+    _file: File,
 }
 
 impl InstallationLock {
@@ -727,24 +814,26 @@ impl InstallationLock {
             .truncate(false)
             .open(&path)?;
         loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Self { file }),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if started.elapsed() >= INSTALL_LOCK_TIMEOUT {
-                        return Err(Error::InstallLockTimeout(path));
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(TryLockError::WouldBlock) if started.elapsed() < INSTALL_LOCK_TIMEOUT => {
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Err(error) => return Err(Error::Io(error)),
+                Err(TryLockError::WouldBlock) => return Err(Error::InstallLockTimeout(path)),
+                Err(TryLockError::Error(error)) => return Err(Error::Io(error)),
             }
         }
     }
-}
 
-impl Drop for InstallationLock {
-    /// Releases the advisory lock while leaving its inode for future installers.
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+    /// Takes the exclusive lock on an existing lock file without waiting, returning `None`
+    /// while another process holds it.
+    fn try_acquire(path: &Path) -> Result<Option<Self>, Error> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(Error::Io(error)),
+        }
     }
 }
 
@@ -817,6 +906,32 @@ impl Manager {
         self.install(VersionSelector::Bytecode(bytecode))
     }
 
+    /// Returns the selected release's verified installation without downloading anything.
+    pub fn installed<'a, S>(&self, selector: S) -> Result<Option<Installation>, Error>
+    where
+        S: Into<VersionSelector<'a>>,
+    {
+        let release = self.resolve(selector)?;
+        self.cache.installed(release)
+    }
+
+    /// Removes the selected release's installation, reporting whether anything was removed.
+    pub fn uninstall<'a, S>(&self, selector: S) -> Result<bool, Error>
+    where
+        S: Into<VersionSelector<'a>>,
+    {
+        let release = self.resolve(selector)?;
+        self.cache.uninstall(release)
+    }
+
+    /// Removes cache entries that are not valid installations of registry releases, such as
+    /// interrupted installs and directories left by older cache layouts.
+    ///
+    /// Returns the removed paths.
+    pub fn prune(&self) -> Result<Vec<PathBuf>, Error> {
+        self.cache.prune()
+    }
+
     /// Builds a command for the selected release and tool after verifying its installation.
     pub fn command<'a, S>(&self, selector: S, tool: Tool) -> Result<Command, Error>
     where
@@ -879,7 +994,7 @@ fn lock_path(destination: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Computes the lowercase SHA-256 digest used in cache identity paths.
+/// Computes the lowercase SHA-256 digest of a byte buffer.
 fn digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1317,6 +1432,15 @@ fn is_valid_executable(path: &Path) -> bool {
     }
 }
 
+/// Reports whether a path exists without following a final symlink.
+fn path_exists(path: &Path) -> Result<bool, Error> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 /// Removes a stale destination without following symlinks or recursively deleting a file.
 fn remove_stale_destination(path: &Path) -> Result<(), Error> {
     match fs::symlink_metadata(path) {
@@ -1402,10 +1526,10 @@ mod tests {
     #[test]
     fn bytecode_conversion_is_typed() {
         assert_eq!(BytecodeVersion::try_from(9), Ok(BytecodeVersion::V9));
-        assert_eq!(u8::from(BytecodeVersion::V11), 11);
+        assert_eq!(u8::from(BytecodeVersion::V14), 14);
         assert_eq!(
-            BytecodeVersion::try_from(12),
-            Err(InvalidBytecodeVersion { number: 12 })
+            BytecodeVersion::try_from(15),
+            Err(InvalidBytecodeVersion { number: 15 })
         );
     }
 
@@ -1534,7 +1658,7 @@ mod tests {
             ),
         ]);
         let hash = digest(&bytes);
-        let destination = cache.installation_path_for_hash("fixture", &hash).unwrap();
+        let destination = cache.installation_path("fixture").unwrap();
 
         assert!(matches!(
             cache.install_archive(&fixture_release(), &bytes, &hash),
@@ -1550,9 +1674,7 @@ mod tests {
         let cache = Cache::at(directory.path());
         let bytes = complete_archive();
         let expected = "f".repeat(64);
-        let destination = cache
-            .installation_path_for_hash("fixture", &expected)
-            .unwrap();
+        let destination = cache.installation_path("fixture").unwrap();
 
         assert!(matches!(
             cache.install_archive(&fixture_release(), &bytes, &expected),
@@ -1622,7 +1744,7 @@ mod tests {
         let cache = Cache::at(directory.path());
         let bytes = complete_archive();
         let hash = digest(&bytes);
-        let destination = cache.installation_path_for_hash("fixture", &hash).unwrap();
+        let destination = cache.installation_path("fixture").unwrap();
         fs::create_dir_all(&destination).unwrap();
         fs::write(destination.join(Tool::Luau.file_name()), b"stale").unwrap();
 
@@ -1716,5 +1838,111 @@ mod tests {
             .install_archive(&fixture_release(), &bytes, &hash)
             .unwrap();
         assert!(is_valid_installation(installation.path(), &hash));
+    }
+
+    /// Replaces an installation in place when the registry archive for a release changes.
+    #[test]
+    fn changed_archive_replaces_installation_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let first = complete_archive();
+        let first_hash = digest(&first);
+        let original = cache
+            .install_archive(&fixture_release(), &first, &first_hash)
+            .unwrap();
+
+        let second = archive(&[
+            (format!("bin/{}", os_bin!("luau")), b"luau-2".as_slice()),
+            (
+                format!("bin/{}", os_bin!("luau-analyze")),
+                b"analyze-2".as_slice(),
+            ),
+            (
+                format!("bin/{}", os_bin!("luau-compile")),
+                b"compile-2".as_slice(),
+            ),
+        ]);
+        let second_hash = digest(&second);
+        let replaced = cache
+            .install_archive(&fixture_release(), &second, &second_hash)
+            .unwrap();
+
+        assert_eq!(replaced.path(), original.path());
+        assert_eq!(fs::read(replaced.luau_path()).unwrap(), b"luau-2");
+        assert!(replaced.ast_path().is_none());
+        assert!(!is_valid_installation(replaced.path(), &first_hash));
+        assert!(is_valid_installation(replaced.path(), &second_hash));
+    }
+
+    /// Reports a missing installation without creating any cache entries.
+    #[test]
+    fn installed_does_not_create_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let release = Registry::releases()
+            .iter()
+            .find(|release| release.is_available())
+            .expect("registry has a release for the test platform");
+
+        assert!(cache.installed(release).unwrap().is_none());
+        assert!(!cache.uninstall(release).unwrap());
+        assert!(directory.path().read_dir().unwrap().next().is_none());
+    }
+
+    /// Removes legacy and invalid entries while keeping in-flight extractions and live locks.
+    #[test]
+    fn prune_removes_unknown_and_invalid_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let installations = directory.path().join("installations");
+        let release = Registry::releases()[0].version;
+
+        let legacy = installations.join(format!("{release}-{}", "a".repeat(64)));
+        let legacy_lock = lock_path(&legacy);
+        let invalid = installations.join(release);
+        let temporary = installations.join(".tmp-extract");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(&legacy_lock, b"").unwrap();
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(invalid.join(Tool::Luau.file_name()), b"stale").unwrap();
+        fs::create_dir_all(&temporary).unwrap();
+
+        let mut removed = cache.prune().unwrap();
+        removed.sort();
+        let mut expected = vec![legacy.clone(), legacy_lock.clone(), invalid.clone()];
+        expected.sort();
+        assert_eq!(removed, expected);
+
+        assert!(!legacy.exists());
+        assert!(!legacy_lock.exists());
+        assert!(!invalid.exists());
+        assert!(lock_path(&invalid).exists());
+        assert!(temporary.exists());
+    }
+
+    /// Keeps a legacy lock file while another process holds it.
+    #[test]
+    fn prune_keeps_held_legacy_locks() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let installations = directory.path().join("installations");
+        let release = Registry::releases()[0].version;
+
+        let legacy = installations.join(format!("{release}-{}", "a".repeat(64)));
+        let legacy_lock = lock_path(&legacy);
+        fs::create_dir_all(&installations).unwrap();
+        let _held = InstallationLock::acquire(legacy_lock.clone()).unwrap();
+
+        assert!(cache.prune().unwrap().is_empty());
+        assert!(legacy_lock.exists());
+    }
+
+    /// Treats a missing installations directory as an empty cache.
+    #[test]
+    fn prune_on_empty_cache_is_a_no_op() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+
+        assert!(cache.prune().unwrap().is_empty());
     }
 }

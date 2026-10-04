@@ -161,9 +161,9 @@ fn asset_spec(platform: &str) -> (&'static str, &'static str) {
 /// Validate every invariant required before generated code can be compiled.
 fn validate_release(version: &str, release: &ReleaseFile) {
     let _ = version_number(version);
-    if !(4..=11).contains(&release.bytecode) {
+    if !(4..=14).contains(&release.bytecode) {
         fail(format!(
-            "release {version} has bytecode {}; supported range is 4..=11",
+            "release {version} has bytecode {}; supported range is 4..=14",
             release.bytecode
         ));
     }
@@ -267,7 +267,7 @@ fn main() {
     let registry_path = Path::new(&manifest_dir).join("registry.json");
     let bytes = fs::read(&registry_path).unwrap_or_else(|error| {
         panic!(
-            "could not read {}: {error}; create the canonical registry JSON or run scripts/seed-registry.nu",
+            "could not read {}: {error}",
             registry_path.display()
         )
     });

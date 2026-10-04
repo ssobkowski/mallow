@@ -1,6 +1,227 @@
 {
   "schema": 1,
   "releases": {
+    "0.741": {
+      "bytecode": 14,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.741/luau-windows.zip",
+          "sha256": "be90c3223f3dc26777ef234244c2b1eae16b3c574f1ab7d1446972f72c28cab1"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.741/luau-ubuntu.zip",
+          "sha256": "134dc762ad26232af83e43f98dec03ff6030dd3a4452f9408b9d50ccea025503"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.741/luau-macos.zip",
+          "sha256": "839cc1de39b0f765fbaea8e89421c12acfed6bd3d8d2cc2a2d3fc64bdde32b0f"
+        }
+      }
+    },
+    "0.740": {
+      "bytecode": 14,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.740/luau-windows.zip",
+          "sha256": "be676d9a1092b3d5ee36be5f5f11e2af1976911c32f5644a052548dc7c66bb9c"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.740/luau-ubuntu.zip",
+          "sha256": "7d4035db01816f977f6e4c42e3d5e8ef4235d95e9afe63a3c38905b42dde60f2"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.740/luau-macos.zip",
+          "sha256": "8414763743116cbc2533ee7c932d41ba66bd25ea7c2353bc7eed2934b60b6715"
+        }
+      }
+    },
+    "0.739": {
+      "bytecode": 14,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.739/luau-windows.zip",
+          "sha256": "c5db8c3273f056416da224fd3cf20aa4644afb5af8498303b6b87ca0bd843ad1"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.739/luau-ubuntu.zip",
+          "sha256": "8a9b4b381021722c82d6e6cda0964b5c9e7f354ec1035fcd8b657acc22e49247"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.739/luau-macos.zip",
+          "sha256": "f66cabc7937ce1df0c40d160139aa115a4f0db57b2288e35a83f75d218bc3ff3"
+        }
+      }
+    },
+    "0.738": {
+      "bytecode": 14,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.738/luau-windows.zip",
+          "sha256": "1d465aa225dff00ed589f32dd79f6e766b54c4de57e3b8652410ccbd4d491695"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.738/luau-ubuntu.zip",
+          "sha256": "e967efb6c2a74e691637a82b0fd54de9ae43a2ec9f7be895eee51c1efb84363a"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.738/luau-macos.zip",
+          "sha256": "4ebb270fa5dd3f9c977f13ad7e0aa25be98b1a8685b724bcee6296c068b8b026"
+        }
+      }
+    },
+    "0.737": {
+      "bytecode": 14,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.737/luau-windows.zip",
+          "sha256": "8cd28be648f3e5cc4bfc977d2344e43540ade5f3524440b171eecf54d3a4fb7c"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.737/luau-ubuntu.zip",
+          "sha256": "c3f000d0bb190301b9548f50f82ae9e217a8b5ba7b3551b038dbf28cb2e5ed32"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.737/luau-macos.zip",
+          "sha256": "c7dc0b4476f49bb70b310868e904a55c5299b92db29a2647f303656b316e37cd"
+        }
+      }
+    },
+    "0.736": {
+      "bytecode": 14,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.736/luau-windows.zip",
+          "sha256": "d6aa4edaf2417a4f70d59f470d0cd02c4a7ce42387f433d7cddbbfe948e66c8f"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.736/luau-ubuntu.zip",
+          "sha256": "4e3d1660b044c0b7ed8b9ef3d97cbc4a1690cad98c3e71e37d86d5eb91975a61"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.736/luau-macos.zip",
+          "sha256": "a2056a90874be87298550cc7cd8ac61cfc57b2df51c17917e1a678672c0617e0"
+        }
+      }
+    },
+    "0.735": {
+      "bytecode": 14,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.735/luau-windows.zip",
+          "sha256": "a809d127b25ed9b28017cc65bcc8f4a6bc880d38740c29e48b15b158d1d35bf3"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.735/luau-ubuntu.zip",
+          "sha256": "b8ea2c5dfa229840dd6fa5a16be082b9a3468c82b8b270b7f695a23233e7eceb"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.735/luau-macos.zip",
+          "sha256": "770b960b4f5261c75ef70f3bd8ec6f68527ace3ae61422542999db035b8c5997"
+        }
+      }
+    },
+    "0.734": {
+      "bytecode": 13,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.734/luau-windows.zip",
+          "sha256": "0f814860c2939f85d2e37bc2e8a8f848012523d1e52c435c6832845fb3fe5dc8"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.734/luau-ubuntu.zip",
+          "sha256": "3e514385267c6606f1ff6824bd9d21708a5dd272ea91ab7355a2743b20d45d45"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.734/luau-macos.zip",
+          "sha256": "b76ae047fafc86f82be646af6a2767228c1589437fb38f36959a8ea4bd967cdd"
+        }
+      }
+    },
+    "0.733": {
+      "bytecode": 13,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.733/luau-windows.zip",
+          "sha256": "af6ccdb2dba70469297aab6436f5e46a68943de62a035f875eb3c777c3894d2b"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.733/luau-ubuntu.zip",
+          "sha256": "2f37bbe79a6389ea2304531e2b4bba333bd0c2076bdc90256dfe30ace16f3c03"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.733/luau-macos.zip",
+          "sha256": "9ae1e43068eb10e508e19a23c3a657b638aaf20c0c0b2179dbadde87148a5766"
+        }
+      }
+    },
+    "0.732": {
+      "bytecode": 13,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.732/luau-windows.zip",
+          "sha256": "d471cb4f47c1a56e9f1a6a31599fbb4b58fa1744a7e170a9b530f71cadcc9e0a"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.732/luau-ubuntu.zip",
+          "sha256": "05d0e67bedbe012cbb1faf8be4cc93099fa0968a621ee0c1f27ad9088d999555"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.732/luau-macos.zip",
+          "sha256": "4577dfa936a4a3759cae3d2a65df8e5599539c3760e45b5fe838eb54148fb524"
+        }
+      }
+    },
+    "0.731": {
+      "bytecode": 12,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.731/luau-windows.zip",
+          "sha256": "2fab3fca875a41d1be33440bd295c6d1db3c3ab08583d24eef84ccb5a5db9c83"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.731/luau-ubuntu.zip",
+          "sha256": "4fe023ee801158d6d04af3327dbdb8c164697e286229ba52221716cccd0e3dbe"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.731/luau-macos.zip",
+          "sha256": "1230f8499a7fec84dd63c327b7637e4ca03c0a9eb3fb04da4d83540009adc961"
+        }
+      }
+    },
+    "0.730": {
+      "bytecode": 12,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.730/luau-windows.zip",
+          "sha256": "692cee7366e474af312f50962b6ca055c36779aebdec8a1b0bef15f1ccf6d418"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.730/luau-ubuntu.zip",
+          "sha256": "de51b1bee2e9d0d0e0d90c75ba3c7817e176cc802bbaacb73694ccc9f62fa8e9"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.730/luau-macos.zip",
+          "sha256": "36a90a8e6c80468ff00edd7057159325d1f7adc8708bebf69d782a7882e52d4e"
+        }
+      }
+    },
+    "0.729": {
+      "bytecode": 12,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.729/luau-windows.zip",
+          "sha256": "16c079e4eebe9ba5aabfd86357ae1e48ae0bfb04b7ac4be133d403da389f2e84"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.729/luau-ubuntu.zip",
+          "sha256": "cadc6e5737e6186c3b6a17047ffb25ff9ccd3728f8951ba39df7d39121a0f0f6"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.729/luau-macos.zip",
+          "sha256": "1027273dd636b4a8ad1a4167f7a43d153fef8d0c13e8a8502ed488ce95d8e2d9"
+        }
+      }
+    },
     "0.728": {
       "bytecode": 11,
       "assets": {

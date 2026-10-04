@@ -1,5 +1,7 @@
 *
 
+!.github/
+!.github/**/*
 !.gitignore
 !.gitattributes
 !build.rs
@@ -9,6 +11,8 @@
 !crates/**/*
 !docs/
 !docs/**/*
+!scripts/
+!scripts/**/*
 !src/
 !src/**/*
 !tests

@@ -1,0 +1,39 @@
+name: Update Luau registry
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: update
+        run: |
+          added=$(python3 scripts/update-registry.py)
+          echo "added=$added" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - if: steps.update.outputs.added != ''
+        uses: dtolnay/rust-toolchain@stable
+
+      # build.rs validates the registry, e.g. rejects bytecode versions the crate cannot represent.
+      - if: steps.update.outputs.added != ''
+        run: cargo check -p mallow-luau-toolchain
+
+      - if: steps.update.outputs.added != ''
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: update-luau-registry
+          commit-message: "toolchain: add Luau ${{ steps.update.outputs.added }}"
+          title: "toolchain: add Luau ${{ steps.update.outputs.added }}"
+          body: Adds Luau releases ${{ steps.update.outputs.added }} to `registry.json`.
+          delete-branch: true

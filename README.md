@@ -2,7 +2,7 @@
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-a [Luau](https://luau.org) bytecode disassembler and decompiler.
+a [Luau](https://luau.org) bytecode disassembler, decompiler and toolchain.
 
 > **Note:** only Luau bytecode versions 5 through 9 are supported.
 
@@ -73,7 +73,7 @@ To include CFG visualization support:
 cargo build --release --features visualize
 ```
 
-To let the development `roundtrip` command download and cache verified Luau releases:
+To build in the managed Luau toolchain, a development utility that downloads and caches verified Luau releases:
 
 ```sh
 cargo build --release -p mallow-cli --features luau-toolchain
@@ -83,46 +83,57 @@ Binary lands at `target/release/mallow`.
 
 ## Usage
 
+Every command takes either bytecode or Luau source. Files ending in `.luau` or `.lua` are compiled with `luau-compile` from PATH first; anything else is read as bytecode. Pass `--input-kind source` or `--input-kind bytecode` to override this. Compiler options (`-O`, `-g`, `-t`) apply to source input only.
+
 **disassemble** - dump the raw instruction stream:
 
 ```sh
-mallow disasm -i <bytecode>
+mallow disasm <bytecode>
+mallow disasm <source.luau>
 ```
 
 **decompile** - reconstruct source from bytecode:
 
 ```sh
-mallow decompile -i <bytecode>
+mallow decompile <bytecode>
+mallow decompile <source.luau>
 ```
 
 Pass `--emit=ir` to emit flat intermediate representation instead of cleaned source:
 
 ```sh
-mallow decompile -i <bytecode> --emit=ir
-```
-
-**roundtrip** - compile a `.luau` file then immediately decompile it. Without the `luau-toolchain` feature, this requires `luau-compile` in PATH:
-
-```sh
-mallow roundtrip -i <source.luau>
-```
-
-With the `luau-toolchain` feature, an exact Luau release or the newest release for a bytecode version can be selected explicitly. Without either selector, roundtrip still uses `luau-compile` from PATH:
-
-```sh
-mallow roundtrip -i <source.luau> --luau-release 0.650
-mallow roundtrip -i <source.luau> --luau-bytecode 8
+mallow decompile <bytecode> --emit=ir
 ```
 
 **visualize** - generate an interactive CFG as HTML (requires `--features visualize`):
 
 ```sh
-mallow visualize -i <bytecode> -o <output.html>
+mallow visualize <bytecode> -o <output.html>
+```
+
+### Managed Luau toolchain
+
+With the `luau-toolchain` feature, `--luau` compiles source input with a managed release instead of `luau-compile` from PATH. It accepts an exact release, or `bc<N>` for the newest release emitting bytecode version `N`:
+
+```sh
+mallow decompile <source.luau> --luau 0.650
+mallow disasm <source.luau> --luau bc8
+```
+
+The `toolchain` command manages the cached releases and runs their tools:
+
+```sh
+mallow toolchain list [--bytecode 8] [--all]
+mallow toolchain install bc6 0.700
+mallow toolchain uninstall 0.700
+mallow toolchain path bc6 --tool compile
+mallow toolchain run bc6 compile -- --text <source.luau>
+mallow toolchain prune
 ```
 
 ### Using just
 
-Commands can get quite verbose, so running them with [just](https://github.com/casey/just) is preferred. See: [justfile](justfile).
+Commands can get quite verbose, so running them with [just](https://github.com/casey/just) is preferred during development. See: [justfile](justfile).
 
 ## Testing
 

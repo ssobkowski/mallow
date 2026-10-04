@@ -7,7 +7,6 @@ readme.workspace = true
 
 [dependencies]
 directories = { workspace = true }
-fs2 = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
