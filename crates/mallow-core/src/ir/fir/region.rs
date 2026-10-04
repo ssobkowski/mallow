@@ -1,4 +1,4 @@
-use crate::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, IndexSet};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -440,17 +440,17 @@ struct LoopCtx {
     /// Loop header block. Kept for diagnostics, as the header work is done on [`LoopInfo`].
     header: usize,
     /// In-body CFG targets that mean "start the next iteration".
-    continue_targets: HashSet<usize>,
+    continue_targets: IndexSet<usize>,
     /// Blocks whose backedge to a continue target are the loop's implicit tail.
-    implicit_tail_blocks: HashSet<usize>,
+    implicit_tail_blocks: IndexSet<usize>,
     /// Continue targets that carry statements before the backedge jump and
     /// must be emitted as body payload rather than jumped over.
-    payload_continue_targets: HashSet<usize>,
+    payload_continue_targets: IndexSet<usize>,
     /// CFG targets immediately outside the loop body.
-    exits: HashSet<usize>,
+    exits: IndexSet<usize>,
     /// Exit targets that carry statements before reaching the post-loop code;
     /// a branch landing here must emit that payload before the implicit break.
-    payload_exit_targets: HashSet<usize>,
+    payload_exit_targets: IndexSet<usize>,
 }
 
 /// An identifier for a loop, consisting of its header and latch blocks.
@@ -474,7 +474,7 @@ struct LoopShape {
     /// Immediate successor blocks outside the natural loop body. A single exit
     /// is the enclosing scope's next block; multiple exits require enclosing
     /// structure to account for them before linear sequencing can continue.
-    exits: HashSet<usize>,
+    exits: IndexSet<usize>,
 }
 
 /// Determines where a recovered loop condition belongs in the source shape.
@@ -488,9 +488,9 @@ enum LoopKind {
         body: usize,
         /// Empty conditional blocks consumed into `condition`; these are loop
         /// syntax, not body payload.
-        guard_nodes: HashSet<usize>,
+        guard_nodes: IndexSet<usize>,
         /// Guard leaves reached when the while condition fails.
-        exits: HashSet<usize>,
+        exits: IndexSet<usize>,
     },
     /// `repeat ... until cond`; condition is owned by the loop latch.
     RepeatUntil {
@@ -532,9 +532,9 @@ struct LoopBodyPlan {
     /// First block emitted as body payload.
     entry: usize,
     /// Blocks available to the body scope.
-    nodes: HashSet<usize>,
+    nodes: IndexSet<usize>,
     /// Hard boundaries for the body scope.
-    exits: HashSet<usize>,
+    exits: IndexSet<usize>,
     /// For post-test (repeat-until) loops: the latch block whose conditional exit
     /// should be suppressed. The latch's statements are emitted as body payload,
     /// only its backedge/exit jump is owned by the loop syntax.
@@ -551,12 +551,12 @@ struct Scope {
     /// Ordinary traversal should not walk outside this set, but a
     /// branch entry that is also an exit target is still allowed
     /// to be structured so its payload is not lost.
-    nodes: HashSet<usize>,
+    nodes: IndexSet<usize>,
     /// Boundary targets for this scope. These are stop points for sequencing.
-    exits: HashSet<usize>,
+    exits: IndexSet<usize>,
     /// Exit targets that represent ordinary fallthrough for this scope, such as
     /// the merge block of a structured conditional branch.
-    merge_points: HashSet<usize>,
+    merge_points: IndexSet<usize>,
     /// Whether this scope suppresses explicit `continue` for its loop's tail edge.
     ///
     /// In a `while` loop body, the latch's jump back to the header is the loop's
@@ -591,11 +591,11 @@ struct LoopInfo {
     ///
     /// Most loops have a single latch, but source-level pre-test loops can have
     /// several body exits that jump back to the same header.
-    latches: HashSet<usize>,
+    latches: IndexSet<usize>,
     /// Natural loop body collected by walking predecessors from latch to header.
-    body: HashSet<usize>,
+    body: IndexSet<usize>,
     /// Successor targets reached by edges leaving the natural cycle body.
-    exits: HashSet<usize>,
+    exits: IndexSet<usize>,
     /// Smallest containing loop, when loop bodies are nested by containment.
     parent: Option<LoopId>,
     /// Loops directly nested inside this loop.
@@ -609,9 +609,9 @@ struct WhileGuard {
     /// Unique payload entry reached by the truthy guard paths.
     body: usize,
     /// Empty CFG blocks folded into `condition`.
-    guard_nodes: HashSet<usize>,
+    guard_nodes: IndexSet<usize>,
     /// CFG targets reached by falsy guard paths.
-    exits: HashSet<usize>,
+    exits: IndexSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -621,9 +621,9 @@ struct GuardBranch {
     /// Payload entry reached by this branch, or `None` for a loop exit branch.
     body: Option<usize>,
     /// Empty CFG blocks folded while following this branch.
-    guard_nodes: HashSet<usize>,
+    guard_nodes: IndexSet<usize>,
     /// Exit targets discovered while following this branch.
-    exits: HashSet<usize>,
+    exits: IndexSet<usize>,
 }
 
 /// Index of all natural loops visible to the region structurer.
@@ -650,7 +650,7 @@ impl LoopForest {
     fn build(graph: &RegionGraph, idoms: &DominatorTree<usize>) -> Self {
         let mut loops = HashMap::default();
         let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::default();
-        let reachable: HashSet<_> = graph.reverse_post_order().collect();
+        let reachable: IndexSet<_> = graph.reverse_post_order().collect();
 
         for latch in graph.nodes() {
             if !reachable.contains(&latch) {
@@ -663,7 +663,7 @@ impl LoopForest {
                     let body = natural_loop_body(graph, header, latch, &reachable);
                     let exits = body
                         .iter()
-                        .flat_map(|&block| graph.successors(block))
+                        .flat_map(|block| graph.successors(block))
                         .filter(|target| !body.contains(target))
                         .collect();
 
@@ -732,11 +732,11 @@ impl LoopForest {
                     .copied()
                     .max_by_key(|id| (loops[id].body.len(), *id))?;
 
-                let mut body = HashSet::default();
-                let mut latches = HashSet::default();
+                let mut body = IndexSet::default();
+                let mut latches = IndexSet::default();
                 for id in ids {
-                    body.extend(loops[id].body.iter().copied());
-                    latches.extend(loops[id].latches.iter().copied());
+                    body.extend(loops[id].body.iter());
+                    latches.extend(loops[id].latches.iter());
                 }
 
                 Some((header, representative, ids.clone(), body, latches))
@@ -780,7 +780,7 @@ impl LoopForest {
             info.exits = info
                 .body
                 .iter()
-                .flat_map(|&block| graph.successors(block))
+                .flat_map(|block| graph.successors(block))
                 .filter(|target| !info.body.contains(target))
                 .collect();
         }
@@ -879,9 +879,9 @@ impl LoopForest {
 
             for id in ids {
                 let children = loops[&id].children.clone();
-                let mut child_body = HashSet::default();
+                let mut child_body = IndexSet::default();
                 for child in children {
-                    child_body.extend(loops[&child].body.iter().copied());
+                    child_body.extend(loops[&child].body.iter());
                 }
 
                 let info = loops.get_mut(&id).expect("loop should exist");
@@ -1058,7 +1058,7 @@ struct Structurer<'d> {
     /// Natural loops and their lexical containment.
     loops: LoopForest,
     /// Blocks whose instructions all fold into their branch condition.
-    condition_only_blocks: HashSet<usize>,
+    condition_only_blocks: IndexSet<usize>,
     /// Diagnostic destination for recognition traces and warnings.
     diagnostics: &'d Diagnostics,
 }
@@ -1095,7 +1095,7 @@ impl<'d> Structurer<'d> {
             entry: self.graph.entry(),
             nodes,
             exits,
-            merge_points: HashSet::default(),
+            merge_points: IndexSet::default(),
             allow_implicit_continue: false,
         };
 
@@ -1152,7 +1152,7 @@ impl<'d> Structurer<'d> {
         });
 
         let mut nodes = Vec::new();
-        let mut visited = HashSet::default();
+        let mut visited = IndexSet::default();
         let mut current = scope.entry;
 
         visited.insert(self.graph.exit()); // virtual exit
@@ -1171,7 +1171,7 @@ impl<'d> Structurer<'d> {
             }
 
             if let Some(loop_shape) = self.recognize_loop(current, scope, blocked_loop) {
-                let next = single_target(&loop_shape.exits).copied();
+                let next = single_target(&loop_shape.exits);
                 trace.line(
                     2,
                     format_args!("recognized loop {:?}, next = {:?}", loop_shape.id, next),
@@ -1388,8 +1388,8 @@ impl<'d> Structurer<'d> {
         &self,
         loop_info: &LoopInfo,
         kind: &LoopKind,
-        lexical_body: HashSet<usize>,
-        lexical_exits: HashSet<usize>,
+        lexical_body: IndexSet<usize>,
+        lexical_exits: IndexSet<usize>,
     ) -> LoopBodyPlan {
         match kind {
             LoopKind::While {
@@ -1406,7 +1406,7 @@ impl<'d> Structurer<'d> {
                     nodes,
                     exits: [loop_info.header]
                         .into_iter()
-                        .chain(lexical_exits.iter().copied())
+                        .chain(lexical_exits.iter())
                         .collect(),
                     suppress_exit: None,
                 }
@@ -1447,12 +1447,12 @@ impl<'d> Structurer<'d> {
         &self,
         loop_info: &LoopInfo,
         kind: &LoopKind,
-    ) -> (HashSet<usize>, HashSet<usize>) {
+    ) -> (IndexSet<usize>, IndexSet<usize>) {
         let exits = self.lexical_loop_exits(loop_info, kind);
         let mut body = loop_info.body.clone();
         let mut stack: Vec<_> = body
             .iter()
-            .flat_map(|&block| self.graph.successors(block))
+            .flat_map(|block| self.graph.successors(block))
             .filter(|target| !body.contains(target) && !exits.contains(target))
             .collect();
 
@@ -1480,7 +1480,7 @@ impl<'d> Structurer<'d> {
     /// - For `While` it comes from the guard analysis.
     /// - For `Infinite`, it is the common post-dominator of all natural exits if one
     ///   exists, otherwise all natural exits.
-    fn lexical_loop_exits(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+    fn lexical_loop_exits(&self, loop_info: &LoopInfo, kind: &LoopKind) -> IndexSet<usize> {
         match kind {
             LoopKind::NumericFor { exit, .. } | LoopKind::GenericFor { exit, .. } => {
                 [*exit].into_iter().collect()
@@ -1506,7 +1506,7 @@ impl<'d> Structurer<'d> {
             entry: plan.entry,
             nodes: plan.nodes.clone(),
             exits: plan.exits.clone(),
-            merge_points: HashSet::default(),
+            merge_points: IndexSet::default(),
             allow_implicit_continue: true,
         };
 
@@ -1521,11 +1521,11 @@ impl<'d> Structurer<'d> {
     /// Returns the set of continue targets for the loop.
     ///
     /// For all kinds of loops, these are the loop latches.
-    fn continue_targets(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+    fn continue_targets(&self, loop_info: &LoopInfo, kind: &LoopKind) -> IndexSet<usize> {
         match kind {
             LoopKind::While { .. } | LoopKind::Infinite { .. } => [loop_info.header]
                 .into_iter()
-                .chain(loop_info.latches.iter().copied())
+                .chain(loop_info.latches.iter())
                 .collect(),
             LoopKind::RepeatUntil { .. }
             | LoopKind::NumericFor { .. }
@@ -1537,15 +1537,15 @@ impl<'d> Structurer<'d> {
     ///
     /// Only [`LoopKind::While`] and [`LoopKind::Infinite`] have such -
     /// those are all the latches that are not the loop header.
-    fn implicit_tail_blocks(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+    fn implicit_tail_blocks(&self, loop_info: &LoopInfo, kind: &LoopKind) -> IndexSet<usize> {
         match kind {
             LoopKind::While { .. } | LoopKind::Infinite { .. } => loop_info
                 .latches
                 .iter()
-                .copied()
+                
                 .filter(|latch| *latch != loop_info.header)
                 .collect(),
-            _ => HashSet::default(),
+            _ => IndexSet::default(),
         }
     }
 
@@ -1553,9 +1553,9 @@ impl<'d> Structurer<'d> {
     fn payload_exit_targets(
         &self,
         loop_info: &LoopInfo,
-        lexical_exits: &HashSet<usize>,
-    ) -> HashSet<usize> {
-        loop_info.exits.difference(lexical_exits).copied().collect()
+        lexical_exits: &IndexSet<usize>,
+    ) -> IndexSet<usize> {
+        loop_info.exits.difference(lexical_exits)
     }
 
     /// Returns the set of payload continue targets for the loop body.
@@ -1568,12 +1568,12 @@ impl<'d> Structurer<'d> {
     ///   represented by the `until` condition itself.
     /// - For a numeric/generic for loop, there is only one continue target,
     ///   the loop latch (given it is not empty.)
-    fn payload_continue_targets(&self, loop_info: &LoopInfo, kind: &LoopKind) -> HashSet<usize> {
+    fn payload_continue_targets(&self, loop_info: &LoopInfo, kind: &LoopKind) -> IndexSet<usize> {
         match kind {
             LoopKind::While { .. } | LoopKind::Infinite { .. } => loop_info
                 .latches
                 .iter()
-                .copied()
+                
                 .filter(|latch| *latch != loop_info.header)
                 .collect(),
             LoopKind::NumericFor { .. } | LoopKind::GenericFor { .. }
@@ -1581,7 +1581,7 @@ impl<'d> Structurer<'d> {
             {
                 [loop_info.latch].into_iter().collect()
             }
-            _ => HashSet::default(),
+            _ => IndexSet::default(),
         }
     }
 
@@ -1685,7 +1685,7 @@ impl<'d> Structurer<'d> {
         &self,
         entry: usize,
         scope: &Scope,
-        branch_exits: &HashSet<usize>,
+        branch_exits: &IndexSet<usize>,
         loop_ctx: Option<&LoopCtx>,
         suppress_exit: Option<usize>,
     ) -> HashMap<usize, usize> {
@@ -1725,7 +1725,7 @@ impl<'d> Structurer<'d> {
         &self,
         node: usize,
         scope: &Scope,
-        branch_exits: &HashSet<usize>,
+        branch_exits: &IndexSet<usize>,
         loop_ctx: Option<&LoopCtx>,
         suppress_exit: Option<usize>,
     ) -> bool {
@@ -1793,7 +1793,7 @@ impl<'d> Structurer<'d> {
             format_args!("else_nodes = {:?}", sorted_nodes(&else_nodes)),
         );
 
-        let build_branch = |entry: usize, mut nodes: HashSet<usize>| {
+        let build_branch = |entry: usize, mut nodes: IndexSet<usize>| {
             trace.line(
                 1,
                 format_args!(
@@ -1845,7 +1845,7 @@ impl<'d> Structurer<'d> {
             let owned_payload_exit = loop_ctx.and_then(|ctx| {
                 ctx.payload_continue_targets
                     .iter()
-                    .copied()
+                    
                     .filter(|payload| {
                         !scope.merge_points.contains(payload)
                             && (Some(*payload) != shape.merge || scope.exits.contains(payload))
@@ -1864,7 +1864,7 @@ impl<'d> Structurer<'d> {
                 nodes,
                 exits: branch_exits
                     .iter()
-                    .copied()
+                    
                     .filter(|exit| *exit != entry && Some(*exit) != owned_payload_exit)
                     .collect(),
                 merge_points: shape.merge.into_iter().chain(owned_payload_exit).collect(),
@@ -2035,7 +2035,7 @@ impl<'d> Structurer<'d> {
     /// A block whose instructions all fold into its branch condition counts as
     /// having no statements. Returns `None` if the header does not match that shape.
     fn recognize_while_guard(&self, loop_info: &LoopInfo) -> Option<WhileGuard> {
-        let mut visiting = HashSet::default();
+        let mut visiting = IndexSet::default();
         let guard = self.recognize_while_guard_node(loop_info, loop_info.header, &mut visiting)?;
 
         Some(WhileGuard {
@@ -2058,7 +2058,7 @@ impl<'d> Structurer<'d> {
         &self,
         loop_info: &LoopInfo,
         node: usize,
-        visiting: &mut HashSet<usize>,
+        visiting: &mut IndexSet<usize>,
     ) -> Option<GuardBranch> {
         if !loop_info.body.contains(&node) || self.has_statements(node) {
             return None;
@@ -2115,13 +2115,13 @@ impl<'d> Structurer<'d> {
         &self,
         loop_info: &LoopInfo,
         target: usize,
-        visiting: &mut HashSet<usize>,
+        visiting: &mut IndexSet<usize>,
     ) -> Option<GuardBranch> {
         if !loop_info.body.contains(&target) {
             return Some(GuardBranch {
                 condition: Predicate::False,
                 body: None,
-                guard_nodes: HashSet::default(),
+                guard_nodes: IndexSet::default(),
                 exits: [target].into_iter().collect(),
             });
         }
@@ -2138,8 +2138,8 @@ impl<'d> Structurer<'d> {
         Some(GuardBranch {
             condition: Predicate::True,
             body: Some(target),
-            guard_nodes: HashSet::default(),
-            exits: HashSet::default(),
+            guard_nodes: IndexSet::default(),
+            exits: IndexSet::default(),
         })
     }
 
@@ -2197,7 +2197,7 @@ impl<'d> Structurer<'d> {
         // If that LCD is one of the exit blocks itself, it post-dominates all exits.
         if let Some(lcd) = self
             .ipdoms
-            .lowest_common_dominator(loop_info.exits.iter().copied())
+            .lowest_common_dominator(loop_info.exits.iter())
             && loop_info.exits.contains(&lcd)
         {
             return Some(lcd);
@@ -2205,7 +2205,7 @@ impl<'d> Structurer<'d> {
 
         // 3. Fallback: Check if all exits share a single, identical external target.
         let mut follow = None;
-        for &exit in &loop_info.exits {
+        for exit in &loop_info.exits {
             let target = single_target(self.graph.successors(exit))?;
             if loop_info.body.contains(&target) {
                 return None;
@@ -2315,10 +2315,10 @@ impl<'d> Structurer<'d> {
         &self,
         entry: usize,
         scope: &Scope,
-        exits: &HashSet<usize>,
+        exits: &IndexSet<usize>,
         include_boundary_entry: bool,
-    ) -> HashSet<usize> {
-        let mut nodes = HashSet::default();
+    ) -> IndexSet<usize> {
+        let mut nodes = IndexSet::default();
         let mut stack = vec![entry];
 
         while let Some(node) = stack.pop() {
@@ -2432,9 +2432,9 @@ fn natural_loop_body(
     cfg: &RegionGraph,
     header: usize,
     latch: usize,
-    reachable: &HashSet<usize>,
-) -> HashSet<usize> {
-    let mut body = HashSet::default();
+    reachable: &IndexSet<usize>,
+) -> IndexSet<usize> {
+    let mut body = IndexSet::default();
     body.insert(header);
 
     let mut stack = vec![latch];
@@ -2472,8 +2472,8 @@ fn merge_optional_body(lhs: Option<usize>, rhs: Option<usize>) -> Option<Option<
 }
 
 /// Returns block IDs in deterministic order for diagnostics.
-fn sorted_nodes(nodes: &HashSet<usize>) -> Vec<usize> {
-    let mut nodes: Vec<_> = nodes.iter().copied().collect();
+fn sorted_nodes(nodes: &IndexSet<usize>) -> Vec<usize> {
+    let mut nodes: Vec<_> = nodes.iter().collect();
     nodes.sort_unstable();
     nodes
 }
@@ -2484,7 +2484,7 @@ fn conditional_branch_exits(
     loop_ctx: Option<&LoopCtx>,
     suppress_exit: Option<usize>,
     merge: Option<usize>,
-) -> HashSet<usize> {
+) -> IndexSet<usize> {
     let mut branch_exits = scope.exits.clone();
     if let Some(merge) = merge {
         branch_exits.insert(merge);
@@ -2495,10 +2495,10 @@ fn conditional_branch_exits(
     if let Some(ctx) = loop_ctx {
         // Implicit tails still contain loop-body statements; structure them
         // in the branch and suppress only their final backedge.
-        branch_exits.extend(ctx.continue_targets.iter().copied().filter(|target| {
+        branch_exits.extend(ctx.continue_targets.iter().filter(|target| {
             suppress_exit != Some(*target) && !ctx.implicit_tail_blocks.contains(target)
         }));
-        branch_exits.extend(ctx.exits.iter().copied());
+        branch_exits.extend(ctx.exits.iter());
     }
 
     branch_exits

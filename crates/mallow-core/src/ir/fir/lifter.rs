@@ -1,4 +1,4 @@
-use crate::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet, IndexSet};
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -1634,7 +1634,7 @@ fn resolve_exit(exit: &mut BlockExit, aliases: &HashMap<ValueId, ValueId>) {
 /// block from the cycle.
 fn threaded_target(blocks: &[RawBlock], target: usize) -> usize {
     let mut current = target;
-    let mut visited = HashSet::default();
+    let mut visited = IndexSet::default();
 
     while visited.insert(current) {
         let block = &blocks[current];
@@ -1794,7 +1794,7 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
 
     thread_raw_jumps(&mut raw_blocks);
 
-    let mut reachable = HashSet::default();
+    let mut reachable = IndexSet::default();
     let mut pending = VecDeque::from([0]);
     while let Some(block) = pending.pop_front() {
         if reachable.insert(block) {

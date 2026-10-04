@@ -1,4 +1,4 @@
-use crate::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, IndexSet};
 
 use id_arena::Arena;
 use smallvec::SmallVec;
@@ -283,7 +283,7 @@ impl<'nir> DefUse<'nir> {
     fn replacements(&self, function: &Function) -> Replacements {
         let mut replacements = Replacements::default();
 
-        let cell_sources: HashSet<_> = function
+        let cell_sources: IndexSet<_> = function
             .cell_locals
             .values()
             .map(|local| self.sources[local])

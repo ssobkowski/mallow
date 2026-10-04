@@ -1,4 +1,4 @@
-use crate::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet, IndexSet};
 
 use anyhow::{Result, bail};
 use smol_str::SmolStr;
@@ -699,7 +699,7 @@ impl<'a> BindingCollector<'a> {
 
 /// Returns the nearest source scope containing both inputs.
 fn common_scope(scopes: &[ScopeFacts<'_>], mut lhs: usize, mut rhs: usize) -> usize {
-    let mut lhs_ancestors = HashSet::default();
+    let mut lhs_ancestors = IndexSet::default();
     loop {
         lhs_ancestors.insert(lhs);
         let Some(parent) = scopes[lhs].parent else {

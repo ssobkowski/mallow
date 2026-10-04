@@ -1,6 +1,6 @@
 //! FIR Shape to NIR Region materialization and inlining.
 
-use crate::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet, IndexSet};
 use std::cell::RefCell;
 
 use anyhow::{Result, bail};
@@ -189,7 +189,7 @@ struct Initializations {
 impl Initializations {
     /// Places storage without a concrete definition at its block or in the function prologue.
     fn build(function: &fir::Function, ssa: &SsaMeta, shape: &Shape) -> Self {
-        let mut emitted_blocks = HashSet::default();
+        let mut emitted_blocks = IndexSet::default();
         collect_emitted_blocks(shape, &mut emitted_blocks);
 
         let mut by_block = vec![Vec::new(); function.cfg.len()];
@@ -218,7 +218,7 @@ impl Initializations {
 /// open the block itself, those of predicate-only blocks are placed right
 /// before the structured node testing the predicate. Declarations of blocks
 /// which never appear fall back to the function prologue.
-fn collect_emitted_blocks(shape: &Shape, blocks: &mut HashSet<usize>) {
+fn collect_emitted_blocks(shape: &Shape, blocks: &mut IndexSet<usize>) {
     match shape {
         Shape::Block { block } => {
             blocks.insert(*block);
@@ -251,7 +251,7 @@ fn collect_emitted_blocks(shape: &Shape, blocks: &mut HashSet<usize>) {
 }
 
 /// Collects FIR blocks whose branch decides part of a predicate.
-fn collect_predicate_blocks(predicate: &Predicate, blocks: &mut HashSet<usize>) {
+fn collect_predicate_blocks(predicate: &Predicate, blocks: &mut IndexSet<usize>) {
     match predicate {
         Predicate::Value { block, .. } => {
             blocks.insert(*block);
@@ -275,7 +275,7 @@ fn collect_predicate_blocks(predicate: &Predicate, blocks: &mut HashSet<usize>) 
 }
 
 /// Collects FIR blocks materialized as statement blocks.
-fn collect_statement_blocks(shape: &Shape, blocks: &mut HashSet<usize>) {
+fn collect_statement_blocks(shape: &Shape, blocks: &mut IndexSet<usize>) {
     match shape {
         Shape::Block { block } => {
             blocks.insert(*block);
@@ -328,7 +328,7 @@ struct Materializer<'f> {
     /// Folded definitions already materialized at their use.
     emitted: RefCell<Emitted>,
     /// Blocks materialized as statement blocks.
-    statement_blocks: HashSet<usize>,
+    statement_blocks: IndexSet<usize>,
     /// NIR local arena.
     locals: Arena<Local>,
     /// NIR pack arena.
@@ -392,7 +392,7 @@ impl<'a> Materializer<'a> {
             value_defs,
             pack_defs,
             emitted: RefCell::default(),
-            statement_blocks: HashSet::default(),
+            statement_blocks: IndexSet::default(),
             locals,
             packs,
             values,
@@ -646,7 +646,7 @@ impl<'a> Materializer<'a> {
 
     /// Places declarations of predicate-only blocks right before the node testing them.
     fn with_predicate_declarations(&self, predicate: &Predicate, node: Region) -> Result<Region> {
-        let mut blocks = HashSet::default();
+        let mut blocks = IndexSet::default();
         collect_predicate_blocks(predicate, &mut blocks);
         let mut blocks: Vec<_> = blocks
             .into_iter()

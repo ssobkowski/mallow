@@ -9,7 +9,7 @@
 //! locals into those writes. This recovers assignments such as `t[1], t[2] = f()`
 //! without changing the bounded result count of the original assignment.
 
-use crate::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet, IndexSet};
 
 use crate::ir::nir::visitor::{Visitor, VisitorMut, walk_pack_expr, walk_stmt, walk_stmts_mut};
 use crate::ir::nir::{Expr, Function, LocalId, PackExpr, PackLocalId, Place, Stmt};
@@ -67,7 +67,7 @@ impl PackFacts {
     /// Returns the distinct projected slots.
     #[inline]
     #[must_use]
-    fn slots(&self) -> HashSet<usize> {
+    fn slots(&self) -> IndexSet<usize> {
         self.projections.iter().map(|(index, _)| *index).collect()
     }
 

@@ -15,7 +15,7 @@
 //! which initialize it. Each such run is treated as one constructor node, so
 //! the whole table can fold into its use like any other expression.
 
-use crate::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet, IndexSet};
 
 use smallvec::{SmallVec, smallvec};
 
@@ -49,7 +49,7 @@ pub(crate) struct Folding {
     ///
     /// The structurer may emit such a block purely as part of a predicate,
     /// without a statement block of its own.
-    condition_only_blocks: HashSet<usize>,
+    condition_only_blocks: IndexSet<usize>,
 }
 
 impl Folding {
@@ -116,7 +116,7 @@ impl Folding {
 
     /// Returns all blocks which only compute their branch condition.
     #[inline]
-    pub(crate) fn condition_only_blocks(&self) -> &HashSet<usize> {
+    pub(crate) fn condition_only_blocks(&self) -> &IndexSet<usize> {
         &self.condition_only_blocks
     }
 
