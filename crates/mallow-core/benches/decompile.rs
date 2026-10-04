@@ -31,10 +31,10 @@ fn load_corpus() -> Vec<(String, Vec<u8>)> {
 
 fn bench_decompile(c: &mut Criterion) {
     let corpus = load_corpus();
-    let total: usize = corpus.iter().map(|(_, b)| b.len()).sum();
+    let total: u64 = corpus.iter().map(|(_, b)| b.len() as u64).sum();
 
     let mut group = c.benchmark_group("decompile");
-    group.throughput(Throughput::Bytes(total as u64));
+    group.throughput(Throughput::Bytes(total));
     group.bench_function("corpus", |b| {
         b.iter(|| {
             for (_, bytes) in &corpus {

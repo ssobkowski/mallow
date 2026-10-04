@@ -5,7 +5,7 @@
 //! The only exception is the argument which seeds a loop variable, since the
 //! loop header itself assigns the variable.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use super::{BlockExit, Function, Instr, ValueId};
 use crate::ir::graph::GraphView;
@@ -121,7 +121,7 @@ fn single_assignment_storage(
         .filter_map(Instr::defined_value);
 
     // Values live at entry are defined there, whether or not they are parameters.
-    let mut definitions = HashMap::new();
+    let mut definitions = HashMap::default();
     for value in function
         .params
         .iter()

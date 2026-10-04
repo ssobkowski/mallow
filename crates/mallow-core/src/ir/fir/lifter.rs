@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 
 use anyhow::{Context, Result, bail, ensure};
 use id_arena::Arena;
@@ -117,7 +118,7 @@ impl FunctionCaptures {
         let mut state = CaptureState::default();
         let mut block_states = vec![CaptureState::default(); cfg.len()];
 
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut capture_order = Vec::new();
 
         for (block_index, block) in cfg.enumerate() {
@@ -1633,7 +1634,7 @@ fn resolve_exit(exit: &mut BlockExit, aliases: &HashMap<ValueId, ValueId>) {
 /// block from the cycle.
 fn threaded_target(blocks: &[RawBlock], target: usize) -> usize {
     let mut current = target;
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
 
     while visited.insert(current) {
         let block = &blocks[current];
@@ -1793,7 +1794,7 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
 
     thread_raw_jumps(&mut raw_blocks);
 
-    let mut reachable = HashSet::new();
+    let mut reachable = HashSet::default();
     let mut pending = VecDeque::from([0]);
     while let Some(block) = pending.pop_front() {
         if reachable.insert(block) {

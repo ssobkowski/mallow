@@ -3,7 +3,7 @@
 //! A nil initializer which is overwritten before its storage is read is removed,
 //! so the overwriting assignment becomes the only definition of the storage.
 
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use id_arena::Arena;
 
@@ -28,7 +28,7 @@ pub(super) fn run(function: &mut Function) -> bool {
         let mut finder = DeadInitializers {
             locals,
             cell_sources: &cell_sources,
-            dead: HashSet::new(),
+            dead: HashSet::default(),
         };
         finder.root(body);
         finder.dead

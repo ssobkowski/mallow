@@ -2,7 +2,7 @@ mod name;
 mod plan;
 mod storage;
 
-use std::collections::HashMap;
+use crate::collections::HashMap;
 
 use anyhow::{Context, Result, bail, ensure};
 use name::{Namer, PlainNamer};
@@ -38,7 +38,7 @@ pub(crate) fn emit_ast_with_namer<N: Namer>(
 ) -> Result<ast::Block> {
     let entry = unit.entry();
     let EmittedFunction { mut body, .. } =
-        emit_function(&unit, types, options, &mut namer, entry, HashMap::new())?;
+        emit_function(&unit, types, options, &mut namer, entry, HashMap::default())?;
     body.stmts.insert(
         0,
         ast::Stmt::Comment {
@@ -710,7 +710,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             "closure capture count does not match child upvalues"
         );
 
-        let mut inherited = HashMap::new();
+        let mut inherited = HashMap::default();
         for (&cell, capture) in child_upvalues.iter().zip(captures) {
             let storage = match capture {
                 nir::Capture::Share(parent_cell) => self.plan.cell(*parent_cell)?.clone(),

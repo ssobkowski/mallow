@@ -4,7 +4,7 @@ pub(crate) mod materialize;
 pub(crate) mod passes;
 pub(crate) mod visitor;
 
-use std::collections::HashMap;
+use crate::collections::HashMap;
 
 use id_arena::{Arena, Id};
 pub(crate) use materialize::lift;

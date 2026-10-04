@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::collections::HashMap;
 use std::hash::Hash;
 
 /// A structure that groups items into sets and merges them.
@@ -11,7 +11,7 @@ impl<T: Copy + Hash + Eq> UnionFind<T> {
     /// Makes a new empty set of items, each in its own group.
     pub fn new() -> Self {
         Self {
-            parent: HashMap::new(),
+            parent: HashMap::default(),
         }
     }
 

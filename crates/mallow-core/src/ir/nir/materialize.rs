@@ -1,7 +1,7 @@
 //! FIR Shape to NIR Region materialization and inlining.
 
+use crate::collections::{HashMap, HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
 use id_arena::Arena;
@@ -45,7 +45,7 @@ pub(crate) fn materialize(
 
 /// Unifies NIR symbols which point to the same underlying storage.
 pub(crate) fn destroy_ssa(function: &mut Function) {
-    let mut locals_by_source = HashMap::new();
+    let mut locals_by_source = HashMap::default();
     let replacements: HashMap<_, _> = function
         .locals
         .iter()
@@ -91,7 +91,7 @@ impl<'s> SsaMeta<'s> {
         let cfg = &function.cfg;
         let idoms = cfg.build_idoms();
 
-        let mut storage_blocks: HashMap<_, Vec<_>> = HashMap::new();
+        let mut storage_blocks: HashMap<_, Vec<_>> = HashMap::default();
         for block in cfg.post_order() {
             for param in &cfg[block].params {
                 storage_blocks
@@ -189,7 +189,7 @@ struct Initializations {
 impl Initializations {
     /// Places storage without a concrete definition at its block or in the function prologue.
     fn build(function: &fir::Function, ssa: &SsaMeta, shape: &Shape) -> Self {
-        let mut emitted_blocks = HashSet::new();
+        let mut emitted_blocks = HashSet::default();
         collect_emitted_blocks(shape, &mut emitted_blocks);
 
         let mut by_block = vec![Vec::new(); function.cfg.len()];
@@ -375,8 +375,8 @@ impl<'a> Materializer<'a> {
             .map(|(source, _)| (source, packs.alloc(PackLocal { source })))
             .collect();
 
-        let mut value_defs = HashMap::new();
-        let mut pack_defs = HashMap::new();
+        let mut value_defs = HashMap::default();
+        let mut pack_defs = HashMap::default();
         for instr in function.cfg.items().flat_map(|block| block.instrs.iter()) {
             if let Some(value) = instr.defined_value() {
                 value_defs.insert(value, instr);
@@ -392,7 +392,7 @@ impl<'a> Materializer<'a> {
             value_defs,
             pack_defs,
             emitted: RefCell::default(),
-            statement_blocks: HashSet::new(),
+            statement_blocks: HashSet::default(),
             locals,
             packs,
             values,
@@ -453,7 +453,7 @@ impl<'a> Materializer<'a> {
 
     /// Finds the source local which backs every locally opened cell.
     fn cell_locals(&self) -> Result<HashMap<CellId, LocalId>> {
-        let mut cell_locals = HashMap::new();
+        let mut cell_locals = HashMap::default();
         for instr in self
             .function
             .cfg
@@ -646,7 +646,7 @@ impl<'a> Materializer<'a> {
 
     /// Places declarations of predicate-only blocks right before the node testing them.
     fn with_predicate_declarations(&self, predicate: &Predicate, node: Region) -> Result<Region> {
-        let mut blocks = HashSet::new();
+        let mut blocks = HashSet::default();
         collect_predicate_blocks(predicate, &mut blocks);
         let mut blocks: Vec<_> = blocks
             .into_iter()

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
 use smol_str::SmolStr;
@@ -105,10 +105,10 @@ impl FunctionPlan {
         );
         let mut names = Names::new(reserved);
         let mut facts = BindingCollector::collect(function, inherited_cells);
-        let mut locals = HashMap::new();
+        let mut locals = HashMap::default();
         let mut cells = inherited_cells.clone();
-        let mut packs = HashMap::new();
-        let mut inline_declarations = HashMap::new();
+        let mut packs = HashMap::default();
+        let mut inline_declarations = HashMap::default();
         let mut scopes = Vec::with_capacity(facts.len());
         let mut active_named = vec![0usize; facts.len()];
 
@@ -312,7 +312,7 @@ impl<'a> BindingCollector<'a> {
                 parent: None,
                 bindings: Vec::new(),
             }],
-            bindings: HashMap::new(),
+            bindings: HashMap::default(),
             inherited_cells,
             cell_locals: &function.cell_locals,
             next_order: 0,
@@ -699,7 +699,7 @@ impl<'a> BindingCollector<'a> {
 
 /// Returns the nearest source scope containing both inputs.
 fn common_scope(scopes: &[ScopeFacts<'_>], mut lhs: usize, mut rhs: usize) -> usize {
-    let mut lhs_ancestors = HashSet::new();
+    let mut lhs_ancestors = HashSet::default();
     loop {
         lhs_ancestors.insert(lhs);
         let Some(parent) = scopes[lhs].parent else {

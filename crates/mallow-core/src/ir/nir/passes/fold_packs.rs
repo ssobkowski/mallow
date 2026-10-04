@@ -9,7 +9,7 @@
 //! locals into those writes. This recovers assignments such as `t[1], t[2] = f()`
 //! without changing the bounded result count of the original assignment.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use crate::ir::nir::visitor::{Visitor, VisitorMut, walk_pack_expr, walk_stmt, walk_stmts_mut};
 use crate::ir::nir::{Expr, Function, LocalId, PackExpr, PackLocalId, Place, Stmt};

@@ -1,5 +1,6 @@
 mod ast;
 mod bytecode_types;
+mod collections;
 mod common;
 mod disasm;
 mod emitter;

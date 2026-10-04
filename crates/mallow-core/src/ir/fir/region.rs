@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 use std::fmt;
 
 use anyhow::{Result, ensure};
@@ -647,8 +648,8 @@ impl LoopForest {
     /// final bodies, and same-header multi-latch loops are represented by a
     /// single [`LoopInfo`] whose `latches` set records all backedge sources.
     fn build(graph: &RegionGraph, idoms: &DominatorTree<usize>) -> Self {
-        let mut loops = HashMap::new();
-        let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::new();
+        let mut loops = HashMap::default();
+        let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::default();
         let reachable: HashSet<_> = graph.reverse_post_order().collect();
 
         for latch in graph.nodes() {
@@ -731,8 +732,8 @@ impl LoopForest {
                     .copied()
                     .max_by_key(|id| (loops[id].body.len(), *id))?;
 
-                let mut body = HashSet::new();
-                let mut latches = HashSet::new();
+                let mut body = HashSet::default();
+                let mut latches = HashSet::default();
                 for id in ids {
                     body.extend(loops[id].body.iter().copied());
                     latches.extend(loops[id].latches.iter().copied());
@@ -878,7 +879,7 @@ impl LoopForest {
 
             for id in ids {
                 let children = loops[&id].children.clone();
-                let mut child_body = HashSet::new();
+                let mut child_body = HashSet::default();
                 for child in children {
                     child_body.extend(loops[&child].body.iter().copied());
                 }
@@ -901,7 +902,7 @@ impl LoopForest {
     /// aggregation deletes raw loop IDs and may change the representative body
     /// size used for deterministic ordering.
     fn rebuild_by_header(loops: &HashMap<LoopId, LoopInfo>) -> HashMap<usize, Vec<LoopId>> {
-        let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::new();
+        let mut by_header: HashMap<usize, Vec<LoopId>> = HashMap::default();
 
         for (&id, info) in loops {
             by_header.entry(info.header).or_default().push(id);
@@ -1094,7 +1095,7 @@ impl<'d> Structurer<'d> {
             entry: self.graph.entry(),
             nodes,
             exits,
-            merge_points: HashSet::new(),
+            merge_points: HashSet::default(),
             allow_implicit_continue: false,
         };
 
@@ -1151,7 +1152,7 @@ impl<'d> Structurer<'d> {
         });
 
         let mut nodes = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         let mut current = scope.entry;
 
         visited.insert(self.graph.exit()); // virtual exit
@@ -1505,7 +1506,7 @@ impl<'d> Structurer<'d> {
             entry: plan.entry,
             nodes: plan.nodes.clone(),
             exits: plan.exits.clone(),
-            merge_points: HashSet::new(),
+            merge_points: HashSet::default(),
             allow_implicit_continue: true,
         };
 
@@ -1544,7 +1545,7 @@ impl<'d> Structurer<'d> {
                 .copied()
                 .filter(|latch| *latch != loop_info.header)
                 .collect(),
-            _ => HashSet::new(),
+            _ => HashSet::default(),
         }
     }
 
@@ -1580,7 +1581,7 @@ impl<'d> Structurer<'d> {
             {
                 [loop_info.latch].into_iter().collect()
             }
-            _ => HashSet::new(),
+            _ => HashSet::default(),
         }
     }
 
@@ -1688,7 +1689,7 @@ impl<'d> Structurer<'d> {
         loop_ctx: Option<&LoopCtx>,
         suppress_exit: Option<usize>,
     ) -> HashMap<usize, usize> {
-        let mut distances = HashMap::new();
+        let mut distances = HashMap::default();
         let mut queue = VecDeque::from([(entry, 0)]);
 
         while let Some((node, distance)) = queue.pop_front() {
@@ -2034,7 +2035,7 @@ impl<'d> Structurer<'d> {
     /// A block whose instructions all fold into its branch condition counts as
     /// having no statements. Returns `None` if the header does not match that shape.
     fn recognize_while_guard(&self, loop_info: &LoopInfo) -> Option<WhileGuard> {
-        let mut visiting = HashSet::new();
+        let mut visiting = HashSet::default();
         let guard = self.recognize_while_guard_node(loop_info, loop_info.header, &mut visiting)?;
 
         Some(WhileGuard {
@@ -2120,7 +2121,7 @@ impl<'d> Structurer<'d> {
             return Some(GuardBranch {
                 condition: Predicate::False,
                 body: None,
-                guard_nodes: HashSet::new(),
+                guard_nodes: HashSet::default(),
                 exits: [target].into_iter().collect(),
             });
         }
@@ -2137,8 +2138,8 @@ impl<'d> Structurer<'d> {
         Some(GuardBranch {
             condition: Predicate::True,
             body: Some(target),
-            guard_nodes: HashSet::new(),
-            exits: HashSet::new(),
+            guard_nodes: HashSet::default(),
+            exits: HashSet::default(),
         })
     }
 
@@ -2317,7 +2318,7 @@ impl<'d> Structurer<'d> {
         exits: &HashSet<usize>,
         include_boundary_entry: bool,
     ) -> HashSet<usize> {
-        let mut nodes = HashSet::new();
+        let mut nodes = HashSet::default();
         let mut stack = vec![entry];
 
         while let Some(node) = stack.pop() {
@@ -2433,7 +2434,7 @@ fn natural_loop_body(
     latch: usize,
     reachable: &HashSet<usize>,
 ) -> HashSet<usize> {
-    let mut body = HashSet::new();
+    let mut body = HashSet::default();
     body.insert(header);
 
     let mut stack = vec![latch];

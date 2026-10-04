@@ -9,7 +9,7 @@ mod display;
 mod lifter;
 mod ssa;
 
-use std::collections::HashSet;
+use crate::collections::HashSet;
 use std::fmt;
 
 use anyhow::{Result, ensure};
@@ -692,9 +692,9 @@ impl Function {
 
         // Each pack and value must be defined before use
         let mut value_defs: HashSet<_> = self.params.iter().copied().collect();
-        let mut value_uses = HashSet::new();
-        let mut pack_defs = HashSet::new();
-        let mut pack_uses = HashSet::new();
+        let mut value_uses = HashSet::default();
+        let mut pack_defs = HashSet::default();
+        let mut pack_uses = HashSet::default();
         for block in self.cfg.items() {
             value_defs.extend(block.params.iter().copied());
             value_defs.extend(block.outputs.iter().copied());

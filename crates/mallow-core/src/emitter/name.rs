@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use smol_str::{SmolStr, format_smolstr};
 

@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
+use crate::collections::HashMap;
+use std::collections::BTreeSet;
 
 use id_arena::Arena;
 
@@ -64,12 +65,12 @@ impl<'g, G: GraphView<Node = usize>> Ssa<'g, G> {
             register_count,
             graph,
             values: Arena::new(),
-            aliases: HashMap::new(),
-            phi_uses: HashMap::new(),
-            phi_to_block: HashMap::new(),
-            phi_to_inputs: HashMap::new(),
+            aliases: HashMap::default(),
+            phi_uses: HashMap::default(),
+            phi_to_block: HashMap::default(),
+            phi_to_inputs: HashMap::default(),
             filled_blocks: vec![false; block_count].into_boxed_slice(),
-            incomplete_phis: HashMap::new(),
+            incomplete_phis: HashMap::default(),
         }
     }
 

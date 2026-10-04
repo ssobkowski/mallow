@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 /// A read-only view of a directed graph.
@@ -65,7 +65,7 @@ pub trait GraphView {
             order.push(node);
         }
 
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         let mut order = Vec::new();
         dfs(self, self.entry(), &mut visited, &mut order);
         order.into_iter()
@@ -84,11 +84,11 @@ pub trait GraphView {
         let rpo_nodes: Vec<_> = self.reverse_post_order().collect();
         if rpo_nodes.is_empty() {
             return DominatorTree {
-                idoms: HashMap::new(),
+                idoms: HashMap::default(),
             };
         }
 
-        let mut idoms = HashMap::with_capacity(rpo_nodes.len());
+        let mut idoms = HashMap::with_capacity_and_hasher(rpo_nodes.len(), Default::default());
         idoms.insert(self.entry(), self.entry());
 
         let rpo_number: HashMap<_, _> = rpo_nodes

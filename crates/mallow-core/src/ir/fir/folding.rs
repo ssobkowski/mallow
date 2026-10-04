@@ -15,7 +15,7 @@
 //! which initialize it. Each such run is treated as one constructor node, so
 //! the whole table can fold into its use like any other expression.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use smallvec::{SmallVec, smallvec};
 
@@ -257,7 +257,7 @@ impl UseFacts {
             .items()
             .flat_map(|block| block.instrs.iter())
             .collect();
-        let mut instr_defined = HashSet::new();
+        let mut instr_defined = HashSet::default();
         instr_defined.extend(instrs.iter().filter_map(|instr| instr.defined_value()));
         loop {
             let floating: HashSet<_> = instrs

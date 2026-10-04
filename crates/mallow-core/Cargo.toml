@@ -9,6 +9,7 @@ readme.workspace = true
 anyhow = { workspace = true }
 either = { workspace = true }
 id-arena = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 smallvec = { workspace = true }
