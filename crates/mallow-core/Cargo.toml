@@ -21,6 +21,7 @@ mallow-luau-toolchain = { workspace = true }
 libtest-mimic = { workspace = true }
 tempfile = { workspace = true }
 wait-timeout = { workspace = true }
+criterion = "0.8.2"
 
 [features]
 default = []
@@ -28,4 +29,8 @@ visualize = ["dep:serde", "dep:serde_json"]
 
 [[test]]
 name = "decompiler"
+harness = false
+
+[[bench]]
+name = "decompile"
 harness = false
