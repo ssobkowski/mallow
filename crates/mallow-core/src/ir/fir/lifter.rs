@@ -1,4 +1,4 @@
-use crate::collections::{HashMap, HashSet, IndexSet};
+use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -1513,15 +1513,15 @@ const fn unop_for_instr(instr: il::Instr) -> UnOp {
 }
 
 /// Resolves one value through the trivial-Phi alias map.
-fn resolve_alias(mut value: ValueId, aliases: &HashMap<ValueId, ValueId>) -> ValueId {
-    while let Some(&alias) = aliases.get(&value) {
+fn resolve_alias(mut value: ValueId, aliases: &IndexMap<ValueId, ValueId>) -> ValueId {
+    while let Some(&alias) = aliases.get(value) {
         value = alias;
     }
     value
 }
 
 /// Rewrites all block references to surviving SSA values.
-fn resolve_aliases(cfg: &mut ControlFlowGraph<Block>, aliases: &HashMap<ValueId, ValueId>) {
+fn resolve_aliases(cfg: &mut ControlFlowGraph<Block>, aliases: &IndexMap<ValueId, ValueId>) {
     for block in cfg.items_mut() {
         for output in &mut block.outputs {
             *output = resolve_alias(*output, aliases);
@@ -1536,7 +1536,7 @@ fn resolve_aliases(cfg: &mut ControlFlowGraph<Block>, aliases: &HashMap<ValueId,
 }
 
 /// Rewrites value references in an IR instruction.
-fn resolve_instr(instr: &mut ir::Instr, aliases: &HashMap<ValueId, ValueId>) {
+fn resolve_instr(instr: &mut ir::Instr, aliases: &IndexMap<ValueId, ValueId>) {
     let resolve = |value: &mut ValueId| *value = resolve_alias(*value, aliases);
     match instr {
         ir::Instr::Const { out, .. }
@@ -1596,7 +1596,7 @@ fn resolve_instr(instr: &mut ir::Instr, aliases: &HashMap<ValueId, ValueId>) {
 }
 
 /// Rewrites value references in a block exit.
-fn resolve_exit(exit: &mut BlockExit, aliases: &HashMap<ValueId, ValueId>) {
+fn resolve_exit(exit: &mut BlockExit, aliases: &IndexMap<ValueId, ValueId>) {
     let resolve = |value: &mut ValueId| *value = resolve_alias(*value, aliases);
     match exit {
         BlockExit::Fallthrough(_)
@@ -1805,7 +1805,7 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
     let mut old_to_new = vec![None; raw_blocks.len()];
     let mut next = 0;
     for (old, item) in old_to_new.iter_mut().enumerate() {
-        if reachable.contains(&old) {
+        if reachable.contains(old) {
             *item = Some(next);
             next += 1;
         }
@@ -1815,7 +1815,7 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
         .into_iter()
         .enumerate()
         .filter_map(|(old, mut block)| {
-            reachable.contains(&old).then(|| {
+            reachable.contains(old).then(|| {
                 remap_raw_exit(&mut block.exit, &old_to_new);
                 block
             })

@@ -4,7 +4,7 @@ pub(crate) mod materialize;
 pub(crate) mod passes;
 pub(crate) mod visitor;
 
-use crate::collections::HashMap;
+use crate::collections::IndexMap;
 
 use id_arena::{Arena, Id};
 pub(crate) use materialize::lift;
@@ -476,7 +476,7 @@ pub(crate) struct Function {
     /// Upvalue cells in closure capture order.
     pub(crate) upvalues: Vec<CellId>,
     /// Source locals which provide storage for locally opened cells.
-    pub(crate) cell_locals: HashMap<CellId, LocalId>,
+    pub(crate) cell_locals: IndexMap<CellId, LocalId>,
     /// Statements that declare storage before control flow starts.
     pub(crate) prologue: Vec<Stmt>,
     /// Nested function body.

@@ -1,6 +1,6 @@
 //! FIR Shape to NIR Region materialization and inlining.
 
-use crate::collections::{HashMap, HashSet, IndexSet};
+use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
 use std::cell::RefCell;
 
 use anyhow::{Result, bail};
@@ -46,7 +46,7 @@ pub(crate) fn materialize(
 /// Unifies NIR symbols which point to the same underlying storage.
 pub(crate) fn destroy_ssa(function: &mut Function) {
     let mut locals_by_source = HashMap::default();
-    let replacements: HashMap<_, _> = function
+    let replacements: IndexMap<_, _> = function
         .locals
         .iter()
         .map(|(local, data)| {
@@ -195,7 +195,7 @@ impl Initializations {
         let mut by_block = vec![Vec::new(); function.cfg.len()];
         let mut prologue = Vec::new();
         for (block, storages) in ssa.declarations.iter().enumerate() {
-            if emitted_blocks.contains(&block) {
+            if emitted_blocks.contains(block) {
                 by_block[block].extend(
                     storages
                         .iter()
@@ -306,12 +306,12 @@ fn collect_statement_blocks(shape: &Shape, blocks: &mut IndexSet<usize>) {
 /// Rewrites SSA local references to their shared storage locals.
 struct LocalRewriter<'a> {
     /// Shared storage local for every SSA local.
-    replacements: &'a HashMap<LocalId, LocalId>,
+    replacements: &'a IndexMap<LocalId, LocalId>,
 }
 
 impl VisitorMut for LocalRewriter<'_> {
     fn visit_local(&mut self, local: &mut LocalId) {
-        *local = self.replacements[local];
+        *local = self.replacements[*local];
     }
 }
 
@@ -322,9 +322,9 @@ struct Materializer<'f> {
     /// Definitions which are materialized at their single use.
     folding: &'f Folding,
     /// Instruction defining every FIR value.
-    value_defs: HashMap<ValueId, &'f fir::Instr>,
+    value_defs: IndexMap<ValueId, &'f fir::Instr>,
     /// Instruction defining every FIR pack.
-    pack_defs: HashMap<PackId, &'f fir::Instr>,
+    pack_defs: IndexMap<PackId, &'f fir::Instr>,
     /// Folded definitions already materialized at their use.
     emitted: RefCell<Emitted>,
     /// Blocks materialized as statement blocks.
@@ -334,9 +334,9 @@ struct Materializer<'f> {
     /// NIR pack arena.
     packs: Arena<PackLocal>,
     /// FIR value to NIR local mapping.
-    values: HashMap<ValueId, LocalId>,
+    values: IndexMap<ValueId, LocalId>,
     /// FIR pack to NIR pack mapping.
-    pack_values: HashMap<PackId, PackLocalId>,
+    pack_values: IndexMap<PackId, PackLocalId>,
     /// Synthetic storage declarations for the structured function.
     initializations: Initializations,
 }
@@ -345,9 +345,9 @@ struct Materializer<'f> {
 #[derive(Debug, Default)]
 struct Emitted {
     /// Folded values materialized at their use.
-    values: HashSet<ValueId>,
+    values: IndexSet<ValueId>,
     /// Folded packs materialized at their use.
-    packs: HashSet<PackId>,
+    packs: IndexSet<PackId>,
 }
 
 impl<'a> Materializer<'a> {
@@ -375,8 +375,8 @@ impl<'a> Materializer<'a> {
             .map(|(source, _)| (source, packs.alloc(PackLocal { source })))
             .collect();
 
-        let mut value_defs = HashMap::default();
-        let mut pack_defs = HashMap::default();
+        let mut value_defs = IndexMap::default();
+        let mut pack_defs = IndexMap::default();
         for instr in function.cfg.items().flat_map(|block| block.instrs.iter()) {
             if let Some(value) = instr.defined_value() {
                 value_defs.insert(value, instr);
@@ -452,8 +452,8 @@ impl<'a> Materializer<'a> {
     }
 
     /// Finds the source local which backs every locally opened cell.
-    fn cell_locals(&self) -> Result<HashMap<CellId, LocalId>> {
-        let mut cell_locals = HashMap::default();
+    fn cell_locals(&self) -> Result<IndexMap<CellId, LocalId>> {
+        let mut cell_locals = IndexMap::default();
         for instr in self
             .function
             .cfg
@@ -486,7 +486,7 @@ impl<'a> Materializer<'a> {
     #[inline]
     fn local(&self, value: ValueId) -> Result<LocalId> {
         self.values
-            .get(&value)
+            .get(value)
             .copied()
             .ok_or_else(|| anyhow::anyhow!("missing NIR local for %v{}", value.index()))
     }
@@ -495,7 +495,7 @@ impl<'a> Materializer<'a> {
     #[inline]
     fn pack(&self, pack: PackId) -> Result<PackLocalId> {
         self.pack_values
-            .get(&pack)
+            .get(pack)
             .copied()
             .ok_or_else(|| anyhow::anyhow!("missing NIR pack for %q{}", pack.index()))
     }
@@ -509,7 +509,7 @@ impl<'a> Materializer<'a> {
         }
         // The structurer may duplicate a block, and its trees along with it.
         self.emitted.borrow_mut().values.insert(value);
-        let Some(instr) = self.value_defs.get(&value) else {
+        let Some(instr) = self.value_defs.get(value) else {
             bail!("folded %v{} has no defining instruction", value.index());
         };
         self.value_expr(instr)
@@ -523,7 +523,7 @@ impl<'a> Materializer<'a> {
             return Ok(PackExpr::local(self.pack(pack)?));
         }
         self.emitted.borrow_mut().packs.insert(pack);
-        let Some(instr) = self.pack_defs.get(&pack) else {
+        let Some(instr) = self.pack_defs.get(pack) else {
             bail!("folded %q{} has no defining instruction", pack.index());
         };
         self.pack_expr(instr)
@@ -536,7 +536,7 @@ impl<'a> Materializer<'a> {
     fn verify_folded(&self) -> Result<()> {
         let emitted = self.emitted.borrow();
         for (block_id, block) in self.function.cfg.items().enumerate() {
-            if !self.statement_blocks.contains(&block_id)
+            if !self.statement_blocks.contains(block_id)
                 && !self.folding.is_condition_only(block_id)
             {
                 continue;
@@ -545,7 +545,7 @@ impl<'a> Materializer<'a> {
                 if let Some(value) = instr.defined_value()
                     && self.folding.is_folded(value)
                     && !self.folding.is_floating(value)
-                    && !emitted.values.contains(&value)
+                    && !emitted.values.contains(value)
                 {
                     bail!(
                         "folded %v{} in @P{} bb{block_id} was never materialized",
@@ -555,7 +555,7 @@ impl<'a> Materializer<'a> {
                 }
                 if let Some(pack) = instr.defined_pack()
                     && self.folding.is_pack_folded(pack)
-                    && !emitted.packs.contains(&pack)
+                    && !emitted.packs.contains(pack)
                 {
                     bail!(
                         "folded %q{} in @P{} bb{block_id} was never materialized",

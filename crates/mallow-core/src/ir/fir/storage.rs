@@ -5,7 +5,7 @@
 //! The only exception is the argument which seeds a loop variable, since the
 //! loop header itself assigns the variable.
 
-use crate::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
 
 use super::{BlockExit, Function, Instr, ValueId};
 use crate::ir::graph::GraphView;
@@ -15,11 +15,11 @@ use crate::ir::union_find::UnionFind;
 #[derive(Debug)]
 pub(crate) struct Storage {
     /// Canonical storage for every value.
-    storage: HashMap<ValueId, ValueId>,
+    storage: IndexMap<ValueId, ValueId>,
     /// Storage assigned by a loop header on every iteration.
-    loop_storage: HashSet<ValueId>,
+    loop_storage: IndexSet<ValueId>,
     /// Storage which is only ever assigned once.
-    single_assignment: HashSet<ValueId>,
+    single_assignment: IndexSet<ValueId>,
 }
 
 impl Storage {
@@ -72,7 +72,7 @@ impl Storage {
             }
         }
 
-        let storage: HashMap<_, _> = function
+        let storage: IndexMap<_, _> = function
             .values
             .iter()
             .map(|(value, _)| (value, groups.find(value)))
@@ -96,13 +96,13 @@ impl Storage {
     /// Returns whether a loop header assigns the storage on every iteration.
     #[inline]
     pub(crate) fn is_loop_storage(&self, storage: ValueId) -> bool {
-        self.loop_storage.contains(&storage)
+        self.loop_storage.contains(storage)
     }
 
     /// Returns whether the storage of a value is only ever assigned once.
     #[inline]
     pub(crate) fn is_single_assignment(&self, value: ValueId) -> bool {
-        self.single_assignment.contains(&self.of(value))
+        self.single_assignment.contains(self.of(value))
     }
 }
 
@@ -112,8 +112,8 @@ impl Storage {
 /// or by an instruction, and no block exit assigns it.
 fn single_assignment_storage(
     function: &Function,
-    storage: &HashMap<ValueId, ValueId>,
-) -> HashSet<ValueId> {
+    storage: &IndexMap<ValueId, ValueId>,
+) -> IndexSet<ValueId> {
     let instr_defined = function
         .cfg
         .items()
@@ -134,7 +134,7 @@ fn single_assignment_storage(
         *definitions.entry(storage[&value]).or_insert(0usize) += 1;
     }
 
-    let exit_assigned: HashSet<_> = function
+    let exit_assigned: IndexSet<_> = function
         .cfg
         .items()
         .flat_map(|block| {

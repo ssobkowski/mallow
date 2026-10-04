@@ -1513,10 +1513,11 @@ impl Proto {
 
     /// Returns the debug-local index visible after the instruction at `pc`.
     pub fn local_index_after(&self, register: u8, pc: u32) -> Option<usize> {
+        // Instructions are stored in ascending `word_pc` order.
+        let next = self.instrs.partition_point(|instr| instr.word_pc <= pc);
         let next_pc = self
             .instrs
-            .iter()
-            .find(|instr| instr.word_pc > pc)
+            .get(next)
             .map_or(pc.saturating_add(1), |instr| instr.word_pc);
         self.local_index_at(register, next_pc)
     }

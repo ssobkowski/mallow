@@ -9,7 +9,7 @@
 //! locals into those writes. This recovers assignments such as `t[1], t[2] = f()`
 //! without changing the bounded result count of the original assignment.
 
-use crate::collections::{HashMap, HashSet, IndexSet};
+use crate::collections::{HashSet, IndexMap, IndexSet};
 
 use crate::ir::nir::visitor::{Visitor, VisitorMut, walk_pack_expr, walk_stmt, walk_stmts_mut};
 use crate::ir::nir::{Expr, Function, LocalId, PackExpr, PackLocalId, Place, Stmt};
@@ -83,9 +83,9 @@ impl PackFacts {
 #[derive(Default)]
 struct UseFacts {
     /// Facts keyed by pack local identity.
-    packs: HashMap<PackLocalId, PackFacts>,
+    packs: IndexMap<PackLocalId, PackFacts>,
     /// Number of mentions for every scalar local.
-    local_mentions: HashMap<LocalId, usize>,
+    local_mentions: IndexMap<LocalId, usize>,
 }
 
 impl UseFacts {
@@ -224,7 +224,7 @@ impl Folder {
         let value = value.clone();
 
         // A pack without facts has no consumers, but its value may have effects.
-        let Some(facts) = self.facts.packs.get(&local) else {
+        let Some(facts) = self.facts.packs.get(local) else {
             stmts[index] = Stmt::Eval { value };
             self.changed = true;
             return;

@@ -2,7 +2,7 @@ mod name;
 mod plan;
 mod storage;
 
-use crate::collections::HashMap;
+use crate::collections::IndexMap;
 
 use anyhow::{Context, Result, bail, ensure};
 use name::{Namer, PlainNamer};
@@ -38,7 +38,7 @@ pub(crate) fn emit_ast_with_namer<N: Namer>(
 ) -> Result<ast::Block> {
     let entry = unit.entry();
     let EmittedFunction { mut body, .. } =
-        emit_function(&unit, types, options, &mut namer, entry, HashMap::default())?;
+        emit_function(&unit, types, options, &mut namer, entry, IndexMap::default())?;
     body.stmts.insert(
         0,
         ast::Stmt::Comment {
@@ -55,7 +55,7 @@ fn emit_function<N: Namer>(
     options: DecompileOptions,
     namer: &mut N,
     id: ProtoId,
-    inherited_cells: HashMap<CellId, Storage>,
+    inherited_cells: IndexMap<CellId, Storage>,
 ) -> Result<EmittedFunction> {
     let function = &unit[id];
     let plan = FunctionPlan::build(function, &inherited_cells, options.spill_locals, namer)?;
@@ -710,7 +710,7 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
             "closure capture count does not match child upvalues"
         );
 
-        let mut inherited = HashMap::default();
+        let mut inherited = IndexMap::default();
         for (&cell, capture) in child_upvalues.iter().zip(captures) {
             let storage = match capture {
                 nir::Capture::Share(parent_cell) => self.plan.cell(*parent_cell)?.clone(),

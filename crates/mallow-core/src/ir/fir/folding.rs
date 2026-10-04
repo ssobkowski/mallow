@@ -15,7 +15,7 @@
 //! which initialize it. Each such run is treated as one constructor node, so
 //! the whole table can fold into its use like any other expression.
 
-use crate::collections::{HashMap, HashSet, IndexSet};
+use crate::collections::{HashSet, IndexMap, IndexSet};
 
 use smallvec::{SmallVec, smallvec};
 
@@ -31,18 +31,18 @@ pub(crate) type InstrRef = (usize, usize);
 #[derive(Debug, Default)]
 pub(crate) struct Folding {
     /// Values materialized as an expression at their use.
-    values: HashSet<ValueId>,
+    values: IndexSet<ValueId>,
     /// Packs materialized as an expression at their use.
-    packs: HashSet<PackId>,
+    packs: IndexSet<PackId>,
     /// Ordered comparisons whose right operand was evaluated first.
     ///
     /// Luau compiles `a > b` as `b < a` while still evaluating `a` first, so
     /// these must be emitted with the mirrored operator to keep that order.
-    mirrored: HashSet<ValueId>,
+    mirrored: IndexSet<ValueId>,
     /// Folded values whose definition floats to their use from any position.
-    floating: HashSet<ValueId>,
+    floating: IndexSet<ValueId>,
     /// Initializing statements of every folded table constructor, in order.
-    constructors: HashMap<ValueId, Vec<InstrRef>>,
+    constructors: IndexMap<ValueId, Vec<InstrRef>>,
     /// Statements materialized inside a folded table constructor.
     initializers: HashSet<InstrRef>,
     /// Blocks whose instructions are all folded into their branch condition.
@@ -75,31 +75,31 @@ impl Folding {
     /// Returns whether a value is materialized at its use instead of being bound.
     #[inline]
     pub(crate) fn is_folded(&self, value: ValueId) -> bool {
-        self.values.contains(&value)
+        self.values.contains(value)
     }
 
     /// Returns whether a pack is materialized at its use instead of being bound.
     #[inline]
     pub(crate) fn is_pack_folded(&self, pack: PackId) -> bool {
-        self.packs.contains(&pack)
+        self.packs.contains(pack)
     }
 
     /// Returns whether a folded value floats to its use from any position.
     #[inline]
     pub(crate) fn is_floating(&self, value: ValueId) -> bool {
-        self.floating.contains(&value)
+        self.floating.contains(value)
     }
 
     /// Returns whether an ordered comparison must be emitted with mirrored operands.
     #[inline]
     pub(crate) fn is_mirrored(&self, value: ValueId) -> bool {
-        self.mirrored.contains(&value)
+        self.mirrored.contains(value)
     }
 
     /// Returns the initializing statements of a folded table constructor.
     #[inline]
     pub(crate) fn constructor(&self, table: ValueId) -> Option<&[InstrRef]> {
-        self.constructors.get(&table).map(Vec::as_slice)
+        self.constructors.get(table).map(Vec::as_slice)
     }
 
     /// Returns whether a statement is materialized inside a folded table constructor.
@@ -111,7 +111,7 @@ impl Folding {
     /// Returns whether a block only computes its branch condition.
     #[inline]
     pub(crate) fn is_condition_only(&self, block: usize) -> bool {
-        self.condition_only_blocks.contains(&block)
+        self.condition_only_blocks.contains(block)
     }
 
     /// Returns all blocks which only compute their branch condition.
@@ -122,9 +122,9 @@ impl Folding {
 
     /// Adds the trees of one block.
     fn merge(&mut self, block: BlockFolding) {
-        self.values.extend(block.values);
-        self.packs.extend(block.packs);
-        self.mirrored.extend(block.mirrored);
+        self.values.union_with(&block.values);
+        self.packs.union_with(&block.packs);
+        self.mirrored.union_with(&block.mirrored);
         self.constructors.extend(block.constructors);
         self.initializers.extend(block.initializers);
         if block.is_condition_only {
@@ -167,17 +167,17 @@ impl Slot {
 #[derive(Debug, Default)]
 struct UseFacts {
     /// Number of uses of every value.
-    value_uses: HashMap<ValueId, usize>,
+    value_uses: IndexMap<ValueId, usize>,
     /// Number of uses of every pack.
-    pack_uses: HashMap<PackId, usize>,
+    pack_uses: IndexMap<PackId, usize>,
     /// Values which must stay bound to a local.
-    pinned_values: HashSet<ValueId>,
+    pinned_values: IndexSet<ValueId>,
     /// Packs which must stay bound to a pack local.
-    pinned_packs: HashSet<PackId>,
+    pinned_packs: IndexSet<PackId>,
     /// Values whose definition folds into their use from any position.
-    floating: HashSet<ValueId>,
+    floating: IndexSet<ValueId>,
     /// Floating constants holding a string.
-    string_constants: HashSet<ValueId>,
+    string_constants: IndexSet<ValueId>,
 }
 
 impl UseFacts {
@@ -257,10 +257,10 @@ impl UseFacts {
             .items()
             .flat_map(|block| block.instrs.iter())
             .collect();
-        let mut instr_defined = HashSet::default();
+        let mut instr_defined = IndexSet::new();
         instr_defined.extend(instrs.iter().filter_map(|instr| instr.defined_value()));
         loop {
-            let floating: HashSet<_> = instrs
+            let floating: IndexSet<_> = instrs
                 .iter()
                 .filter(|instr| facts.is_floating(instr, storage, &instr_defined))
                 .filter_map(|instr| instr.defined_value())
@@ -276,13 +276,13 @@ impl UseFacts {
     /// Returns whether a value has exactly one use which may hold its expression.
     #[inline]
     fn is_candidate(&self, value: ValueId) -> bool {
-        self.value_uses.get(&value) == Some(&1) && !self.pinned_values.contains(&value)
+        self.value_uses.get(value) == Some(&1) && !self.pinned_values.contains(value)
     }
 
     /// Returns whether a pack has exactly one use which may hold its expression.
     #[inline]
     fn is_pack_candidate(&self, pack: PackId) -> bool {
-        self.pack_uses.get(&pack) == Some(&1) && !self.pinned_packs.contains(&pack)
+        self.pack_uses.get(pack) == Some(&1) && !self.pinned_packs.contains(pack)
     }
 
     /// Returns whether an instruction can be folded at any later point.
@@ -295,7 +295,7 @@ impl UseFacts {
         &self,
         instr: &Instr,
         storage: &Storage,
-        instr_defined: &HashSet<ValueId>,
+        instr_defined: &IndexSet<ValueId>,
     ) -> bool {
         match instr {
             Instr::Const { out, .. } => self.is_candidate(*out),
@@ -366,13 +366,13 @@ struct BlockFolding {
     /// Block owning these trees.
     block: usize,
     /// Values folded in this block.
-    values: HashSet<ValueId>,
+    values: IndexSet<ValueId>,
     /// Packs folded in this block.
-    packs: HashSet<PackId>,
+    packs: IndexSet<PackId>,
     /// Comparisons emitted with mirrored operands.
-    mirrored: HashSet<ValueId>,
+    mirrored: IndexSet<ValueId>,
     /// Folded table constructors and their initializers.
-    constructors: HashMap<ValueId, Vec<InstrRef>>,
+    constructors: IndexMap<ValueId, Vec<InstrRef>>,
     /// Statements materialized inside a folded constructor.
     initializers: HashSet<InstrRef>,
     /// Whether every instruction folds into the branch condition.
@@ -392,7 +392,7 @@ impl BlockFolding {
             .filter(|(_, instr)| {
                 !instr
                     .defined_value()
-                    .is_some_and(|value| facts.floating.contains(&value))
+                    .is_some_and(|value| facts.floating.contains(value))
             })
             .collect();
 
@@ -422,10 +422,10 @@ impl BlockFolding {
         folding.is_condition_only = matches!(block.exit, BlockExit::Branch { .. })
             && block.instrs.iter().enumerate().all(|(index, instr)| {
                 instr.defined_value().is_some_and(|value| {
-                    facts.floating.contains(&value) || folding.values.contains(&value)
+                    facts.floating.contains(value) || folding.values.contains(value)
                 }) || instr
                     .defined_pack()
-                    .is_some_and(|pack| folding.packs.contains(&pack))
+                    .is_some_and(|pack| folding.packs.contains(pack))
                     || folding.initializers.contains(&(block_id, index))
             });
         folding
@@ -437,10 +437,10 @@ impl BlockFolding {
             Item::Instr(_, instr) => {
                 !instr
                     .defined_value()
-                    .is_some_and(|value| self.values.contains(&value))
+                    .is_some_and(|value| self.values.contains(value))
                     && !instr
                         .defined_pack()
-                        .is_some_and(|pack| self.packs.contains(&pack))
+                        .is_some_and(|pack| self.packs.contains(pack))
             }
             Item::Constructor { table, .. } => !self.values.contains(table),
         }
@@ -537,7 +537,7 @@ impl BlockFolding {
 
     /// Returns the fixed length of a folded value pack and whether it has an open tail.
     fn pack_shape(&self, positioned: &[(usize, &Instr)], pack: PackId) -> (Option<usize>, bool) {
-        if !self.packs.contains(&pack) {
+        if !self.packs.contains(pack) {
             return (None, false);
         }
         positioned
@@ -753,7 +753,7 @@ impl TreeBuilder<'_> {
 
     /// Returns whether a value is folded, including floating values.
     fn is_folded(&self, value: ValueId) -> bool {
-        self.facts.floating.contains(&value) || self.folding.values.contains(&value)
+        self.facts.floating.contains(value) || self.folding.values.contains(value)
     }
 
     /// Returns whether a value has one use outside of its own constructor.
@@ -763,9 +763,9 @@ impl TreeBuilder<'_> {
             .iter()
             .find(|span| span.table == value)
             .map_or(0, |span| span.initializers);
-        let uses = self.facts.value_uses.get(&value).copied();
+        let uses = self.facts.value_uses.get(value).copied();
         uses.and_then(|u| u.checked_sub(internal)) == Some(1)
-            && !self.facts.pinned_values.contains(&value)
+            && !self.facts.pinned_values.contains(value)
     }
 
     /// Returns whether the top item can fold into `value`'s use.

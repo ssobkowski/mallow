@@ -3,7 +3,7 @@
 //! A nil initializer which is overwritten before its storage is read is removed,
 //! so the overwriting assignment becomes the only definition of the storage.
 
-use crate::collections::HashSet;
+use crate::collections::{HashSet, IndexSet};
 
 use id_arena::Arena;
 
@@ -21,7 +21,7 @@ pub(super) fn run(function: &mut Function) -> bool {
     } = function;
 
     let dead = {
-        let cell_sources: HashSet<_> = cell_locals
+        let cell_sources: IndexSet<_> = cell_locals
             .values()
             .map(|local| locals[*local].source)
             .collect();
@@ -55,7 +55,7 @@ enum Access {
 struct DeadInitializers<'a> {
     locals: &'a Arena<Local>,
     /// Storage backing a cell, whose accesses are not explicit local uses.
-    cell_sources: &'a HashSet<ValueId>,
+    cell_sources: &'a IndexSet<ValueId>,
     /// Addresses of the dead initializers.
     dead: HashSet<*const Stmt>,
 }
@@ -82,7 +82,7 @@ impl DeadInitializers<'_> {
                             continue;
                         };
                         let source = self.locals[*local].source;
-                        if self.cell_sources.contains(&source) {
+                        if self.cell_sources.contains(source) {
                             continue;
                         }
                         let access =

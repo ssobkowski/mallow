@@ -1,4 +1,4 @@
-use crate::collections::{HashMap, HashSet, IndexSet};
+use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
 
 use anyhow::{Result, bail};
 use smol_str::SmolStr;
@@ -75,9 +75,9 @@ pub(crate) struct ScopePlan {
 
 /// Complete storage and naming plan for one NIR function.
 pub(crate) struct FunctionPlan {
-    locals: HashMap<LocalId, Storage>,
-    cells: HashMap<CellId, Storage>,
-    packs: HashMap<PackLocalId, Storage>,
+    locals: IndexMap<LocalId, Storage>,
+    cells: IndexMap<CellId, Storage>,
+    packs: IndexMap<PackLocalId, Storage>,
     inline_declarations: HashMap<BindingKey, usize>,
     scopes: Vec<ScopePlan>,
     /// Identifier namespace retained for emitter-generated helper bindings.
@@ -88,7 +88,7 @@ impl FunctionPlan {
     /// Plans every source binding and its declaration scope.
     pub(crate) fn build<N: Namer>(
         function: &nir::Function,
-        inherited_cells: &HashMap<CellId, Storage>,
+        inherited_cells: &IndexMap<CellId, Storage>,
         spill_locals: bool,
         namer: &mut N,
     ) -> Result<Self> {
@@ -105,9 +105,9 @@ impl FunctionPlan {
         );
         let mut names = Names::new(reserved);
         let mut facts = BindingCollector::collect(function, inherited_cells);
-        let mut locals = HashMap::default();
+        let mut locals = IndexMap::default();
         let mut cells = inherited_cells.clone();
-        let mut packs = HashMap::default();
+        let mut packs = IndexMap::default();
         let mut inline_declarations = HashMap::default();
         let mut scopes = Vec::with_capacity(facts.len());
         let mut active_named = vec![0usize; facts.len()];
@@ -184,7 +184,7 @@ impl FunctionPlan {
 
         for (&cell, &local) in &function.cell_locals {
             let storage = locals
-                .get(&local)
+                .get(local)
                 .ok_or_else(|| anyhow::anyhow!("missing backing local for cell {}", cell.index()))?
                 .clone();
             cells.insert(cell, storage);
@@ -203,21 +203,21 @@ impl FunctionPlan {
     /// Returns storage for one NIR local.
     pub(crate) fn local(&self, local: LocalId) -> Result<&Storage> {
         self.locals
-            .get(&local)
+            .get(local)
             .ok_or_else(|| anyhow::anyhow!("missing source storage for local {}", local.index()))
     }
 
     /// Returns storage for one NIR cell.
     pub(crate) fn cell(&self, cell: CellId) -> Result<&Storage> {
         self.cells
-            .get(&cell)
+            .get(cell)
             .ok_or_else(|| anyhow::anyhow!("missing source storage for cell {}", cell.index()))
     }
 
     /// Returns storage for one materialized pack.
     pub(crate) fn pack(&self, pack: PackLocalId) -> Result<&Storage> {
         self.packs
-            .get(&pack)
+            .get(pack)
             .ok_or_else(|| anyhow::anyhow!("missing source storage for pack {}", pack.index()))
     }
 
@@ -253,9 +253,9 @@ impl FunctionPlan {
 fn insert_storage(
     key: BindingKey,
     storage: Storage,
-    locals: &mut HashMap<LocalId, Storage>,
-    cells: &mut HashMap<CellId, Storage>,
-    packs: &mut HashMap<PackLocalId, Storage>,
+    locals: &mut IndexMap<LocalId, Storage>,
+    cells: &mut IndexMap<CellId, Storage>,
+    packs: &mut IndexMap<PackLocalId, Storage>,
 ) {
     match key {
         BindingKey::Local(local) => {
@@ -296,8 +296,8 @@ struct BindingData<'a> {
 struct BindingCollector<'a> {
     scopes: Vec<ScopeFacts<'a>>,
     bindings: HashMap<BindingKey, BindingData<'a>>,
-    inherited_cells: &'a HashMap<CellId, Storage>,
-    cell_locals: &'a HashMap<CellId, LocalId>,
+    inherited_cells: &'a IndexMap<CellId, Storage>,
+    cell_locals: &'a IndexMap<CellId, LocalId>,
     next_order: usize,
 }
 
@@ -305,7 +305,7 @@ impl<'a> BindingCollector<'a> {
     /// Collects and groups all bindings by their common lexical scope.
     fn collect(
         function: &'a nir::Function,
-        inherited_cells: &'a HashMap<CellId, Storage>,
+        inherited_cells: &'a IndexMap<CellId, Storage>,
     ) -> Vec<ScopeFacts<'a>> {
         let mut collector = Self {
             scopes: vec![ScopeFacts {
@@ -360,8 +360,8 @@ impl<'a> BindingCollector<'a> {
         value: Option<&'a nir::Expr>,
     ) {
         let key = match key {
-            BindingKey::Cell(cell) if self.inherited_cells.contains_key(&cell) => return,
-            BindingKey::Cell(cell) if self.cell_locals.contains_key(&cell) => {
+            BindingKey::Cell(cell) if self.inherited_cells.contains_key(cell) => return,
+            BindingKey::Cell(cell) if self.cell_locals.contains_key(cell) => {
                 BindingKey::Local(self.cell_locals[&cell])
             }
             key => key,
@@ -708,7 +708,7 @@ fn common_scope(scopes: &[ScopeFacts<'_>], mut lhs: usize, mut rhs: usize) -> us
         lhs = parent;
     }
     loop {
-        if lhs_ancestors.contains(&rhs) {
+        if lhs_ancestors.contains(rhs) {
             return rhs;
         }
         rhs = scopes[rhs]

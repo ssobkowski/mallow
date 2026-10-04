@@ -1,4 +1,4 @@
-use crate::collections::{HashMap, IndexSet};
+use crate::collections::{IndexMap, IndexSet};
 
 use id_arena::Arena;
 use smallvec::SmallVec;
@@ -227,9 +227,9 @@ impl<'nir> UseContext<'nir> {
 #[derive(Debug, Default)]
 struct Replacements {
     /// Scalar replacements indexed by source storage.
-    locals: HashMap<ValueId, Expr>,
+    locals: IndexMap<ValueId, Expr>,
     /// Pack replacements indexed by pack-local identity.
-    packs: HashMap<PackLocalId, PackExpr>,
+    packs: IndexMap<PackLocalId, PackExpr>,
 }
 
 impl Replacements {
@@ -244,17 +244,23 @@ impl Replacements {
 #[derive(Debug, Default)]
 struct DefUse<'nir> {
     /// Source storage of every scalar symbol.
-    sources: HashMap<LocalId, ValueId>,
+    sources: IndexMap<LocalId, ValueId>,
     /// Chains indexed by scalar source storage.
-    locals: HashMap<ValueId, LocalChain<'nir>>,
+    locals: IndexMap<ValueId, LocalChain<'nir>>,
     /// Chains indexed by pack symbol identity.
-    packs: HashMap<PackLocalId, PackChain<'nir>>,
+    packs: IndexMap<PackLocalId, PackChain<'nir>>,
 }
 
 impl<'nir> DefUse<'nir> {
     /// Collects def-use chains from one complete function.
     fn collect(function: &'nir Function) -> Self {
-        let mut def_use = Self::default();
+        // Storage sources are nearly dense, so the local count is a close
+        // estimate of the largest source index.
+        let mut def_use = Self {
+            sources: IndexMap::with_capacity(function.locals.len()),
+            locals: IndexMap::with_capacity(function.locals.len()),
+            packs: IndexMap::with_capacity(function.packs.len()),
+        };
 
         for (local, data) in function.locals.iter() {
             def_use.sources.insert(local, data.source);
@@ -625,7 +631,7 @@ impl VisitorMut for Inliner<'_> {
             } => !self
                 .replacements
                 .locals
-                .contains_key(&self.locals[*local].source),
+                .contains_key(self.locals[*local].source),
             Stmt::BindPack { local, .. } => !self.replacements.packs.contains_key(local),
             _ => true,
         });
@@ -636,7 +642,7 @@ impl VisitorMut for Inliner<'_> {
 
     fn visit_expr(&mut self, expr: &mut Expr) {
         while let Expr::Local(local) = expr {
-            let Some(replacement) = self.replacements.locals.get(&self.locals[*local].source)
+            let Some(replacement) = self.replacements.locals.get(self.locals[*local].source)
             else {
                 break;
             };
@@ -649,7 +655,7 @@ impl VisitorMut for Inliner<'_> {
 
     fn visit_pack_expr(&mut self, pack: &mut PackExpr) {
         while let PackExpr::Local(local) = pack {
-            let Some(replacement) = self.replacements.packs.get(local) else {
+            let Some(replacement) = self.replacements.packs.get(*local) else {
                 break;
             };
             *pack = replacement.clone();

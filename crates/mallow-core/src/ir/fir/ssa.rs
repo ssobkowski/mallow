@@ -1,4 +1,4 @@
-use crate::collections::HashMap;
+use crate::collections::{HashMap, IndexMap};
 use std::collections::BTreeSet;
 
 use id_arena::Arena;
@@ -37,13 +37,13 @@ pub struct Ssa<'g, G> {
     /// Values allocated while constructing SSA.
     values: Arena<Value>,
     /// Trivial Phi values mapped to their surviving values.
-    aliases: HashMap<ValueId, ValueId>,
+    aliases: IndexMap<ValueId, ValueId>,
     /// Phi values that read each value.
-    phi_uses: HashMap<ValueId, BTreeSet<ValueId>>,
+    phi_uses: IndexMap<ValueId, BTreeSet<ValueId>>,
     /// Block containing each Phi value.
-    phi_to_block: HashMap<ValueId, usize>,
+    phi_to_block: IndexMap<ValueId, usize>,
     /// Predecessor inputs read by each Phi value.
-    phi_to_inputs: HashMap<ValueId, Vec<Input>>,
+    phi_to_inputs: IndexMap<ValueId, Vec<Input>>,
     /// Whether each block has received all local writes.
     filled_blocks: Box<[bool]>,
     /// Phi values waiting for predecessor blocks to be filled.
@@ -65,10 +65,10 @@ impl<'g, G: GraphView<Node = usize>> Ssa<'g, G> {
             register_count,
             graph,
             values: Arena::new(),
-            aliases: HashMap::default(),
-            phi_uses: HashMap::default(),
-            phi_to_block: HashMap::default(),
-            phi_to_inputs: HashMap::default(),
+            aliases: IndexMap::default(),
+            phi_uses: IndexMap::default(),
+            phi_to_block: IndexMap::default(),
+            phi_to_inputs: IndexMap::default(),
             filled_blocks: vec![false; block_count].into_boxed_slice(),
             incomplete_phis: HashMap::default(),
         }
@@ -124,7 +124,7 @@ impl<'g, G: GraphView<Node = usize>> Ssa<'g, G> {
     pub fn finish(
         mut self,
         cfg: &mut ControlFlowGraph<Block>,
-    ) -> (Arena<Value>, HashMap<ValueId, ValueId>, Edge) {
+    ) -> (Arena<Value>, IndexMap<ValueId, ValueId>, Edge) {
         self.seal_blocks();
         self.remove_remaining_trivial_phis();
         let mut phis: Vec<_> = std::mem::take(&mut self.phi_to_inputs)
@@ -175,7 +175,7 @@ impl<'g, G: GraphView<Node = usize>> Ssa<'g, G> {
     /// Resolves one value through trivial Phi aliases.
     #[inline]
     fn resolve(&self, mut value: ValueId) -> ValueId {
-        while let Some(&alias) = self.aliases.get(&value) {
+        while let Some(&alias) = self.aliases.get(value) {
             value = alias;
         }
         value
@@ -252,7 +252,7 @@ impl<'g, G: GraphView<Node = usize>> Ssa<'g, G> {
 
     /// Removes one trivial Phi and revisits dependent Phi values.
     fn remove_trivial_phi(&mut self, phi: ValueId) -> ValueId {
-        let Some(inputs) = self.phi_to_inputs.get(&phi) else {
+        let Some(inputs) = self.phi_to_inputs.get(phi) else {
             return self.resolve(phi);
         };
 
@@ -269,11 +269,11 @@ impl<'g, G: GraphView<Node = usize>> Ssa<'g, G> {
         }
 
         let replacement = same.unwrap_or_else(|| self.alloc());
-        self.phi_to_inputs.remove(&phi);
-        self.phi_to_block.remove(&phi);
+        self.phi_to_inputs.remove(phi);
+        self.phi_to_block.remove(phi);
         self.aliases.insert(phi, replacement);
 
-        if let Some(uses) = self.phi_uses.remove(&phi) {
+        if let Some(uses) = self.phi_uses.remove(phi) {
             let active_uses: Vec<_> = uses
                 .into_iter()
                 .filter(|use_value| !self.aliases.contains_key(use_value))
@@ -294,7 +294,7 @@ impl<'g, G: GraphView<Node = usize>> Ssa<'g, G> {
         let mut phis: Vec<_> = self.phi_to_inputs.keys().copied().collect();
         phis.sort_unstable();
         for phi in phis {
-            if !self.aliases.contains_key(&phi) {
+            if !self.aliases.contains_key(phi) {
                 self.remove_trivial_phi(phi);
             }
         }

@@ -653,12 +653,12 @@ impl LoopForest {
         let reachable: IndexSet<_> = graph.reverse_post_order().collect();
 
         for latch in graph.nodes() {
-            if !reachable.contains(&latch) {
+            if !reachable.contains(latch) {
                 continue;
             }
 
             for header in graph.successors(latch) {
-                if reachable.contains(&header) && idoms.dominates(header, latch) {
+                if reachable.contains(header) && idoms.dominates(header, latch) {
                     let id = LoopId { header, latch };
                     let body = natural_loop_body(graph, header, latch, &reachable);
                     let exits = body
@@ -1084,7 +1084,7 @@ impl<'d> Structurer<'d> {
     /// Returns whether a block has statements outside of its branch condition.
     #[inline]
     fn has_statements(&self, block: usize) -> bool {
-        !self.graph.blocks[block].instrs.is_empty() && !self.condition_only_blocks.contains(&block)
+        !self.graph.blocks[block].instrs.is_empty() && !self.condition_only_blocks.contains(block)
     }
 
     /// Recursively structures the region graph into a [`RecognizedShape`] tree.
@@ -1158,8 +1158,8 @@ impl<'d> Structurer<'d> {
         visited.insert(self.graph.exit()); // virtual exit
 
         while current != self.graph.exit()
-            && scope.nodes.contains(&current)
-            && !scope.exits.contains(&current)
+            && scope.nodes.contains(current)
+            && !scope.exits.contains(current)
             && visited.insert(current)
         {
             trace.line(1, format_args!("visit block {}", current));
@@ -1181,11 +1181,11 @@ impl<'d> Structurer<'d> {
                 let Some(next) = next else {
                     break;
                 };
-                if scope.exits.contains(&next) {
+                if scope.exits.contains(next) {
                     if !scope.allow_implicit_continue
                         && loop_ctx.is_some_and(|ctx| {
-                            ctx.continue_targets.contains(&next)
-                                && !ctx.payload_continue_targets.contains(&next)
+                            ctx.continue_targets.contains(next)
+                                && !ctx.payload_continue_targets.contains(next)
                         })
                     {
                         trace.line(
@@ -1193,7 +1193,7 @@ impl<'d> Structurer<'d> {
                             format_args!("nested loop exits to outer continuation -> continue"),
                         );
                         nodes.push(RecognizedShape::Continue);
-                    } else if loop_ctx.is_some_and(|ctx| ctx.exits.contains(&next)) {
+                    } else if loop_ctx.is_some_and(|ctx| ctx.exits.contains(next)) {
                         trace.line(2, format_args!("nested loop exits outer loop -> break"));
                         nodes.push(RecognizedShape::Break);
                     }
@@ -1248,7 +1248,7 @@ impl<'d> Structurer<'d> {
                 break;
             };
 
-            if scope.exits.contains(&next) {
+            if scope.exits.contains(next) {
                 trace.line(2, format_args!("next block {} is a scope exit", next));
                 break;
             }
@@ -1257,7 +1257,7 @@ impl<'d> Structurer<'d> {
             current = next;
         }
 
-        if scope.nodes.contains(&current) && !scope.exits.contains(&current) {
+        if scope.nodes.contains(current) && !scope.exits.contains(current) {
             trace.line(
                 1,
                 format_args!(
@@ -1286,7 +1286,7 @@ impl<'d> Structurer<'d> {
         let (lexical_body, lexical_exits) = self.lexical_loop_body(loop_info, &kind);
 
         if blocked_loop.is_some_and(|blocked| {
-            blocked.header == loop_info.header && lexical_body.contains(&blocked.latch)
+            blocked.header == loop_info.header && lexical_body.contains(blocked.latch)
         }) {
             self.diagnostics
                 .at(LogLevel::Trace, LogTarget::Region)
@@ -1457,7 +1457,7 @@ impl<'d> Structurer<'d> {
             .collect();
 
         while let Some(node) = stack.pop() {
-            if exits.contains(&node) || !body.insert(node) {
+            if exits.contains(node) || !body.insert(node) {
                 continue;
             }
 
@@ -1703,7 +1703,7 @@ impl<'d> Structurer<'d> {
 
             distances.insert(node, distance);
 
-            if branch_exits.contains(&node) {
+            if branch_exits.contains(node) {
                 continue;
             }
 
@@ -1730,11 +1730,11 @@ impl<'d> Structurer<'d> {
         suppress_exit: Option<usize>,
     ) -> bool {
         let is_loop_payload = loop_ctx.is_some_and(|ctx| {
-            ctx.payload_continue_targets.contains(&node) || ctx.payload_exit_targets.contains(&node)
+            ctx.payload_continue_targets.contains(node) || ctx.payload_exit_targets.contains(node)
         });
 
-        (scope.nodes.contains(&node) || is_loop_payload)
-            && (!branch_exits.contains(&node) || suppress_exit == Some(node) || is_loop_payload)
+        (scope.nodes.contains(node) || is_loop_payload)
+            && (!branch_exits.contains(node) || suppress_exit == Some(node) || is_loop_payload)
     }
 
     /// Structures a [`ConditionalShape`] into a [`RecognizedShape`] by recursively structuring
@@ -1764,10 +1764,10 @@ impl<'d> Structurer<'d> {
         let owned_boundary_entry = |entry: usize| {
             Some(entry) != shape.merge
                 && suppress_exit != Some(entry)
-                && !scope.merge_points.contains(&entry)
+                && !scope.merge_points.contains(entry)
                 && loop_ctx.is_some_and(|ctx| {
-                    ctx.payload_continue_targets.contains(&entry)
-                        || ctx.payload_exit_targets.contains(&entry)
+                    ctx.payload_continue_targets.contains(entry)
+                        || ctx.payload_exit_targets.contains(entry)
                 })
         };
 
@@ -1813,21 +1813,21 @@ impl<'d> Structurer<'d> {
                     trace.line(2, format_args!("empty branch reaches suppressed terminal"));
                     return RecognizedShape::sequence(Vec::new());
                 }
-                if scope.merge_points.contains(&entry) {
+                if scope.merge_points.contains(entry) {
                     trace.line(2, format_args!("empty branch reaches implicit outer merge"));
                     return RecognizedShape::sequence(Vec::new());
                 }
 
                 // If the branch jumps out of the region entirely, map it to the correct exit instruction.
                 if let Some(ctx) = loop_ctx {
-                    if ctx.continue_targets.contains(&entry) {
+                    if ctx.continue_targets.contains(entry) {
                         trace.line(
                             2,
                             format_args!("empty branch reaches loop continuation -> continue"),
                         );
                         return RecognizedShape::Continue;
                     }
-                    if ctx.exits.contains(&entry) {
+                    if ctx.exits.contains(entry) {
                         trace.line(2, format_args!("empty branch exits loop -> break"));
                         return RecognizedShape::Break;
                     }
@@ -2060,7 +2060,7 @@ impl<'d> Structurer<'d> {
         node: usize,
         visiting: &mut IndexSet<usize>,
     ) -> Option<GuardBranch> {
-        if !loop_info.body.contains(&node) || self.has_statements(node) {
+        if !loop_info.body.contains(node) || self.has_statements(node) {
             return None;
         }
         if !visiting.insert(node) {
@@ -2073,14 +2073,14 @@ impl<'d> Structurer<'d> {
             else_edge,
         } = &self.graph.blocks[node].exit
         else {
-            visiting.remove(&node);
+            visiting.remove(node);
             return None;
         };
 
         let then_branch = self.recognize_while_guard_branch(loop_info, then_edge.target, visiting);
         let else_branch = self.recognize_while_guard_branch(loop_info, else_edge.target, visiting);
 
-        visiting.remove(&node);
+        visiting.remove(node);
 
         let then_branch = then_branch?;
         let else_branch = else_branch?;
@@ -2117,7 +2117,7 @@ impl<'d> Structurer<'d> {
         target: usize,
         visiting: &mut IndexSet<usize>,
     ) -> Option<GuardBranch> {
-        if !loop_info.body.contains(&target) {
+        if !loop_info.body.contains(target) {
             return Some(GuardBranch {
                 condition: Predicate::False,
                 body: None,
@@ -2126,7 +2126,7 @@ impl<'d> Structurer<'d> {
             });
         }
 
-        if !loop_info.latches.contains(&target)
+        if !loop_info.latches.contains(target)
             && !self.has_statements(target)
             && matches!(&self.graph.blocks[target].exit, BlockExit::Branch { .. })
             && self.conditional_has_loop_exit(loop_info, target)
@@ -2154,7 +2154,7 @@ impl<'d> Structurer<'d> {
             return false;
         };
 
-        !loop_info.body.contains(&then_edge.target) || !loop_info.body.contains(&else_edge.target)
+        !loop_info.body.contains(then_edge.target) || !loop_info.body.contains(else_edge.target)
     }
 
     /// Returns whether the loop can be represented as a `repeat until` loop.
@@ -2172,7 +2172,7 @@ impl<'d> Structurer<'d> {
             && self
                 .graph
                 .successors(loop_info.header)
-                .any(|target| !loop_info.body.contains(&target))
+                .any(|target| !loop_info.body.contains(target))
         {
             return false;
         }
@@ -2188,7 +2188,7 @@ impl<'d> Structurer<'d> {
     fn common_loop_follow(&self, loop_info: &LoopInfo) -> Option<usize> {
         // 1. Header's immediate post-dominator outside the loop
         if let Some(follow) = self.ipdoms.idom(loop_info.header)
-            && !loop_info.body.contains(&follow)
+            && !loop_info.body.contains(follow)
         {
             return Some(follow);
         }
@@ -2198,7 +2198,7 @@ impl<'d> Structurer<'d> {
         if let Some(lcd) = self
             .ipdoms
             .lowest_common_dominator(loop_info.exits.iter())
-            && loop_info.exits.contains(&lcd)
+            && loop_info.exits.contains(lcd)
         {
             return Some(lcd);
         }
@@ -2207,7 +2207,7 @@ impl<'d> Structurer<'d> {
         let mut follow = None;
         for exit in &loop_info.exits {
             let target = single_target(self.graph.successors(exit))?;
-            if loop_info.body.contains(&target) {
+            if loop_info.body.contains(target) {
                 return None;
             }
 
@@ -2230,8 +2230,8 @@ impl<'d> Structurer<'d> {
         // Nested conditionals may rejoin at the containing branch's merge.
         // Such a node is outside the nested scope by ownership, but it is
         // still ordinary fallthrough rather than a loop-control boundary.
-        ((scope.nodes.contains(&merge) && !scope.exits.contains(&merge))
-            || scope.merge_points.contains(&merge))
+        ((scope.nodes.contains(merge) && !scope.exits.contains(merge))
+            || scope.merge_points.contains(merge))
         .then_some(merge)
     }
 
@@ -2248,7 +2248,7 @@ impl<'d> Structurer<'d> {
 
         match &self.graph.blocks[block].exit {
             BlockExit::Jump(edge) | BlockExit::Fallthrough(edge)
-                if scope.merge_points.contains(&edge.target) =>
+                if scope.merge_points.contains(edge.target) =>
             {
                 trace.line(
                     2,
@@ -2258,8 +2258,8 @@ impl<'d> Structurer<'d> {
             }
             BlockExit::Jump(edge) | BlockExit::Fallthrough(edge)
                 if loop_ctx.is_some_and(|ctx| {
-                    ctx.continue_targets.contains(&edge.target)
-                        && !ctx.payload_continue_targets.contains(&edge.target)
+                    ctx.continue_targets.contains(edge.target)
+                        && !ctx.payload_continue_targets.contains(edge.target)
                 }) =>
             {
                 if suppress_exit == Some(edge.target)
@@ -2276,7 +2276,7 @@ impl<'d> Structurer<'d> {
                 }
 
                 if scope.allow_implicit_continue
-                    && loop_ctx.is_some_and(|ctx| ctx.implicit_tail_blocks.contains(&block))
+                    && loop_ctx.is_some_and(|ctx| ctx.implicit_tail_blocks.contains(block))
                 {
                     trace.line(
                         2,
@@ -2295,7 +2295,7 @@ impl<'d> Structurer<'d> {
                 RecognizedShape::sequence([block_shape, RecognizedShape::Continue])
             }
             BlockExit::Jump(edge) | BlockExit::Fallthrough(edge)
-                if loop_ctx.is_some_and(|ctx| ctx.exits.contains(&edge.target)) =>
+                if loop_ctx.is_some_and(|ctx| ctx.exits.contains(edge.target)) =>
             {
                 trace.line(
                     2,
@@ -2323,16 +2323,16 @@ impl<'d> Structurer<'d> {
 
         while let Some(node) = stack.pop() {
             let owns_boundary_entry = include_boundary_entry && node == entry;
-            if !scope.nodes.contains(&node) && !owns_boundary_entry {
+            if !scope.nodes.contains(node) && !owns_boundary_entry {
                 continue;
             }
-            if exits.contains(&node) && !owns_boundary_entry {
+            if exits.contains(node) && !owns_boundary_entry {
                 continue;
             }
             if !nodes.insert(node) {
                 continue;
             }
-            if exits.contains(&node) {
+            if exits.contains(node) {
                 continue;
             }
 
@@ -2439,13 +2439,13 @@ fn natural_loop_body(
 
     let mut stack = vec![latch];
     while let Some(node) = stack.pop() {
-        if !reachable.contains(&node) {
+        if !reachable.contains(node) {
             continue;
         }
 
         if body.insert(node) && node != header {
             for pred in cfg.predecessors(node) {
-                if reachable.contains(&pred) {
+                if reachable.contains(pred) {
                     stack.push(pred);
                 }
             }
