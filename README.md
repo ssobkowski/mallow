@@ -108,7 +108,7 @@ mallow decompile <bytecode> --emit=ir
 **visualize** - generate an interactive CFG as HTML (requires `--features visualize`):
 
 ```sh
-mallow visualize <bytecode> -o <output.html>
+mallow visualize <bytecode> > <output.html>
 ```
 
 ### Managed Luau toolchain

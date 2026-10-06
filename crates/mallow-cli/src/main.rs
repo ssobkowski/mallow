@@ -4,7 +4,6 @@ mod input;
 mod toolchain;
 
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -41,7 +40,7 @@ struct Cli {
     /// Write a Chrome trace profile to this path.
     #[cfg(feature = "profile")]
     #[arg(long, global = true, value_name = "PATH")]
-    profile_output: Option<PathBuf>,
+    profile_output: Option<std::path::PathBuf>,
 }
 
 /// Output form selected by the command line.
@@ -69,10 +68,6 @@ impl Emit {
 /// Decompiler settings shared by commands that emit decompiled output.
 #[derive(Debug, clap::Args)]
 struct DecompileArgs {
-    /// Output file path. Prints to stdout if omitted
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-
     /// Output form to emit
     #[arg(long, value_enum, default_value = "source")]
     emit: Emit,
@@ -108,10 +103,6 @@ enum Commands {
         /// Input to disassemble.
         #[command(flatten)]
         input: InputArgs,
-
-        /// Output file path. Prints to stdout if omitted
-        #[arg(short, long)]
-        output: Option<PathBuf>,
     },
     /// Decompile bytecode into the selected output form
     Decompile {
@@ -129,10 +120,6 @@ enum Commands {
         /// Input to visualize.
         #[command(flatten)]
         input: InputArgs,
-
-        /// Output file path
-        #[arg(short, long)]
-        output: PathBuf,
     },
     /// Manage the Luau releases used for compilation and testing
     #[cfg(feature = "luau-toolchain")]
@@ -149,12 +136,11 @@ fn main() -> Result<ExitCode> {
     let diagnostics = Diagnostics::new(diagnostic_config);
 
     match cli.command {
-        Commands::Disasm { input, output } => {
+        Commands::Disasm { input } => {
             let bytecode = input.bytecode()?;
 
             let chunk = disassemble_bytecode_with_diagnostics(&bytecode, &diagnostics)?;
-            let mut out = get_output(output)?;
-            chunk.dump(&mut out)?;
+            chunk.dump(&mut std::io::stdout().lock())?;
         }
         Commands::Decompile { input, decompile } => {
             let bytecode = input.bytecode()?;
@@ -165,24 +151,17 @@ fn main() -> Result<ExitCode> {
             let code =
                 decompile_bytecode_with_diagnostics(&bytecode, decompile.options(), &diagnostics)?;
 
-            let mut out = get_output(decompile.output)?;
-            out.write_all(code.as_bytes())?;
+            std::io::stdout().lock().write_all(code.as_bytes())?;
         }
         #[cfg(feature = "visualize")]
-        Commands::Visualize { input, output } => {
+        Commands::Visualize { input } => {
             let bytecode = input.bytecode()?;
-            mallow_core::visualize_bytecode(&bytecode, output, &diagnostics)?;
+            let html = mallow_core::visualize_bytecode(&bytecode, &diagnostics)?;
+            std::io::stdout().lock().write_all(html.as_bytes())?;
         }
         #[cfg(feature = "luau-toolchain")]
         Commands::Toolchain { command } => return command.run(),
     }
 
     Ok(ExitCode::SUCCESS)
-}
-
-fn get_output(path: Option<PathBuf>) -> std::io::Result<Box<dyn std::io::Write>> {
-    match path {
-        Some(path) => Ok(Box::new(std::fs::File::create(path)?)),
-        None => Ok(Box::new(std::io::stdout())),
-    }
 }

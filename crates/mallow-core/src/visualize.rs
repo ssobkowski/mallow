@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use serde_json::{Value, json};
 
 use crate::Unit;
@@ -307,7 +305,8 @@ fn add_edge<G: GraphView<Node = usize>>(
     });
 }
 
-pub fn dump_cfgs(unit: &Unit<Function>, output: PathBuf) {
+/// Renders the control-flow graphs of every function in `unit` as a standalone HTML page.
+pub fn render_cfgs(unit: &Unit<Function>) -> String {
     let payloads: Vec<_> = unit
         .functions()
         .map(|function| graph_payload(&function, &format!("Proto {}", function.id.0)))
@@ -319,9 +318,7 @@ pub fn dump_cfgs(unit: &Unit<Function>, output: PathBuf) {
     );
 
     let graphs_json = build_graphs_json(&payloads);
-    let html = build_html(&graphs_json, unit.entry().0 as usize, &title);
-
-    std::fs::write(&output, &html).expect("failed to write cfg html");
+    build_html(&graphs_json, unit.entry().0 as usize, &title)
 }
 
 fn build_elk_json(

@@ -33,7 +33,7 @@ profile file *args:
 
 # Render a CFG visualization
 viz file out *args:
-    cargo run -q -p mallow-cli --features visualize,luau-toolchain -- visualize {{file}} -o {{out}} {{args}}
+    cargo run -q -p mallow-cli --features visualize,luau-toolchain -- visualize {{file}} {{args}} > {{out}}
 
 # Run the whole test suite with every feature enabled
 test *args:

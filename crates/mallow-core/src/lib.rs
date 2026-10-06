@@ -256,17 +256,12 @@ pub fn decompile_bytecode_with_diagnostics(
     }
 }
 
-/// Generates a control-flow graph visualization from Luau bytecode.
+/// Renders a control-flow graph visualization of Luau bytecode as a standalone HTML page.
 #[cfg(feature = "visualize")]
-pub fn visualize_bytecode(
-    bytecode: &[u8],
-    output: impl AsRef<std::path::Path>,
-    diagnostics: &Diagnostics,
-) -> Result<()> {
+pub fn visualize_bytecode(bytecode: &[u8], diagnostics: &Diagnostics) -> Result<String> {
     let span = tracing::info_span!("visualize_bytecode", byte_len = bytecode.len());
     let _enter = span.enter();
 
     let unit = lift_bytecode_with_diagnostics(bytecode, diagnostics)?;
-    visualize::dump_cfgs(&unit, output.as_ref().to_path_buf());
-    Ok(())
+    Ok(visualize::render_cfgs(&unit))
 }
