@@ -8,6 +8,7 @@ mod ir;
 mod logging;
 mod operator;
 mod printer;
+pub mod style;
 
 #[cfg(feature = "visualize")]
 mod visualize;
@@ -18,9 +19,9 @@ pub use logging::{
 };
 
 use crate::disasm::Chunk;
-use crate::il::{BytecodeType, TypeTag};
 use crate::ir::{Unit, fir};
 use crate::logging::{LogLevel as DiagnosticLevel, LogTarget as DiagnosticTarget};
+use crate::style::StyledWrite;
 
 /// Output form produced by bytecode decompilation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -109,7 +110,7 @@ pub fn disassemble_bytecode_with_diagnostics(
                 .params
                 .iter()
                 .enumerate()
-                .map(|(i, tag)| format!("R{i}: {}", format_type_tag(*tag, &chunk)))
+                .map(|(i, tag)| format!("R{i}: {}", chunk.type_name(*tag)))
                 .collect::<Vec<_>>()
                 .join(", ");
             info.line(
@@ -121,10 +122,7 @@ pub fn disassemble_bytecode_with_diagnostics(
         if !type_info.upvalues.is_empty() {
             info.line(3, format_args!("upvalues:"));
             for (index, tag) in type_info.upvalues.iter().enumerate() {
-                info.line(
-                    4,
-                    format_args!("U{index}: {}", format_type_tag(*tag, &chunk)),
-                );
+                info.line(4, format_args!("U{index}: {}", chunk.type_name(*tag)));
             }
         }
 
@@ -136,7 +134,7 @@ pub fn disassemble_bytecode_with_diagnostics(
                     format_args!(
                         "R{}: {} from {} to {}",
                         local.register,
-                        format_type_tag(local.ty, &chunk),
+                        chunk.type_name(local.ty),
                         local.start_pc,
                         local.end_pc
                     ),
@@ -146,28 +144,6 @@ pub fn disassemble_bytecode_with_diagnostics(
     }
 
     Ok(chunk)
-}
-
-fn format_type_tag(tag: TypeTag, chunk: &Chunk) -> String {
-    let mut base = match tag.ty {
-        BytecodeType::TaggedUserdata(index) => chunk
-            .userdata_type_mappings
-            .as_ref()
-            .and_then(|mappings| {
-                mappings
-                    .iter()
-                    .find(|mapping| mapping.index == index)
-                    .map(|mapping| format!("{:?}", mapping.name))
-            })
-            .unwrap_or_else(|| format!("tagged-userdata[{index}]")),
-        _ => tag.ty.to_string(),
-    };
-
-    if tag.optional {
-        base.push('?');
-    }
-
-    base
 }
 
 /// Lifts Luau bytecode into the FIR.
@@ -201,6 +177,18 @@ pub fn decompile_bytecode_with_diagnostics(
     options: DecompileOptions,
     diagnostics: &Diagnostics,
 ) -> Result<String> {
+    let mut out = String::new();
+    decompile_bytecode_into(bytecode, options, diagnostics, &mut out)?;
+    Ok(out)
+}
+
+/// Emits Luau bytecode into a styled sink using an already constructed diagnostics context.
+pub fn decompile_bytecode_into<W: StyledWrite>(
+    bytecode: &[u8],
+    options: DecompileOptions,
+    diagnostics: &Diagnostics,
+    out: &mut W,
+) -> Result<()> {
     let span = tracing::info_span!(
         "decompile_bytecode",
         byte_len = bytecode.len(),
@@ -217,8 +205,6 @@ pub fn decompile_bytecode_with_diagnostics(
     let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
     let unit = ir::fir::lift(chunk)?;
 
-    use core::fmt::Write;
-
     match options.emit {
         EmitMode::Source => {
             let types = bytecode_types::BytecodeTypes::read(&unit);
@@ -232,28 +218,26 @@ pub fn decompile_bytecode_with_diagnostics(
                 ir::nir::materialize::destroy_ssa(function);
             }
             let block = emitter::emit_ast(nested_unit, &types, options)?;
-            Ok(printer::print(&block))
+            out.write_str(&printer::print(&block))?;
         }
         EmitMode::Ir | EmitMode::Nir => {
-            let mut out = String::new();
             for (index, function) in unit.into_iter().enumerate() {
                 if index != 0 {
-                    out.push_str("\n\n");
+                    out.write_str("\n\n")?;
                 }
                 match options.emit {
-                    EmitMode::Ir => write!(out, "{function}"),
+                    EmitMode::Ir => function.write(out)?,
                     EmitMode::Nir => {
                         let diagnostics = diagnostics.for_proto(function.id.0);
                         let function = ir::nir::lift(function, &diagnostics)?;
-                        write!(out, "{function:#?}")
+                        write!(out, "{function:#?}")?;
                     }
                     EmitMode::Source => unreachable!("handled above"),
                 }
-                .expect("writing should not fail here");
             }
-            Ok(out)
         }
     }
+    Ok(())
 }
 
 /// Renders a control-flow graph visualization of Luau bytecode as a standalone HTML page.

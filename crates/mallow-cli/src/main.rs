@@ -1,5 +1,6 @@
 mod diagnostics;
 mod input;
+mod render;
 #[cfg(feature = "luau-toolchain")]
 mod toolchain;
 
@@ -10,11 +11,12 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use mallow_core::{
     DEFAULT_MAX_PASS_ITERATIONS, DecompileOptions, Diagnostics, EmitMode, LogLevel, LogTarget,
-    ProtoSelector, decompile_bytecode_with_diagnostics, disassemble_bytecode_with_diagnostics,
+    ProtoSelector, decompile_bytecode_into, disassemble_bytecode_with_diagnostics,
 };
 
 use crate::diagnostics::{CliLogLevel, CliLogTarget};
 use crate::input::InputArgs;
+use crate::render::{ColorChoice, StdoutPainter};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -24,6 +26,16 @@ struct Cli {
 
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// When to color output.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "WHEN",
+        default_value = "auto"
+    )]
+    color: ColorChoice,
 
     /// Diagnostic verbosity. Use with --log-target and --log-proto for large files.
     #[arg(long, global = true, value_enum)]
@@ -134,13 +146,18 @@ fn main() -> Result<ExitCode> {
     let diagnostic_config = diagnostics::diagnostic_config(&cli);
     let _tracing_guard = diagnostics::init_tracing(&cli);
     let diagnostics = Diagnostics::new(diagnostic_config);
+    cli.color.apply();
 
     match cli.command {
         Commands::Disasm { input } => {
             let bytecode = input.bytecode()?;
 
             let chunk = disassemble_bytecode_with_diagnostics(&bytecode, &diagnostics)?;
-            chunk.dump(&mut std::io::stdout().lock())?;
+            let mut out = StdoutPainter::default();
+            chunk.write_listing(&mut out)?;
+            std::io::stdout()
+                .lock()
+                .write_all(out.as_str().as_bytes())?;
         }
         Commands::Decompile { input, decompile } => {
             let bytecode = input.bytecode()?;
@@ -148,10 +165,11 @@ fn main() -> Result<ExitCode> {
             diagnostics
                 .at(LogLevel::Info, LogTarget::Driver)
                 .line(0, format_args!("decompiling..."));
-            let code =
-                decompile_bytecode_with_diagnostics(&bytecode, decompile.options(), &diagnostics)?;
-
-            std::io::stdout().lock().write_all(code.as_bytes())?;
+            let mut out = StdoutPainter::default();
+            decompile_bytecode_into(&bytecode, decompile.options(), &diagnostics, &mut out)?;
+            std::io::stdout()
+                .lock()
+                .write_all(out.as_str().as_bytes())?;
         }
         #[cfg(feature = "visualize")]
         Commands::Visualize { input } => {

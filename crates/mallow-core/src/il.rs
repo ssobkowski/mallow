@@ -31,7 +31,6 @@ pub struct ImportPath(pub u32);
 
 impl ImportPath {
     /// Returns an iterator over the [`ConstId`]s referenced by this import path.
-    #[inline]
     pub fn const_ids(self) -> Result<impl Iterator<Item = ConstId>> {
         let path = self.0;
         let count = (path >> 30) as usize;
@@ -72,8 +71,6 @@ pub enum Count {
 }
 
 impl Count {
-    #[inline]
-    #[must_use]
     pub const fn new(encoded: u8) -> Self {
         match encoded {
             0 => Count::Variadic,
@@ -82,15 +79,12 @@ impl Count {
     }
 
     /// Returns whether this count is variadic.
-    #[inline]
-    #[must_use]
     pub const fn is_variadic(&self) -> bool {
         matches!(self, Count::Variadic)
     }
 }
 
 impl From<u8> for Count {
-    #[inline]
     fn from(encoded: u8) -> Self {
         Count::new(encoded)
     }
@@ -898,213 +892,418 @@ impl Instr {
     }
 }
 
-impl fmt::Display for Instr {
+/// One operand of an instruction, as it appears in a listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operand {
+    /// A register.
+    Reg(u8),
+    /// An upvalue slot.
+    Upval(u8),
+    /// An index into the constant table.
+    Const(u32),
+    /// An index into the constant table holding an import path.
+    Import(u16),
+    /// An index into the child proto table.
+    ChildProto(u16),
+    /// An immediate integer.
+    Int(i64),
+    /// An immediate boolean.
+    Bool(bool),
+    /// An encoded count, where zero means "up to the top of the stack".
+    Count(u8),
+    /// An encoded table hash size, `0` or `ceil(log2(size)) + 1`.
+    HashSize(u8),
+    /// A branch offset in words, relative to the next instruction word.
+    Jump(i32),
+    /// A fastcall skip distance in instructions.
+    Skip(u8),
+    /// A fastcall builtin function id.
+    Builtin(u8),
+    /// A CAPTURE kind.
+    Capture(u8),
+    /// The inversion flag of a `JUMPXEQK*` instruction.
+    Not,
+}
+
+impl fmt::Display for Operand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            // basic loads/moves
-            Instr::Nop => write!(f, "NOP"),
-            Instr::Break => write!(f, "BREAK"),
-            Instr::LoadNil { reg } => write!(f, "LOADNIL R{reg}"),
-            Instr::LoadB { reg, value, jump } => write!(f, "LOADB R{reg} {value} +{jump}"),
-            Instr::LoadN { reg, value } => write!(f, "LOADN R{reg} {value}"),
-            Instr::LoadK { reg, index } => write!(f, "LOADK R{reg} K{index}"),
-            Instr::Move { dest, src } => write!(f, "MOVE R{dest} R{src}"),
+            Operand::Reg(reg) => write!(f, "R{reg}"),
+            Operand::Upval(upval) => write!(f, "U{upval}"),
+            Operand::Const(k) => write!(f, "K{k}"),
+            Operand::Import(k) => write!(f, "{k}"),
+            Operand::ChildProto(proto) => write!(f, "P{proto}"),
+            Operand::Int(value) => write!(f, "{value}"),
+            Operand::Bool(value) => write!(f, "{value}"),
+            Operand::Count(count) | Operand::HashSize(count) => write!(f, "{count}"),
+            Operand::Jump(offset) => write!(f, "{offset:+}"),
+            Operand::Skip(skip) => write!(f, "+{skip}"),
+            Operand::Builtin(builtin) | Operand::Capture(builtin) => write!(f, "{builtin}"),
+            Operand::Not => write!(f, "!"),
+        }
+    }
+}
 
-            // globals/upvalues/imports
-            // `slot` is a runtime cache hint, not meaningful in disassembly
-            Instr::GetGlobal { dest, key, .. } => write!(f, "GETGLOBAL R{dest} K{key}"),
-            Instr::SetGlobal { src, key, .. } => write!(f, "SETGLOBAL R{src} K{key}"),
-            Instr::GetUpval { dest, upval } => write!(f, "GETUPVAL R{dest} U{upval}"),
-            Instr::SetUpval { src, upval } => write!(f, "SETUPVAL R{src} U{upval}"),
-            Instr::CloseUpvals { reg } => write!(f, "CLOSEUPVALS R{reg}"),
-            // `path` is the aux word encoding the import chain, shown separately if needed
-            Instr::GetImport { dest, index, .. } => write!(f, "GETIMPORT R{dest} {index}"),
+/// The operands of one instruction, in listing order.
+pub type Operands = SmallVec<[Operand; 4]>;
 
-            // table access
-            Instr::GetTable { dest, table, key } => write!(f, "GETTABLE R{dest} R{table} R{key}"),
-            Instr::SetTable { src, table, key } => write!(f, "SETTABLE R{src} R{table} R{key}"),
+impl Instr {
+    /// Returns the assembly mnemonic of this instruction.
+    #[must_use]
+    pub const fn mnemonic(&self) -> &'static str {
+        match self {
+            Instr::Nop => "NOP",
+            Instr::Break => "BREAK",
+            Instr::LoadNil { .. } => "LOADNIL",
+            Instr::LoadB { .. } => "LOADB",
+            Instr::LoadN { .. } => "LOADN",
+            Instr::LoadK { .. } => "LOADK",
+            Instr::Move { .. } => "MOVE",
+            Instr::GetGlobal { .. } => "GETGLOBAL",
+            Instr::SetGlobal { .. } => "SETGLOBAL",
+            Instr::GetUpval { .. } => "GETUPVAL",
+            Instr::SetUpval { .. } => "SETUPVAL",
+            Instr::CloseUpvals { .. } => "CLOSEUPVALS",
+            Instr::GetImport { .. } => "GETIMPORT",
+            Instr::GetTable { .. } => "GETTABLE",
+            Instr::SetTable { .. } => "SETTABLE",
+            Instr::GetTableKS { .. } => "GETTABLEKS",
+            Instr::SetTableKS { .. } => "SETTABLEKS",
+            Instr::GetTableN { .. } => "GETTABLEN",
+            Instr::SetTableN { .. } => "SETTABLEN",
+            Instr::NewClosure { .. } => "NEWCLOSURE",
+            Instr::NameCall { .. } => "NAMECALL",
+            Instr::Call { .. } => "CALL",
+            Instr::Return { .. } => "RETURN",
+            Instr::Jump { .. } => "JUMP",
+            Instr::JumpBack { .. } => "JUMPBACK",
+            Instr::JumpIf { .. } => "JUMPIF",
+            Instr::JumpIfNot { .. } => "JUMPIFNOT",
+            Instr::JumpIfEq { .. } => "JUMPIFEQ",
+            Instr::JumpIfLe { .. } => "JUMPIFLE",
+            Instr::JumpIfLt { .. } => "JUMPIFLT",
+            Instr::JumpIfNotEq { .. } => "JUMPIFNOTEQ",
+            Instr::JumpIfNotLe { .. } => "JUMPIFNOTLE",
+            Instr::JumpIfNotLt { .. } => "JUMPIFNOTLT",
+            Instr::Add { .. } => "ADD",
+            Instr::Sub { .. } => "SUB",
+            Instr::Mul { .. } => "MUL",
+            Instr::Div { .. } => "DIV",
+            Instr::Mod { .. } => "MOD",
+            Instr::Pow { .. } => "POW",
+            Instr::AddK { .. } => "ADDK",
+            Instr::SubK { .. } => "SUBK",
+            Instr::MulK { .. } => "MULK",
+            Instr::DivK { .. } => "DIVK",
+            Instr::ModK { .. } => "MODK",
+            Instr::PowK { .. } => "POWK",
+            Instr::And { .. } => "AND",
+            Instr::Or { .. } => "OR",
+            Instr::AndK { .. } => "ANDK",
+            Instr::OrK { .. } => "ORK",
+            Instr::Concat { .. } => "CONCAT",
+            Instr::Not { .. } => "NOT",
+            Instr::Minus { .. } => "MINUS",
+            Instr::Length { .. } => "LENGTH",
+            Instr::NewTable { .. } => "NEWTABLE",
+            Instr::DupTable { .. } => "DUPTABLE",
+            Instr::SetList { .. } => "SETLIST",
+            Instr::FornPrep { .. } => "FORNPREP",
+            Instr::FornLoop { .. } => "FORNLOOP",
+            Instr::ForgLoop { .. } => "FORGLOOP",
+            Instr::ForgPrepInext { .. } => "FORGPREP_INEXT",
+            Instr::FastCall3 { .. } => "FASTCALL3",
+            Instr::ForgPrepNext { .. } => "FORGPREP_NEXT",
+            Instr::NativeCall => "NATIVECALL",
+            Instr::GetVarArgs { .. } => "GETVARARGS",
+            Instr::DupClosure { .. } => "DUPCLOSURE",
+            Instr::PrepVarArgs { .. } => "PREPVARARGS",
+            Instr::LoadKX { .. } => "LOADKX",
+            Instr::JumpX { .. } => "JUMPX",
+            Instr::FastCall { .. } => "FASTCALL",
+            Instr::Coverage => "COVERAGE",
+            Instr::Capture { .. } => "CAPTURE",
+            Instr::SubRK { .. } => "SUBRK",
+            Instr::DivRK { .. } => "DIVRK",
+            Instr::FastCall1 { .. } => "FASTCALL1",
+            Instr::FastCall2 { .. } => "FASTCALL2",
+            Instr::FastCall2K { .. } => "FASTCALL2K",
+            Instr::ForgPrep { .. } => "FORGPREP",
+            Instr::JumpXEqKNil { .. } => "JUMPXEQKNIL",
+            Instr::JumpXEqKB { .. } => "JUMPXEQKB",
+            Instr::JumpXEqKN { .. } => "JUMPXEQKN",
+            Instr::JumpXEqKS { .. } => "JUMPXEQKS",
+            Instr::IDiv { .. } => "IDIV",
+            Instr::IDivK { .. } => "IDIVK",
+            Instr::GetUDataKS { .. } => "GETUDATAKS",
+            Instr::SetUDataKS { .. } => "SETUDATAKS",
+            Instr::NameCallUData { .. } => "NAMECALLUDATA",
+        }
+    }
+
+    /// Returns the operands of this instruction in listing order.
+    ///
+    /// Runtime cache hints (`slot` fields) and aux words already folded into
+    /// another operand are left out.
+    #[must_use]
+    pub fn operands(&self) -> Operands {
+        use Operand::{
+            Bool, Builtin, ChildProto, Const, Count, HashSize, Import, Int, Jump, Reg, Skip, Upval,
+        };
+
+        let mut ops: Operands = match *self {
+            Instr::Nop | Instr::Break | Instr::NativeCall | Instr::Coverage => smallvec![],
+
+            Instr::LoadNil { reg } => smallvec![Reg(reg)],
+            Instr::LoadB { reg, value, jump } if jump > 0 => {
+                smallvec![Reg(reg), Bool(value), Jump(jump.into())]
+            }
+            Instr::LoadB { reg, value, .. } => smallvec![Reg(reg), Bool(value)],
+            Instr::LoadN { reg, value } => smallvec![Reg(reg), Int(value.into())],
+            Instr::LoadK { reg, index } => smallvec![Reg(reg), Const(index.into())],
+            Instr::LoadKX { reg, index } => smallvec![Reg(reg), Const(index)],
+            Instr::Move { dest, src } => smallvec![Reg(dest), Reg(src)],
+
+            Instr::GetGlobal { dest: reg, key, .. } | Instr::SetGlobal { src: reg, key, .. } => {
+                smallvec![Reg(reg), Const(key)]
+            }
+            Instr::GetUpval { dest: reg, upval } | Instr::SetUpval { src: reg, upval } => {
+                smallvec![Reg(reg), Upval(upval)]
+            }
+            Instr::CloseUpvals { reg } => smallvec![Reg(reg)],
+            Instr::GetImport { dest, index, .. } => smallvec![Reg(dest), Import(index)],
+
+            Instr::GetTable {
+                dest: a,
+                table,
+                key,
+            }
+            | Instr::SetTable { src: a, table, key } => smallvec![Reg(a), Reg(table), Reg(key)],
             Instr::GetTableKS {
-                dest, table, key, ..
-            } => write!(f, "GETTABLEKS R{dest} R{table} K{key}"),
-            Instr::SetTableKS {
-                src, table, key, ..
-            } => write!(f, "SETTABLEKS R{src} R{table} K{key}"),
-            Instr::GetUDataKS {
-                dest,
-                userdata,
+                dest: a,
+                table,
                 key,
                 ..
-            } => write!(f, "GETUDATAKS R{dest} R{userdata} K{key}"),
-            Instr::SetUDataKS {
-                src, userdata, key, ..
-            } => write!(f, "SETUDATAKS R{src} R{userdata} K{key}"),
-            Instr::GetTableN { dest, table, index } => {
-                write!(f, "GETTABLEN R{dest} R{table} {index}")
             }
-            Instr::SetTableN { src, table, index } => {
-                write!(f, "SETTABLEN R{src} R{table} {index}")
+            | Instr::SetTableKS {
+                src: a, table, key, ..
             }
-            Instr::NewClosure { dest, proto } => write!(f, "NEWCLOSURE R{dest} P{proto}"),
-            Instr::NameCall {
-                dest,
-                object,
-                method,
+            | Instr::NameCall {
+                dest: a,
+                object: table,
+                method: key,
                 ..
-            } => write!(f, "NAMECALL R{dest} R{object} K{method}"),
-            Instr::NameCallUData {
-                dest,
-                object,
-                method,
+            } => smallvec![Reg(a), Reg(table), Const(key)],
+            Instr::GetUDataKS {
+                dest: a,
+                userdata: table,
+                key,
                 ..
-            } => write!(f, "NAMECALLUDATA R{dest} R{object} K{method}"),
+            }
+            | Instr::SetUDataKS {
+                src: a,
+                userdata: table,
+                key,
+                ..
+            }
+            | Instr::NameCallUData {
+                dest: a,
+                object: table,
+                method: key,
+                ..
+            } => smallvec![Reg(a), Reg(table), Const(key.into())],
+            Instr::GetTableN {
+                dest: a,
+                table,
+                index,
+            }
+            | Instr::SetTableN {
+                src: a,
+                table,
+                index,
+            } => {
+                smallvec![Reg(a), Reg(table), Int(index.into())]
+            }
+            Instr::NewClosure { dest, proto } => smallvec![Reg(dest), ChildProto(proto)],
 
-            // calls, returns, branches
             Instr::Call {
                 func,
                 arg_count,
                 ret_count,
-            } => write!(f, "CALL R{func} {arg_count} {ret_count}"),
-            Instr::Return { base, count } => write!(f, "RETURN R{base} {count}"),
-            Instr::Jump { offset } => write!(f, "JUMP {offset:+}"),
-            Instr::JumpBack { offset } => write!(f, "JUMPBACK {offset:+}"),
-            Instr::JumpIf { reg, offset } => write!(f, "JUMPIF R{reg} {offset:+}"),
-            Instr::JumpIfNot { reg, offset } => write!(f, "JUMPIFNOT R{reg} {offset:+}"),
-            Instr::JumpIfEq { reg, aux, offset } => write!(f, "JUMPIFEQ R{reg} R{aux} {offset:+}"),
-            Instr::JumpIfLe { reg, aux, offset } => write!(f, "JUMPIFLE R{reg} R{aux} {offset:+}"),
-            Instr::JumpIfLt { reg, aux, offset } => write!(f, "JUMPIFLT R{reg} R{aux} {offset:+}"),
-            Instr::JumpIfNotEq { reg, aux, offset } => {
-                write!(f, "JUMPIFNOTEQ R{reg} R{aux} {offset:+}")
+            } => smallvec![Reg(func), Count(arg_count), Count(ret_count)],
+            Instr::Return { base, count } => smallvec![Reg(base), Count(count)],
+            Instr::Jump { offset } | Instr::JumpBack { offset } => smallvec![Jump(offset.into())],
+            Instr::JumpX { offset } => smallvec![Jump(offset)],
+            Instr::JumpIf { reg, offset } | Instr::JumpIfNot { reg, offset } => {
+                smallvec![Reg(reg), Jump(offset.into())]
             }
-            Instr::JumpIfNotLe { reg, aux, offset } => {
-                write!(f, "JUMPIFNOTLE R{reg} R{aux} {offset:+}")
-            }
-            Instr::JumpIfNotLt { reg, aux, offset } => {
-                write!(f, "JUMPIFNOTLT R{reg} R{aux} {offset:+}")
+            Instr::JumpIfEq { reg, aux, offset }
+            | Instr::JumpIfLe { reg, aux, offset }
+            | Instr::JumpIfLt { reg, aux, offset }
+            | Instr::JumpIfNotEq { reg, aux, offset }
+            | Instr::JumpIfNotLe { reg, aux, offset }
+            | Instr::JumpIfNotLt { reg, aux, offset } => {
+                smallvec![Reg(reg), Reg(aux), Jump(offset.into())]
             }
 
-            // arithmetic/logical/unary
-            Instr::Add { dest, a, b } => write!(f, "ADD R{dest} R{a} R{b}"),
-            Instr::Sub { dest, a, b } => write!(f, "SUB R{dest} R{a} R{b}"),
-            Instr::Mul { dest, a, b } => write!(f, "MUL R{dest} R{a} R{b}"),
-            Instr::Div { dest, a, b } => write!(f, "DIV R{dest} R{a} R{b}"),
-            Instr::Mod { dest, a, b } => write!(f, "MOD R{dest} R{a} R{b}"),
-            Instr::Pow { dest, a, b } => write!(f, "POW R{dest} R{a} R{b}"),
-            Instr::AddK { dest, reg, k } => write!(f, "ADDK R{dest} R{reg} K{k}"),
-            Instr::SubK { dest, reg, k } => write!(f, "SUBK R{dest} R{reg} K{k}"),
-            Instr::MulK { dest, reg, k } => write!(f, "MULK R{dest} R{reg} K{k}"),
-            Instr::DivK { dest, reg, k } => write!(f, "DIVK R{dest} R{reg} K{k}"),
-            Instr::ModK { dest, reg, k } => write!(f, "MODK R{dest} R{reg} K{k}"),
-            Instr::PowK { dest, reg, k } => write!(f, "POWK R{dest} R{reg} K{k}"),
-            Instr::And { dest, a, b } => write!(f, "AND R{dest} R{a} R{b}"),
-            Instr::Or { dest, a, b } => write!(f, "OR R{dest} R{a} R{b}"),
-            Instr::AndK { dest, reg, k } => write!(f, "ANDK R{dest} R{reg} K{k}"),
-            Instr::OrK { dest, reg, k } => write!(f, "ORK R{dest} R{reg} K{k}"),
-            Instr::Concat { dest, a, b } => write!(f, "CONCAT R{dest} R{a} R{b}"),
-            Instr::Not { dest, reg } => write!(f, "NOT R{dest} R{reg}"),
-            Instr::Minus { dest, reg } => write!(f, "MINUS R{dest} R{reg}"),
-            Instr::Length { dest, reg } => write!(f, "LENGTH R{dest} R{reg}"),
+            Instr::Add { dest, a, b }
+            | Instr::Sub { dest, a, b }
+            | Instr::Mul { dest, a, b }
+            | Instr::Div { dest, a, b }
+            | Instr::Mod { dest, a, b }
+            | Instr::Pow { dest, a, b }
+            | Instr::IDiv { dest, a, b }
+            | Instr::And { dest, a, b }
+            | Instr::Or { dest, a, b }
+            | Instr::Concat { dest, a, b } => smallvec![Reg(dest), Reg(a), Reg(b)],
+            Instr::AddK { dest, reg, k }
+            | Instr::SubK { dest, reg, k }
+            | Instr::MulK { dest, reg, k }
+            | Instr::DivK { dest, reg, k }
+            | Instr::ModK { dest, reg, k }
+            | Instr::PowK { dest, reg, k }
+            | Instr::IDivK { dest, reg, k }
+            | Instr::AndK { dest, reg, k }
+            | Instr::OrK { dest, reg, k } => smallvec![Reg(dest), Reg(reg), Const(k.into())],
+            Instr::SubRK { dest, k, reg } | Instr::DivRK { dest, k, reg } => {
+                smallvec![Reg(dest), Const(k.into()), Reg(reg)]
+            }
+            Instr::Not { dest, reg } | Instr::Minus { dest, reg } | Instr::Length { dest, reg } => {
+                smallvec![Reg(dest), Reg(reg)]
+            }
 
-            // table construction and loop ops
             Instr::NewTable {
                 dest,
                 hash_size,
                 array_size,
-            } => write!(f, "NEWTABLE R{dest} {hash_size} {array_size}"),
-            Instr::DupTable { dest, k } => write!(f, "DUPTABLE R{dest} K{k}"),
+            } => smallvec![Reg(dest), HashSize(hash_size), Int(array_size.into())],
+            Instr::DupTable { dest, k } => smallvec![Reg(dest), Const(k.into())],
             Instr::SetList {
                 table,
                 base,
                 count,
                 index,
-            } => write!(f, "SETLIST R{table} R{base} {count} {index}"),
-            Instr::FornPrep { base, offset } => write!(f, "FORNPREP R{base} {offset:+}"),
-            Instr::FornLoop { base, offset } => write!(f, "FORNLOOP R{base} {offset:+}"),
+            } => smallvec![Reg(table), Reg(base), Count(count), Int(index.into())],
+            Instr::FornPrep { base, offset }
+            | Instr::FornLoop { base, offset }
+            | Instr::ForgPrep { base, offset }
+            | Instr::ForgPrepInext { base, offset }
+            | Instr::ForgPrepNext { base, offset } => smallvec![Reg(base), Jump(offset.into())],
             Instr::ForgLoop {
                 base,
                 offset,
                 var_count,
                 ..
-            } => write!(f, "FORGLOOP R{base} {offset:+} {var_count}"),
-            Instr::ForgPrepInext { base, offset } => write!(f, "FORGPREP_INEXT R{base} {offset:+}"),
-            Instr::ForgPrepNext { base, offset } => write!(f, "FORGPREP_NEXT R{base} {offset:+}"),
-            Instr::ForgPrep { base, offset } => write!(f, "FORGPREP R{base} {offset:+}"),
+            } => smallvec![Reg(base), Jump(offset.into()), Int(var_count.into())],
 
-            // fastcall, varargs, closure helpers, extended ops
-            Instr::FastCall { builtin, jump } => write!(f, "FASTCALL {builtin} {jump:+}"),
+            Instr::FastCall { builtin, jump } => smallvec![Builtin(builtin), Skip(jump)],
             Instr::FastCall1 { builtin, arg, jump } => {
-                write!(f, "FASTCALL1 {builtin} R{arg} {jump:+}")
+                smallvec![Builtin(builtin), Reg(arg), Skip(jump)]
             }
             Instr::FastCall2 {
                 builtin,
                 arg1,
                 arg2,
                 jump,
-            } => write!(f, "FASTCALL2 {builtin} R{arg1} R{arg2} {jump:+}"),
+            } => smallvec![Builtin(builtin), Reg(arg1), Reg(arg2), Skip(jump)],
             Instr::FastCall2K {
                 builtin,
                 arg,
                 k,
                 jump,
-            } => write!(f, "FASTCALL2K {builtin} R{arg} K{k} {jump:+}"),
+            } => smallvec![Builtin(builtin), Reg(arg), Const(k), Skip(jump)],
             Instr::FastCall3 {
                 builtin,
                 arg1,
                 arg2,
                 arg3,
                 jump,
-            } => write!(f, "FASTCALL3 {builtin} R{arg1} R{arg2} R{arg3} {jump:+}"),
-            Instr::NativeCall => write!(f, "NATIVECALL"),
-            Instr::GetVarArgs { dest, count } => write!(f, "GETVARARGS R{dest} {count}"),
-            Instr::PrepVarArgs { nparams } => write!(f, "PREPVARARGS {nparams}"),
-            Instr::DupClosure { dest, k } => write!(f, "DUPCLOSURE R{dest} K{k}"),
-            Instr::Capture { capture_type, reg } => write!(f, "CAPTURE {capture_type} R{reg}"),
-            Instr::LoadKX { reg, index } => write!(f, "LOADKX R{reg} K{index}"),
-            Instr::JumpX { offset } => write!(f, "JUMPX {offset:+}"),
-            Instr::Coverage => write!(f, "COVERAGE"),
-            Instr::SubRK { dest, k, reg } => write!(f, "SUBRK R{dest} K{k} R{reg}"),
-            Instr::DivRK { dest, k, reg } => write!(f, "DIVRK R{dest} K{k} R{reg}"),
-
-            // extended comparisons — invert flag shown as trailing `!`
-            Instr::JumpXEqKNil {
-                reg,
-                invert,
-                offset,
             } => {
-                write!(f, "JUMPXEQKNIL R{reg} {offset:+}")?;
-                if *invert { write!(f, " !") } else { Ok(()) }
+                let mut ops = smallvec![Builtin(builtin), Reg(arg1), Reg(arg2), Reg(arg3)];
+                ops.push(Skip(jump));
+                ops
             }
-            Instr::JumpXEqKB {
-                reg,
-                k,
-                invert,
-                offset,
-            } => {
-                write!(f, "JUMPXEQKB R{reg} {k} {offset:+}")?;
-                if *invert { write!(f, " !") } else { Ok(()) }
+            Instr::GetVarArgs { dest, count } => smallvec![Reg(dest), Count(count)],
+            Instr::PrepVarArgs { nparams } => smallvec![Int(nparams.into())],
+            Instr::DupClosure { dest, k } => smallvec![Reg(dest), Const(k.into())],
+            // CAPTURE UPVAL names an upvalue of the enclosing function, not a register.
+            Instr::Capture { capture_type, reg } if capture_type == 2 => {
+                smallvec![Operand::Capture(capture_type), Upval(reg)]
             }
-            Instr::JumpXEqKN {
-                reg,
-                k,
-                invert,
-                offset,
-            } => {
-                write!(f, "JUMPXEQKN R{reg} K{k} {offset:+}")?;
-                if *invert { write!(f, " !") } else { Ok(()) }
-            }
-            Instr::JumpXEqKS {
-                reg,
-                k,
-                invert,
-                offset,
-            } => {
-                write!(f, "JUMPXEQKS R{reg} K{k} {offset:+}")?;
-                if *invert { write!(f, " !") } else { Ok(()) }
+            Instr::Capture { capture_type, reg } => {
+                smallvec![Operand::Capture(capture_type), Reg(reg)]
             }
 
-            // floor division
-            Instr::IDiv { dest, a, b } => write!(f, "IDIV R{dest} R{a} R{b}"),
-            Instr::IDivK { dest, reg, k } => write!(f, "IDIVK R{dest} R{reg} K{k}"),
+            Instr::JumpXEqKNil { reg, offset, .. } => smallvec![Reg(reg), Jump(offset.into())],
+            Instr::JumpXEqKB { reg, k, offset, .. } => {
+                smallvec![Reg(reg), Bool(k), Jump(offset.into())]
+            }
+            Instr::JumpXEqKN { reg, k, offset, .. } | Instr::JumpXEqKS { reg, k, offset, .. } => {
+                smallvec![Reg(reg), Const(k), Jump(offset.into())]
+            }
+        };
+
+        if let Instr::JumpXEqKNil { invert: true, .. }
+        | Instr::JumpXEqKB { invert: true, .. }
+        | Instr::JumpXEqKN { invert: true, .. }
+        | Instr::JumpXEqKS { invert: true, .. } = self
+        {
+            ops.push(Operand::Not);
         }
+
+        ops
+    }
+
+    /// Returns the branch offset of this instruction in words, relative to the
+    /// word after the instruction header.
+    ///
+    /// Fastcall skips are not branches: the CALL they skip is always lifted.
+    #[must_use]
+    pub fn branch_offset(&self) -> Option<i32> {
+        match *self {
+            Instr::Jump { offset }
+            | Instr::JumpBack { offset }
+            | Instr::JumpIf { offset, .. }
+            | Instr::JumpIfNot { offset, .. }
+            | Instr::JumpIfEq { offset, .. }
+            | Instr::JumpIfLe { offset, .. }
+            | Instr::JumpIfLt { offset, .. }
+            | Instr::JumpIfNotEq { offset, .. }
+            | Instr::JumpIfNotLe { offset, .. }
+            | Instr::JumpIfNotLt { offset, .. }
+            | Instr::JumpXEqKNil { offset, .. }
+            | Instr::JumpXEqKB { offset, .. }
+            | Instr::JumpXEqKN { offset, .. }
+            | Instr::JumpXEqKS { offset, .. }
+            | Instr::FornPrep { offset, .. }
+            | Instr::FornLoop { offset, .. }
+            | Instr::ForgPrep { offset, .. }
+            | Instr::ForgPrepInext { offset, .. }
+            | Instr::ForgPrepNext { offset, .. }
+            | Instr::ForgLoop { offset, .. } => Some(offset.into()),
+            Instr::JumpX { offset } => Some(offset),
+            Instr::LoadB { jump, .. } if jump > 0 => Some(jump.into()),
+            _ => None,
+        }
+    }
+}
+
+impl DecodedInstr {
+    /// Returns the word position this instruction branches to, if it branches.
+    #[must_use]
+    pub fn branch_target(&self) -> Option<u32> {
+        let offset = self.instr.branch_offset()?;
+        self.word_pc.checked_add(1)?.checked_add_signed(offset)
+    }
+}
+
+impl fmt::Display for Instr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.mnemonic())?;
+        for operand in self.operands() {
+            write!(f, " {operand}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1121,6 +1320,35 @@ pub struct LineInfo {
     pub interval_log2: u8,
     pub deltas: Vec<u8>,
     pub anchors: Vec<i32>,
+}
+
+impl LineInfo {
+    /// Decodes the source line of every instruction word.
+    #[must_use]
+    pub fn lines(&self) -> Vec<i32> {
+        // Each line is the anchor if its interval plus a byte offset.
+
+        let mut offset = 0u8;
+        let mut anchor = 0i32;
+        let anchors: Vec<_> = self
+            .anchors
+            .iter()
+            .map(|delta| {
+                anchor = anchor.wrapping_add(*delta);
+                anchor
+            })
+            .collect();
+
+        self.deltas
+            .iter()
+            .enumerate()
+            .map(|(pc, delta)| {
+                offset = offset.wrapping_add(*delta);
+                let anchor = anchors.get(pc >> self.interval_log2).copied().unwrap_or(0);
+                anchor + offset as i32
+            })
+            .collect()
+    }
 }
 
 /// A free-standing representation of value's type.
@@ -1262,13 +1490,11 @@ pub struct Proto {
 
 impl Proto {
     /// Resolves a constant by its index.
-    #[inline]
     pub fn get_constant(&self, id: ConstId) -> Option<&Constant> {
         self.consts.get(id.0 as usize)
     }
 
     /// Resolves a proto by its index.
-    #[inline]
     pub fn get_child_proto(&self, id: ChildProtoId) -> Option<ProtoId> {
         self.child_protos.get(id.0 as usize).copied()
     }

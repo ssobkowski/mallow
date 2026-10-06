@@ -56,7 +56,7 @@ fn build_label(idx: usize, function: &Function, block: &Block, is_entry: bool) -
 
     if !matches!(&block.exit, BlockExit::Jump(_) | BlockExit::Fallthrough(_)) {
         let is_return = matches!(&block.exit, BlockExit::Return(_));
-        lines.push((block.exit.display().to_string(), !is_return));
+        lines.push((function.display_exit(&block.exit).to_string(), !is_return));
     }
 
     NodeLabel { header, lines }
