@@ -131,6 +131,18 @@ mallow toolchain run bc6 compile -- --text <source.luau>
 mallow toolchain prune
 ```
 
+### AI Integration
+
+Use the `ai` cargo feature to let an LLM rename variables for readability:
+
+```sh
+mallow decompile <source> --ai-rename "qwen/qwen3.8-27b" --ai-reasoning low
+```
+
+The model name as well as its reasoning is customizable and uses OpenRouter to generate responses. For it to work, you need to set up `OPENROUTER_API_KEY` in your environment.
+
+> **Note:** LLM Output is not deterministic, can cause errors or be very slow depending on the file size.
+
 ### Using just
 
 Commands can get quite verbose, so running them with [just](https://github.com/casey/just) is preferred during development. See: [justfile](justfile).

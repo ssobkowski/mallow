@@ -1,8 +1,12 @@
 mod diagnostics;
 mod input;
 mod render;
+
 #[cfg(feature = "luau-toolchain")]
 mod toolchain;
+
+#[cfg(feature = "ai")]
+mod ai;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -13,6 +17,9 @@ use mallow_core::{
     DEFAULT_MAX_PASS_ITERATIONS, DecompileOptions, Diagnostics, EmitMode, LogLevel, LogTarget,
     ProtoSelector, decompile_bytecode_into, disassemble_bytecode_with_diagnostics,
 };
+
+#[cfg(feature = "ai")]
+use mallow_core::decompile_source;
 
 use crate::diagnostics::{CliLogLevel, CliLogTarget};
 use crate::input::InputArgs;
@@ -95,6 +102,27 @@ struct DecompileArgs {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
     )]
     max_pass_iterations: usize,
+
+    /// Ask an LLM through OpenRouter to rename decompiled locals. Reads the API key from OPENROUTER_API_KEY
+    #[cfg(feature = "ai")]
+    #[arg(
+        long,
+        value_name = "MODEL",
+        num_args = 0..=1,
+        default_missing_value = ai::DEFAULT_MODEL
+    )]
+    ai_rename: Option<String>,
+
+    /// How much the --ai-rename model may reason before answering
+    #[cfg(feature = "ai")]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "EFFORT",
+        default_value = "medium",
+        requires = "ai_rename"
+    )]
+    ai_reasoning: ai::Reasoning,
 }
 
 impl DecompileArgs {
@@ -165,6 +193,26 @@ fn main() -> Result<ExitCode> {
             diagnostics
                 .at(LogLevel::Info, LogTarget::Driver)
                 .line(0, format_args!("decompiling..."));
+            #[cfg(feature = "ai")]
+            if let Some(model) = &decompile.ai_rename {
+                anyhow::ensure!(
+                    matches!(decompile.emit, Emit::Source),
+                    "--ai-rename requires --emit source"
+                );
+                let renamer = ai::AiRenamer::from_env(model, decompile.ai_reasoning)?;
+                let mut source = decompile_source(&bytecode, decompile.options(), &diagnostics)?;
+                match renamer.rename(&mut source) {
+                    Ok(report) => renamer.report(&report, cli.verbose),
+                    Err(error) => diagnostics::warning(
+                        ai::LOG_TARGET,
+                        format_args!("AI renaming failed: {error:#}"),
+                    ),
+                }
+                std::io::stdout()
+                    .lock()
+                    .write_all(source.print().as_bytes())?;
+                return Ok(ExitCode::SUCCESS);
+            }
             let mut out = StdoutPainter::default();
             decompile_bytecode_into(&bytecode, decompile.options(), &diagnostics, &mut out)?;
             std::io::stdout()

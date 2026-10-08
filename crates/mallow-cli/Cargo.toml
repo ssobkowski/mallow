@@ -19,9 +19,12 @@ tracing = { workspace = true }
 tracing-chrome = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true }
 owo-colors = { version = "4.4.0", features = ["supports-colors"] }
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [features]
 default = []
+ai = ["dep:reqwest", "dep:serde_json"]
 luau-toolchain = ["dep:mallow-luau-toolchain"]
 profile = ["dep:tracing-chrome"]
 visualize = ["mallow-core/visualize"]

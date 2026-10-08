@@ -92,6 +92,12 @@ pub fn escape_bytes<S: AsRef<[u8]>>(bytes: S) -> String {
     out
 }
 
+/// Strict reserved keywords, which can never be identifiers.
+pub const LUAU_KEYWORDS: [&str; 21] = [
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in", "local",
+    "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+];
+
 /// Returns whether if the given string is a valid Lua identifier.
 pub fn is_valid_luau_identifier<S: AsRef<[u8]>>(s: S) -> bool {
     let bytes = s.as_ref();
@@ -111,31 +117,9 @@ pub fn is_valid_luau_identifier<S: AsRef<[u8]>>(s: S) -> bool {
     }
 
     // 3. Must not be a strict reserved keyword
-    const KEYWORDS: [&[u8]; 21] = [
-        b"and",
-        b"break",
-        b"do",
-        b"else",
-        b"elseif",
-        b"end",
-        b"false",
-        b"for",
-        b"function",
-        b"if",
-        b"in",
-        b"local",
-        b"nil",
-        b"not",
-        b"or",
-        b"repeat",
-        b"return",
-        b"then",
-        b"true",
-        b"until",
-        b"while",
-    ];
-
-    !KEYWORDS.contains(&bytes)
+    !LUAU_KEYWORDS
+        .iter()
+        .any(|keyword| keyword.as_bytes() == bytes)
 }
 
 #[cfg(test)]

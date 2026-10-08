@@ -198,6 +198,18 @@ fn write_diagnostic_line(
     }
 }
 
+/// Writes a CLI status line for `target`, regardless of the configured log level.
+#[cfg(feature = "ai")]
+pub fn notice(target: &str, indent: u64, args: fmt::Arguments<'_>) {
+    write_diagnostic_line(target, None, indent, false, &args.to_string());
+}
+
+/// Writes a CLI warning line for `target`, regardless of the configured log level.
+#[cfg(feature = "ai")]
+pub fn warning(target: &str, args: fmt::Arguments<'_>) {
+    write_diagnostic_line(target, None, 0, true, &args.to_string());
+}
+
 /// Tracing layer that renders core diagnostic events for humans.
 struct DiagnosticLayer;
 

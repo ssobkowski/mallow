@@ -1,3 +1,5 @@
+pub(crate) mod visitor;
+
 use smol_str::SmolStr;
 
 use crate::common::ByteString;
@@ -365,6 +367,10 @@ impl<T> Typed<T> {
 
     pub const fn as_ref(&self) -> &T {
         &self.node
+    }
+
+    pub const fn as_mut(&mut self) -> &mut T {
+        &mut self.node
     }
 
     pub const fn ty(&self) -> Option<&Type> {

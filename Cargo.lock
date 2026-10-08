@@ -1238,6 +1238,8 @@ dependencies = [
  "mallow-core",
  "mallow-luau-toolchain",
  "owo-colors",
+ "reqwest",
+ "serde_json",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",

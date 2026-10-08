@@ -9,15 +9,18 @@ mod ir;
 mod logging;
 mod operator;
 mod printer;
+mod rename;
 pub mod style;
 
 #[cfg(feature = "visualize")]
 mod visualize;
 
 use anyhow::{Result, ensure};
+pub use common::LUAU_KEYWORDS;
 pub use logging::{
     DIAGNOSTIC_EVENT_TARGET, DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
 };
+pub use rename::{RenameReport, SkippedRename};
 
 use crate::disasm::Chunk;
 use crate::ir::{Unit, fir};
@@ -208,17 +211,7 @@ pub fn decompile_bytecode_into<W: StyledWrite>(
 
     match options.emit {
         EmitMode::Source => {
-            let types = bytecode_types::BytecodeTypes::read(&unit);
-            let mut nested_unit = unit.map_functions(|function| {
-                let diagnostics = diagnostics.for_proto(function.id.0);
-                ir::nir::lift(function, &diagnostics)
-            })?;
-
-            ir::nir::passes::run(&mut nested_unit);
-            for function in nested_unit.functions_mut() {
-                ir::nir::materialize::destroy_ssa(function);
-            }
-            let block = emitter::emit_ast(nested_unit, &types, options)?;
+            let block = emit_source_ast(unit, options, diagnostics)?;
             out.write_str(&printer::print(&block))?;
         }
         EmitMode::Ir | EmitMode::Nir => {
@@ -239,6 +232,86 @@ pub fn decompile_bytecode_into<W: StyledWrite>(
         }
     }
     Ok(())
+}
+
+/// Decompiled Luau source whose local names can still change before printing.
+#[derive(Debug, Clone)]
+pub struct DecompiledSource {
+    block: ast::Block,
+}
+
+impl DecompiledSource {
+    /// Returns the decompiler-generated local names that `rename_locals` accepts,
+    /// in no particular order.
+    pub fn local_names(&self) -> Vec<String> {
+        rename::renamable_locals(&mut self.block.clone())
+    }
+
+    /// Renames decompiler-generated locals from `(old, new)` pairs.
+    ///
+    /// Invalid requests are skipped, and new names are suffixed when needed so a
+    /// rename never changes which variable any reference resolves to.
+    pub fn rename_locals<I, K, V>(&mut self, renames: I) -> RenameReport
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let renames = renames
+            .into_iter()
+            .map(|(from, to)| (from.into(), to.into()));
+        rename::rename_locals(&mut self.block, renames)
+    }
+
+    /// Prints the source.
+    pub fn print(&self) -> String {
+        printer::print(&self.block)
+    }
+}
+
+/// Decompiles Luau bytecode into source that can be renamed before printing.
+///
+/// Ignores `options.emit`.
+pub fn decompile_source(
+    bytecode: &[u8],
+    options: DecompileOptions,
+    diagnostics: &Diagnostics,
+) -> Result<DecompiledSource> {
+    let span = tracing::info_span!(
+        "decompile_source",
+        byte_len = bytecode.len(),
+        spill_locals = options.spill_locals,
+        max_pass_iterations = options.max_pass_iterations,
+    );
+    let _enter = span.enter();
+
+    ensure!(
+        options.max_pass_iterations > 0,
+        "max pass iterations must be greater than zero"
+    );
+    let chunk = disassemble_bytecode_with_diagnostics(bytecode, diagnostics)?;
+    let unit = ir::fir::lift(chunk)?;
+    let block = emit_source_ast(unit, options, diagnostics)?;
+    Ok(DecompiledSource { block })
+}
+
+/// Structures, cleans, and emits a lifted unit as a source AST.
+fn emit_source_ast(
+    unit: Unit<fir::Function>,
+    options: DecompileOptions,
+    diagnostics: &Diagnostics,
+) -> Result<ast::Block> {
+    let types = bytecode_types::BytecodeTypes::read(&unit);
+    let mut nested_unit = unit.map_functions(|function| {
+        let diagnostics = diagnostics.for_proto(function.id.0);
+        ir::nir::lift(function, &diagnostics)
+    })?;
+
+    ir::nir::passes::run(&mut nested_unit);
+    for function in nested_unit.functions_mut() {
+        ir::nir::materialize::destroy_ssa(function);
+    }
+    emitter::emit_ast(nested_unit, &types, options)
 }
 
 /// Renders a control-flow graph visualization of Luau bytecode as a standalone HTML page.
