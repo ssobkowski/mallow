@@ -1,4 +1,4 @@
-use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -9,6 +9,7 @@ use smol_str::{SmolStr, ToSmolStr};
 use super::cflow::{Cond, CondRhs, RawBlock, RawBlockExit, build_raw_from_proto};
 use super::ssa::Ssa;
 use super::{self as ir, Block, BlockExit, Capture, DebugBinding, Function, Pack, PackId, ValueId};
+use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
 use crate::common::ByteString;
 use crate::disasm::Chunk;
 use crate::il::{
@@ -58,112 +59,246 @@ struct DeferredValue {
     index: usize,
 }
 
-/// Capture storage state for physical registers.
-#[derive(Debug, Clone)]
-struct CaptureState {
-    /// Current storage generation for each register.
-    generations: [u16; 256],
-    /// Open captured generation for each register.
-    open: [Option<u16>; 256],
+/// Identifies a place where a cell is first opened.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+enum OpenSite {
+    /// A reference capture that found its register closed.
+    Capture { block: usize, instr: usize },
+    /// A cell forced open at the end of a block, before the block's exit.
+    Hoisted { block: usize, reg: u8 },
 }
 
-impl Default for CaptureState {
-    fn default() -> Self {
-        Self {
-            generations: [0; 256],
-            open: [None; 256],
-        }
-    }
+/// Capture storage state for physical registers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureState {
+    /// Site that opened each captured register's cell.
+    open: Box<[Option<OpenSite>]>,
 }
 
 impl CaptureState {
-    /// Returns the current generation of one register.
-    fn generation(&self, reg: u8) -> u16 {
-        self.generations[reg as usize]
+    /// Creates a new capture state with the given amount of register slots.
+    fn new(slots: u8) -> Self {
+        Self {
+            open: vec![None; slots as usize].into_boxed_slice(),
+        }
     }
 
-    /// Returns the open generation of one captured register.
-    fn open_generation(&self, reg: u8) -> Option<u16> {
+    /// Returns the site that opened one register's cell.
+    fn open_site(&self, reg: u8) -> Option<OpenSite> {
         self.open[reg as usize]
     }
 
-    /// Opens the current generation of one captured register.
-    fn open(&mut self, reg: u8) {
-        self.open[reg as usize] = Some(self.generation(reg));
+    /// Opens one register's cell at a site unless it is already open.
+    ///
+    /// Returns whether this site opened the cell.
+    fn open_at(&mut self, reg: u8, site: OpenSite) -> bool {
+        let slot = &mut self.open[reg as usize];
+        let opened = slot.is_none();
+        slot.get_or_insert(site);
+        opened
     }
 
-    /// Closes captured registers and starts their next generations.
-    fn close(&mut self, from_reg: u8) -> Result<()> {
-        for generation in &mut self.generations[from_reg as usize..] {
-            *generation = generation
-                .checked_add(1)
-                .context("capture generation overflow")?;
-        }
+    /// Closes captured registers.
+    fn close(&mut self, from_reg: u8) {
         self.open[from_reg as usize..].fill(None);
-        Ok(())
+    }
+
+    /// Merges a predecessor's exit state into this state.
+    ///
+    /// # Returns
+    ///
+    /// Returns registers whose predecessors have a conflict for whether
+    /// this cell should be opened or closed.
+    fn merge(&mut self, other: &Self) -> SmallVec<[u8; 4]> {
+        let mut conflicts = SmallVec::new();
+        for (reg, (this, other)) in self.open.iter_mut().zip(&other.open).enumerate() {
+            if this != other {
+                if this.is_some() || other.is_some() {
+                    conflicts.push(reg as u8);
+                }
+                *this = None;
+            }
+        }
+        conflicts
+    }
+
+    /// Merges the exit states of a block's predecessors into its entry state.
+    ///
+    /// # Returns
+    ///
+    /// Returns the merged state and the registers its predecessors disagree on.
+    /// A block without predecessors starts with every register closed.
+    fn merged<'a>(
+        slots: u8,
+        inputs: impl IntoIterator<Item = &'a Self>,
+    ) -> (Self, SmallVec<[u8; 4]>) {
+        let mut inputs = inputs.into_iter();
+        let Some(first) = inputs.next() else {
+            return (Self::new(slots), SmallVec::new());
+        };
+
+        let mut state = first.clone();
+        let mut conflicts = SmallVec::new();
+        for input in inputs {
+            for reg in state.merge(input) {
+                // This is quadratic in theory but probably small enough to not cause issues.
+                // If it does, see RegSet.
+                if !conflicts.contains(&reg) {
+                    conflicts.push(reg);
+                }
+            }
+        }
+        (state, conflicts)
+    }
+
+    /// Applies one block's captures, closes, and hoisted cells to this state.
+    ///
+    /// Calls `on_open` with each site that opens a cell and its register.
+    fn apply_block(
+        &mut self,
+        block: usize,
+        raw: &RawBlock<'_>,
+        hoists: &[u8],
+        mut on_open: impl FnMut(OpenSite, u8),
+    ) {
+        for (instr, decoded) in raw.instrs.iter().enumerate() {
+            match decoded.instr {
+                il::Instr::Capture {
+                    capture_type: CAPTURE_REF,
+                    reg,
+                } => {
+                    let site = OpenSite::Capture { block, instr };
+                    if self.open_at(reg, site) {
+                        on_open(site, reg);
+                    }
+                }
+                il::Instr::CloseUpvals { reg } => self.close(reg),
+                _ => {}
+            }
+        }
+        for &reg in hoists {
+            let site = OpenSite::Hoisted { block, reg };
+            if self.open_at(reg, site) {
+                on_open(site, reg);
+            }
+        }
     }
 }
 
 /// Function-wide facts about reference-captured registers.
 struct FunctionCaptures {
-    /// Cell for each captured register generation.
-    register_cells: HashMap<(u8, u16), CellId>,
+    /// Cell for each site that opens one.
+    register_cells: HashMap<OpenSite, CellId>,
     /// Capture state at each raw block entry.
-    block_states: Vec<CaptureState>,
+    block_states: Box<[CaptureState]>,
+    /// Registers forced open at the end of each raw block.
+    block_hoists: Box<[SmallVec<[u8; 4]>]>,
 }
 
 impl FunctionCaptures {
-    /// Finds captured register generations and allocates their cells in bytecode order.
-    fn analyze(cfg: &ControlFlowGraph<RawBlock<'_>>, cells: &mut Arena<Cell>) -> Result<Self> {
-        let mut state = CaptureState::default();
-        let mut block_states = vec![CaptureState::default(); cfg.len()];
+    /// Finds which cell backs each captured register at every block entry.
+    ///
+    /// Capture states flow along control-flow edges. When predecessors of a join disagree
+    /// about a register's cell, the cell is hoisted to the end of the join's immediate
+    /// dominator so that every path into the join shares it, and the analysis reruns.
+    fn analyze(
+        slots: u8,
+        cfg: &ControlFlowGraph<RawBlock<'_>>,
+        cells: &mut Arena<Cell>,
+    ) -> Result<Self> {
+        let idoms = cfg.build_idoms();
+        let mut block_hoists = vec![SmallVec::new(); cfg.len()].into_boxed_slice();
+        let mut hoisted = HashSet::default();
 
-        let mut seen = HashSet::default();
-        let mut capture_order = Vec::new();
+        loop {
+            let (block_states, conflicts, sites) = Self::propagate(slots, cfg, &block_hoists);
+            if conflicts.is_empty() {
+                // Allocation does not make a cell active. Opening sites activate it while lifting.
+                let register_cells = sites
+                    .into_iter()
+                    .map(|(site, reg)| {
+                        let cell = cells.alloc(Cell {
+                            origin: CellOrigin::CapturedRegister { reg },
+                        });
+                        (site, cell)
+                    })
+                    .collect();
 
-        for (block_index, block) in cfg.enumerate() {
-            block_states[block_index] = state.clone();
+                return Ok(Self {
+                    register_cells,
+                    block_states,
+                    block_hoists,
+                });
+            }
 
-            for decoded in block.instrs.iter() {
-                match decoded.instr {
-                    il::Instr::Capture {
-                        capture_type: CAPTURE_REF,
-                        reg,
-                    } => {
-                        let key = (reg, state.generation(reg));
-                        if seen.insert(key) {
-                            capture_order.push(key);
-                        }
-                        state.open(reg);
-                    }
-                    il::Instr::CloseUpvals { reg } => state.close(reg)?,
-                    _ => {}
+            for (join, reg) in conflicts {
+                ensure!(
+                    hoisted.insert((join, reg)),
+                    "captured R{reg} still disagrees at bb{join} after hoisting its cell"
+                );
+                let dominator = idoms
+                    .idom(join)
+                    .with_context(|| format!("captured R{reg} disagrees at entry bb{join}"))?;
+                block_hoists[dominator].push(reg);
+            }
+        }
+    }
+
+    /// Runs the capture dataflow to a fixed point for one set of hoisted cells.
+    ///
+    /// Returns the entry state of each block, every `(join, reg)` whose predecessors
+    /// disagree, and each opening site with its register in reverse post order.
+    #[allow(clippy::type_complexity)]
+    fn propagate(
+        slots: u8,
+        cfg: &ControlFlowGraph<RawBlock<'_>>,
+        block_hoists: &[SmallVec<[u8; 4]>],
+    ) -> (Box<[CaptureState]>, Vec<(usize, u8)>, Vec<(OpenSite, u8)>) {
+        let order: Vec<_> = cfg.reverse_post_order().collect();
+        let mut exits: Vec<Option<CaptureState>> = vec![None; cfg.len()];
+        let mut entries = vec![CaptureState::new(slots); cfg.len()].into_boxed_slice();
+
+        // Predecessors that have not been visited yet are skipped.
+        let entry_state = |block: usize, exits: &[Option<CaptureState>]| {
+            CaptureState::merged(
+                slots,
+                cfg.predecessors(block)
+                    .filter_map(|predecessor| exits[predecessor].as_ref()),
+            )
+        };
+
+        // Merging only ever closes registers, so this terminates.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &block in &order {
+                let (entry, _) = entry_state(block, &exits);
+                let mut exit = entry.clone();
+                exit.apply_block(block, &cfg[block], &block_hoists[block], |_, _| {});
+                entries[block] = entry;
+                if exits[block].as_ref() != Some(&exit) {
+                    exits[block] = Some(exit);
+                    changed = true;
                 }
             }
         }
 
-        // Allocation does not make a cell active. CAPTURE_REF opens it while lifting.
-        let register_cells: HashMap<_, _> = capture_order
-            .into_iter()
-            .map(|(reg, generation)| {
-                let cell = cells.alloc(Cell {
-                    origin: CellOrigin::CapturedRegister { reg, generation },
-                });
-                ((reg, generation), cell)
-            })
-            .collect();
+        let mut conflicts = Vec::new();
+        let mut sites = Vec::new();
+        for &block in &order {
+            let (mut state, block_conflicts) = entry_state(block, &exits);
+            conflicts.extend(block_conflicts.into_iter().map(|reg| (block, reg)));
+            state.apply_block(block, &cfg[block], &block_hoists[block], |site, reg| {
+                sites.push((site, reg));
+            });
+        }
 
-        Ok(Self {
-            register_cells,
-            block_states,
-        })
+        (entries, conflicts, sites)
     }
 
-    /// Returns the cell for one captured register generation.
-    #[inline]
-    #[must_use]
-    fn cell(&self, reg: u8, generation: u16) -> Option<CellId> {
-        self.register_cells.get(&(reg, generation)).copied()
+    /// Returns the cell opened at one site.
+    fn cell(&self, site: OpenSite) -> Option<CellId> {
+        self.register_cells.get(&site).copied()
     }
 }
 
@@ -198,7 +333,7 @@ impl<'c> FunctionLifter<'c> {
                 })
             })
             .collect();
-        let captures = FunctionCaptures::analyze(&graph, &mut cells)?;
+        let captures = FunctionCaptures::analyze(proto.max_stack_size, &graph, &mut cells)?;
 
         Ok(Self {
             proto,
@@ -316,7 +451,7 @@ struct BlockLifter<'l, 'c, 'g> {
     /// Pack available to an immediate variadic consumer.
     pending: Option<PendingValues>,
     /// Register values projected only when they are read.
-    deferred: [Option<DeferredValue>; 256],
+    deferred: Box<[Option<DeferredValue>]>,
     /// Capture state at the current instruction.
     capture_state: CaptureState,
 }
@@ -340,7 +475,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             cursor: 0,
             emitted: Vec::new(),
             pending: None,
-            deferred: [None; 256],
+            deferred: vec![None; function.proto.max_stack_size as usize].into_boxed_slice(),
             capture_state,
         })
     }
@@ -351,6 +486,18 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             self.flush_pending_before(instr)?;
             self.lift_instr(instr)?;
         }
+
+        // Cells shared by paths that join later are opened before the block's exit.
+        for &reg in &self.function.captures.block_hoists[self.block] {
+            self.open_cell_at(
+                reg,
+                OpenSite::Hoisted {
+                    block: self.block,
+                    reg,
+                },
+            )?;
+        }
+
         self.ssa.mark_filled(self.block);
 
         let (exit, outputs) = self.lift_exit()?;
@@ -365,19 +512,16 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Returns the instructions for the current block.
-    #[inline]
     fn instrs(&self) -> &[DecodedInstr] {
         &self.function.graph[self.block].instrs
     }
 
     /// Returns the instruction at a given position.
-    #[inline]
     fn instr_at(&self, pos: usize) -> Option<DecodedInstr> {
         self.instrs().get(pos).copied()
     }
 
     /// Returns the next bytecode instruction and advances the cursor.
-    #[inline]
     fn next(&mut self) -> Option<il::Instr> {
         let instr = self.instr_at(self.cursor)?.instr;
         self.cursor += 1;
@@ -385,33 +529,28 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Returns the next bytecode instruction without advancing the cursor.
-    #[inline]
     fn peek(&self) -> Option<il::Instr> {
         Some(self.instr_at(self.cursor)?.instr)
     }
 
     /// Returns the current bytecode program counter.
-    #[inline]
     fn current_pc(&self) -> Option<u32> {
         Some(self.instr_at(self.cursor.saturating_sub(1))?.word_pc)
     }
 
     /// Allocates a immutable value identity.
-    #[inline]
     #[must_use]
     fn value(&mut self) -> ValueId {
         self.ssa.alloc()
     }
 
     /// Allocates a value pack identity.
-    #[inline]
     #[must_use]
     fn pack(&mut self) -> PackId {
         self.packs.alloc(Pack)
     }
 
     /// Emits a fixed value pack.
-    #[inline]
     #[must_use]
     fn fixed_pack(&mut self, head: Vec<ValueId>) -> PackId {
         let out = self.pack();
@@ -424,7 +563,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Emits a pack with a fixed prefix and open tail.
-    #[inline]
     #[must_use]
     fn open_pack(&mut self, head: Vec<ValueId>, tail: PackId) -> PackId {
         let out = self.pack();
@@ -437,14 +575,12 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Returns the active cell for a captured register.
-    #[inline]
     fn open_cell(&self, reg: u8) -> Option<CellId> {
-        let generation = self.capture_state.open_generation(reg)?;
-        self.function.captures.cell(reg, generation)
+        let site = self.capture_state.open_site(reg)?;
+        self.function.captures.cell(site)
     }
 
     /// Projects a deferred register into its current storage.
-    #[inline]
     fn materialize_deferred(&mut self, reg: u8) -> Option<ValueId> {
         let deferred = self.deferred[reg as usize].take()?;
         let out = self.value();
@@ -458,7 +594,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Records all register values represented by an open pack.
-    #[inline]
     fn defer_pack(&mut self, base: u8, pack: PackId) {
         for reg in base..self.function.proto.max_stack_size {
             self.deferred[reg as usize] = Some(DeferredValue {
@@ -508,7 +643,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Reads a register and emits a cell load when its storage is captured.
-    #[inline]
     fn read_reg(&mut self, reg: u8) -> ValueId {
         if let Some(value) = self.materialize_deferred(reg) {
             self.record_debug_read(reg, value);
@@ -536,7 +670,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Reads a fixed register range in order.
-    #[inline]
     #[must_use]
     fn read_regs(&mut self, start: u8, count: u8) -> Vec<ValueId> {
         reg_range(start, count)
@@ -545,7 +678,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Defines a register from an already emitted immutable value.
-    #[inline]
     fn write_reg(&mut self, reg: u8, value: ValueId) {
         self.deferred[reg as usize] = None;
         self.record_debug_write(reg, value);
@@ -559,7 +691,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Defines a register with a fresh copy identity.
-    #[inline]
     fn copy_reg(&mut self, reg: u8, value: ValueId) {
         let out = self.value();
         self.emitted.push(ir::Instr::Copy { out, value });
@@ -567,7 +698,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Projects fixed results from a pack into consecutive registers.
-    #[inline]
     fn write_pack(&mut self, start: u8, count: u8, pack: PackId) {
         for (index, reg) in reg_range(start, count).enumerate() {
             let out = self.value();
@@ -577,7 +707,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Emits one literal constant.
-    #[inline]
     #[must_use]
     fn constant(&mut self, value: ir::Constant) -> ValueId {
         let out = self.value();
@@ -586,7 +715,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Emits a global read.
-    #[inline]
     #[must_use]
     fn global(&mut self, name: SmolStr) -> ValueId {
         let out = self.value();
@@ -595,7 +723,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Emits a binary operation.
-    #[inline]
     #[must_use]
     fn binary(&mut self, lhs: ValueId, op: BinOp, rhs: ValueId) -> ValueId {
         let out = self.value();
@@ -604,7 +731,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Emits a string-keyed table read without changing the key bytes.
-    #[inline]
     #[must_use]
     fn string_access(&mut self, table: ValueId, key: ByteString) -> ValueId {
         let key = self.constant(ir::Constant::String(key));
@@ -614,28 +740,38 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Emits a string-keyed table write without changing the key bytes.
-    #[inline]
     fn string_store(&mut self, table: ValueId, key: ByteString, value: ValueId) {
         let key = self.constant(ir::Constant::String(key));
         self.emitted.push(ir::Instr::SetTable { table, key, value });
     }
 
-    /// Opens one captured register and returns its cell.
-    fn open_capture_cell(&mut self, reg: u8) -> Result<CellId> {
+    /// Returns the [`OpenSite`] for the instruction that was just consumed.
+    fn capture_site(&self) -> OpenSite {
+        OpenSite::Capture {
+            block: self.block,
+            instr: self.cursor - 1,
+        }
+    }
+
+    /// Marks one register's cell open at a site without initializing it.
+    fn activate_cell(&mut self, reg: u8, site: OpenSite) -> Result<CellId> {
+        let cell = self
+            .function
+            .captures
+            .cell(site)
+            .with_context(|| format!("R{reg} has no cell opened at {site:?}"))?;
+        self.capture_state.open_at(reg, site);
+        Ok(cell)
+    }
+
+    /// Opens one captured register at a site and returns its cell.
+    fn open_cell_at(&mut self, reg: u8, site: OpenSite) -> Result<CellId> {
         if let Some(cell) = self.open_cell(reg) {
             return Ok(cell);
         }
 
         let value = self.read_reg(reg);
-        let generation = self.capture_state.generation(reg);
-        let cell = self
-            .function
-            .captures
-            .cell(reg, generation)
-            .with_context(|| {
-                format!("reference capture has no cell for R{reg} generation {generation}")
-            })?;
-        self.capture_state.open(reg);
+        let cell = self.activate_cell(reg, site)?;
         self.record_debug_cell_read(reg, cell);
         self.emitted.push(ir::Instr::OpenCell { cell, value });
         Ok(cell)
@@ -655,11 +791,11 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             self.ssa.write_reg(self.block, reg, value);
         }
 
-        self.capture_state.close(from_reg)
+        self.capture_state.close(from_reg);
+        Ok(())
     }
 
     /// Marks an open pack as unavailable to later variadic consumers.
-    #[inline]
     fn flush_pending(&mut self) {
         self.pending = None;
     }
@@ -714,7 +850,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Takes a pending open pack and prefixes earlier fixed registers.
-    #[inline]
     fn take_variadic_from(&mut self, first: u8) -> Result<PackId> {
         let pending = self
             .pending
@@ -734,7 +869,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Resolves one byte-string constant.
-    #[inline]
     fn const_string(&self, id: ConstId) -> Result<ByteString> {
         let constant = self
             .function
@@ -751,7 +885,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Resolves one UTF-8 name constant.
-    #[inline]
     fn const_name(&self, id: ConstId) -> Result<SmolStr> {
         let string = self.const_string(id)?;
         string
@@ -761,7 +894,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Emits a numeric constant required by an arithmetic opcode.
-    #[inline]
     fn emit_const_number(&mut self, id: ConstId) -> Result<ValueId> {
         let value = match self.function.proto.get_constant(id) {
             Some(il::Constant::Number(value)) => *value,
@@ -943,7 +1075,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Writes fixed call results or records open call results.
-    #[inline]
     fn handle_call_results(&mut self, dest: u8, count: u8, pack: PackId) -> Result<()> {
         match Count::from(count) {
             Count::Number(count) => self.write_pack(dest, count, pack),
@@ -1003,21 +1134,11 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
                 CAPTURE_VAL if reg == closure_reg => Capture::Copy(closure),
                 CAPTURE_VAL => Capture::Copy(self.read_reg(reg)),
                 CAPTURE_REF if reg == closure_reg && self.open_cell(reg).is_none() => {
-                    let generation = self.capture_state.generation(reg);
-                    let cell = self
-                        .function
-                        .captures
-                        .cell(reg, generation)
-                        .with_context(|| {
-                            format!(
-                                "recursive capture has no cell for R{reg} generation {generation}"
-                            )
-                        })?;
-                    self.capture_state.open(reg);
+                    let cell = self.activate_cell(reg, self.capture_site())?;
                     recursive_cell = Some(cell);
                     Capture::Share(cell)
                 }
-                CAPTURE_REF => Capture::Share(self.open_capture_cell(reg)?),
+                CAPTURE_REF => Capture::Share(self.open_cell_at(reg, self.capture_site())?),
                 CAPTURE_UPVAL => {
                     let cell = self
                         .function
@@ -1055,7 +1176,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
     }
 
     /// Lifts one bytecode instruction into explicit flat instructions.
-    #[inline]
     fn lift_instr(&mut self, instr: il::Instr) -> Result<()> {
         match instr {
             il::Instr::Nop => {}
@@ -1485,7 +1605,6 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
 }
 
 /// Returns the binary operator encoded by an arithmetic instruction.
-#[inline]
 const fn binop_for_instr(instr: il::Instr) -> BinOp {
     match instr {
         il::Instr::Add { .. } | il::Instr::AddK { .. } => BinOp::Add,
@@ -1502,7 +1621,6 @@ const fn binop_for_instr(instr: il::Instr) -> BinOp {
 }
 
 /// Returns the unary operator encoded by an instruction.
-#[inline]
 const fn unop_for_instr(instr: il::Instr) -> UnOp {
     match instr {
         il::Instr::Not { .. } => UnOp::Not,
@@ -1822,7 +1940,30 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
         })
         .collect();
 
-    Ok(merge_raw_chains(raw_blocks))
+    let mut raw_blocks = merge_raw_chains(raw_blocks);
+
+    // Give a looping entry block a preheader, so that the function entry has no
+    // predecessors and every join has an immediate dominator to open shared cells in.
+    if raw_blocks
+        .iter()
+        .any(|block| block.exit.targets().contains(&0))
+    {
+        for block in &mut raw_blocks {
+            for target in raw_exit_references_mut(&mut block.exit) {
+                *target += 1;
+            }
+        }
+        raw_blocks.insert(
+            0,
+            RawBlock {
+                instrs: Cow::Borrowed(&[]),
+                exit_writes: SmallVec::new(),
+                exit: RawBlockExit::Fallthrough(1),
+            },
+        );
+    }
+
+    Ok(raw_blocks)
 }
 
 /// Resolves one proto's debug strings from its disassembled chunk.

@@ -9,7 +9,6 @@ mod display;
 mod lifter;
 mod ssa;
 
-use crate::collections::HashSet;
 use std::fmt;
 
 use anyhow::{Result, ensure};
@@ -18,6 +17,7 @@ pub(crate) use lifter::lift;
 use smallvec::{SmallVec, smallvec};
 use smol_str::SmolStr;
 
+use crate::collections::HashSet;
 use crate::common::ByteString;
 use crate::il::{ProtoId, ProtoTypeInfo};
 use crate::ir::Debug;
@@ -95,8 +95,8 @@ pub struct Cell {
 pub enum CellOrigin {
     /// One declared upvalue slot in the current function.
     Upvalue(u8),
-    /// One generation of an open captured register.
-    CapturedRegister { reg: u8, generation: u16 },
+    /// One open captured register, identified by the site that opened it.
+    CapturedRegister { reg: u8 },
 }
 
 /// A value or cell captured by one closure.
@@ -724,6 +724,73 @@ impl Function {
                 "used pack %pack{} has no definition",
                 pack.index()
             );
+        }
+
+        self.verify_cells()
+    }
+
+    /// Checks that every use of a captured-register cell is dominated by its opening.
+    fn verify_cells(&self) -> Result<()> {
+        let idoms = self.cfg.build_idoms();
+        let opens: Vec<HashSet<CellId>> = self
+            .cfg
+            .items()
+            .map(|block| {
+                block
+                    .instrs
+                    .iter()
+                    .filter_map(|instr| match instr {
+                        Instr::OpenCell { cell, .. } => Some(*cell),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        for block_id in self.cfg.nodes() {
+            if !self.cfg.is_reachable(block_id) {
+                continue;
+            }
+            let mut open: HashSet<CellId> = idoms
+                .dominators(block_id)
+                .flat_map(|dominator| opens[dominator].iter().copied())
+                .collect();
+            let instrs = &self.cfg[block_id].instrs;
+            for (index, instr) in instrs.iter().enumerate() {
+                let used: SmallVec<[CellId; 2]> = match instr {
+                    Instr::OpenCell { cell, .. } => {
+                        open.insert(*cell);
+                        continue;
+                    }
+                    Instr::LoadCell { cell, .. } | Instr::StoreCell { cell, .. } => {
+                        smallvec![*cell]
+                    }
+                    // A closure capturing its own register opens the cell right after itself.
+                    Instr::Closure { captures, .. } => captures
+                        .iter()
+                        .filter_map(|capture| match capture {
+                            Capture::Share(cell)
+                                if !matches!(
+                                    instrs.get(index + 1),
+                                    Some(Instr::OpenCell { cell: next, .. }) if next == cell
+                                ) =>
+                            {
+                                Some(*cell)
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => continue,
+                };
+                for cell in used {
+                    ensure!(
+                        !matches!(self.cells[cell].origin, CellOrigin::CapturedRegister { .. })
+                            || open.contains(&cell),
+                        "cell $c{} is used in bb{block_id} without a dominating open",
+                        cell.index()
+                    );
+                }
+            }
         }
         Ok(())
     }
