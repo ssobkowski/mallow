@@ -3,11 +3,10 @@
 use std::error::Error;
 use std::fmt;
 use std::io::IsTerminal;
-use std::sync::OnceLock;
-use std::time::Instant;
-
 #[cfg(feature = "profile")]
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use clap::ValueEnum;
 use mallow_core::{DIAGNOSTIC_EVENT_TARGET, DiagnosticConfig, LogLevel, LogTarget};

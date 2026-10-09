@@ -5,9 +5,8 @@
 //! The only exception is the argument which seeds a loop variable, since the
 //! loop header itself assigns the variable.
 
-use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
-
 use super::{BlockExit, Function, Instr, ValueId};
+use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
 use crate::ir::graph::GraphView;
 use crate::ir::union_find::UnionFind;
 

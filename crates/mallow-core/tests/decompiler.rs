@@ -51,6 +51,11 @@ static IGNORED_CASES: LazyLock<HashSet<(&'static OsStr, BytecodeVersion, OptLeve
         cases.insert((OsStr::new("tables17"), BytecodeVersion::V8, OptLevel::O0));
         cases.insert((OsStr::new("tables17"), BytecodeVersion::V9, OptLevel::O0));
 
+        // something related to parsing a type (syntax only)
+        cases.insert((OsStr::new("intg-toml"), BytecodeVersion::V5, OptLevel::O0));
+        cases.insert((OsStr::new("intg-toml"), BytecodeVersion::V5, OptLevel::O1));
+        cases.insert((OsStr::new("intg-toml"), BytecodeVersion::V5, OptLevel::O2));
+
         cases
     });
 

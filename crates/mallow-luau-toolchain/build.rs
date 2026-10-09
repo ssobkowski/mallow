@@ -265,12 +265,8 @@ fn main() {
 
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set");
     let registry_path = Path::new(&manifest_dir).join("registry.json");
-    let bytes = fs::read(&registry_path).unwrap_or_else(|error| {
-        panic!(
-            "could not read {}: {error}",
-            registry_path.display()
-        )
-    });
+    let bytes = fs::read(&registry_path)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", registry_path.display()));
     let registry: RegistryFile = serde_json::from_slice(&bytes)
         .unwrap_or_else(|error| panic!("could not parse {}: {error}", registry_path.display()));
     if registry.schema != SCHEMA {

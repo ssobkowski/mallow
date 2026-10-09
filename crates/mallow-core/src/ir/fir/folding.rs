@@ -15,12 +15,11 @@
 //! which initialize it. Each such run is treated as one constructor node, so
 //! the whole table can fold into its use like any other expression.
 
-use crate::collections::{HashSet, IndexMap, IndexSet};
-
 use smallvec::{SmallVec, smallvec};
 
 use super::storage::{Storage, initializes_loop_variable};
 use super::{BlockExit, Capture, Constant, Function, Instr, PackId, ValueId};
+use crate::collections::{HashSet, IndexMap, IndexSet};
 use crate::ir::graph::GraphView;
 use crate::operator::BinOp;
 

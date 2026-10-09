@@ -1,6 +1,5 @@
 //! FIR Shape to NIR Region materialization and inlining.
 
-use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
 use std::cell::RefCell;
 
 use anyhow::{Result, bail};
@@ -8,6 +7,7 @@ use id_arena::Arena;
 
 use super::visitor::VisitorMut;
 use super::*;
+use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
 use crate::ir::fir::folding::Folding;
 use crate::ir::fir::region::{Predicate, Shape};
 use crate::ir::fir::storage::Storage;

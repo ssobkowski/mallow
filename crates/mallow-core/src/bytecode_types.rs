@@ -1,7 +1,7 @@
-use crate::collections::HashMap;
 use std::hash::Hash;
 
 use crate::ast;
+use crate::collections::HashMap;
 use crate::il::{BytecodeType, ProtoId, TypeTag};
 use crate::ir::fir::{CellId, Function, ValueId};
 use crate::ir::{Unit, UserdataTypeMapping};

@@ -1,9 +1,9 @@
-use crate::collections::{HashMap, IndexMap};
 use std::collections::BTreeSet;
 
 use id_arena::Arena;
 
 use super::{Block, Value, ValueId};
+use crate::collections::{HashMap, IndexMap};
 use crate::ir::fir::{ControlFlowGraph, Edge};
 use crate::ir::graph::GraphView;
 

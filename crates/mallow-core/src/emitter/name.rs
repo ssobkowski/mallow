@@ -1,8 +1,7 @@
-use crate::collections::HashSet;
-
 use smol_str::{SmolStr, format_smolstr};
 
 use crate::ast::Identifier;
+use crate::collections::HashSet;
 use crate::common::is_valid_luau_identifier;
 use crate::ir::fir::CellId;
 use crate::ir::nir::{Expr, LocalId, PackLocalId};

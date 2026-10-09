@@ -350,6 +350,7 @@ impl<'c> FunctionLifter<'c> {
         let mut ssa = Ssa::new(&self.graph, self.proto.max_stack_size);
         let mut packs = Arena::new();
         let mut bindings = vec![DebugBinding::default(); self.proto.locals.len()];
+        let mut close_loads = Vec::new();
 
         let mut params: Vec<_> = (0..self.proto.num_params)
             .map(|reg| {
@@ -364,8 +365,13 @@ impl<'c> FunctionLifter<'c> {
 
         let mut blocks = vec![None; self.graph.len()];
         for block_index in self.graph.reverse_post_order() {
-            blocks[block_index] =
-                Some(self.lift_block(block_index, &mut ssa, &mut packs, &mut bindings)?);
+            blocks[block_index] = Some(self.lift_block(
+                block_index,
+                &mut ssa,
+                &mut packs,
+                &mut bindings,
+                &mut close_loads,
+            )?);
         }
 
         for (block_index, block) in blocks.iter().enumerate() {
@@ -382,15 +388,29 @@ impl<'c> FunctionLifter<'c> {
 
         let (values, aliases, entry) = ssa.finish(&mut cfg);
 
-        resolve_aliases(&mut cfg, &aliases);
+        let read = resolve_aliases(&mut cfg, &aliases);
         for p in &mut params {
             *p = resolve_alias(*p, &aliases)
+        }
+
+        // Closing a cell loads its value back into the register, which is dead
+        // when the register is never read again, as at the end of a scope.
+        let dead_loads: IndexSet<_> = close_loads
+            .iter()
+            .map(|value| resolve_alias(*value, &aliases))
+            .filter(|value| !read.contains(*value))
+            .collect();
+        for block in cfg.items_mut() {
+            block.instrs.retain(|instr| {
+                !matches!(instr, ir::Instr::LoadCell { out, .. } if dead_loads.contains(*out))
+            });
         }
 
         for binding in &mut bindings {
             for value in &mut binding.values {
                 *value = resolve_alias(*value, &aliases);
             }
+            binding.values.retain(|value| !dead_loads.contains(*value));
             binding.values.sort_unstable_by_key(|value| value.index());
             binding.values.dedup();
             binding.cells.sort_unstable_by_key(|cell| cell.index());
@@ -425,8 +445,9 @@ impl<'c> FunctionLifter<'c> {
         ssa: &'l mut Ssa<'g, ControlFlowGraph<RawBlock<'c>>>,
         packs: &'l mut Arena<Pack>,
         bindings: &'l mut [DebugBinding],
+        close_loads: &'l mut Vec<ValueId>,
     ) -> Result<Block> {
-        BlockLifter::new(self, ssa, packs, bindings, block)?.lift()
+        BlockLifter::new(self, ssa, packs, bindings, close_loads, block)?.lift()
     }
 }
 
@@ -440,6 +461,8 @@ struct BlockLifter<'l, 'c, 'g> {
     packs: &'l mut Arena<Pack>,
     /// FIR identities associated with source debug locals.
     bindings: &'l mut [DebugBinding],
+    /// Values loaded back into registers when their cells are closed.
+    close_loads: &'l mut Vec<ValueId>, // TODO: add a 'ArenaSet' collection, that uses IndexSet and stores the `arena_id` to reconstruct ids?
 
     /// Block currently being lifted.
     block: usize,
@@ -463,6 +486,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
         ssa: &'l mut Ssa<'g, ControlFlowGraph<RawBlock<'c>>>,
         packs: &'l mut Arena<Pack>,
         bindings: &'l mut [DebugBinding],
+        close_loads: &'l mut Vec<ValueId>,
         block: usize,
     ) -> Result<Self> {
         let capture_state = function.captures.block_states[block].clone();
@@ -471,6 +495,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             ssa,
             packs,
             bindings,
+            close_loads,
             block,
             cursor: 0,
             emitted: Vec::new(),
@@ -786,6 +811,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             self.materialize_deferred(reg);
             let value = self.value();
             self.emitted.push(ir::Instr::LoadCell { out: value, cell });
+            self.close_loads.push(value);
             self.record_debug_cell_read(reg, cell);
             self.record_debug_read(reg, value);
             self.ssa.write_reg(self.block, reg, value);
@@ -1639,7 +1665,13 @@ fn resolve_alias(mut value: ValueId, aliases: &IndexMap<ValueId, ValueId>) -> Va
 }
 
 /// Rewrites all block references to surviving SSA values.
-fn resolve_aliases(cfg: &mut ControlFlowGraph<Block>, aliases: &IndexMap<ValueId, ValueId>) {
+///
+/// Returns every value read by an instruction, a block exit, or an edge.
+fn resolve_aliases(
+    cfg: &mut ControlFlowGraph<Block>,
+    aliases: &IndexMap<ValueId, ValueId>,
+) -> IndexSet<ValueId> {
+    let mut read = IndexSet::new();
     for block in cfg.items_mut() {
         for output in &mut block.outputs {
             *output = resolve_alias(*output, aliases);
@@ -1648,9 +1680,15 @@ fn resolve_aliases(cfg: &mut ControlFlowGraph<Block>, aliases: &IndexMap<ValueId
         block.outputs.dedup();
         for instr in &mut block.instrs {
             resolve_instr(instr, aliases);
+            read.extend(instr.used_values());
         }
         resolve_exit(&mut block.exit, aliases);
+        read.extend(block.exit.used_values());
+        for edge in block.exit.edges() {
+            read.extend(edge.params.iter().copied());
+        }
     }
+    read
 }
 
 /// Rewrites value references in an IR instruction.

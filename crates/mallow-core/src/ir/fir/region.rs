@@ -1,4 +1,3 @@
-use crate::collections::{HashMap, IndexSet};
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -7,6 +6,7 @@ use either::Either;
 
 use super::folding::Folding;
 use super::{Block, BlockExit, Function, Instr, PackId, ValueId};
+use crate::collections::{HashMap, IndexSet};
 use crate::ir::fir::ControlFlowGraph;
 use crate::ir::graph::{DominatorTree, GraphView, Reversed, SeseGraphView};
 use crate::logging::{Diagnostics, LogLevel, LogTarget};
@@ -1542,7 +1542,6 @@ impl<'d> Structurer<'d> {
             LoopKind::While { .. } | LoopKind::Infinite { .. } => loop_info
                 .latches
                 .iter()
-                
                 .filter(|latch| *latch != loop_info.header)
                 .collect(),
             _ => IndexSet::default(),
@@ -1573,7 +1572,6 @@ impl<'d> Structurer<'d> {
             LoopKind::While { .. } | LoopKind::Infinite { .. } => loop_info
                 .latches
                 .iter()
-                
                 .filter(|latch| *latch != loop_info.header)
                 .collect(),
             LoopKind::NumericFor { .. } | LoopKind::GenericFor { .. }
@@ -1845,7 +1843,6 @@ impl<'d> Structurer<'d> {
             let owned_payload_exit = loop_ctx.and_then(|ctx| {
                 ctx.payload_continue_targets
                     .iter()
-                    
                     .filter(|payload| {
                         !scope.merge_points.contains(payload)
                             && (Some(*payload) != shape.merge || scope.exits.contains(payload))
@@ -1864,7 +1861,6 @@ impl<'d> Structurer<'d> {
                 nodes,
                 exits: branch_exits
                     .iter()
-                    
                     .filter(|exit| *exit != entry && Some(*exit) != owned_payload_exit)
                     .collect(),
                 merge_points: shape.merge.into_iter().chain(owned_payload_exit).collect(),
@@ -2195,9 +2191,7 @@ impl<'d> Structurer<'d> {
 
         // 2. O(N): Find the Lowest Common Post-Dominator among all exit blocks.
         // If that LCD is one of the exit blocks itself, it post-dominates all exits.
-        if let Some(lcd) = self
-            .ipdoms
-            .lowest_common_dominator(loop_info.exits.iter())
+        if let Some(lcd) = self.ipdoms.lowest_common_dominator(loop_info.exits.iter())
             && loop_info.exits.contains(lcd)
         {
             return Some(lcd);

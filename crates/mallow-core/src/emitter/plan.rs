@@ -1,11 +1,10 @@
-use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
-
 use anyhow::{Result, bail};
 use smol_str::SmolStr;
 
 use super::name::{LocalNameCtx, LocalRole, LocalSource, Namer, Names};
 use super::storage::Storage;
 use crate::ast::Identifier;
+use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
 use crate::ir::fir::CellId;
 use crate::ir::nir::visitor::Visitor;
 use crate::ir::nir::{self, LocalId, PackLocalId};

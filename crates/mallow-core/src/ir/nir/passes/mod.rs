@@ -10,11 +10,10 @@ mod normalize;
 
 use id_arena::Arena;
 
-use crate::ir::Unit;
-use crate::ir::fir::ValueId;
-
 use super::visitor::{Visitor, walk_expr};
 use super::{Expr, Function, Local, LocalId, Region, Stmt};
+use crate::ir::Unit;
+use crate::ir::fir::ValueId;
 
 /// Runs every NIR pass over all functions until stable.
 ///

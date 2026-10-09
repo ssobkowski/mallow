@@ -3,11 +3,10 @@
 //! A nil initializer which is overwritten before its storage is read is removed,
 //! so the overwriting assignment becomes the only definition of the storage.
 
-use crate::collections::{HashSet, IndexSet};
-
 use id_arena::Arena;
 
 use super::StorageUse;
+use crate::collections::{HashSet, IndexSet};
 use crate::ir::fir::{Constant, ValueId};
 use crate::ir::nir::visitor::{VisitorMut, walk_stmts_mut};
 use crate::ir::nir::{Expr, Function, Local, Place, Region, Stmt};

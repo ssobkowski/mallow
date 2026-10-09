@@ -1,7 +1,8 @@
 //! Hash collections using the Fx hasher, plus a bitset for dense integer keys.
 
+use std::fmt;
+use std::iter::FusedIterator;
 use std::marker::PhantomData;
-use std::{fmt, iter::FusedIterator};
 
 use id_arena::Id;
 pub(crate) use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -426,7 +427,8 @@ impl<'a, K, V> Iterator for IndexMapIter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.slots.find_map(|slot| slot.as_ref().map(|(key, value)| (key, value)))
+        self.slots
+            .find_map(|slot| slot.as_ref().map(|(key, value)| (key, value)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

@@ -2,8 +2,6 @@ mod name;
 mod plan;
 mod storage;
 
-use crate::collections::IndexMap;
-
 use anyhow::{Context, Result, bail, ensure};
 use name::{Namer, PlainNamer};
 use plan::{BindingKey, FunctionPlan};
@@ -12,11 +10,11 @@ use storage::Storage;
 
 use crate::ast::Identifier;
 use crate::bytecode_types::BytecodeTypes;
+use crate::collections::IndexMap;
 use crate::common::is_valid_luau_identifier;
 use crate::il::ProtoId;
-use crate::ir::Unit;
 use crate::ir::fir::{CellId, Constant, Number};
-use crate::ir::nir;
+use crate::ir::{Unit, nir};
 use crate::operator::{BinOp, CompoundBinOp};
 use crate::{DecompileOptions, ast};
 
@@ -37,8 +35,14 @@ pub(crate) fn emit_ast_with_namer<N: Namer>(
     mut namer: N,
 ) -> Result<ast::Block> {
     let entry = unit.entry();
-    let EmittedFunction { mut body, .. } =
-        emit_function(&unit, types, options, &mut namer, entry, IndexMap::default())?;
+    let EmittedFunction { mut body, .. } = emit_function(
+        &unit,
+        types,
+        options,
+        &mut namer,
+        entry,
+        IndexMap::default(),
+    )?;
     body.stmts.insert(
         0,
         ast::Stmt::Comment {

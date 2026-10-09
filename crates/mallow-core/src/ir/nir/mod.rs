@@ -4,13 +4,12 @@ pub(crate) mod materialize;
 pub(crate) mod passes;
 pub(crate) mod visitor;
 
-use crate::collections::IndexMap;
-
 use id_arena::{Arena, Id};
 pub(crate) use materialize::lift;
 use smallvec::SmallVec;
 use smol_str::SmolStr;
 
+use crate::collections::IndexMap;
 use crate::il::ProtoId;
 use crate::ir::Debug;
 use crate::ir::fir::{CellId, Constant, PackId, ValueId};

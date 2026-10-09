@@ -13,13 +13,12 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "ai")]
+use mallow_core::decompile_source;
 use mallow_core::{
     DEFAULT_MAX_PASS_ITERATIONS, DecompileOptions, Diagnostics, EmitMode, LogLevel, LogTarget,
     ProtoSelector, decompile_bytecode_into, disassemble_bytecode_with_diagnostics,
 };
-
-#[cfg(feature = "ai")]
-use mallow_core::decompile_source;
 
 use crate::diagnostics::{CliLogLevel, CliLogTarget};
 use crate::input::InputArgs;

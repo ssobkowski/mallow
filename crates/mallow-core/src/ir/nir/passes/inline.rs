@@ -1,8 +1,7 @@
-use crate::collections::{IndexMap, IndexSet};
-
 use id_arena::Arena;
 use smallvec::SmallVec;
 
+use crate::collections::{IndexMap, IndexSet};
 use crate::ir::fir::ValueId;
 use crate::ir::nir::visitor::{VisitorMut, walk_expr_mut, walk_pack_expr_mut, walk_stmts_mut};
 use crate::ir::nir::{
@@ -642,8 +641,7 @@ impl VisitorMut for Inliner<'_> {
 
     fn visit_expr(&mut self, expr: &mut Expr) {
         while let Expr::Local(local) = expr {
-            let Some(replacement) = self.replacements.locals.get(self.locals[*local].source)
-            else {
+            let Some(replacement) = self.replacements.locals.get(self.locals[*local].source) else {
                 break;
             };
             *expr = replacement.clone();

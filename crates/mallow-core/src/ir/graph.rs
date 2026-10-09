@@ -1,5 +1,6 @@
-use crate::collections::{HashMap, HashSet};
 use std::hash::Hash;
+
+use crate::collections::{HashMap, HashSet};
 
 /// A read-only view of a directed graph.
 pub trait GraphView {
