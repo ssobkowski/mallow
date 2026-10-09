@@ -110,25 +110,21 @@ pub(crate) enum Expr {
 
 impl Expr {
     /// Creates a local reference.
-    #[inline]
     const fn local(local: LocalId) -> Self {
         Self::Local(local)
     }
 
     /// Creates a literal boolean.
-    #[inline]
     const fn boolean(value: bool) -> Self {
         Self::Constant(Constant::Bool(value))
     }
 
     /// Creates a nil value.
-    #[inline]
     const fn nil() -> Self {
         Self::Constant(Constant::Nil)
     }
 
     /// Creates a 'or' expression with the given operands.
-    #[inline]
     pub fn or(left: Self, right: Self) -> Self {
         Self::Binary {
             op: BinOp::Or,
@@ -138,7 +134,6 @@ impl Expr {
     }
 
     /// Creates an 'and' expression with the given operands.
-    #[inline]
     pub fn and(left: Self, right: Self) -> Self {
         Self::Binary {
             op: BinOp::And,
@@ -148,7 +143,6 @@ impl Expr {
     }
 
     /// Creates a 'not' expression with the given operand.
-    #[inline]
     pub fn not(operand: Self) -> Self {
         Self::Unary {
             op: UnOp::Not,
@@ -166,12 +160,37 @@ impl Expr {
         contains.found
     }
 
+    /// Returns whether this expression always evaluates to a boolean.
+    ///
+    /// Comparisons qualify because the VM coerces comparison metamethod results
+    /// to booleans.
+    pub fn is_boolean(&self) -> bool {
+        match self {
+            Expr::Constant(Constant::Bool(_)) => true,
+            Expr::Unary { op: UnOp::Not, .. } => true,
+            Expr::Binary {
+                op: BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Lte | BinOp::Gt | BinOp::Gte,
+                ..
+            } => true,
+            Expr::Binary {
+                op: BinOp::And | BinOp::Or,
+                lhs,
+                rhs,
+            } => lhs.is_boolean() && rhs.is_boolean(),
+            Expr::Select {
+                then_value,
+                else_value,
+                ..
+            } => then_value.is_boolean() && else_value.is_boolean(),
+            _ => false,
+        }
+    }
+
     /// Returns the semantic negation of this expression.
     ///
     /// Ordered comparisons are wrapped in `not` instead of being converted to
     /// the opposite comparison because values such as NaN make those forms
     /// observably different.
-    #[inline]
     pub fn invert(self) -> Expr {
         match self {
             Expr::Constant(Constant::Bool(b)) => Expr::Constant(Constant::Bool(!b)),

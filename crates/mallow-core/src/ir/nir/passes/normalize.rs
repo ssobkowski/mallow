@@ -4,9 +4,11 @@
 //! 2. Remove empty sequence children and unwrap singleton sequences.
 //! 3. Canonicalize binary comparison expressions of the form `[literal] op [!literal]` to `[!literal] op [literal]`.
 //! 4. Simplify pattern `not (a [op @ ==|~=] b)` into `a [invert(op)] b`.
+//! 5. Simplify `if c then true else false` into `not not c`, and `if c then false else true` into `not c`.
+//! 6. Simplify `not not c` into `c` when `c` always evaluates to a boolean.
 
 use crate::ir::nir::visitor::{VisitorMut, walk_expr_mut, walk_region_mut};
-use crate::ir::nir::{Expr, Function, Region};
+use crate::ir::nir::{Constant, Expr, Function, Region};
 use crate::operator::{BinOp, UnOp};
 
 pub fn run(function: &mut Function) -> bool {
@@ -50,6 +52,40 @@ impl VisitorMut for Normalizer {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
+        if let Expr::Select {
+            condition,
+            then_value,
+            else_value,
+        } = expr
+            && let (
+                Expr::Constant(Constant::Bool(then_bool)),
+                Expr::Constant(Constant::Bool(else_bool)),
+            ) = (then_value.as_ref(), else_value.as_ref())
+            && then_bool != else_bool
+        {
+            let negated = Expr::not(condition.as_ref().clone());
+            *expr = if *then_bool {
+                Expr::not(negated)
+            } else {
+                negated
+            };
+            self.changed = true;
+        }
+
+        if let Expr::Unary {
+            op: UnOp::Not,
+            value,
+        } = expr
+            && let Expr::Unary {
+                op: UnOp::Not,
+                value: inner,
+            } = value.as_ref()
+            && inner.is_boolean()
+        {
+            *expr = inner.as_ref().clone();
+            self.changed = true;
+        }
+
         if let Expr::Binary { lhs, op, rhs } = expr
             && let Some(flipped) = op.flip()
             && matches!(lhs.as_ref(), Expr::Constant(_))
