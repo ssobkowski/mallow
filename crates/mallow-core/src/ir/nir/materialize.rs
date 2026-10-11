@@ -7,7 +7,7 @@ use id_arena::Arena;
 
 use super::visitor::VisitorMut;
 use super::*;
-use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
+use crate::collections::{ArenaSet, HashMap, HashSet, IndexMap, IndexSet};
 use crate::ir::fir::folding::Folding;
 use crate::ir::fir::region::{Predicate, Shape};
 use crate::ir::fir::storage::Storage;
@@ -342,12 +342,22 @@ struct Materializer<'f> {
 }
 
 /// Folded definitions materialized so far.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Emitted {
     /// Folded values materialized at their use.
-    values: IndexSet<ValueId>,
+    values: ArenaSet<fir::Value>,
     /// Folded packs materialized at their use.
-    packs: IndexSet<PackId>,
+    packs: ArenaSet<fir::Pack>,
+}
+
+impl Emitted {
+    /// Creates an empty record for the values and packs of `function`.
+    fn new(function: &fir::Function) -> Self {
+        Self {
+            values: ArenaSet::new(&function.values),
+            packs: ArenaSet::new(&function.packs),
+        }
+    }
 }
 
 impl<'a> Materializer<'a> {
@@ -391,7 +401,7 @@ impl<'a> Materializer<'a> {
             folding,
             value_defs,
             pack_defs,
-            emitted: RefCell::default(),
+            emitted: RefCell::new(Emitted::new(function)),
             statement_blocks: IndexSet::default(),
             locals,
             packs,

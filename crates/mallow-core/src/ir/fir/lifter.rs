@@ -8,8 +8,10 @@ use smol_str::{SmolStr, ToSmolStr};
 
 use super::cflow::{Cond, CondRhs, RawBlock, RawBlockExit, build_raw_from_proto};
 use super::ssa::Ssa;
-use super::{self as ir, Block, BlockExit, Capture, DebugBinding, Function, Pack, PackId, ValueId};
-use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
+use super::{
+    self as ir, Block, BlockExit, Capture, DebugBinding, Function, Pack, PackId, Value, ValueId,
+};
+use crate::collections::{ArenaSet, HashMap, HashSet, IndexMap, IndexSet};
 use crate::common::ByteString;
 use crate::disasm::Chunk;
 use crate::il::{
@@ -388,18 +390,20 @@ impl<'c> FunctionLifter<'c> {
 
         let (values, aliases, entry) = ssa.finish(&mut cfg);
 
-        let read = resolve_aliases(&mut cfg, &aliases);
+        let read = resolve_aliases(&mut cfg, &values, &aliases);
         for p in &mut params {
             *p = resolve_alias(*p, &aliases)
         }
 
         // Closing a cell loads its value back into the register, which is dead
         // when the register is never read again, as at the end of a scope.
-        let dead_loads: IndexSet<_> = close_loads
-            .iter()
-            .map(|value| resolve_alias(*value, &aliases))
-            .filter(|value| !read.contains(*value))
-            .collect();
+        let mut dead_loads = ArenaSet::new(&values);
+        dead_loads.extend(
+            close_loads
+                .iter()
+                .map(|value| resolve_alias(*value, &aliases))
+                .filter(|value| !read.contains(*value)),
+        );
         for block in cfg.items_mut() {
             block.instrs.retain(|instr| {
                 !matches!(instr, ir::Instr::LoadCell { out, .. } if dead_loads.contains(*out))
@@ -462,7 +466,7 @@ struct BlockLifter<'l, 'c, 'g> {
     /// FIR identities associated with source debug locals.
     bindings: &'l mut [DebugBinding],
     /// Values loaded back into registers when their cells are closed.
-    close_loads: &'l mut Vec<ValueId>, // TODO: add a 'ArenaSet' collection, that uses IndexSet and stores the `arena_id` to reconstruct ids?
+    close_loads: &'l mut Vec<ValueId>,
 
     /// Block currently being lifted.
     block: usize,
@@ -1669,9 +1673,10 @@ fn resolve_alias(mut value: ValueId, aliases: &IndexMap<ValueId, ValueId>) -> Va
 /// Returns every value read by an instruction, a block exit, or an edge.
 fn resolve_aliases(
     cfg: &mut ControlFlowGraph<Block>,
+    values: &Arena<Value>,
     aliases: &IndexMap<ValueId, ValueId>,
-) -> IndexSet<ValueId> {
-    let mut read = IndexSet::new();
+) -> ArenaSet<Value> {
+    let mut read = ArenaSet::new(values);
     for block in cfg.items_mut() {
         for output in &mut block.outputs {
             *output = resolve_alias(*output, aliases);

@@ -1,10 +1,11 @@
 //! Hash collections using the Fx hasher, plus a bitset for dense integer keys.
 
+use std::borrow::Borrow;
 use std::fmt;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 
-use id_arena::Id;
+use id_arena::{Arena, ArenaBehavior, DefaultArenaBehavior, Id};
 pub(crate) use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// A key that maps to a small dense integer.
@@ -262,6 +263,150 @@ impl<K: Index> FromIterator<K> for IndexSet<K> {
 }
 
 impl<K: Index> fmt::Debug for IndexSet<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+/// A set of arena ids, backed by an [`IndexSet`] of their indices.
+///
+/// Unlike `IndexSet<Id<T>>`, the set remembers the arena it belongs to, so
+/// iteration yields the original ids back. Iteration is in ascending index
+/// order. All ids must come from the arena the set was created for.
+pub(crate) struct ArenaSet<T, A: ArenaBehavior = DefaultArenaBehavior<T>> {
+    set: IndexSet<usize>,
+    arena_id: u32,
+    _arena: PhantomData<fn() -> (T, A)>,
+}
+
+impl<T, A: ArenaBehavior> Clone for ArenaSet<T, A> {
+    fn clone(&self) -> Self {
+        Self {
+            set: self.set.clone(),
+            arena_id: self.arena_id,
+            _arena: PhantomData,
+        }
+    }
+}
+
+impl<T, A: ArenaBehavior> PartialEq for ArenaSet<T, A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.set == other.set
+    }
+}
+
+impl<T, A: ArenaBehavior> Eq for ArenaSet<T, A> {}
+
+impl<T, A: ArenaBehavior> ArenaSet<T, A> {
+    /// Creates an empty set for ids of `arena`.
+    pub(crate) fn new(arena: &Arena<T, A>) -> Self {
+        Self {
+            set: IndexSet::new(),
+            arena_id: A::arena_id(arena.next_id()),
+            _arena: PhantomData,
+        }
+    }
+
+    /// Adds `id`, returning whether it was newly inserted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` belongs to a different arena than the set.
+    pub(crate) fn insert(&mut self, id: impl Borrow<A::Id>) -> bool {
+        let id = *id.borrow();
+        assert_eq!(A::arena_id(id), self.arena_id, "id from a different arena");
+        self.set.insert(A::index(id))
+    }
+
+    pub(crate) fn contains(&self, id: impl Borrow<A::Id>) -> bool {
+        let id = *id.borrow();
+        debug_assert_eq!(A::arena_id(id), self.arena_id, "id from a different arena");
+        self.set.contains(A::index(id))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Adds every id of `other`.
+    pub(crate) fn union_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.arena_id, other.arena_id, "sets from different arenas");
+        self.set.union_with(&other.set);
+    }
+
+    /// Returns an iterator over the ids in the set.
+    pub(crate) fn iter(&self) -> ArenaSetIter<'_, A> {
+        ArenaSetIter {
+            inner: self.set.iter(),
+            arena_id: self.arena_id,
+            _arena: PhantomData,
+        }
+    }
+}
+
+/// Iterator over the ids of an [`ArenaSet`] in ascending index order.
+pub(crate) struct ArenaSetIter<'a, A> {
+    inner: IndexSetIter<'a>,
+    arena_id: u32,
+    _arena: PhantomData<fn() -> A>,
+}
+
+impl<A: ArenaBehavior> Iterator for ArenaSetIter<'_, A> {
+    type Item = A::Id;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|index| A::new_id(self.arena_id, index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<A: ArenaBehavior> ExactSizeIterator for ArenaSetIter<'_, A> {}
+impl<A: ArenaBehavior> FusedIterator for ArenaSetIter<'_, A> {}
+
+impl<'a, T, A: ArenaBehavior> IntoIterator for &'a ArenaSet<T, A> {
+    type Item = A::Id;
+    type IntoIter = ArenaSetIter<'a, A>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T, A: ArenaBehavior> Extend<A::Id> for ArenaSet<T, A> {
+    fn extend<I: IntoIterator<Item = A::Id>>(&mut self, iter: I) {
+        for id in iter {
+            self.insert(id);
+        }
+    }
+}
+
+impl<T, A: ArenaBehavior> FromIterator<A::Id> for ArenaSet<T, A> {
+    /// Takes the arena from the first id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the iterator is empty, or yields ids from different arenas.
+    /// Use [`ArenaSet::new`] and [`Extend`] when the iterator may be empty.
+    fn from_iter<I: IntoIterator<Item = A::Id>>(iter: I) -> Self {
+        let mut iter = iter.into_iter();
+        let first = iter.next().expect("cannot infer the arena of an empty set");
+        let mut set = Self {
+            set: IndexSet::new(),
+            arena_id: A::arena_id(first),
+            _arena: PhantomData,
+        };
+        set.insert(first);
+        set.extend(iter);
+        set
+    }
+}
+
+impl<T, A: ArenaBehavior<Id: fmt::Debug>> fmt::Debug for ArenaSet<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.iter()).finish()
     }

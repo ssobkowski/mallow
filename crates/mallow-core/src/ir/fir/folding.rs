@@ -18,8 +18,8 @@
 use smallvec::{SmallVec, smallvec};
 
 use super::storage::{Storage, initializes_loop_variable};
-use super::{BlockExit, Capture, Constant, Function, Instr, PackId, ValueId};
-use crate::collections::{HashSet, IndexMap, IndexSet};
+use super::{BlockExit, Capture, Constant, Function, Instr, Pack, PackId, Value, ValueId};
+use crate::collections::{ArenaSet, HashSet, IndexMap, IndexSet};
 use crate::ir::graph::GraphView;
 use crate::operator::BinOp;
 
@@ -27,19 +27,19 @@ use crate::operator::BinOp;
 pub(crate) type InstrRef = (usize, usize);
 
 /// Values and packs whose definitions are folded into their single use.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Folding {
     /// Values materialized as an expression at their use.
-    values: IndexSet<ValueId>,
+    values: ArenaSet<Value>,
     /// Packs materialized as an expression at their use.
-    packs: IndexSet<PackId>,
+    packs: ArenaSet<Pack>,
     /// Ordered comparisons whose right operand was evaluated first.
     ///
     /// Luau compiles `a > b` as `b < a` while still evaluating `a` first, so
     /// these must be emitted with the mirrored operator to keep that order.
-    mirrored: IndexSet<ValueId>,
+    mirrored: ArenaSet<Value>,
     /// Folded values whose definition floats to their use from any position.
-    floating: IndexSet<ValueId>,
+    floating: ArenaSet<Value>,
     /// Initializing statements of every folded table constructor, in order.
     constructors: IndexMap<ValueId, Vec<InstrRef>>,
     /// Statements materialized inside a folded table constructor.
@@ -56,9 +56,13 @@ impl Folding {
     pub(crate) fn build(function: &Function, storage: &Storage) -> Self {
         let facts = UseFacts::collect(function, storage);
         let mut folding = Self {
-            floating: facts.floating.clone(),
             values: facts.floating.clone(),
-            ..Self::default()
+            packs: ArenaSet::new(&function.packs),
+            mirrored: ArenaSet::new(&function.values),
+            floating: facts.floating.clone(),
+            constructors: IndexMap::default(),
+            initializers: HashSet::default(),
+            condition_only_blocks: IndexSet::default(),
         };
 
         for block_id in function.cfg.nodes() {
@@ -163,26 +167,33 @@ impl Slot {
 }
 
 /// Use facts shared by every block.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct UseFacts {
     /// Number of uses of every value.
     value_uses: IndexMap<ValueId, usize>,
     /// Number of uses of every pack.
     pack_uses: IndexMap<PackId, usize>,
     /// Values which must stay bound to a local.
-    pinned_values: IndexSet<ValueId>,
+    pinned_values: ArenaSet<Value>,
     /// Packs which must stay bound to a pack local.
-    pinned_packs: IndexSet<PackId>,
+    pinned_packs: ArenaSet<Pack>,
     /// Values whose definition folds into their use from any position.
-    floating: IndexSet<ValueId>,
+    floating: ArenaSet<Value>,
     /// Floating constants holding a string.
-    string_constants: IndexSet<ValueId>,
+    string_constants: ArenaSet<Value>,
 }
 
 impl UseFacts {
     /// Collects use counts and pinned identities for one function.
     fn collect(function: &Function, storage: &Storage) -> Self {
-        let mut facts = Self::default();
+        let mut facts = Self {
+            value_uses: IndexMap::default(),
+            pack_uses: IndexMap::default(),
+            pinned_values: ArenaSet::new(&function.values),
+            pinned_packs: ArenaSet::new(&function.packs),
+            floating: ArenaSet::new(&function.values),
+            string_constants: ArenaSet::new(&function.values),
+        };
 
         for binding in &function.bindings {
             facts.pinned_values.extend(binding.values.iter().copied());
@@ -238,32 +249,37 @@ impl UseFacts {
             }
         }
 
-        facts.string_constants = function
-            .cfg
-            .items()
-            .flat_map(|block| block.instrs.iter())
-            .filter_map(|instr| match instr {
-                Instr::Const {
-                    out,
-                    value: Constant::String(_),
-                } if facts.is_candidate(*out) => Some(*out),
-                _ => None,
-            })
-            .collect();
+        let mut string_constants = ArenaSet::new(&function.values);
+        string_constants.extend(
+            function
+                .cfg
+                .items()
+                .flat_map(|block| block.instrs.iter())
+                .filter_map(|instr| match instr {
+                    Instr::Const {
+                        out,
+                        value: Constant::String(_),
+                    } if facts.is_candidate(*out) => Some(*out),
+                    _ => None,
+                }),
+        );
+        facts.string_constants = string_constants;
         // A copy floats once its source is floating, so iterate to a fixpoint.
         let instrs: Vec<&Instr> = function
             .cfg
             .items()
             .flat_map(|block| block.instrs.iter())
             .collect();
-        let mut instr_defined = IndexSet::new();
+        let mut instr_defined = ArenaSet::new(&function.values);
         instr_defined.extend(instrs.iter().filter_map(|instr| instr.defined_value()));
         loop {
-            let floating: IndexSet<_> = instrs
-                .iter()
-                .filter(|instr| facts.is_floating(instr, storage, &instr_defined))
-                .filter_map(|instr| instr.defined_value())
-                .collect();
+            let mut floating = ArenaSet::new(&function.values);
+            floating.extend(
+                instrs
+                    .iter()
+                    .filter(|instr| facts.is_floating(instr, storage, &instr_defined))
+                    .filter_map(|instr| instr.defined_value()),
+            );
             if floating.len() == facts.floating.len() {
                 break;
             }
@@ -294,7 +310,7 @@ impl UseFacts {
         &self,
         instr: &Instr,
         storage: &Storage,
-        instr_defined: &IndexSet<ValueId>,
+        instr_defined: &ArenaSet<Value>,
     ) -> bool {
         match instr {
             Instr::Const { out, .. } => self.is_candidate(*out),
@@ -360,16 +376,16 @@ struct ConstructorSpan {
 }
 
 /// Expression trees of one block.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BlockFolding {
     /// Block owning these trees.
     block: usize,
     /// Values folded in this block.
-    values: IndexSet<ValueId>,
+    values: ArenaSet<Value>,
     /// Packs folded in this block.
-    packs: IndexSet<PackId>,
+    packs: ArenaSet<Pack>,
     /// Comparisons emitted with mirrored operands.
-    mirrored: IndexSet<ValueId>,
+    mirrored: ArenaSet<Value>,
     /// Folded table constructors and their initializers.
     constructors: IndexMap<ValueId, Vec<InstrRef>>,
     /// Statements materialized inside a folded constructor.
@@ -379,6 +395,19 @@ struct BlockFolding {
 }
 
 impl BlockFolding {
+    /// Creates empty trees for one block.
+    fn new(function: &Function, block: usize) -> Self {
+        Self {
+            block,
+            values: ArenaSet::new(&function.values),
+            packs: ArenaSet::new(&function.packs),
+            mirrored: ArenaSet::new(&function.values),
+            constructors: IndexMap::default(),
+            initializers: HashSet::default(),
+            is_condition_only: false,
+        }
+    }
+
     /// Builds the trees of one block, collapsing table constructors until stable.
     fn build(function: &Function, facts: &UseFacts, block_id: usize) -> Self {
         let block = &function.cfg[block_id];
@@ -405,10 +434,7 @@ impl BlockFolding {
                 facts,
                 block: block_id,
                 spans: &spans,
-                folding: Self {
-                    block: block_id,
-                    ..Self::default()
-                },
+                folding: Self::new(function, block_id),
             };
             builder.walk(&items, &block.exit);
             let folding = builder.folding;

@@ -5,8 +5,8 @@
 //! The only exception is the argument which seeds a loop variable, since the
 //! loop header itself assigns the variable.
 
-use super::{BlockExit, Function, Instr, ValueId};
-use crate::collections::{HashMap, HashSet, IndexMap, IndexSet};
+use super::{BlockExit, Function, Instr, Value, ValueId};
+use crate::collections::{ArenaSet, HashMap, HashSet, IndexMap};
 use crate::ir::graph::GraphView;
 use crate::ir::union_find::UnionFind;
 
@@ -16,9 +16,9 @@ pub(crate) struct Storage {
     /// Canonical storage for every value.
     storage: IndexMap<ValueId, ValueId>,
     /// Storage assigned by a loop header on every iteration.
-    loop_storage: IndexSet<ValueId>,
+    loop_storage: ArenaSet<Value>,
     /// Storage which is only ever assigned once.
-    single_assignment: IndexSet<ValueId>,
+    single_assignment: ArenaSet<Value>,
 }
 
 impl Storage {
@@ -76,7 +76,8 @@ impl Storage {
             .iter()
             .map(|(value, _)| (value, groups.find(value)))
             .collect();
-        let loop_storage = loop_values.iter().map(|value| storage[value]).collect();
+        let mut loop_storage = ArenaSet::new(&function.values);
+        loop_storage.extend(loop_values.iter().map(|value| storage[value]));
         let single_assignment = single_assignment_storage(function, &storage);
 
         Self {
@@ -112,7 +113,7 @@ impl Storage {
 fn single_assignment_storage(
     function: &Function,
     storage: &IndexMap<ValueId, ValueId>,
-) -> IndexSet<ValueId> {
+) -> ArenaSet<Value> {
     let instr_defined = function
         .cfg
         .items()
@@ -133,24 +134,29 @@ fn single_assignment_storage(
         *definitions.entry(storage[&value]).or_insert(0usize) += 1;
     }
 
-    let exit_assigned: IndexSet<_> = function
-        .cfg
-        .items()
-        .flat_map(|block| {
-            block
-                .outputs
-                .iter()
-                .copied()
-                .chain(block.exit.defined_values())
-        })
-        .map(|value| storage[&value])
-        .collect();
+    let mut exit_assigned = ArenaSet::new(&function.values);
+    exit_assigned.extend(
+        function
+            .cfg
+            .items()
+            .flat_map(|block| {
+                block
+                    .outputs
+                    .iter()
+                    .copied()
+                    .chain(block.exit.defined_values())
+            })
+            .map(|value| storage[&value]),
+    );
 
-    definitions
-        .into_iter()
-        .filter(|(storage, count)| *count == 1 && !exit_assigned.contains(storage))
-        .map(|(storage, _)| storage)
-        .collect()
+    let mut single_assignment = ArenaSet::new(&function.values);
+    single_assignment.extend(
+        definitions
+            .into_iter()
+            .filter(|(storage, count)| *count == 1 && !exit_assigned.contains(*storage))
+            .map(|(storage, _)| storage),
+    );
+    single_assignment
 }
 
 /// Returns whether a loop entry edge argument only seeds the loop variable.
