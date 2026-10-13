@@ -15,6 +15,8 @@
 //! which initialize it. Each such run is treated as one constructor node, so
 //! the whole table can fold into its use like any other expression.
 
+#[cfg(test)]
+use id_arena::Arena;
 use smallvec::{SmallVec, smallvec};
 
 use super::storage::{Storage, initializes_loop_variable};
@@ -76,51 +78,53 @@ impl Folding {
     }
 
     /// Returns whether a value is materialized at its use instead of being bound.
-    #[inline]
     pub(crate) fn is_folded(&self, value: ValueId) -> bool {
         self.values.contains(value)
     }
 
     /// Returns whether a pack is materialized at its use instead of being bound.
-    #[inline]
     pub(crate) fn is_pack_folded(&self, pack: PackId) -> bool {
         self.packs.contains(pack)
     }
 
     /// Returns whether a folded value floats to its use from any position.
-    #[inline]
     pub(crate) fn is_floating(&self, value: ValueId) -> bool {
         self.floating.contains(value)
     }
 
     /// Returns whether an ordered comparison must be emitted with mirrored operands.
-    #[inline]
     pub(crate) fn is_mirrored(&self, value: ValueId) -> bool {
         self.mirrored.contains(value)
     }
 
     /// Returns the initializing statements of a folded table constructor.
-    #[inline]
     pub(crate) fn constructor(&self, table: ValueId) -> Option<&[InstrRef]> {
         self.constructors.get(table).map(Vec::as_slice)
     }
 
     /// Returns whether a statement is materialized inside a folded table constructor.
-    #[inline]
     pub(crate) fn is_initializer(&self, instr: InstrRef) -> bool {
         self.initializers.contains(&instr)
     }
 
     /// Returns whether a block only computes its branch condition.
-    #[inline]
     pub(crate) fn is_condition_only(&self, block: usize) -> bool {
         self.condition_only_blocks.contains(block)
     }
 
-    /// Returns all blocks which only compute their branch condition.
-    #[inline]
-    pub(crate) fn condition_only_blocks(&self) -> &IndexSet<usize> {
-        &self.condition_only_blocks
+    /// Returns a folding where only `blocks` are condition-only and nothing
+    /// else folds.
+    #[cfg(test)]
+    pub(crate) fn with_condition_only(blocks: impl IntoIterator<Item = usize>) -> Self {
+        Self {
+            values: ArenaSet::new(&Arena::new()),
+            packs: ArenaSet::new(&Arena::new()),
+            mirrored: ArenaSet::new(&Arena::new()),
+            floating: ArenaSet::new(&Arena::new()),
+            constructors: IndexMap::default(),
+            initializers: HashSet::default(),
+            condition_only_blocks: blocks.into_iter().collect(),
+        }
     }
 
     /// Adds the trees of one block.

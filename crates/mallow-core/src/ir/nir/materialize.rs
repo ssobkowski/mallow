@@ -19,7 +19,7 @@ use crate::logging::Diagnostics;
 pub(crate) fn lift(function: fir::Function, diagnostics: &Diagnostics) -> Result<Function> {
     let storage = Storage::build(&function);
     let folding = Folding::build(&function, &storage);
-    let shape = fir::region::structure(&function, &folding, diagnostics)?;
+    let shape = fir::region::structure(&function.cfg, &folding, diagnostics)?;
     materialize(function, &storage, &folding, shape)
 }
 
@@ -261,15 +261,6 @@ fn collect_predicate_blocks(predicate: &Predicate, blocks: &mut IndexSet<usize>)
         Predicate::And(lhs, rhs) | Predicate::Or(lhs, rhs) => {
             collect_predicate_blocks(lhs, blocks);
             collect_predicate_blocks(rhs, blocks);
-        }
-        Predicate::Select {
-            condition,
-            then_predicate,
-            else_predicate,
-        } => {
-            collect_predicate_blocks(condition, blocks);
-            collect_predicate_blocks(then_predicate, blocks);
-            collect_predicate_blocks(else_predicate, blocks);
         }
     }
 }
@@ -920,29 +911,9 @@ impl<'a> Materializer<'a> {
             Predicate::Value { value, .. } => self.value(value)?,
             Predicate::True => Expr::boolean(true),
             Predicate::False => Expr::boolean(false),
-            Predicate::Not(inner) => Expr::Unary {
-                op: UnOp::Not,
-                value: Box::new(self.predicate(*inner)?),
-            },
-            Predicate::And(lhs, rhs) => Expr::Binary {
-                lhs: Box::new(self.predicate(*lhs)?),
-                op: BinOp::And,
-                rhs: Box::new(self.predicate(*rhs)?),
-            },
-            Predicate::Or(lhs, rhs) => Expr::Binary {
-                lhs: Box::new(self.predicate(*lhs)?),
-                op: BinOp::Or,
-                rhs: Box::new(self.predicate(*rhs)?),
-            },
-            Predicate::Select {
-                condition,
-                then_predicate,
-                else_predicate,
-            } => Expr::Select {
-                condition: Box::new(self.predicate(*condition)?),
-                then_value: Box::new(self.predicate(*then_predicate)?),
-                else_value: Box::new(self.predicate(*else_predicate)?),
-            },
+            Predicate::Not(inner) => Expr::not(self.predicate(*inner)?),
+            Predicate::And(lhs, rhs) => Expr::and(self.predicate(*lhs)?, self.predicate(*rhs)?),
+            Predicate::Or(lhs, rhs) => Expr::or(self.predicate(*lhs)?, self.predicate(*rhs)?),
         })
     }
 }

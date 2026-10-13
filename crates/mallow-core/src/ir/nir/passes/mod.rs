@@ -6,6 +6,7 @@ mod fold_packs;
 mod fold_shapes;
 mod fold_tables;
 mod inline;
+mod jumps;
 mod normalize;
 
 use id_arena::Arena;
@@ -29,6 +30,7 @@ pub(crate) fn run(unit: &mut Unit<Function>) -> bool {
             round_changed |= fold_tables::run(function);
             round_changed |= fold_assignments::run(function);
             round_changed |= dead_initializers::run(function);
+            round_changed |= jumps::run(function);
             round_changed |= fold_shapes::run(function);
         }
         if !round_changed {

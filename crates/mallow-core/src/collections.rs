@@ -135,6 +135,17 @@ impl<K: Index> IndexSet<K> {
         out
     }
 
+    /// Returns whether every key of `self` is also in `other`.
+    pub(crate) fn is_subset(&self, other: &Self) -> bool {
+        let (head, tail) = self.words.split_at(self.words.len().min(other.words.len()));
+        head.iter().zip(&other.words).all(|(&a, &b)| a & !b == 0) && tail.iter().all(|&w| w == 0)
+    }
+
+    /// Returns whether `self` and `other` have no key in common.
+    pub(crate) fn is_disjoint(&self, other: &Self) -> bool {
+        self.words.iter().zip(&other.words).all(|(a, b)| a & b == 0)
+    }
+
     /// Returns an iterator over the set bits.
     pub(crate) fn iter(&self) -> IndexSetIter<'_> {
         IndexSetIter::new(&self.words)
