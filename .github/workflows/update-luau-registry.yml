@@ -33,6 +33,7 @@ jobs:
         uses: peter-evans/create-pull-request@v8
         with:
           branch: update-luau-registry
+          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
           commit-message: "toolchain: add Luau ${{ steps.update.outputs.added }}"
           title: "toolchain: add Luau ${{ steps.update.outputs.added }}"
           body: Adds Luau releases ${{ steps.update.outputs.added }} to `registry.json`.
