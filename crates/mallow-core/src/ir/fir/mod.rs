@@ -550,6 +550,11 @@ impl<T> ControlFlowGraph<T> {
             in_edges: in_edges.into_boxed_slice(),
         }
     }
+
+    /// Returns the nodes in index order and drops the edges.
+    pub fn into_items(self) -> impl ExactSizeIterator<Item = T> {
+        self.nodes.into_vec().into_iter()
+    }
 }
 
 impl<T> GraphView for ControlFlowGraph<T> {

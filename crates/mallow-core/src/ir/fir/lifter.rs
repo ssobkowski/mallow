@@ -410,6 +410,8 @@ impl<'c> FunctionLifter<'c> {
             });
         }
 
+        cfg = fold_select_diamonds(cfg);
+
         for binding in &mut bindings {
             for value in &mut binding.values {
                 *value = resolve_alias(*value, &aliases);
@@ -1902,41 +1904,48 @@ fn raw_exit_references_mut(exit: &mut RawBlockExit) -> SmallVec<[&mut usize; 2]>
 
 /// Merges each block into its predecessor when it has no other way in and
 /// directly follows that predecessor in bytecode order.
-fn merge_raw_chains(mut blocks: Vec<RawBlock<'_>>) -> Vec<RawBlock<'_>> {
+fn merge_raw_chains(blocks: &mut Vec<RawBlock<'_>>) {
     // luau-compile producing V5 bytecode will generate a jump when it inlines
     // a function, even though the two blocks could have been one block.
 
     // The entry is referenced by the function itself.
     let mut references = vec![0usize; blocks.len()];
     references[0] = 1;
-    for block in &mut blocks {
+    for block in blocks.iter_mut() {
         for target in raw_exit_references_mut(&mut block.exit) {
             references[*target] += 1;
         }
     }
 
-    let mut merged: Vec<RawBlock<'_>> = Vec::with_capacity(blocks.len());
+    let mut write = 0;
     let mut old_to_new = vec![None; blocks.len()];
-    for (old, block) in blocks.into_iter().enumerate() {
-        if let Some(previous) = merged.last_mut()
+    for read in 0..blocks.len() {
+        // We're avoiding borrow checking or allocs by splitting.
+        let (kept, rest) = blocks.split_at_mut(read);
+        let block = &mut rest[0];
+
+        if let Some(previous) = kept[..write].last_mut()
             && let RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) = previous.exit
-            && target == old
+            && target == read
             && previous.exit_writes.is_empty()
-            && references[old] == 1
+            && references[read] == 1
         {
             previous.instrs.to_mut().extend_from_slice(&block.instrs);
-            previous.exit_writes = block.exit_writes;
-            previous.exit = block.exit;
+            // `block` is dead after this and gets truncated away, so swapping
+            // avoids needing `Default` or `Clone` on these fields.
+            std::mem::swap(&mut previous.exit_writes, &mut block.exit_writes);
+            std::mem::swap(&mut previous.exit, &mut block.exit);
         } else {
-            old_to_new[old] = Some(merged.len());
-            merged.push(block);
+            old_to_new[read] = Some(write);
+            blocks.swap(write, read);
+            write += 1;
         }
     }
+    blocks.truncate(write);
 
-    for block in &mut merged {
+    for block in blocks.iter_mut() {
         remap_raw_exit(&mut block.exit, &old_to_new);
     }
-    merged
 }
 
 /// Removes unreachable raw blocks and merges straight-line chains while retaining bytecode order.
@@ -1972,7 +1981,7 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
         }
     }
 
-    let raw_blocks = raw_blocks
+    let mut raw_blocks = raw_blocks
         .into_iter()
         .enumerate()
         .filter_map(|(old, mut block)| {
@@ -1983,7 +1992,7 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
         })
         .collect();
 
-    let mut raw_blocks = merge_raw_chains(raw_blocks);
+    merge_raw_chains(&mut raw_blocks);
 
     // Give a looping entry block a preheader, so that the function entry has no
     // predecessors and every join has an immediate dominator to open shared cells in.
@@ -2007,6 +2016,255 @@ fn reachable_raw_blocks<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
     }
 
     Ok(raw_blocks)
+}
+
+/// Folds the diamond that Luau emits for a comparison used as a value into
+/// one [Select](ir::Instr::Select) instruction.
+///
+/// Luau writes such a value with a conditional jump into the pair
+/// `LOADB R false +1` and `LOADB R true`. After lifting, each `LOADB` is an
+/// arm that holds one boolean constant and passes it to the same join.
+/// That is the only shape this folds. Diamonds with any other arms, such as
+/// if-expressions, stay as they are.
+///
+/// # The problem
+/// Under normal circumstances such shapes are handled fine, through
+/// the `folding` module. However, because LOADB can jump on its own,
+/// it creates more blocks. Because `folding` does not work cross-block,
+/// this effectively forces the region structurer to later (possibly)
+/// miss some conditions or decisions and duplicate blocks as a result.
+///
+/// # Example
+///
+/// ```text
+/// bb1(%v9, %v20):
+///     %v7 = copy %v3
+///     %v8 = const 5
+///     %v10 = lt %v9, %v8
+///     branch %v10, bb3, bb2
+///
+/// bb2:
+///     %v11 = const false
+///     jump bb4(%v11)
+///
+/// bb3:
+///     %v12 = const true
+///     fallthrough bb4(%v12)
+///
+/// bb4(%v13):
+///     %q2 = pack [%v13]
+///     %q3 = call %v7(%q2)
+///     %v15 = project %q3, 0
+///     branch %v15, bb5, bb9
+/// ```
+///
+/// Above FIR snippet is somewhat equivalent to this:
+///
+/// ```luau
+/// if v7(v9 < 5) then
+/// ```
+///
+/// If this were to appear as a loop guard, it wouldn't be structured
+/// prettily. The intended shape after this transformation is:
+///
+/// ```text
+/// bb1(%v9, %v20):
+///     %v7 = copy %v3
+///     %v8 = const 5
+///     %v10 = lt %v9, %v8
+///     %v11 = const false
+///     %v12 = const true
+///     %v13 = select %v10, %v12, %v11
+///     %q2 = pack [%v13]
+///     %q3 = call %v7(%q2)
+///     %v15 = project %q3, 0
+///     branch %v15, bb5, bb9
+/// ```
+///
+/// The diamond was replaced with a single select.
+fn fold_select_diamonds(cfg: ControlFlowGraph<Block>) -> ControlFlowGraph<Block> {
+    let mut predecessors: Vec<SmallVec<[usize; 2]>> = cfg
+        .nodes()
+        .map(|block| cfg.predecessors(block).collect())
+        .collect();
+    let mut blocks: Vec<Option<Block>> = cfg.into_items().map(Some).collect();
+
+    for head in 0..blocks.len() {
+        // The head takes over the exit of the join, which can branch into
+        // another diamond, as in `f(a < b, c < d)`.
+        while let Some(diamond) = SelectDiamond::find(&blocks, &predecessors, head) {
+            diamond.fold(&mut blocks, &mut predecessors);
+        }
+    }
+
+    // The folds leave the graph out of date in two ways.
+    //
+    // `ControlFlowGraph` computes its successor and predecessor lists once,
+    // when it is built, and keeps them in dense, immutable storage (CSR) for
+    // speed. Each fold gave its head the successors of the join, and those
+    // successors are now reached from the head. Only a new graph has the
+    // right lists.
+    //
+    // The folded arms and joins are unreachable now. The passes after
+    // lifting expect every block to be reachable and every predecessor to
+    // be a real way into its block. `Storage`, `Folding` and materialization
+    // walk every block, and the region structurer reads every predecessor.
+    // So the new graph holds only the kept blocks, renumbered.
+    compact_blocks(blocks)
+}
+
+/// A `LOADB` diamond found by [`fold_select_diamonds`].
+struct SelectDiamond {
+    head: usize,
+    then_arm: BoolArm,
+    else_arm: BoolArm,
+    join: usize,
+}
+
+impl SelectDiamond {
+    /// Returns the diamond that `head` branches into, if there is one.
+    fn find(
+        blocks: &[Option<Block>],
+        predecessors: &[SmallVec<[usize; 2]>],
+        head: usize,
+    ) -> Option<Self> {
+        let BlockExit::Branch {
+            then_edge,
+            else_edge,
+            ..
+        } = &blocks[head].as_ref()?.exit
+        else {
+            return None;
+        };
+        let then_arm = BoolArm::find(blocks, predecessors, head, then_edge.target)?;
+        let else_arm = BoolArm::find(blocks, predecessors, head, else_edge.target)?;
+
+        let join = then_arm.join;
+        let join_predecessors = &predecessors[join];
+        let is_diamond = then_arm.block != else_arm.block
+            && else_arm.join == join
+            && then_arm.constant != else_arm.constant
+            && join != head
+            && blocks[join].as_ref()?.params.len() == 1
+            && join_predecessors.len() == 2
+            && join_predecessors.contains(&then_arm.block)
+            && join_predecessors.contains(&else_arm.block);
+
+        is_diamond.then_some(Self {
+            head,
+            then_arm,
+            else_arm,
+            join,
+        })
+    }
+
+    /// Moves both arms and the join into the head, with the join param
+    /// defined by a select over the two constants.
+    fn fold(self, blocks: &mut [Option<Block>], predecessors: &mut [SmallVec<[usize; 2]>]) {
+        let then_arm = blocks[self.then_arm.block].take().expect("found above");
+        let else_arm = blocks[self.else_arm.block].take().expect("found above");
+        let join = blocks[self.join].take().expect("found above");
+        let head = blocks[self.head].as_mut().expect("found above");
+
+        let BlockExit::Branch { condition, .. } = &head.exit else {
+            unreachable!("the head of a diamond branches");
+        };
+        let select = ir::Instr::Select {
+            out: join.params[0],
+            condition: *condition,
+            then_value: self.then_arm.out,
+            else_value: self.else_arm.out,
+        };
+
+        head.instrs.extend(then_arm.instrs);
+        head.instrs.extend(else_arm.instrs);
+        head.instrs.push(select);
+        head.instrs.extend(join.instrs);
+        head.outputs.extend(join.outputs);
+        head.exit = join.exit;
+
+        for target in head.exit.targets() {
+            for predecessor in &mut predecessors[target] {
+                if *predecessor == self.join {
+                    *predecessor = self.head;
+                }
+            }
+        }
+    }
+}
+
+/// An arm of a [`SelectDiamond`]. It is a lifted `LOADB`.
+struct BoolArm {
+    block: usize,
+    out: ValueId,
+    constant: bool,
+    join: usize,
+}
+
+impl BoolArm {
+    /// Returns the arm at `block` if it only loads one boolean constant and
+    /// passes it on, and `head` is the only way into it.
+    fn find(
+        blocks: &[Option<Block>],
+        predecessors: &[SmallVec<[usize; 2]>],
+        head: usize,
+        block: usize,
+    ) -> Option<Self> {
+        let arm = blocks[block].as_ref()?;
+        let [
+            ir::Instr::Const {
+                out,
+                value: ir::Constant::Bool(constant),
+            },
+        ] = arm.instrs.as_slice()
+        else {
+            return None;
+        };
+        let (BlockExit::Jump(edge) | BlockExit::Fallthrough(edge)) = &arm.exit else {
+            return None;
+        };
+
+        let is_arm = predecessors[block].as_slice() == [head]
+            && arm.params.is_empty()
+            && arm.outputs.is_empty()
+            && edge.params == [*out];
+
+        is_arm.then_some(Self {
+            block,
+            out: *out,
+            constant: *constant,
+            join: edge.target,
+        })
+    }
+}
+
+/// Drops the folded blocks and renumbers the edges of the rest.
+fn compact_blocks(blocks: Vec<Option<Block>>) -> ControlFlowGraph<Block> {
+    let mut renumbered = vec![None; blocks.len()];
+    let mut kept = Vec::with_capacity(blocks.len());
+    for (old, block) in blocks.into_iter().enumerate() {
+        if let Some(block) = block {
+            renumbered[old] = Some(kept.len());
+            kept.push(block);
+        }
+    }
+
+    let renumber = |target: &mut usize| {
+        *target = renumbered[*target].expect("edges only reach kept blocks");
+    };
+    for block in &mut kept {
+        for edge in block.exit.edges_mut() {
+            renumber(&mut edge.target);
+        }
+        if let BlockExit::GenericFor { loop_block, .. } = &mut block.exit {
+            renumber(loop_block);
+        }
+    }
+
+    ControlFlowGraph::from_nodes_and_exits(kept.into_iter().map(|block| {
+        let targets = block.exit.targets();
+        (block, targets)
+    }))
 }
 
 /// Resolves one proto's debug strings from its disassembled chunk.
