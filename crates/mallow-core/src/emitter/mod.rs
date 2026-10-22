@@ -685,6 +685,18 @@ impl<'f, 'n, N: Namer> FunctionEmitter<'f, 'n, N> {
                 }
                 combined
             }
+            nir::Expr::Interpolation(parts) => {
+                let mut lifted = Vec::with_capacity(parts.len());
+                for part in parts {
+                    lifted.push(match part {
+                        nir::TemplatePart::Text(text) => ast::TemplatePart::Text(text.clone()),
+                        nir::TemplatePart::Value(value) => {
+                            ast::TemplatePart::Value(self.lift_expr(value)?)
+                        }
+                    });
+                }
+                ast::Expr::Interpolation(lifted)
+            }
             nir::Expr::Select {
                 condition,
                 then_value,

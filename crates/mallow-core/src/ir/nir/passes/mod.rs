@@ -6,6 +6,7 @@ mod fold_packs;
 mod fold_shapes;
 mod fold_tables;
 mod inline;
+mod interpolate;
 mod jumps;
 mod normalize;
 
@@ -32,6 +33,7 @@ pub(crate) fn run(unit: &mut Unit<Function>) -> bool {
             round_changed |= dead_initializers::run(function);
             round_changed |= jumps::run(function);
             round_changed |= fold_shapes::run(function);
+            round_changed |= interpolate::run(function);
         }
         if !round_changed {
             return changed;

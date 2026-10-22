@@ -629,6 +629,13 @@ impl<'a> BindingCollector<'a> {
                     self.expr(value, scope);
                 }
             }
+            nir::Expr::Interpolation(parts) => {
+                for part in parts {
+                    if let nir::TemplatePart::Value(value) = part {
+                        self.expr(value, scope);
+                    }
+                }
+            }
             nir::Expr::Select {
                 condition,
                 then_value,

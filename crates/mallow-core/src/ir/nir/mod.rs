@@ -10,6 +10,7 @@ use smallvec::SmallVec;
 use smol_str::SmolStr;
 
 use crate::collections::IndexMap;
+use crate::common::ByteString;
 use crate::il::ProtoId;
 use crate::ir::Debug;
 use crate::ir::fir::{CellId, Constant, PackId, ValueId};
@@ -86,6 +87,8 @@ pub(crate) enum Expr {
     },
     /// Concatenates values in evaluation order.
     Concat(Vec<Expr>),
+    /// Builds a string from text and values in evaluation order, like `` `a{x}b` ``.
+    Interpolation(Vec<TemplatePart>),
     /// Evaluates one of two values.
     Select {
         /// Selection condition.
@@ -213,6 +216,15 @@ impl Expr {
             other => Expr::not(other),
         }
     }
+}
+
+/// One piece of an [`Expr::Interpolation`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TemplatePart {
+    /// Raw text copied into the result as is.
+    Text(ByteString),
+    /// A value converted to a string like `tostring` does.
+    Value(Expr),
 }
 
 /// An entry in the table constructor.

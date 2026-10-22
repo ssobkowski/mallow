@@ -305,6 +305,17 @@ pub enum Expr {
     Vararg,
     /// Literal expression.
     Literal(Literal),
+    /// Interpolated string (`` `a{x}b` ``).
+    Interpolation(Vec<TemplatePart>),
+}
+
+/// One piece of an interpolated string.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TemplatePart {
+    /// Raw text, printed with escapes.
+    Text(ByteString),
+    /// A value printed inside braces.
+    Value(Expr),
 }
 
 /// Literal values.

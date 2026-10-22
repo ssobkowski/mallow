@@ -1,4 +1,6 @@
-use super::{Block, ElseClause, Expr, Identifier, If, Parameter, Stmt, TableItem, Typed};
+use super::{
+    Block, ElseClause, Expr, Identifier, If, Parameter, Stmt, TableItem, TemplatePart, Typed,
+};
 
 /// Visits and may change an AST.
 ///
@@ -151,6 +153,13 @@ pub(crate) fn walk_expr<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut Expr
                         visitor.visit_expr(index);
                         visitor.visit_expr(value);
                     }
+                }
+            }
+        }
+        Expr::Interpolation(parts) => {
+            for part in parts {
+                if let TemplatePart::Value(value) = part {
+                    visitor.visit_expr(value);
                 }
             }
         }

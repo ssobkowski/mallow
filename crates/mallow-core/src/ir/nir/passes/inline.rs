@@ -6,6 +6,7 @@ use crate::ir::fir::ValueId;
 use crate::ir::nir::visitor::{VisitorMut, walk_expr_mut, walk_pack_expr_mut, walk_stmts_mut};
 use crate::ir::nir::{
     Capture, Expr, Function, Local, LocalId, PackExpr, PackLocalId, Place, Region, Stmt, TableItem,
+    TemplatePart,
 };
 use crate::operator::BinOp;
 
@@ -539,6 +540,15 @@ impl<'nir> DefUse<'nir> {
                 for value in values {
                     self.collect_expr(value, context);
                     context = context.after_expr(value);
+                }
+            }
+            Expr::Interpolation(parts) => {
+                let mut context = context;
+                for part in parts {
+                    if let TemplatePart::Value(value) = part {
+                        self.collect_expr(value, context);
+                        context = context.after_expr(value);
+                    }
                 }
             }
             Expr::Select {

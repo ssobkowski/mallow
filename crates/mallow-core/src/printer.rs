@@ -1,5 +1,6 @@
 use crate::ast::{
-    Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, Type, TypePrecedence, Typed,
+    Block, ElseClause, Expr, If, Literal, Parameter, Stmt, TableItem, TemplatePart, Type,
+    TypePrecedence, Typed,
 };
 use crate::common::{ByteString, escape_bytes};
 use crate::operator::{BinOp, UnOp};
@@ -402,7 +403,29 @@ impl AstPrinter {
             Expr::Table { items } => self.write_table(items),
             Expr::Vararg => self.write("..."),
             Expr::Literal(lit) => self.write_literal(lit),
+            Expr::Interpolation(parts) => self.write_interpolation(parts),
         }
+    }
+
+    fn write_interpolation(&mut self, parts: &[TemplatePart]) {
+        self.write("`");
+        for part in parts {
+            match part {
+                TemplatePart::Text(text) => self.write(&escape_template_text(text)),
+                TemplatePart::Value(value) => {
+                    self.write("{");
+                    let start = self.out.len();
+                    self.walk_expr(value, 0, Side::None);
+                    // Luau rejects `{{` inside interpolated strings, so a value
+                    // that starts with a table constructor gets a space first.
+                    if self.out[start..].starts_with('{') {
+                        self.out.insert(start, ' ');
+                    }
+                    self.write("}");
+                }
+            }
+        }
+        self.write("`");
     }
 
     fn write_params(&mut self, params: &[Typed<Parameter>]) {
@@ -586,10 +609,48 @@ const fn needs_prefix_wrap(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::Literal(_)
+            | Expr::Interpolation(_)
             | Expr::Table { .. }
             | Expr::AnonymousFunction { .. }
             | Expr::IfElse { .. }
     )
+}
+
+/// Escapes text for the inside of an interpolated string.
+///
+/// Backticks and opening braces get a backslash. Double quotes stay as they
+/// are. Printable non-ASCII characters stay as they are when the text is
+/// valid UTF-8. Every other byte uses the quoted string escapes.
+fn escape_template_text(text: &ByteString) -> String {
+    let Some(text) = text.as_utf8() else {
+        return text
+            .as_ref()
+            .iter()
+            .map(|&byte| escape_template_byte(byte))
+            .collect();
+    };
+
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            out.push_str(&escape_template_byte(ch as u8));
+        } else if ch.is_control() {
+            out.push_str(&escape_bytes(ch.to_string()));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Escapes one byte for the inside of an interpolated string.
+fn escape_template_byte(byte: u8) -> String {
+    match byte {
+        b'`' => "\\`".to_string(),
+        b'{' => "\\{".to_string(),
+        b'"' => "\"".to_string(),
+        _ => escape_bytes([byte]),
+    }
 }
 
 const fn binary_assoc(op: &BinOp) -> Assoc {

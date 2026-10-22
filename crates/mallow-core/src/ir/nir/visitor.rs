@@ -8,7 +8,7 @@ use smol_str::SmolStr;
 use super::{Capture, Expr, Function, LocalId, PackExpr, PackLocalId, Place, Region, Stmt};
 use crate::common::ByteString;
 use crate::ir::fir::{CellId, Constant, Number};
-use crate::ir::nir::TableItem;
+use crate::ir::nir::{TableItem, TemplatePart};
 
 /// Visits NIR without changing it.
 pub trait Visitor {
@@ -312,6 +312,13 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
                 visitor.visit_expr(value);
             }
         }
+        Expr::Interpolation(parts) => {
+            for part in parts {
+                if let TemplatePart::Value(value) = part {
+                    visitor.visit_expr(value);
+                }
+            }
+        }
         Expr::Select {
             condition,
             then_value,
@@ -493,6 +500,13 @@ pub fn walk_expr_mut<V: VisitorMut + ?Sized>(visitor: &mut V, expr: &mut Expr) {
         Expr::Concat(values) => {
             for value in values {
                 visitor.visit_expr(value);
+            }
+        }
+        Expr::Interpolation(parts) => {
+            for part in parts {
+                if let TemplatePart::Value(value) = part {
+                    visitor.visit_expr(value);
+                }
             }
         }
         Expr::Select {
