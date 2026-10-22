@@ -262,7 +262,15 @@ impl AstPrinter {
                 if op == &UnOp::Not {
                     self.write(" ");
                 }
+                let wrap_operand = op == &UnOp::Minus
+                    && matches!(expr.as_ref(), Expr::Unary { op: UnOp::Minus, .. });
+                if wrap_operand {
+                    self.write("(");
+                }
                 self.walk_expr(expr, prec, Side::Right);
+                if wrap_operand {
+                    self.write(")");
+                }
                 if needs_parens {
                     self.write(")");
                 }
@@ -742,6 +750,7 @@ mod tests {
     };
     use crate::ast::{Block, Expr, Literal, Stmt, Type, TypePrecedence};
     use crate::common::ByteString;
+    use crate::operator::UnOp;
 
     fn render_type(ty: &Type) -> String {
         let mut printer = AstPrinter::new();
@@ -775,6 +784,21 @@ mod tests {
         }]);
 
         assert_eq!(print(&block), "return (-9223372036854775807i - 1i)\n");
+    }
+
+    #[test]
+    fn double_unary_minus_does_not_emit_comment() {
+        let block = Block::with_stmts(vec![Stmt::Return {
+            values: vec![Expr::Unary {
+                op: UnOp::Minus,
+                expr: Box::new(Expr::Unary {
+                    op: UnOp::Minus,
+                    expr: Box::new(Expr::Named("x".into())),
+                }),
+            }],
+        }]);
+
+        assert_eq!(print(&block), "return -(-x)\n");
     }
 
     /// Optional broad function metadata keeps the function type parenthesized.
