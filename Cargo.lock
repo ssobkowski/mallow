@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "mallow-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "mallow-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1267,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "mallow-luau-toolchain"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "directories",
  "reqwest",
