@@ -249,7 +249,7 @@ impl<W: StyledWrite> IrWriter<'_, '_, W> {
             Instr::VarArgs { out } => {
                 self.pack(out)?;
                 self.w.write_str(" = ")?;
-                write_styled!(self.w, Style::Register, "%va")
+                self.op("varargs")
             }
             Instr::OpenCell { cell, value } => {
                 self.cell(cell)?;
