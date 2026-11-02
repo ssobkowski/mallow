@@ -1,6 +1,23 @@
 {
   "schema": 1,
   "releases": {
+    "0.745": {
+      "bytecode": 14,
+      "assets": {
+        "windows-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.745/luau-windows.zip",
+          "sha256": "5afe2fd5db34a045a2e4261ec0ea3144da6346ff38808726d5ac6e06115081c6"
+        },
+        "linux-x86_64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.745/luau-ubuntu.zip",
+          "sha256": "186e5ddaa2b048ebc7390c11ed1b00c04e7d3beaffed429250329e3575d2ece2"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/luau-lang/luau/releases/download/0.745/luau-macos.zip",
+          "sha256": "fb6994f1002212967ab541b6447f5aaea6001c340bc121e077e75bd2fc4e75b9"
+        }
+      }
+    },
     "0.744": {
       "bytecode": 14,
       "assets": {
