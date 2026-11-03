@@ -3,50 +3,10 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::ExitCode;
-use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use clap::{Subcommand, ValueEnum};
-use mallow_luau_toolchain::{BytecodeVersion, Manager, Registry, Tool, VersionSelector};
-
-/// Selects a managed Luau release by exact version or emitted bytecode format.
-#[derive(Debug, Clone)]
-pub enum LuauSelector {
-    /// An exact upstream release, such as `0.700`.
-    Release(String),
-    /// The newest release emitting a bytecode version, written as `bc<N>`.
-    Bytecode(BytecodeVersion),
-}
-
-impl FromStr for LuauSelector {
-    type Err = String;
-
-    /// Parses `bc<N>` as a bytecode selector and anything else as an exact release.
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.strip_prefix("bc") {
-            Some(number) => parse_bytecode(number).map(Self::Bytecode),
-            None => Ok(Self::Release(value.to_owned())),
-        }
-    }
-}
-
-impl LuauSelector {
-    /// Returns the matching library selector.
-    pub fn selector(&self) -> VersionSelector<'_> {
-        match self {
-            Self::Release(version) => VersionSelector::release(version),
-            Self::Bytecode(bytecode) => VersionSelector::bytecode(*bytecode),
-        }
-    }
-}
-
-/// Parses a bytecode version supported by the managed Luau registry.
-fn parse_bytecode(value: &str) -> Result<BytecodeVersion, String> {
-    let number = value
-        .parse::<u8>()
-        .map_err(|_| format!("expected a bytecode version number, got '{value}'"))?;
-    BytecodeVersion::try_from(number).map_err(|error| error.to_string())
-}
+use mallow_luau_toolchain::{BytecodeVersion, LuauSelector, Manager, Registry, Tool};
 
 /// Command-line name of one tool shipped in a Luau release.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -81,7 +41,7 @@ pub enum ToolchainCommand {
     /// List installed releases, newest first
     List {
         /// Only list releases emitting this bytecode version
-        #[arg(long, value_name = "N", value_parser = parse_bytecode)]
+        #[arg(long, value_name = "N")]
         bytecode: Option<BytecodeVersion>,
 
         /// List every registry release, not just installed ones

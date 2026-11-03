@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use directories::ProjectDirs;
@@ -133,6 +134,29 @@ impl TryFrom<u8> for BytecodeVersion {
             14 => Ok(Self::V14),
             number => Err(InvalidBytecodeVersion { number }),
         }
+    }
+}
+
+/// Error returned when text does not name a supported bytecode version.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ParseBytecodeVersionError {
+    /// The text is not a bytecode version number.
+    #[error("expected a bytecode version number, got '{0}'")]
+    NotANumber(String),
+    /// The number is outside the supported range.
+    #[error(transparent)]
+    Unsupported(#[from] InvalidBytecodeVersion),
+}
+
+impl FromStr for BytecodeVersion {
+    type Err = ParseBytecodeVersionError;
+
+    /// Parses a bare bytecode number such as `9`.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let number = value
+            .parse::<u8>()
+            .map_err(|_| ParseBytecodeVersionError::NotANumber(value.to_owned()))?;
+        Ok(Self::try_from(number)?)
     }
 }
 
@@ -299,6 +323,56 @@ impl From<BytecodeVersion> for VersionSelector<'static> {
     /// Treats a bytecode value as a newest-compatible-release selector.
     fn from(bytecode: BytecodeVersion) -> Self {
         Self::Bytecode(bytecode)
+    }
+}
+
+/// An owned [`VersionSelector`], as written on a command line.
+///
+/// `bc<N>` selects the newest release emitting bytecode version N. Anything
+/// else is an exact release such as `0.700`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LuauSelector {
+    /// An exact upstream release, such as `0.700`.
+    Release(String),
+    /// The newest release emitting a bytecode version, written as `bc<N>`.
+    Bytecode(BytecodeVersion),
+}
+
+impl FromStr for LuauSelector {
+    type Err = ParseBytecodeVersionError;
+
+    /// Parses `bc<N>` as a bytecode selector and anything else as an exact release.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.strip_prefix("bc") {
+            Some(number) => number.parse().map(Self::Bytecode),
+            None => Ok(Self::Release(value.to_owned())),
+        }
+    }
+}
+
+impl LuauSelector {
+    /// Returns the matching borrowed selector.
+    pub fn selector(&self) -> VersionSelector<'_> {
+        match self {
+            Self::Release(version) => VersionSelector::release(version),
+            Self::Bytecode(bytecode) => VersionSelector::bytecode(*bytecode),
+        }
+    }
+}
+
+impl std::fmt::Display for LuauSelector {
+    /// Writes the selector in the form [`LuauSelector::from_str`] reads.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Release(version) => formatter.write_str(version),
+            Self::Bytecode(bytecode) => write!(formatter, "bc{bytecode}"),
+        }
+    }
+}
+
+impl<'a> From<&'a LuauSelector> for VersionSelector<'a> {
+    fn from(selector: &'a LuauSelector) -> Self {
+        selector.selector()
     }
 }
 

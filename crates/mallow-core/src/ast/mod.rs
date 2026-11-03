@@ -309,6 +309,58 @@ pub enum Expr {
     Interpolation(Vec<TemplatePart>),
 }
 
+impl Expr {
+    pub const fn nil() -> Self {
+        Self::Literal(Literal::Nil)
+    }
+
+    pub const fn boolean(value: bool) -> Self {
+        Self::Literal(Literal::Bool(value))
+    }
+
+    pub const fn float(value: f64) -> Self {
+        Self::Literal(Literal::Float(value))
+    }
+
+    pub const fn integer(value: i64) -> Self {
+        Self::Literal(Literal::Integer(value))
+    }
+
+    pub fn string(value: impl Into<ByteString>) -> Self {
+        Self::Literal(Literal::String(value.into()))
+    }
+
+    pub fn named(name: impl Into<Identifier>) -> Self {
+        Self::Named(name.into())
+    }
+
+    pub fn binary(lhs: Expr, op: BinOp, rhs: Expr) -> Self {
+        Self::Binary {
+            lhs: Box::new(lhs),
+            op,
+            rhs: Box::new(rhs),
+        }
+    }
+
+    pub fn unary(op: UnOp, expr: Expr) -> Self {
+        Self::Unary {
+            op,
+            expr: Box::new(expr),
+        }
+    }
+
+    pub fn parenthesized(expr: Expr) -> Self {
+        Self::Parenthesized(Box::new(expr))
+    }
+
+    pub fn call(func: Expr, args: Vec<Expr>) -> Self {
+        Self::FunctionCall {
+            func: Box::new(func),
+            args,
+        }
+    }
+}
+
 /// One piece of an interpolated string.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TemplatePart {

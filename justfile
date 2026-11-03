@@ -46,3 +46,7 @@ lint:
 # Install the CLI with every feature enabled
 install:
     cargo install --path crates/mallow-cli --all-features
+
+# Differential fuzzing against a managed Luau, e.g. `just fuzz --count 1000`
+fuzz *args:
+    cargo run -q --release -p mallow-fuzzer -- check {{args}}

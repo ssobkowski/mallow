@@ -253,7 +253,7 @@ impl AstPrinter {
                 }
             }
             Expr::Unary { op, expr } => {
-                let prec = 7;
+                let prec = UNARY_PRECEDENCE;
                 let needs_parens = prec < parent_prec;
                 if needs_parens {
                     self.write("(");
@@ -262,8 +262,9 @@ impl AstPrinter {
                 if op == &UnOp::Not {
                     self.write(" ");
                 }
-                let wrap_operand = op == &UnOp::Minus
-                    && matches!(expr.as_ref(), Expr::Unary { op: UnOp::Minus, .. });
+                // `-` followed by an operand that starts with `-` would print
+                // as the comment `--`.
+                let wrap_operand = op == &UnOp::Minus && prints_with_leading_minus(expr);
                 if wrap_operand {
                     self.write("(");
                 }
@@ -410,7 +411,19 @@ impl AstPrinter {
             }
             Expr::Table { items } => self.write_table(items),
             Expr::Vararg => self.write("..."),
-            Expr::Literal(lit) => self.write_literal(lit),
+            Expr::Literal(lit) => {
+                // A negative number reads as a unary minus, so it binds like
+                // one. For example, `(-2) ^ x` keeps its parentheses.
+                let needs_parens =
+                    prints_with_leading_minus(expr) && UNARY_PRECEDENCE < parent_prec;
+                if needs_parens {
+                    self.write("(");
+                }
+                self.write_literal(lit);
+                if needs_parens {
+                    self.write(")");
+                }
+            }
             Expr::Interpolation(parts) => self.write_interpolation(parts),
         }
     }
@@ -496,7 +509,10 @@ impl AstPrinter {
             Literal::Nil => self.write("nil"),
             Literal::Integer(num) => {
                 if *num == i64::MIN {
-                    self.write("(-9223372036854775807i - 1i)");
+                    // Luau reads `-9223372036854775808i` as the negation of a
+                    // literal that overflows. The hex form wraps to the
+                    // minimum instead.
+                    self.write("0x8000000000000000i");
                 } else {
                     self.write(&format!("{num}i"));
                 }
@@ -604,6 +620,21 @@ impl AstPrinter {
     }
 }
 
+/// Returns whether `expr` prints with `-` as its first character.
+///
+/// Negative literals print that way, except the minimum integer, which prints
+/// in hex, and `nan`, which prints as `(0/0)`.
+fn prints_with_leading_minus(expr: &Expr) -> bool {
+    match expr {
+        Expr::Unary {
+            op: UnOp::Minus, ..
+        } => true,
+        Expr::Literal(Literal::Float(value)) => value.is_sign_negative() && !value.is_nan(),
+        Expr::Literal(Literal::Integer(value)) => *value < 0 && *value != i64::MIN,
+        _ => false,
+    }
+}
+
 const fn needs_parens(prec: u8, parent_prec: u8, assoc: Assoc, side: Side) -> bool {
     prec < parent_prec
         || (prec == parent_prec
@@ -661,6 +692,9 @@ fn escape_template_byte(byte: u8) -> String {
     }
 }
 
+/// Binding strength of unary operators. Only `^` binds tighter.
+const UNARY_PRECEDENCE: u8 = 7;
+
 const fn binary_assoc(op: &BinOp) -> Assoc {
     match op {
         BinOp::Concat | BinOp::Pow => Assoc::Right,
@@ -705,11 +739,16 @@ fn long_string_text(value: &ByteString) -> Option<&str> {
     safe_controls.then_some(text)
 }
 
-/// Returns the minimum bracket level that does not occur in `text`.
+/// Returns the minimum bracket level whose closing delimiter first appears
+/// right after `text`.
+///
+/// Text that ends in `]` joins with the closing delimiter, so the check runs on
+/// the whole literal.
 fn long_string_level(text: &str) -> usize {
     for level in 0..=text.len() {
         let closing = format!("]{}]", "=".repeat(level));
-        if !text.contains(&closing) {
+        let literal = format!("{text}{closing}");
+        if literal.find(&closing) == Some(text.len()) {
             return level;
         }
     }
@@ -750,7 +789,7 @@ mod tests {
     };
     use crate::ast::{Block, Expr, Literal, Stmt, Type, TypePrecedence};
     use crate::common::ByteString;
-    use crate::operator::UnOp;
+    use crate::operator::{BinOp, UnOp};
 
     fn render_type(ty: &Type) -> String {
         let mut printer = AstPrinter::new();
@@ -777,13 +816,92 @@ mod tests {
         assert_eq!(print(&block), "return 42, 42i, -42i\n");
     }
 
-    #[test]
-    fn prints_min_luau_integer_without_overflowing_positive_literal() {
-        let block = Block::with_stmts(vec![Stmt::Return {
-            values: vec![Expr::Literal(Literal::Integer(i64::MIN))],
-        }]);
+    /// Prints one expression as a return value.
+    fn render_expr(expr: Expr) -> String {
+        print(&Block::with_stmts(vec![Stmt::Return {
+            values: vec![expr],
+        }]))
+    }
 
-        assert_eq!(print(&block), "return (-9223372036854775807i - 1i)\n");
+    /// Luau integers have no arithmetic operators, so the minimum prints as a
+    /// single hex literal.
+    #[test]
+    fn prints_min_luau_integer_as_hex_literal() {
+        assert_eq!(
+            render_expr(Expr::integer(i64::MIN)),
+            "return 0x8000000000000000i\n"
+        );
+    }
+
+    /// Negating a negative literal keeps the operand apart from the minus.
+    #[test]
+    fn negated_negative_literals_do_not_emit_comment() {
+        assert_eq!(
+            render_expr(Expr::unary(UnOp::Minus, Expr::float(-1.0))),
+            "return -(-1)\n"
+        );
+        assert_eq!(
+            render_expr(Expr::unary(UnOp::Minus, Expr::float(-0.0))),
+            "return -(-0)\n"
+        );
+        assert_eq!(
+            render_expr(Expr::unary(UnOp::Minus, Expr::float(f64::NEG_INFINITY))),
+            "return -(-math.huge)\n"
+        );
+        assert_eq!(
+            render_expr(Expr::unary(UnOp::Minus, Expr::integer(-4))),
+            "return -(-4i)\n"
+        );
+    }
+
+    /// Literals that print without a leading minus need no parentheses.
+    #[test]
+    fn negated_literals_without_leading_minus_stay_bare() {
+        assert_eq!(
+            render_expr(Expr::unary(UnOp::Minus, Expr::float(1.0))),
+            "return -1\n"
+        );
+        assert_eq!(
+            render_expr(Expr::unary(UnOp::Minus, Expr::float(f64::NAN))),
+            "return -(0/0)\n"
+        );
+        assert_eq!(
+            render_expr(Expr::unary(UnOp::Minus, Expr::integer(i64::MIN))),
+            "return -0x8000000000000000i\n"
+        );
+    }
+
+    /// A negative literal as a `^` base keeps its parentheses.
+    #[test]
+    fn negative_pow_base_is_parenthesized() {
+        let y = || Expr::named("y");
+        assert_eq!(
+            render_expr(Expr::binary(Expr::float(-2.0), BinOp::Pow, y())),
+            "return (-2) ^ y\n"
+        );
+        assert_eq!(
+            render_expr(Expr::binary(
+                Expr::float(f64::NEG_INFINITY),
+                BinOp::Pow,
+                y()
+            )),
+            "return (-math.huge) ^ y\n"
+        );
+        assert_eq!(
+            render_expr(Expr::binary(y(), BinOp::Pow, Expr::float(-2.0))),
+            "return y ^ (-2)\n"
+        );
+        assert_eq!(
+            render_expr(Expr::binary(Expr::float(2.0), BinOp::Pow, y())),
+            "return 2 ^ y\n"
+        );
+    }
+
+    /// Negative literals in looser operators need no parentheses.
+    #[test]
+    fn negative_literal_in_sum_stays_bare() {
+        let sum = Expr::binary(Expr::float(-2.0), BinOp::Sub, Expr::float(-3.0));
+        assert_eq!(render_expr(sum), "return -2 - -3\n");
     }
 
     #[test]
@@ -848,6 +966,24 @@ mod tests {
     #[test]
     fn long_string_level_plain() {
         assert_eq!(long_string_level("hello world"), 0);
+    }
+
+    /// A trailing `]` would join `]]` and close the string one byte early.
+    #[test]
+    fn long_string_level_avoids_trailing_bracket() {
+        assert_eq!(long_string_level("end]"), 1);
+        assert_eq!(long_string_level("end]="), 0);
+        assert_eq!(long_string_level("end]=]"), 2);
+    }
+
+    #[test]
+    fn long_string_ending_in_bracket_closes_after_text() {
+        let printed = render_string(ByteString::from("line one\nline two\nline three\nend]"));
+
+        assert_eq!(
+            printed,
+            "return [=[line one\nline two\nline three\nend]]=]\n"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-mod ast;
+pub mod ast;
 mod bytecode_types;
 mod collections;
 mod common;
@@ -7,8 +7,8 @@ mod emitter;
 mod il;
 mod ir;
 mod logging;
-mod operator;
-mod printer;
+pub mod operator;
+pub mod printer;
 mod rename;
 pub mod style;
 
@@ -16,7 +16,8 @@ pub mod style;
 mod visualize;
 
 use anyhow::{Result, ensure};
-pub use common::LUAU_KEYWORDS;
+pub use collections::{Index, IndexSet};
+pub use common::{ByteString, LUAU_KEYWORDS};
 pub use logging::{
     DIAGNOSTIC_EVENT_TARGET, DiagnosticConfig, Diagnostics, LogLevel, LogTarget, ProtoSelector,
 };

@@ -6,9 +6,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 use clap::ValueEnum;
-
 #[cfg(feature = "luau-toolchain")]
-use crate::toolchain::LuauSelector;
+use mallow_luau_toolchain::LuauSelector;
 
 /// How an input file is interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

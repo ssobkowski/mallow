@@ -256,15 +256,15 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use anyhow::{Result, ensure};
+use decision::{Decision, Reducer};
 use either::Either;
+use loops::{Loop, LoopKind, Loops};
 
 use super::folding::Folding;
 use super::{Block, BlockExit, ControlFlowGraph, PackId, ValueId};
 use crate::collections::{HashMap, IndexSet};
 use crate::ir::graph::{DominatorTree, GraphView, Reversed, SeseGraphView};
 use crate::logging::{Diagnostics, LogLevel, LogTarget};
-use decision::{Decision, Reducer};
-use loops::{Loop, LoopKind, Loops};
 
 /// A source condition recovered from control-flow decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]

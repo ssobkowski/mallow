@@ -9,7 +9,7 @@ use id_arena::{Arena, ArenaBehavior, DefaultArenaBehavior, Id};
 pub(crate) use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// A key that maps to a small dense integer.
-pub(crate) trait Index: Copy {
+pub trait Index: Copy {
     fn index(self) -> usize;
 }
 
@@ -34,7 +34,7 @@ impl<T> Index for Id<T> {
 /// A set of integer-like keys backed by a growable bitset.
 ///
 /// Iteration (available for `usize` keys) is in ascending order.
-pub(crate) struct IndexSet<K> {
+pub struct IndexSet<K> {
     words: Vec<u64>,
     _key: PhantomData<fn() -> K>,
 }
@@ -71,12 +71,12 @@ impl<K> PartialEq for IndexSet<K> {
 impl<K> Eq for IndexSet<K> {}
 
 impl<K: Index> IndexSet<K> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Adds `key`, returning whether it was newly inserted.
-    pub(crate) fn insert(&mut self, key: K) -> bool {
+    pub fn insert(&mut self, key: K) -> bool {
         let i = key.index();
         let (word, bit) = (i / 64, 1u64 << (i % 64));
         if word >= self.words.len() {
@@ -88,7 +88,7 @@ impl<K: Index> IndexSet<K> {
     }
 
     /// Removes `key`, returning whether it was present.
-    pub(crate) fn remove(&mut self, key: impl Index) -> bool {
+    pub fn remove(&mut self, key: impl Index) -> bool {
         let i = key.index();
         match self.words.get_mut(i / 64) {
             Some(word) => {
@@ -101,23 +101,23 @@ impl<K: Index> IndexSet<K> {
         }
     }
 
-    pub(crate) fn contains(&self, key: impl Index) -> bool {
+    pub fn contains(&self, key: impl Index) -> bool {
         let i = key.index();
         self.words
             .get(i / 64)
             .is_some_and(|word| word & (1u64 << (i % 64)) != 0)
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.words.iter().all(|&w| w == 0)
     }
 
     /// Adds every key of `other`.
-    pub(crate) fn union_with(&mut self, other: &Self) {
+    pub fn union_with(&mut self, other: &Self) {
         if other.words.len() > self.words.len() {
             self.words.resize(other.words.len(), 0);
         }
@@ -127,7 +127,7 @@ impl<K: Index> IndexSet<K> {
     }
 
     /// Returns the keys of `self` that are not in `other`.
-    pub(crate) fn difference(&self, other: &Self) -> Self {
+    pub fn difference(&self, other: &Self) -> Self {
         let mut out = self.clone();
         for (a, b) in out.words.iter_mut().zip(&other.words) {
             *a &= !b;
@@ -136,18 +136,18 @@ impl<K: Index> IndexSet<K> {
     }
 
     /// Returns whether every key of `self` is also in `other`.
-    pub(crate) fn is_subset(&self, other: &Self) -> bool {
+    pub fn is_subset(&self, other: &Self) -> bool {
         let (head, tail) = self.words.split_at(self.words.len().min(other.words.len()));
         head.iter().zip(&other.words).all(|(&a, &b)| a & !b == 0) && tail.iter().all(|&w| w == 0)
     }
 
     /// Returns whether `self` and `other` have no key in common.
-    pub(crate) fn is_disjoint(&self, other: &Self) -> bool {
+    pub fn is_disjoint(&self, other: &Self) -> bool {
         self.words.iter().zip(&other.words).all(|(a, b)| a & b == 0)
     }
 
     /// Returns an iterator over the set bits.
-    pub(crate) fn iter(&self) -> IndexSetIter<'_> {
+    pub fn iter(&self) -> IndexSetIter<'_> {
         IndexSetIter::new(&self.words)
     }
 }

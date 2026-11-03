@@ -1,0 +1,20 @@
+[package]
+name = "mallow-fuzzer"
+description = "Random Luau program generator for differential testing of the mallow decompiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "mallow-fuzzer"
+path = "src/main.rs"
+
+[dependencies]
+mallow-core.workspace = true
+mallow-luau-toolchain.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+rand.workspace = true
+wait-timeout.workspace = true
