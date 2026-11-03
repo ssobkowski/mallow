@@ -16,8 +16,10 @@ fn find_block_entries(instrs: &[DecodedInstr]) -> Result<Vec<usize>> {
         if decoded.instr.branch_offset().is_some() {
             entries.insert(branch_target_idx(instrs, idx)?);
         }
-        // LoadB jumps without ending its block, since it still assigns a register.
-        if decoded.instr.is_branch_exit() && idx + 1 < instrs.len() {
+        if (decoded.instr.is_branch_exit()
+            || matches!(decoded.instr, Instr::LoadB { jump: 1.., .. }))
+            && idx + 1 < instrs.len()
+        {
             entries.insert(idx + 1);
         }
     }
@@ -152,13 +154,10 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
             continue;
         };
 
-        let (body_end, exit_instr) = if last_instr.is_branch_exit() {
-            (end - 1, Some(last_instr))
-        } else if matches!(last_instr, Instr::LoadB { jump, .. } if jump > 0) {
-            // LoadB still needs to be lifted to assign the boolean
-            (end, Some(last_instr))
+        let body_end = if last_instr.is_branch_exit() {
+            end - 1
         } else {
-            (end, None)
+            end
         };
 
         let mut exit_writes = if last_instr.is_branch_exit() {
@@ -168,17 +167,17 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
         };
 
         let exit_instr_idx = end.saturating_sub(1);
-        let exit = match exit_instr {
-            Some(Instr::Return { base, count }) => RawBlockExit::Return { base, count },
-            Some(Instr::Jump { .. }) | Some(Instr::JumpBack { .. }) => {
+        let exit = match last_instr {
+            Instr::Return { base, count } => RawBlockExit::Return { base, count },
+            Instr::Jump { .. } | Instr::JumpBack { .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::Jump(pc_to_block_idx(&entries, target))
             }
-            Some(Instr::JumpX { .. }) => {
+            Instr::JumpX { .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::Jump(pc_to_block_idx(&entries, target))
             }
-            Some(Instr::JumpIfNotLt { reg, aux, .. }) => {
+            Instr::JumpIfNotLt { reg, aux, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
@@ -190,7 +189,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block: pc_to_block_idx(&entries, target),
                 }
             }
-            Some(Instr::JumpIf { reg, .. }) => {
+            Instr::JumpIf { reg, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Unary(reg),
@@ -198,7 +197,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block: block_idx + 1,
                 }
             }
-            Some(Instr::JumpIfNot { reg, .. }) => {
+            Instr::JumpIfNot { reg, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Unary(reg),
@@ -206,7 +205,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block: pc_to_block_idx(&entries, target),
                 }
             }
-            Some(Instr::JumpIfEq { reg, aux, .. }) => {
+            Instr::JumpIfEq { reg, aux, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
@@ -218,7 +217,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block: block_idx + 1,
                 }
             }
-            Some(Instr::JumpIfNotEq { reg, aux, .. }) => {
+            Instr::JumpIfNotEq { reg, aux, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
@@ -230,7 +229,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block: block_idx + 1,
                 }
             }
-            Some(Instr::JumpIfLe { reg, aux, .. }) => {
+            Instr::JumpIfLe { reg, aux, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
@@ -242,7 +241,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block: block_idx + 1,
                 }
             }
-            Some(Instr::JumpIfNotLe { reg, aux, .. }) => {
+            Instr::JumpIfNotLe { reg, aux, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
@@ -254,7 +253,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block: pc_to_block_idx(&entries, target),
                 }
             }
-            Some(Instr::JumpIfLt { reg, aux, .. }) => {
+            Instr::JumpIfLt { reg, aux, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::CondJump {
                     cond: Cond::Binary {
@@ -266,7 +265,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block: block_idx + 1,
                 }
             }
-            Some(Instr::JumpXEqKNil { reg, invert, .. }) => {
+            Instr::JumpXEqKNil { reg, invert, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 let (then_block, else_block) = if invert {
                     (block_idx + 1, pc_to_block_idx(&entries, target))
@@ -283,7 +282,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block,
                 }
             }
-            Some(Instr::JumpXEqKB { reg, k, invert, .. }) => {
+            Instr::JumpXEqKB { reg, k, invert, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 let (then_block, else_block) = if invert {
                     (block_idx + 1, pc_to_block_idx(&entries, target))
@@ -300,8 +299,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block,
                 }
             }
-            Some(Instr::JumpXEqKN { reg, k, invert, .. })
-            | Some(Instr::JumpXEqKS { reg, k, invert, .. }) => {
+            Instr::JumpXEqKN { reg, k, invert, .. } | Instr::JumpXEqKS { reg, k, invert, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 let (then_block, else_block) = if invert {
                     (block_idx + 1, pc_to_block_idx(&entries, target))
@@ -318,7 +316,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     else_block,
                 }
             }
-            Some(Instr::FornPrep { base, .. }) => {
+            Instr::FornPrep { base, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::FornPrep {
                     base,
@@ -326,16 +324,16 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     exit_block: pc_to_block_idx(&entries, target),
                 }
             }
-            Some(Instr::FornLoop { .. }) => {
+            Instr::FornLoop { .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::FornLoop {
                     body_block: pc_to_block_idx(&entries, target),
                     exit_block: block_idx + 1,
                 }
             }
-            Some(Instr::ForgPrep { base, .. })
-            | Some(Instr::ForgPrepInext { base, .. })
-            | Some(Instr::ForgPrepNext { base, .. }) => {
+            Instr::ForgPrep { base, .. }
+            | Instr::ForgPrepInext { base, .. }
+            | Instr::ForgPrepNext { base, .. } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 let loop_block = pc_to_block_idx(&entries, target);
 
@@ -363,9 +361,9 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     exit_block: loop_block + 1,
                 }
             }
-            Some(Instr::ForgLoop {
+            Instr::ForgLoop {
                 base, var_count, ..
-            }) => {
+            } => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::ForgLoop {
                     base,
@@ -374,7 +372,7 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                     result_count: usize::from(var_count),
                 }
             }
-            Some(Instr::LoadB { jump, .. }) if jump > 0 => {
+            Instr::LoadB { jump, .. } if jump > 0 => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
                 RawBlockExit::Jump(pc_to_block_idx(&entries, target))
             }
