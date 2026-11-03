@@ -1570,6 +1570,7 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
             RawBlockExit::ForgPrep {
                 base,
                 body_block,
+                loop_block,
                 exit_block,
             } => {
                 self.flush_pending();
@@ -1586,7 +1587,8 @@ impl<'l, 'c, 'g> BlockLifter<'l, 'c, 'g> {
                     .collect();
                 BlockExit::GenericFor {
                     body_edge: Edge::empty(*body_block),
-                    loop_block: *exit_block,
+                    exit_edge: Edge::empty(*exit_block),
+                    loop_block: *loop_block,
                     variables,
                     values,
                 }
@@ -1834,6 +1836,11 @@ fn thread_raw_exit(exit: &mut RawBlockExit, targets: &[usize]) {
             body_block: then_block,
             exit_block: else_block,
         }
+        | RawBlockExit::ForgPrep {
+            body_block: then_block,
+            exit_block: else_block,
+            ..
+        }
         | RawBlockExit::ForgLoop {
             body_block: then_block,
             exit_block: else_block,
@@ -1842,7 +1849,6 @@ fn thread_raw_exit(exit: &mut RawBlockExit, targets: &[usize]) {
             thread(then_block);
             thread(else_block);
         }
-        RawBlockExit::ForgPrep { body_block, .. } => thread(body_block),
         RawBlockExit::Return { .. } => {}
     }
 }
@@ -1866,11 +1872,7 @@ fn remap_raw_exit(exit: &mut RawBlockExit, old_to_new: &[Option<usize>]) {
 }
 
 /// Returns every block referenced by a raw exit.
-///
-/// Unlike [RawBlockExit::targets], this includes the loop block of a `FORGPREP`,
-/// which is not one of its CFG successors as this function returns the mechanical
-/// exits.
-fn raw_exit_references_mut(exit: &mut RawBlockExit) -> SmallVec<[&mut usize; 2]> {
+fn raw_exit_references_mut(exit: &mut RawBlockExit) -> SmallVec<[&mut usize; 3]> {
     match exit {
         RawBlockExit::Jump(target) | RawBlockExit::Fallthrough(target) => smallvec![target],
         RawBlockExit::CondJump {
@@ -1888,16 +1890,17 @@ fn raw_exit_references_mut(exit: &mut RawBlockExit) -> SmallVec<[&mut usize; 2]>
             exit_block: else_block,
             ..
         }
-        | RawBlockExit::ForgPrep {
-            body_block: then_block,
-            exit_block: else_block,
-            ..
-        }
         | RawBlockExit::ForgLoop {
             body_block: then_block,
             exit_block: else_block,
             ..
         } => smallvec![then_block, else_block],
+        RawBlockExit::ForgPrep {
+            body_block,
+            loop_block,
+            exit_block,
+            ..
+        } => smallvec![body_block, loop_block, exit_block],
         RawBlockExit::Return { .. } => SmallVec::new(),
     }
 }

@@ -339,6 +339,7 @@ impl<W: StyledWrite> IrWriter<'_, '_, W> {
             }
             BlockExit::GenericFor {
                 body_edge,
+                exit_edge,
                 loop_block,
                 variables,
                 values,
@@ -350,6 +351,8 @@ impl<W: StyledWrite> IrWriter<'_, '_, W> {
                 self.punctuated(values, Self::value)?;
                 self.w.write_str("] -> ")?;
                 self.edge(body_edge)?;
+                self.w.write_str(", ")?;
+                self.edge(exit_edge)?;
                 self.w.write_str(", loop ")?;
                 self.block(*loop_block)
             }

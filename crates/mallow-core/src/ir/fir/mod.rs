@@ -359,8 +359,12 @@ pub enum BlockExit {
     GenericFor {
         /// First block in the loop body.
         body_edge: Edge,
-        /// Block containing the generic loop operation.
-        loop_block: usize, // this is structural metadata, not an actual edge.
+        /// First block after the loop. It runs when the first iterator call
+        /// ends the loop, so the body runs zero times.
+        exit_edge: Edge,
+        /// Block that ends in the matching [`BlockExit::GenericForLoop`].
+        /// This is structural metadata and not a CFG edge.
+        loop_block: usize,
         /// Values produced for the source loop variables.
         variables: SmallVec<[ValueId; 3]>,
         /// Iterator, state, and initial control values.
@@ -413,6 +417,11 @@ impl BlockExit {
                 exit_edge: else_edge,
                 ..
             }
+            | Self::GenericFor {
+                body_edge: then_edge,
+                exit_edge: else_edge,
+                ..
+            }
             | Self::NumericForLoop {
                 body_edge: then_edge,
                 exit_edge: else_edge,
@@ -422,7 +431,6 @@ impl BlockExit {
                 exit_edge: else_edge,
                 ..
             } => smallvec![then_edge, else_edge],
-            Self::GenericFor { body_edge, .. } => smallvec![body_edge],
             Self::Return(_) => SmallVec::new(),
         }
     }
@@ -441,6 +449,11 @@ impl BlockExit {
                 exit_edge: else_edge,
                 ..
             }
+            | Self::GenericFor {
+                body_edge: then_edge,
+                exit_edge: else_edge,
+                ..
+            }
             | Self::NumericForLoop {
                 body_edge: then_edge,
                 exit_edge: else_edge,
@@ -450,7 +463,6 @@ impl BlockExit {
                 exit_edge: else_edge,
                 ..
             } => smallvec![then_edge, else_edge],
-            Self::GenericFor { body_edge, .. } => smallvec![body_edge],
             Self::Return(_) => SmallVec::new(),
         }
     }

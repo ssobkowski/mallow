@@ -55,6 +55,7 @@ pub enum RawBlockExit {
     ForgPrep {
         base: u8,
         body_block: usize,
+        loop_block: usize,
         exit_block: usize,
     },
     ForgLoop {
@@ -84,8 +85,12 @@ impl RawBlockExit {
                 body_block,
                 exit_block,
                 ..
+            }
+            | RawBlockExit::ForgPrep {
+                body_block,
+                exit_block,
+                ..
             } => smallvec![*body_block, *exit_block],
-            RawBlockExit::ForgPrep { body_block, .. } => smallvec![*body_block],
             RawBlockExit::FornLoop {
                 body_block,
                 exit_block,
@@ -332,10 +337,10 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
             | Some(Instr::ForgPrepInext { base, .. })
             | Some(Instr::ForgPrepNext { base, .. }) => {
                 let target = branch_target_idx(&proto.instrs, exit_instr_idx)?;
-                let exit_block = pc_to_block_idx(&entries, target);
+                let loop_block = pc_to_block_idx(&entries, target);
 
                 let end = entries
-                    .get(exit_block + 1)
+                    .get(loop_block + 1)
                     .copied()
                     .unwrap_or(proto.instrs.len());
                 let result_count = match proto
@@ -354,7 +359,8 @@ pub fn build_raw_from_proto<'p>(proto: &'p Proto) -> Result<Vec<RawBlock<'p>>> {
                 RawBlockExit::ForgPrep {
                     base,
                     body_block: block_idx + 1,
-                    exit_block: pc_to_block_idx(&entries, target),
+                    loop_block,
+                    exit_block: loop_block + 1,
                 }
             }
             Some(Instr::ForgLoop {

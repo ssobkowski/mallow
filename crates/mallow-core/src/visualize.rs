@@ -205,6 +205,11 @@ fn graph_payload(function: &Function, tag: &str) -> GraphPayload {
                     body_edge,
                     exit_edge,
                 }
+                | BlockExit::GenericFor {
+                    body_edge,
+                    exit_edge,
+                    ..
+                }
                 | BlockExit::GenericForLoop {
                     body_edge,
                     exit_edge,
@@ -231,19 +236,6 @@ fn graph_payload(function: &Function, tag: &str) -> GraphPayload {
                         &function.cfg[exit_edge.target].params,
                         "#f44336",
                         1,
-                    );
-                }
-                BlockExit::GenericFor { body_edge, .. } => {
-                    add_edge(
-                        &mut edges,
-                        &mut edge_counter,
-                        &function.cfg,
-                        idoms,
-                        src,
-                        body_edge,
-                        &function.cfg[body_edge.target].params,
-                        "#4CAF50",
-                        0,
                     );
                 }
                 BlockExit::Return(_) => {}
